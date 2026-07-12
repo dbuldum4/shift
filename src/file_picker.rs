@@ -102,6 +102,40 @@ pub fn pick_file(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Optio
     rx
 }
 
+/// Present a save dialog with a suggested output name.
+pub fn pick_save_file(
+    suggested_name: &str,
+    starting_directory: Option<PathBuf>,
+) -> oneshot::Receiver<Option<PathBuf>> {
+    let (tx, rx) = oneshot::channel();
+
+    if DIALOG_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let _ = tx.send(None);
+        return rx;
+    }
+
+    let start_dir = starting_directory
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            LAST_DIRECTORY
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|path| path.is_dir())
+        })
+        .or_else(default_start_directory);
+
+    // SAFETY: called from the GPUI main thread (click handler).
+    unsafe {
+        present_save_panel(suggested_name, start_dir, tx);
+    }
+
+    rx
+}
+
 fn default_start_directory() -> Option<PathBuf> {
     home_dir()
         .map(|h| h.join("Documents"))
@@ -200,6 +234,85 @@ unsafe fn present_open_panel(start_dir: Option<PathBuf>, tx: oneshot::Sender<Opt
     }
 }
 
+unsafe fn present_save_panel(
+    suggested_name: &str,
+    start_dir: Option<PathBuf>,
+    tx: oneshot::Sender<Option<PathBuf>>,
+) {
+    unsafe {
+        let panel = NSSavePanel::savePanel(nil);
+        let panel: id = msg_send![panel, retain];
+        panel.setCanCreateDirectories(YES);
+
+        if let Some(dir) = start_dir.as_ref() {
+            set_directory_url(panel, dir);
+        }
+
+        let name = NSString::alloc(nil).init_str(suggested_name);
+        let _: () = msg_send![panel, setNameFieldStringValue: name];
+        let _: () = msg_send![name, release];
+
+        let prompt = NSString::alloc(nil).init_str("Save");
+        let _: () = msg_send![panel, setPrompt: prompt];
+        let _: () = msg_send![prompt, release];
+
+        let level = CGShieldingWindowLevel() as i64;
+        let _: () = msg_send![panel, setLevel: level];
+
+        let app = NSApp();
+        app.activateIgnoringOtherApps_(YES);
+        let previous_key: id = msg_send![app, keyWindow];
+        if previous_key != nil {
+            let _: id = msg_send![previous_key, retain];
+        }
+        let parent = sheet_parent(app);
+
+        let done = Cell::new(Some(CompletionState {
+            tx,
+            panel,
+            previous_key,
+        }));
+        let block = block::ConcreteBlock::new(move |response: NSModalResponse| {
+            let Some(state) = done.take() else {
+                return;
+            };
+
+            let result = if response == NSModalResponse::NSModalResponseOk {
+                selected_save_path(state.panel)
+            } else {
+                None
+            };
+
+            if let Some(parent) = result.as_ref().and_then(|path| path.parent()) {
+                if let Ok(mut guard) = LAST_DIRECTORY.lock() {
+                    *guard = Some(parent.to_path_buf());
+                }
+            }
+
+            let _: () = msg_send![state.panel, orderOut: nil];
+            let _: () = msg_send![state.panel, release];
+            if state.previous_key != nil {
+                let _: () = msg_send![state.previous_key, makeKeyAndOrderFront: nil];
+                let _: () = msg_send![state.previous_key, release];
+            }
+
+            DIALOG_OPEN.store(false, Ordering::Release);
+            let _ = state.tx.send(result);
+        });
+        let block = block.copy();
+
+        if parent != nil {
+            let _: () = msg_send![
+                panel,
+                beginSheetModalForWindow: parent
+                completionHandler: block
+            ];
+        } else {
+            let _: () = msg_send![panel, beginWithCompletionHandler: block];
+        }
+    }
+}
+
 struct CompletionState {
     tx: oneshot::Sender<Option<PathBuf>>,
     panel: id,
@@ -261,6 +374,16 @@ fn first_selected_path(panel: id) -> Option<PathBuf> {
             }
         }
         None
+    }
+}
+
+fn selected_save_path(panel: id) -> Option<PathBuf> {
+    unsafe {
+        let url: id = msg_send![panel, URL];
+        if url == nil {
+            return None;
+        }
+        ns_url_to_path(url)
     }
 }
 

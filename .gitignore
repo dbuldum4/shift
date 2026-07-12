@@ -1,5 +1,5 @@
 /target
+/.venv
 .DS_Store
 *.swp
 *.swo
-

@@ -3,6 +3,19 @@ name = "shift"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+default-run = "shift"
+
+[lib]
+name = "shift_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shift"
+path = "src/main.rs"
+
+[[bin]]
+name = "shift-cli"
+path = "src/bin/shift-cli.rs"
 
 [dependencies]
 gpui = "=0.2.2"
