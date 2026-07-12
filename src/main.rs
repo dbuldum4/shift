@@ -1,15 +1,19 @@
 mod file_picker;
+mod text_input;
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Bounds, Context, ExternalPaths, FontWeight,
+    Animation, AnimationExt, App, Application, Bounds, Context, Entity, ExternalPaths, FontWeight,
     KeyBinding, Menu, MenuItem, PathBuilder, PathStyle, Pixels, Point, Render, SharedString,
     StrokeOptions, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
     canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
 };
-use shift_core::conversion::{ConversionArtifact, ConversionRegistry, OutputFormat};
+use shift_core::conversion::{
+    ConversionArtifact, ConversionRegistry, OutputFormat, looks_like_url,
+};
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use text_input::TextInput;
 
 const APP_NAME: &str = "Shift";
 const DROP_ZONE_COLOR: u32 = 0x171a1f;
@@ -239,6 +243,27 @@ fn empty_drop_prompt() -> impl IntoElement {
         )
 }
 
+fn build_url_preview(url: &str) -> FilePreview {
+    let host = url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("HTTPS://")
+        .trim_start_matches("HTTP://")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("Web")
+        .to_owned();
+
+    FilePreview {
+        name: url.trim().to_owned().into(),
+        subtitle: format!("URL  ·  {host}").into(),
+        extension_label: "WEB".into(),
+        badge_color: 0x243038,
+        badge_text_color: 0x9ec4d8,
+    }
+}
+
 fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl IntoElement {
     let badge_color = preview.badge_color;
     let badge_text_color = preview.badge_text_color;
@@ -404,7 +429,9 @@ fn output_panel(
                     .max_w(px(260.0))
                     .text_sm()
                     .text_color(rgb(0x767e8b))
-                    .child("Choose a supported file and Shift will convert it automatically."),
+                    .child(
+                        "Choose a supported file or paste a URL — Shift converts it automatically.",
+                    ),
             ),
         ConversionState::Converting => div()
             .flex()
@@ -640,8 +667,53 @@ fn module_label(id: &str) -> &str {
     match id {
         "markitdown" => "MarkItDown",
         "pandoc" => "Pandoc",
+        "defuddle" => "Defuddle",
         other => other,
     }
+}
+
+fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl IntoElement {
+    div()
+        .id("url-input-bar")
+        .flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .rounded_lg()
+                .bg(rgb(0x1b1f25))
+                .border_1()
+                .border_color(rgb(0x303640))
+                .text_sm()
+                .text_color(rgb(0xe8edf3))
+                .overflow_hidden()
+                .child(url_input),
+        )
+        .child(
+            div()
+                .id("convert-url")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(40.0))
+                .px_4()
+                .rounded_lg()
+                .bg(rgb(0xdcebf5))
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0x18242c))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0xf0f7fb)))
+                .active(|style| style.opacity(0.82))
+                .child("Convert")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.submit_url_from_input(cx);
+                    cx.stop_propagation();
+                })),
+        )
 }
 
 fn settings_modal(priority: &[String], cx: &mut Context<Shift>) -> impl IntoElement {
@@ -776,6 +848,7 @@ actions!(shift, [Quit]);
 
 struct Shift {
     selected_file: Option<PathBuf>,
+    selected_url: Option<String>,
     file_preview: Option<FilePreview>,
     selection_generation: u64,
     conversion_generation: u64,
@@ -785,6 +858,7 @@ struct Shift {
     output_menu_open: bool,
     settings_open: bool,
     module_priority: Vec<String>,
+    url_input: Entity<TextInput>,
 }
 
 impl Shift {
@@ -820,6 +894,9 @@ impl Shift {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
 
+        self.selected_url = None;
+        self.url_input
+            .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = Some(build_file_preview_with_size(&path, "…".into()));
         self.selected_file = Some(path.clone());
         let available_outputs = ConversionRegistry::default().available_outputs(&path);
@@ -856,12 +933,61 @@ impl Shift {
         self.start_conversion(cx);
     }
 
-    fn start_conversion(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_file.clone() else {
-            self.conversion = ConversionState::Empty;
+    fn submit_url_from_input(&mut self, cx: &mut Context<Self>) {
+        let url = self.url_input.read(cx).content().trim().to_owned();
+        self.set_selected_url(url, cx);
+    }
+
+    fn set_selected_url(&mut self, url: String, cx: &mut Context<Self>) {
+        let url = url.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        if !looks_like_url(&url) {
+            self.conversion = ConversionState::Failed(
+                "Enter a full http:// or https:// URL to extract with Defuddle.".into(),
+            );
+            self.save_status = None;
+            self.output_menu_open = false;
             cx.notify();
             return;
-        };
+        }
+
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selected_file = None;
+        self.selected_url = Some(url.clone());
+        self.file_preview = Some(build_url_preview(&url));
+        self.url_input
+            .update(cx, |input, cx| input.set_content(url.clone(), cx));
+
+        let available_outputs = ConversionRegistry::default().available_url_outputs();
+        if !available_outputs.contains(&self.output_format) {
+            self.output_format = available_outputs
+                .first()
+                .copied()
+                .unwrap_or(OutputFormat::MARKDOWN);
+        }
+        self.conversion = ConversionState::Converting;
+        self.save_status = None;
+        self.output_menu_open = false;
+        cx.notify();
+        self.start_conversion(cx);
+    }
+
+    fn start_conversion(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_file.clone() {
+            self.start_file_conversion(path, cx);
+            return;
+        }
+        if let Some(url) = self.selected_url.clone() {
+            self.start_url_conversion(url, cx);
+            return;
+        }
+        self.conversion = ConversionState::Empty;
+        cx.notify();
+    }
+
+    fn start_file_conversion(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
         let conversion_generation = self.conversion_generation;
         let generation = self.selection_generation;
@@ -895,6 +1021,40 @@ impl Shift {
         .detach();
     }
 
+    fn start_url_conversion(&mut self, url: String, cx: &mut Context<Self>) {
+        self.conversion_generation = self.conversion_generation.wrapping_add(1);
+        let conversion_generation = self.conversion_generation;
+        let generation = self.selection_generation;
+        let output_format = self.output_format;
+        let priority = self.module_priority.clone();
+        self.conversion = ConversionState::Converting;
+        self.save_status = None;
+        cx.notify();
+
+        let conversion_url = url.clone();
+        let conversion_task = cx.background_executor().spawn(async move {
+            ConversionRegistry::default()
+                .with_priority(&priority)
+                .convert_url(&conversion_url, output_format)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = conversion_task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_generation == generation
+                    && this.conversion_generation == conversion_generation
+                    && this.selected_url.as_ref() == Some(&url)
+                {
+                    this.conversion = match result {
+                        Ok(artifact) => ConversionState::Ready(artifact),
+                        Err(error) => ConversionState::Failed(error.to_string().into()),
+                    };
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn set_output_format(&mut self, format: OutputFormat, cx: &mut Context<Self>) {
         self.output_menu_open = false;
         if self.output_format != format {
@@ -912,7 +1072,7 @@ impl Shift {
         let module = self.module_priority.remove(from);
         self.module_priority.insert(to, module);
         let _ = save_module_priority(&self.module_priority);
-        if self.selected_file.is_some() {
+        if self.selected_file.is_some() || self.selected_url.is_some() {
             self.start_conversion(cx);
         } else {
             cx.notify();
@@ -922,6 +1082,9 @@ impl Shift {
     fn clear_selected_file(&mut self, cx: &mut Context<Self>) {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selected_file = None;
+        self.selected_url = None;
+        self.url_input
+            .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = None;
         self.conversion = ConversionState::Empty;
         self.save_status = None;
@@ -969,18 +1132,21 @@ impl Shift {
 impl Render for Shift {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview = self.file_preview.clone();
-        let has_selection = self.selected_file.is_some();
+        let has_selection = self.selected_file.is_some() || self.selected_url.is_some();
         let conversion = self.conversion.clone();
         let save_status = self.save_status.clone();
-        let available_outputs = self
-            .selected_file
-            .as_ref()
-            .map(|path| ConversionRegistry::default().available_outputs(path))
-            .unwrap_or_else(|| OutputFormat::ALL.to_vec());
+        let available_outputs = if self.selected_url.is_some() {
+            ConversionRegistry::default().available_url_outputs()
+        } else if let Some(path) = self.selected_file.as_ref() {
+            ConversionRegistry::default().available_outputs(path)
+        } else {
+            OutputFormat::ALL.to_vec()
+        };
         let output_format = self.output_format;
         let output_menu_open = self.output_menu_open;
         let settings_open = self.settings_open;
         let module_priority = self.module_priority.clone();
+        let url_input = self.url_input.clone();
 
         div()
             .id("shift-root")
@@ -995,35 +1161,48 @@ impl Render for Shift {
                     cx.notify();
                 }
             }))
-            .child(div().flex_1().min_w_0().h_full().p_8().child({
-                // Hover styling uses hitbox hover (stays true while pressed).
-                // Do NOT drive ElementId / with_animation from on_hover: that
-                // API reports false on mouse-down, remounts this node, and
-                // clears pending_mouse_down — so the first click is eaten.
+            .child(
                 div()
-                    .id("file-drop-zone")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .p_8()
                     .flex()
                     .flex_col()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .rounded_xl()
-                    .bg(rgb(DROP_ZONE_COLOR))
-                    .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
-                    .cursor_pointer()
-                    .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x1c242a)))
-                    .child(rounded_dashed_border(has_selection))
-                    .when_some(preview, |zone, preview| {
-                        zone.child(file_preview_card(preview, cx))
-                    })
-                    .when(!has_selection, |zone| zone.child(empty_drop_prompt()))
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
-                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                        if let Some(path) = paths.paths().first() {
-                            this.set_selected_file(path.clone(), cx);
-                        }
-                    }))
-            }))
+                    .gap_4()
+                    .child(url_input_bar(url_input, cx))
+                    .child({
+                        // Hover styling uses hitbox hover (stays true while pressed).
+                        // Do NOT drive ElementId / with_animation from on_hover: that
+                        // API reports false on mouse-down, remounts this node, and
+                        // clears pending_mouse_down — so the first click is eaten.
+                        div()
+                            .id("file-drop-zone")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .items_center()
+                            .justify_center()
+                            .rounded_xl()
+                            .bg(rgb(DROP_ZONE_COLOR))
+                            .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
+                            .cursor_pointer()
+                            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x1c242a)))
+                            .child(rounded_dashed_border(has_selection))
+                            .when_some(preview, |zone, preview| {
+                                zone.child(file_preview_card(preview, cx))
+                            })
+                            .when(!has_selection, |zone| zone.child(empty_drop_prompt()))
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
+                            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                                if let Some(path) = paths.paths().first() {
+                                    this.set_selected_file(path.clone(), cx);
+                                }
+                            }))
+                    }),
+            )
             .child(
                 div()
                     .h_full()
@@ -1079,6 +1258,7 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        text_input::bind_keys(cx);
         cx.set_menus(vec![Menu {
             name: APP_NAME.into(),
             items: vec![
@@ -1103,18 +1283,38 @@ fn main() {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|_| Shift {
-                    selected_file: None,
-                    file_preview: None,
-                    selection_generation: 0,
-                    conversion_generation: 0,
-                    conversion: ConversionState::Empty,
-                    save_status: None,
-                    output_format: OutputFormat::MARKDOWN,
-                    output_menu_open: false,
-                    settings_open: false,
-                    module_priority: load_module_priority(),
-                })
+                let shift_entity = cx.new(|cx| {
+                    let url_input = cx.new(|cx| TextInput::new(cx, "Paste a URL to extract…", ""));
+                    Shift {
+                        selected_file: None,
+                        selected_url: None,
+                        file_preview: None,
+                        selection_generation: 0,
+                        conversion_generation: 0,
+                        conversion: ConversionState::Empty,
+                        save_status: None,
+                        output_format: OutputFormat::MARKDOWN,
+                        output_menu_open: false,
+                        settings_open: false,
+                        module_priority: load_module_priority(),
+                        url_input,
+                    }
+                });
+
+                // Route Enter in the URL field back to the app entity.
+                let parent = shift_entity.downgrade();
+                let url_input = shift_entity.read(cx).url_input.clone();
+                url_input.update(cx, |input, _cx| {
+                    input.set_on_submit(move |url, cx| {
+                        let parent = parent.clone();
+                        let url = url.to_owned();
+                        cx.defer(move |cx| {
+                            let _ = parent.update(cx, |this, cx| this.set_selected_url(url, cx));
+                        });
+                    });
+                });
+
+                shift_entity
             },
         )
         .expect("failed to open the main window");

@@ -1,5 +1,8 @@
-use shift_core::conversion::{ConversionRegistry, OutputFormat, default_output_path};
+use shift_core::conversion::{
+    ConversionRegistry, OutputFormat, default_output_path, looks_like_url,
+};
 use shift_core::preferences::load_module_priority;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 fn main() {
@@ -9,7 +12,7 @@ fn main() {
     }
 }
 
-fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
+fn run(arguments: Vec<OsString>) -> Result<(), String> {
     if arguments.is_empty() {
         print_help();
         return Ok(());
@@ -37,8 +40,8 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     let input = arguments
         .get(cursor)
         .filter(|value| !value.to_string_lossy().starts_with('-'))
-        .map(PathBuf::from)
-        .ok_or_else(|| "missing input file (try `shift-cli --help`)".to_owned())?;
+        .cloned()
+        .ok_or_else(|| "missing input file or URL (try `shift-cli --help`)".to_owned())?;
     cursor += 1;
 
     let mut output = None;
@@ -90,9 +93,17 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     } else {
         ConversionRegistry::default().with_priority(&load_module_priority())
     };
-    let artifact = registry
-        .convert_to(&input, target)
-        .map_err(|error| error.to_string())?;
+
+    let input_url = url_input(&input);
+    let artifact = if let Some(url) = input_url {
+        registry
+            .convert_url(url, target)
+            .map_err(|error| error.to_string())?
+    } else {
+        registry
+            .convert_to(PathBuf::from(&input), target)
+            .map_err(|error| error.to_string())?
+    };
 
     if stdout {
         use std::io::Write;
@@ -100,7 +111,13 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
             .write_all(&artifact.bytes)
             .map_err(|error| format!("could not write output: {error}"))?;
     } else {
-        let output = output.unwrap_or_else(|| default_output_path(&input, target));
+        let output = output.unwrap_or_else(|| {
+            if input_url.is_some() {
+                PathBuf::from(&artifact.file_name)
+            } else {
+                default_output_path(PathBuf::from(&input).as_path(), target)
+            }
+        });
         artifact
             .write_to(&output)
             .map_err(|error| error.to_string())?;
@@ -108,6 +125,10 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn url_input(input: &OsStr) -> Option<&str> {
+    input.to_str().filter(|value| looks_like_url(value))
 }
 
 fn print_formats() {
@@ -118,22 +139,50 @@ fn print_formats() {
             .map(|format| format.id())
             .collect::<Vec<_>>()
             .join(", ");
+        let inputs = if module.supports_url(OutputFormat::MARKDOWN)
+            || module.supports_url(OutputFormat::HTML)
+        {
+            let mut parts = module.input_extensions().to_vec();
+            parts.push("url");
+            parts.join(", ")
+        } else {
+            module.input_extensions().join(", ")
+        };
         println!(
-            "{} ({}): {} -> {outputs}",
+            "{} ({}): {inputs} -> {outputs}",
             module.label(),
             module.id(),
-            module.input_extensions().join(", ")
         );
     }
 }
 
 fn print_help() {
     println!(
-        "Shift converts files through the same modules as the native app.\n\n\
-         Usage:\n  shift-cli <INPUT> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--module <ID>]\n  \
-         shift-cli convert <INPUT> [-t <FORMAT>] [-o <OUTPUT>] [--stdout]\n  \
+        "Shift converts files and URLs through the same modules as the native app.\n\n\
+         Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--module <ID>]\n  \
+         shift-cli convert <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout]\n  \
          shift-cli formats\n\n\
+         URLs (http/https) are extracted with Defuddle.\n\
          Use `shift-cli formats` to list every installed conversion capability.\n\
-         If no output is supplied, Shift writes beside the source using the target extension."
+         If no output is supplied, Shift writes beside the source (or the current directory for URLs)."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_inputs_remain_file_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let input = OsString::from_vec(b"report-\xff.pdf".to_vec());
+
+        assert_eq!(url_input(&input), None);
+        assert_eq!(
+            PathBuf::from(input).as_os_str().as_bytes(),
+            b"report-\xff.pdf"
+        );
+    }
 }

@@ -24,9 +24,10 @@ Never implement a converter directly inside a UI event handler or CLI parser.
 
 The MarkItDown adapter converts broad heterogeneous inputs to Markdown. Pandoc
 handles publishing formats and overlaps on some document-to-Markdown paths.
-Keep capability lists explicit so unsupported pairs fail before an external
-process is launched. If a new module overlaps an existing conversion pair,
-document and test the registry precedence.
+Defuddle extracts clean article content from `http(s)` URLs and local HTML
+(Markdown or HTML output). Keep capability lists explicit so unsupported pairs
+fail before an external process is launched. If a new module overlaps an
+existing conversion pair, document and test the registry precedence.
 
 ## Verification
 

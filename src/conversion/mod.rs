@@ -1,5 +1,6 @@
 //! Format conversion modules and capability-based dispatch.
 
+mod defuddle;
 mod markitdown;
 mod pandoc;
 
@@ -7,6 +8,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub use defuddle::{DefuddleModule, looks_like_url};
 pub use markitdown::MarkItDownModule;
 pub use pandoc::PandocModule;
 
@@ -250,6 +252,23 @@ pub trait ConversionModule: Send + Sync {
             .any(|candidate| extension.eq_ignore_ascii_case(candidate))
             && self.output_formats().contains(&output)
     }
+
+    /// Whether this module can convert a remote URL to the given format.
+    fn supports_url(&self, _output: OutputFormat) -> bool {
+        false
+    }
+
+    /// Convert a remote URL. Default rejects; URL-capable modules override.
+    fn convert_url(
+        &self,
+        url: &str,
+        _output: OutputFormat,
+    ) -> Result<ConversionArtifact, ConversionError> {
+        Err(ConversionError::new(format!(
+            "{} does not support URL conversion ({url})",
+            self.label()
+        )))
+    }
 }
 
 /// Dispatches requests according to module order. Earlier modules win.
@@ -262,6 +281,7 @@ impl Default for ConversionRegistry {
         Self::new()
             .with_module(MarkItDownModule::default())
             .with_module(PandocModule::default())
+            .with_module(DefuddleModule::default())
     }
 }
 
@@ -298,11 +318,26 @@ impl ConversionRegistry {
             .map(Box::as_ref)
     }
 
+    pub fn module_for_url(&self, output: OutputFormat) -> Option<&dyn ConversionModule> {
+        self.modules
+            .iter()
+            .find(|module| module.supports_url(output))
+            .map(Box::as_ref)
+    }
+
     pub fn available_outputs(&self, input: &Path) -> Vec<OutputFormat> {
         OutputFormat::ALL
             .iter()
             .copied()
             .filter(|output| self.module_for(input, *output).is_some())
+            .collect()
+    }
+
+    pub fn available_url_outputs(&self) -> Vec<OutputFormat> {
+        OutputFormat::ALL
+            .iter()
+            .copied()
+            .filter(|output| self.module_for_url(*output).is_some())
             .collect()
     }
 
@@ -335,6 +370,28 @@ impl ConversionRegistry {
         })?;
 
         module.convert(input, output)
+    }
+
+    pub fn convert_url(
+        &self,
+        url: &str,
+        output: OutputFormat,
+    ) -> Result<ConversionArtifact, ConversionError> {
+        let url = url.trim();
+        if !looks_like_url(url) {
+            return Err(ConversionError::new(format!(
+                "not a valid http(s) URL: {url}"
+            )));
+        }
+
+        let module = self.module_for_url(output).ok_or_else(|| {
+            ConversionError::new(format!(
+                "no conversion module supports URL conversion to {}",
+                output.label()
+            ))
+        })?;
+
+        module.convert_url(url, output)
     }
 }
 
@@ -423,5 +480,33 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), original_len);
+    }
+
+    #[test]
+    fn url_conversion_routes_to_defuddle() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for_url(OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "defuddle"
+        );
+        assert_eq!(
+            registry.available_url_outputs(),
+            vec![OutputFormat::MARKDOWN, OutputFormat::HTML]
+        );
+    }
+
+    #[test]
+    fn default_priority_still_prefers_markitdown_for_local_html() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for(Path::new("page.html"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "markitdown"
+        );
     }
 }

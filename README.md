@@ -1,16 +1,18 @@
 # Shift
 
-Shift is a native macOS file-to-Markdown converter. Drop a supported file on
-the left, inspect the Markdown on the right, and download it immediately. The
-`shift-cli` executable exposes the same conversion modules for scripts and
-terminal workflows.
+Shift is a native macOS file- and URL-to-Markdown converter. Drop a supported
+file on the left, paste a URL into the input bar, inspect the result on the
+right, and download it immediately. The `shift-cli` executable exposes the same
+conversion modules for scripts and terminal workflows.
 
 The ingestion module is powered by
 [Microsoft MarkItDown](https://github.com/microsoft/markitdown), which preserves
 useful document structure such as headings, lists, links, and tables. A second
 module uses [Pandoc](https://pandoc.org/) for its complete reader/writer format
-set. The output menu ranks mainstream formats first, followed by authoring,
-publishing, wiki, presentation, and specialized formats.
+set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle),
+which removes clutter and returns clean Markdown or HTML. The output menu ranks
+mainstream formats first, followed by authoring, publishing, wiki, presentation,
+and specialized formats.
 
 ## Supported input
 
@@ -54,6 +56,17 @@ Set `SHIFT_PANDOC_BIN=/absolute/path/to/pandoc` when it is not available on
 `PATH`. PDF output may additionally require one of Pandoc's supported PDF
 engines.
 
+- [Defuddle](https://github.com/kepano/defuddle) for extracting clean article
+  content from web pages (URLs) or local HTML:
+
+```sh
+npm install -g defuddle
+# or use npx / a project-local node_modules/.bin/defuddle
+```
+
+Set `SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle` when it is not available on
+`PATH`.
+
 Shift exposes every writer reported by Pandoc 3.10, including Markdown
 variants, HTML, PDF, Word, PowerPoint, EPUB, ODT, RTF, LaTeX, Typst, AsciiDoc,
 reStructuredText, Jupyter, Org, DocBook, JATS, bibliography formats, wiki
@@ -66,11 +79,13 @@ cargo dev
 ```
 
 The first build downloads and compiles GPUI and may take a few minutes. Dropping
-or choosing a supported file starts conversion automatically. The source file
-is never modified. Use the output dropdown on the right to choose a format. The
-settings button opens a module-priority list; drag a module above another to
-make it the preferred engine for overlapping conversions. Priority is saved in
-macOS Application Support and shared with `shift-cli`.
+or choosing a supported file starts conversion automatically. Paste an `http(s)`
+URL into the bar above the drop zone and press Enter or Convert to extract the
+page with Defuddle. The source file is never modified. Use the output dropdown
+on the right to choose a format. The settings button opens a module-priority
+list; drag a module above another to make it the preferred engine for
+overlapping conversions. Priority is saved in macOS Application Support and
+shared with `shift-cli`.
 
 ## CLI
 
@@ -87,6 +102,9 @@ cargo run --bin shift-cli -- report.docx --to html
 # Prefer Pandoc where both modules can produce Markdown
 cargo run --bin shift-cli -- report.docx --module pandoc
 
+# Extract a web page with Defuddle
+cargo run --bin shift-cli -- https://example.com/article
+
 # Pipe Markdown to another command
 cargo run --bin shift-cli -- data.xlsx --stdout
 
@@ -101,8 +119,8 @@ same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
 
 ```text
 GPUI app ─────┐                          ┌─ MarkItDownModule
-              ├── ConversionRegistry ───┤
-shift-cli ────┘                          └─ PandocModule
+              ├── ConversionRegistry ───┼─ PandocModule
+shift-cli ────┘                          └─ DefuddleModule  (URLs + HTML)
 ```
 
 `src/conversion/` is the product boundary. A module advertises supported

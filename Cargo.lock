@@ -4805,6 +4805,8 @@ dependencies = [
  "gpui",
  "lyon",
  "objc",
+ "unicode-segmentation",
+ "url",
 ]
 
 [[package]]
