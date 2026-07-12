@@ -1,18 +1,34 @@
 use gpui::{
-    App, Application, Bounds, Context, ExternalPaths, KeyBinding, Menu, MenuItem, PathBuilder,
-    PathPromptOptions, PathStyle, Render, StrokeOptions, SystemMenuType, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, canvas, div, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Application, Bounds, Context, ExternalPaths, KeyBinding, Menu,
+    MenuItem, PathBuilder, PathPromptOptions, PathStyle, Render, Rgba, StrokeOptions,
+    SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas, div,
+    ease_out_quint, point, prelude::*, px, rgb, size,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 
 const APP_NAME: &str = "Shift";
+const DROP_ZONE_COLOR: u32 = 0x171a1f;
+const DROP_ZONE_HOVER_COLOR: u32 = 0x1c2026;
+
+fn interpolate_color(from: Rgba, to: Rgba, progress: f32) -> Rgba {
+    Rgba {
+        r: from.r + (to.r - from.r) * progress,
+        g: from.g + (to.g - from.g) * progress,
+        b: from.b + (to.b - from.b) * progress,
+        a: from.a + (to.a - from.a) * progress,
+    }
+}
 
 fn rounded_dashed_border() -> impl IntoElement {
     canvas(
         |_, _, _| {},
         |bounds, _, window, _| {
-            let inset = px(2.0);
-            let radius = px(12.0);
+            // Leave 4px of visible clearance beyond the 4px stroke.
+            let inset = px(6.0);
+            // `rounded_xl` is a 12px outer radius, so the inset path needs a
+            // matching 6px centerline radius to remain concentric.
+            let radius = px(6.0);
             let left = bounds.left() + inset;
             let right = bounds.right() - inset;
             let top = bounds.top() + inset;
@@ -73,6 +89,7 @@ actions!(shift, [Quit]);
 
 struct Shift {
     selected_file: Option<PathBuf>,
+    drop_zone_hovered: bool,
 }
 
 impl Shift {
@@ -110,58 +127,77 @@ impl Render for Shift {
             .size_full()
             .bg(rgb(0x101216))
             .text_color(rgb(0xf5f7fa))
-            .child(
-                div().flex_1().h_full().p_8().child(
-                    div()
-                        .id("file-drop-zone")
-                        .flex()
-                        .flex_col()
-                        .size_full()
-                        .items_center()
-                        .justify_center()
-                        .gap_3()
-                        .rounded_xl()
-                        .border_4()
-                        .border_color(gpui::transparent_black())
-                        .bg(rgb(0x171a1f))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x1c2026)))
-                        .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x1c2722)))
-                        .child(rounded_dashed_border())
-                        .child(div().text_3xl().text_color(rgb(0x8faa98)).child("\u{2191}"))
-                        .child(
+            .child(div().flex_1().h_full().p_8().child({
+                let drop_zone_hovered = self.drop_zone_hovered;
+
+                div()
+                    .id("file-drop-zone")
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .rounded_xl()
+                    .bg(rgb(DROP_ZONE_COLOR))
+                    .cursor_pointer()
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if this.drop_zone_hovered != *hovered {
+                            this.drop_zone_hovered = *hovered;
+                            cx.notify();
+                        }
+                    }))
+                    .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x1c2722)))
+                    .child(rounded_dashed_border())
+                    .child(div().text_3xl().text_color(rgb(0x8faa98)).child("\u{2191}"))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Drop a file here"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x9299a6))
+                            .child("or click to browse"),
+                    )
+                    .when_some(selected_name, |element, name| {
+                        element.child(
                             div()
-                                .text_lg()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child("Drop a file here"),
-                        )
-                        .child(
-                            div()
+                                .mt_3()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x23272e))
                                 .text_sm()
-                                .text_color(rgb(0x9299a6))
-                                .child("or click to browse"),
+                                .child(name),
                         )
-                        .when_some(selected_name, |element, name| {
-                            element.child(
-                                div()
-                                    .mt_3()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(0x23272e))
-                                    .text_sm()
-                                    .child(name),
-                            )
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
-                        .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                            if let Some(path) = paths.paths().first() {
-                                this.selected_file = Some(path.clone());
-                                cx.notify();
-                            }
-                        })),
-                ),
-            )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                        if let Some(path) = paths.paths().first() {
+                            this.selected_file = Some(path.clone());
+                            cx.notify();
+                        }
+                    }))
+                    .with_animation(
+                        if drop_zone_hovered {
+                            "file-drop-zone-hover-enter"
+                        } else {
+                            "file-drop-zone-hover-leave"
+                        },
+                        Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                        move |element, progress| {
+                            let (from, to) = if drop_zone_hovered {
+                                (rgb(DROP_ZONE_COLOR), rgb(DROP_ZONE_HOVER_COLOR))
+                            } else {
+                                (rgb(DROP_ZONE_HOVER_COLOR), rgb(DROP_ZONE_COLOR))
+                            };
+                            element.bg(interpolate_color(from, to, progress))
+                        },
+                    )
+            }))
             .child(
                 div()
                     .h_full()
@@ -201,6 +237,7 @@ fn main() {
             |_, cx| {
                 cx.new(|_| Shift {
                     selected_file: None,
+                    drop_zone_hovered: false,
                 })
             },
         )
