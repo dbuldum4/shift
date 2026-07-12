@@ -1,0 +1,13 @@
+[package]
+name = "shift"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+gpui = "=0.2.2"
+lyon = "1.0"
+
+[profile.release]
+lto = "thin"
+strip = true
