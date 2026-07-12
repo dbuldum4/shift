@@ -1,7 +1,10 @@
-use super::{ConversionArtifact, ConversionError, ConversionModule, OutputFormat};
+use super::{
+    ConversionArtifact, ConversionError, ConversionModule, OutputFormat, map_spawn_error,
+    max_output_bytes, process_timeout, run_command,
+};
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
 
 const EXTENSIONS: &[&str] = &[
     // Documents
@@ -49,20 +52,16 @@ impl MarkItDownModule {
         }
     }
 
-    fn run(&self, input: &Path) -> Result<Output, ConversionError> {
-        Command::new(&self.executable)
-            .arg(input)
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    ConversionError::new(
-                        "MarkItDown is not installed. Install the complete runtime with: \
-                         python3 -m pip install 'markitdown[all]'",
-                    )
-                } else {
-                    ConversionError::new(format!("could not start MarkItDown: {error}"))
-                }
-            })
+    fn run(&self, input: &Path) -> Result<super::LimitedOutput, ConversionError> {
+        let mut command = Command::new(&self.executable);
+        command.arg(input);
+        run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
+            map_spawn_error(
+                error,
+                "MarkItDown is not installed. Install the complete runtime with: \
+                 python3 -m pip install 'markitdown[all]'",
+            )
+        })
     }
 }
 
@@ -80,6 +79,10 @@ impl ConversionModule for MarkItDownModule {
     }
 
     fn output_formats(&self) -> &'static [OutputFormat] {
+        OUTPUTS
+    }
+
+    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
         OUTPUTS
     }
 

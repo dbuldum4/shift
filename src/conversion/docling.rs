@@ -1,4 +1,7 @@
-use super::{ConversionArtifact, ConversionError, ConversionModule, OutputFormat};
+use super::{
+    ConversionArtifact, ConversionError, ConversionModule, OutputFormat, map_spawn_error,
+    max_output_bytes, process_timeout, read_file_limited, run_command,
+};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,7 +104,8 @@ impl DoclingModule {
         // Docling writes files into --output; it does not stream to stdout.
         // Explicit `convert` keeps the invocation stable if more subcommands are added.
         // `placeholder` images keep artifacts small and conversions faster for desktop use.
-        let output = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .arg("convert")
             .arg(input)
             .arg("--to")
@@ -110,17 +114,14 @@ impl DoclingModule {
             .arg(&work_dir)
             .arg("--image-export-mode")
             .arg("placeholder")
-            .arg("--abort-on-error")
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    ConversionError::new(
-                        "Docling is not installed. Install it with `pip install docling`, \
-                         or set SHIFT_DOCLING_BIN.",
-                    )
-                } else {
-                    ConversionError::new(format!("could not start Docling: {error}"))
-                }
+            .arg("--abort-on-error");
+        let output =
+            run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
+                map_spawn_error(
+                    error,
+                    "Docling is not installed. Install it with `pip install docling`, \
+                     or set SHIFT_DOCLING_BIN.",
+                )
             })?;
 
         if !output.status.success() {
@@ -142,7 +143,7 @@ impl DoclingModule {
         }
 
         let produced = work_dir.join(Self::output_file_name(stem, output_format));
-        let bytes = fs::read(&produced).map_err(|error| {
+        let bytes = read_file_limited(&produced, max_output_bytes()).map_err(|error| {
             ConversionError::new(format!(
                 "Docling finished but did not write {}: {error}",
                 produced.display()
@@ -178,6 +179,10 @@ impl ConversionModule for DoclingModule {
     }
 
     fn output_formats(&self) -> &'static [OutputFormat] {
+        OUTPUTS
+    }
+
+    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
         OUTPUTS
     }
 

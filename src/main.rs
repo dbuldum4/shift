@@ -12,6 +12,7 @@ use shift_core::conversion::{
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use text_input::TextInput;
 
@@ -32,7 +33,8 @@ struct FilePreview {
 enum ConversionState {
     Empty,
     Converting,
-    Ready(ConversionArtifact),
+    /// Shared so render clones stay cheap for large artifacts.
+    Ready(Arc<ConversionArtifact>),
     Failed(SharedString),
 }
 
@@ -485,7 +487,7 @@ fn output_panel(
         ConversionState::Ready(artifact) => {
             let file_name: SharedString = artifact.file_name.clone().into();
             let size = format_file_size(artifact.bytes.len() as u64);
-            let excerpt = markdown_excerpt(&artifact);
+            let excerpt = markdown_excerpt(artifact.as_ref());
             let conversion_detail = format!(
                 "{}  ·  {size}  ·  via {}",
                 artifact.format.label(),
@@ -721,7 +723,11 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
         )
 }
 
-fn settings_modal(priority: &[String], cx: &mut Context<Shift>) -> impl IntoElement {
+fn settings_modal(
+    priority: &[String],
+    preference_error: Option<SharedString>,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
     div()
         .id("settings-backdrop")
         .absolute()
@@ -843,6 +849,19 @@ fn settings_modal(priority: &[String], cx: &mut Context<Shift>) -> impl IntoElem
                                 )
                         })),
                 )
+                .when_some(preference_error, |modal, error| {
+                    modal.child(
+                        div()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(0x251a1d))
+                            .border_1()
+                            .border_color(rgb(0x4a2930))
+                            .text_xs()
+                            .text_color(rgb(0xd4a0a7))
+                            .child(error),
+                    )
+                })
                 .child(div().text_xs().text_color(rgb(0x69727e)).child(
                     "Priority only applies when multiple modules support the selected conversion.",
                 )),
@@ -859,6 +878,7 @@ struct Shift {
     conversion_generation: u64,
     conversion: ConversionState,
     save_status: Option<SharedString>,
+    preference_error: Option<SharedString>,
     output_format: OutputFormat,
     output_menu_open: bool,
     settings_open: bool,
@@ -949,6 +969,13 @@ impl Shift {
             return;
         }
         if !looks_like_url(&url) {
+            // Invalidate any in-flight conversion so a late success cannot
+            // replace this validation error with an unrelated Ready state.
+            self.selection_generation = self.selection_generation.wrapping_add(1);
+            self.conversion_generation = self.conversion_generation.wrapping_add(1);
+            self.selected_file = None;
+            self.selected_url = None;
+            self.file_preview = None;
             self.conversion = ConversionState::Failed(
                 "Enter a full http:// or https:// URL to extract with Defuddle.".into(),
             );
@@ -1016,7 +1043,7 @@ impl Shift {
                     && this.selected_file.as_ref() == Some(&path)
                 {
                     this.conversion = match result {
-                        Ok(artifact) => ConversionState::Ready(artifact),
+                        Ok(artifact) => ConversionState::Ready(Arc::new(artifact)),
                         Err(error) => ConversionState::Failed(error.to_string().into()),
                     };
                     cx.notify();
@@ -1050,7 +1077,7 @@ impl Shift {
                     && this.selected_url.as_ref() == Some(&url)
                 {
                     this.conversion = match result {
-                        Ok(artifact) => ConversionState::Ready(artifact),
+                        Ok(artifact) => ConversionState::Ready(Arc::new(artifact)),
                         Err(error) => ConversionState::Failed(error.to_string().into()),
                     };
                     cx.notify();
@@ -1076,7 +1103,15 @@ impl Shift {
         }
         let module = self.module_priority.remove(from);
         self.module_priority.insert(to, module);
-        let _ = save_module_priority(&self.module_priority);
+        // Apply the new order for this session even if persistence fails, but
+        // surface the write error so the next launch is not silently different.
+        match save_module_priority(&self.module_priority) {
+            Ok(()) => self.preference_error = None,
+            Err(error) => {
+                self.preference_error =
+                    Some(format!("Could not save module priority: {error}").into());
+            }
+        }
         if self.selected_file.is_some() || self.selected_url.is_some() {
             self.start_conversion(cx);
         } else {
@@ -1101,9 +1136,12 @@ impl Shift {
         if file_picker::is_busy() {
             return;
         }
-        let ConversionState::Ready(artifact) = self.conversion.clone() else {
+        let ConversionState::Ready(artifact) = &self.conversion else {
             return;
         };
+        let artifact = Arc::clone(artifact);
+        let selection_generation = self.selection_generation;
+        let conversion_generation = self.conversion_generation;
         let directory = self
             .selected_file
             .as_ref()
@@ -1123,6 +1161,12 @@ impl Shift {
                 .spawn(async move { artifact.write_to(&path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // Only attribute save status to the selection that started it.
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.save_status = Some(match result {
                     Ok(()) => format!("Saved {file_name}").into(),
                     Err(error) => format!("Could not save: {error}").into(),
@@ -1151,6 +1195,7 @@ impl Render for Shift {
         let output_menu_open = self.output_menu_open;
         let settings_open = self.settings_open;
         let module_priority = self.module_priority.clone();
+        let preference_error = self.preference_error.clone();
         let url_input = self.url_input.clone();
 
         div()
@@ -1254,7 +1299,7 @@ impl Render for Shift {
                     })),
             )
             .when(settings_open, |root| {
-                root.child(settings_modal(&module_priority, cx))
+                root.child(settings_modal(&module_priority, preference_error, cx))
             })
     }
 }
@@ -1298,6 +1343,7 @@ fn main() {
                         conversion_generation: 0,
                         conversion: ConversionState::Empty,
                         save_status: None,
+                        preference_error: None,
                         output_format: OutputFormat::MARKDOWN,
                         output_menu_open: false,
                         settings_open: false,

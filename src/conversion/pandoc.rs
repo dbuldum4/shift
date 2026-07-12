@@ -1,4 +1,7 @@
-use super::{ConversionArtifact, ConversionError, ConversionModule, OutputFormat};
+use super::{
+    ConversionArtifact, ConversionError, ConversionModule, OutputFormat, map_spawn_error,
+    max_output_bytes, process_timeout, run_command,
+};
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
@@ -95,6 +98,10 @@ impl ConversionModule for PandocModule {
         OutputFormat::ALL
     }
 
+    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+        OutputFormat::ALL
+    }
+
     fn convert(
         &self,
         input: &Path,
@@ -106,24 +113,23 @@ impl ConversionModule for PandocModule {
             .and_then(|extension| extension.to_str())
             .map(pandoc_input_format)
             .unwrap_or("markdown");
-        let output = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .arg(input)
             .arg("--from")
             .arg(input_format)
             .arg("--to")
             .arg(target)
             .arg("--output")
-            .arg("-")
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    ConversionError::new(
-                        "Pandoc is not installed. Install it with `brew install pandoc`, or set SHIFT_PANDOC_BIN.",
-                    )
-                } else {
-                    ConversionError::new(format!("could not start Pandoc: {error}"))
-                }
-            })?;
+            .arg("-");
+        let output = run_command(command, process_timeout(), max_output_bytes()).map_err(
+            |error| {
+                map_spawn_error(
+                    error,
+                    "Pandoc is not installed. Install it with `brew install pandoc`, or set SHIFT_PANDOC_BIN.",
+                )
+            },
+        )?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();

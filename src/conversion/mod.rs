@@ -4,6 +4,7 @@ mod defuddle;
 mod docling;
 mod markitdown;
 mod pandoc;
+mod process;
 
 use std::error::Error;
 use std::fmt;
@@ -13,6 +14,10 @@ pub use defuddle::{DefuddleModule, looks_like_url};
 pub use docling::DoclingModule;
 pub use markitdown::MarkItDownModule;
 pub use pandoc::PandocModule;
+pub use process::{
+    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, max_output_bytes,
+    process_timeout, read_file_limited, run_command,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OutputFormat(&'static str);
@@ -239,6 +244,8 @@ pub trait ConversionModule: Send + Sync {
     fn label(&self) -> &'static str;
     fn input_extensions(&self) -> &'static [&'static str];
     fn output_formats(&self) -> &'static [OutputFormat];
+    /// Outputs which may be materialized and safely consumed by another module.
+    fn chainable_output_formats(&self) -> &'static [OutputFormat];
     fn convert(
         &self,
         input: &Path,
@@ -276,6 +283,16 @@ pub trait ConversionModule: Send + Sync {
 /// Dispatches requests according to module order. Earlier modules win.
 pub struct ConversionRegistry {
     modules: Vec<Box<dyn ConversionModule>>,
+}
+
+#[derive(Clone, Copy)]
+enum ConversionRoute<'a> {
+    Direct(&'a dyn ConversionModule),
+    TwoStep {
+        first: &'a dyn ConversionModule,
+        intermediate: OutputFormat,
+        second: &'a dyn ConversionModule,
+    },
 }
 
 impl Default for ConversionRegistry {
@@ -317,6 +334,11 @@ impl ConversionRegistry {
         self.modules.iter().map(Box::as_ref)
     }
 
+    /// Whether a registered module uses this stable id.
+    pub fn has_module(&self, id: &str) -> bool {
+        self.modules.iter().any(|module| module.id() == id)
+    }
+
     pub fn module_for(&self, input: &Path, output: OutputFormat) -> Option<&dyn ConversionModule> {
         self.modules
             .iter()
@@ -331,11 +353,121 @@ impl ConversionRegistry {
             .map(Box::as_ref)
     }
 
+    fn route_for(&self, input: &Path, output: OutputFormat) -> Option<ConversionRoute<'_>> {
+        if let Some(module) = self.module_for(input, output) {
+            return Some(ConversionRoute::Direct(module));
+        }
+
+        for (first_index, first) in self.modules.iter().enumerate() {
+            if !first.input_extensions().iter().any(|extension| {
+                input
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|input| input.eq_ignore_ascii_case(extension))
+            }) {
+                continue;
+            }
+            for &intermediate in first.chainable_output_formats() {
+                if !first.output_formats().contains(&intermediate) {
+                    continue;
+                }
+                if let Some((_, second)) =
+                    self.modules
+                        .iter()
+                        .enumerate()
+                        .find(|(second_index, second)| {
+                            *second_index != first_index
+                                && second.input_extensions().iter().any(|extension| {
+                                    extension.eq_ignore_ascii_case(intermediate.extension())
+                                })
+                                && second.output_formats().contains(&output)
+                        })
+                {
+                    return Some(ConversionRoute::TwoStep {
+                        first: first.as_ref(),
+                        intermediate,
+                        second: second.as_ref(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn url_route_for(&self, output: OutputFormat) -> Option<ConversionRoute<'_>> {
+        if let Some(module) = self.module_for_url(output) {
+            return Some(ConversionRoute::Direct(module));
+        }
+        for (first_index, first) in self.modules.iter().enumerate() {
+            for &intermediate in first.chainable_output_formats() {
+                if !first.supports_url(intermediate) {
+                    continue;
+                }
+                if let Some((_, second)) =
+                    self.modules
+                        .iter()
+                        .enumerate()
+                        .find(|(second_index, second)| {
+                            *second_index != first_index
+                                && second.input_extensions().iter().any(|extension| {
+                                    extension.eq_ignore_ascii_case(intermediate.extension())
+                                })
+                                && second.output_formats().contains(&output)
+                        })
+                {
+                    return Some(ConversionRoute::TwoStep {
+                        first: first.as_ref(),
+                        intermediate,
+                        second: second.as_ref(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn execute_route(
+        &self,
+        input: &Path,
+        output: OutputFormat,
+        route: ConversionRoute<'_>,
+    ) -> Result<ConversionArtifact, ConversionError> {
+        match route {
+            ConversionRoute::Direct(module) => module.convert(input, output),
+            ConversionRoute::TwoStep {
+                first,
+                intermediate,
+                second,
+            } => {
+                let artifact = first.convert(input, intermediate)?;
+                self.finish_chain(&artifact, output, second)
+            }
+        }
+    }
+
+    fn finish_chain(
+        &self,
+        intermediate: &ConversionArtifact,
+        output: OutputFormat,
+        second: &dyn ConversionModule,
+    ) -> Result<ConversionArtifact, ConversionError> {
+        let workspace = unique_temp_dir("shift-conversion")?;
+        let _cleanup = TempDirGuard(workspace.clone());
+        let stem = Path::new(&intermediate.file_name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("converted");
+        let input = workspace.join(format!("{stem}.{}", intermediate.format.extension()));
+        intermediate.write_to(&input)?;
+        second.convert(&input, output)
+    }
+
     pub fn available_outputs(&self, input: &Path) -> Vec<OutputFormat> {
         OutputFormat::ALL
             .iter()
             .copied()
-            .filter(|output| self.module_for(input, *output).is_some())
+            .filter(|output| self.route_for(input, *output).is_some())
             .collect()
     }
 
@@ -343,7 +475,7 @@ impl ConversionRegistry {
         OutputFormat::ALL
             .iter()
             .copied()
-            .filter(|output| self.module_for_url(*output).is_some())
+            .filter(|output| self.url_route_for(*output).is_some())
             .collect()
     }
 
@@ -364,7 +496,7 @@ impl ConversionRegistry {
             )));
         }
 
-        let module = self.module_for(input, output).ok_or_else(|| {
+        let route = self.route_for(input, output).ok_or_else(|| {
             let extension = input
                 .extension()
                 .and_then(|value| value.to_str())
@@ -375,7 +507,7 @@ impl ConversionRegistry {
             ))
         })?;
 
-        module.convert(input, output)
+        self.execute_route(input, output, route)
     }
 
     pub fn convert_url(
@@ -390,14 +522,24 @@ impl ConversionRegistry {
             )));
         }
 
-        let module = self.module_for_url(output).ok_or_else(|| {
+        let route = self.url_route_for(output).ok_or_else(|| {
             ConversionError::new(format!(
                 "no conversion module supports URL conversion to {}",
                 output.label()
             ))
         })?;
 
-        module.convert_url(url, output)
+        match route {
+            ConversionRoute::Direct(module) => module.convert_url(url, output),
+            ConversionRoute::TwoStep {
+                first,
+                intermediate,
+                second,
+            } => {
+                let artifact = first.convert_url(url, intermediate)?;
+                self.finish_chain(&artifact, output, second)
+            }
+        }
     }
 }
 
@@ -412,6 +554,23 @@ impl ConversionError {
             message: message.into(),
         }
     }
+
+    /// True when process spawn failed because the executable was missing.
+    pub fn is_executable_not_found(&self) -> bool {
+        self.message.starts_with("executable not found:")
+    }
+}
+
+/// Rewrite spawn failures with an engine-specific install hint.
+pub(crate) fn map_spawn_error(
+    error: ConversionError,
+    not_found_message: impl Into<String>,
+) -> ConversionError {
+    if error.is_executable_not_found() {
+        ConversionError::new(not_found_message)
+    } else {
+        error
+    }
 }
 
 impl fmt::Display for ConversionError {
@@ -422,13 +581,270 @@ impl fmt::Display for ConversionError {
 
 impl Error for ConversionError {}
 
+fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir(&path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create temporary conversion workspace {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(path)
+}
+
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Default download/write path for a conversion, always distinct from `input`.
+///
+/// Same-extension pairs (for example `.html` → HTML or `.md` → Markdown) would
+/// otherwise resolve to the source path and risk overwriting it.
 pub fn default_output_path(input: &Path, output: OutputFormat) -> PathBuf {
-    input.with_extension(output.extension())
+    let extension = output.extension();
+    let candidate = input.with_extension(extension);
+    if paths_refer_to_same_file(input, &candidate) {
+        let stem = input
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("converted");
+        input.with_file_name(format!("{stem}.converted.{extension}"))
+    } else {
+        candidate
+    }
+}
+
+/// True when `left` and `right` name the same filesystem object.
+///
+/// Used to refuse writing conversion output over the selected source. When the
+/// destination does not exist yet, compares the source's canonical path with
+/// the destination's parent (canonicalized when possible) plus file name.
+pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        return left == right;
+    }
+
+    let Ok(left_canonical) = std::fs::canonicalize(left) else {
+        return false;
+    };
+
+    let right_parent = right
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let right_parent = match right_parent {
+        Some(parent) => std::fs::canonicalize(parent).ok(),
+        None => std::env::current_dir().ok(),
+    };
+    let Some(right_parent) = right_parent else {
+        return false;
+    };
+    let Some(file_name) = right.file_name() else {
+        return false;
+    };
+    right_parent.join(file_name) == left_canonical
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeModule {
+        id: &'static str,
+        inputs: &'static [&'static str],
+        outputs: &'static [OutputFormat],
+        chainable: &'static [OutputFormat],
+        marker: &'static [u8],
+        seen_input: Option<Arc<Mutex<Option<PathBuf>>>>,
+    }
+
+    impl ConversionModule for FakeModule {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn label(&self) -> &'static str {
+            self.id
+        }
+        fn input_extensions(&self) -> &'static [&'static str] {
+            self.inputs
+        }
+        fn output_formats(&self) -> &'static [OutputFormat] {
+            self.outputs
+        }
+        fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            self.chainable
+        }
+        fn convert(
+            &self,
+            input: &Path,
+            output: OutputFormat,
+        ) -> Result<ConversionArtifact, ConversionError> {
+            if let Some(seen) = &self.seen_input {
+                *seen.lock().unwrap() = Some(input.to_owned());
+                assert_eq!(std::fs::read(input).unwrap(), b"intermediate");
+            }
+            Ok(ConversionArtifact {
+                file_name: format!("result.{}", output.extension()),
+                media_type: output.media_type(),
+                bytes: self.marker.to_vec(),
+                format: output,
+                module_id: self.id,
+            })
+        }
+    }
+
+    fn fake(
+        id: &'static str,
+        inputs: &'static [&'static str],
+        outputs: &'static [OutputFormat],
+        chainable: &'static [OutputFormat],
+        marker: &'static [u8],
+    ) -> FakeModule {
+        FakeModule {
+            id,
+            inputs,
+            outputs,
+            chainable,
+            marker,
+            seen_input: None,
+        }
+    }
+
+    #[test]
+    fn direct_route_takes_precedence_over_a_two_step_route() {
+        let registry = ConversionRegistry::new()
+            .with_module(fake(
+                "first",
+                &["src"],
+                &[OutputFormat::MARKDOWN],
+                &[OutputFormat::MARKDOWN],
+                b"intermediate",
+            ))
+            .with_module(fake(
+                "second",
+                &["md"],
+                &[OutputFormat::PDF],
+                &[],
+                b"chained",
+            ))
+            .with_module(fake(
+                "direct",
+                &["src"],
+                &[OutputFormat::PDF],
+                &[],
+                b"direct",
+            ));
+        assert_eq!(
+            registry
+                .module_for(Path::new("input.src"), OutputFormat::PDF)
+                .unwrap()
+                .id(),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn two_step_routes_are_derived_executed_and_cleaned_up() {
+        let seen = Arc::new(Mutex::new(None));
+        let mut second = fake("second", &["md"], &[OutputFormat::PDF], &[], b"final");
+        second.seen_input = Some(seen.clone());
+        let registry = ConversionRegistry::new()
+            .with_module(fake(
+                "first",
+                &["src"],
+                &[OutputFormat::MARKDOWN],
+                &[OutputFormat::MARKDOWN],
+                b"intermediate",
+            ))
+            .with_module(second);
+        let input = std::env::temp_dir().join(format!("shift-route-{}.src", std::process::id()));
+        std::fs::write(&input, b"source").unwrap();
+
+        assert!(
+            registry
+                .available_outputs(&input)
+                .contains(&OutputFormat::PDF)
+        );
+        let artifact = registry.convert_to(&input, OutputFormat::PDF).unwrap();
+        assert_eq!(artifact.bytes, b"final");
+        let temporary_input = seen.lock().unwrap().clone().unwrap();
+        assert!(!temporary_input.exists());
+        std::fs::remove_file(input).unwrap();
+    }
+
+    #[test]
+    fn module_order_deterministically_selects_the_first_two_step_route() {
+        let registry = ConversionRegistry::new()
+            .with_module(fake(
+                "preferred",
+                &["src"],
+                &[OutputFormat::MARKDOWN],
+                &[OutputFormat::MARKDOWN],
+                b"intermediate",
+            ))
+            .with_module(fake(
+                "other",
+                &["src"],
+                &[OutputFormat::HTML],
+                &[OutputFormat::HTML],
+                b"other",
+            ))
+            .with_module(fake(
+                "markdown-writer",
+                &["md"],
+                &[OutputFormat::PDF],
+                &[],
+                b"preferred",
+            ))
+            .with_module(fake(
+                "html-writer",
+                &["html"],
+                &[OutputFormat::PDF],
+                &[],
+                b"other",
+            ));
+        let route = registry
+            .route_for(Path::new("input.src"), OutputFormat::PDF)
+            .unwrap();
+        let ConversionRoute::TwoStep { first, second, .. } = route else {
+            panic!("expected chain")
+        };
+        assert_eq!((first.id(), second.id()), ("preferred", "markdown-writer"));
+    }
+
+    #[test]
+    fn outputs_not_marked_chainable_do_not_create_routes() {
+        let registry = ConversionRegistry::new()
+            .with_module(fake(
+                "first",
+                &["src"],
+                &[OutputFormat::MARKDOWN],
+                &[],
+                b"intermediate",
+            ))
+            .with_module(fake("second", &["md"], &[OutputFormat::PDF], &[], b"final"));
+        assert!(
+            registry
+                .route_for(Path::new("input.src"), OutputFormat::PDF)
+                .is_none()
+        );
+    }
 
     #[test]
     fn default_priority_prefers_markitdown_for_shared_markdown_conversion() {
@@ -462,8 +878,8 @@ mod tests {
         assert!(pdf_outputs.contains(&OutputFormat::MARKDOWN));
         assert!(pdf_outputs.contains(&OutputFormat::HTML));
         assert!(pdf_outputs.contains(&OutputFormat("plain")));
-        assert!(!pdf_outputs.contains(&OutputFormat::DOCX));
-        assert!(!pdf_outputs.contains(&OutputFormat::PDF));
+        assert!(pdf_outputs.contains(&OutputFormat::DOCX));
+        assert!(pdf_outputs.contains(&OutputFormat::PDF));
         assert!(
             registry
                 .available_outputs(Path::new("report.docx"))
@@ -516,6 +932,47 @@ mod tests {
     }
 
     #[test]
+    fn output_path_avoids_overwriting_same_extension_source() {
+        assert_eq!(
+            default_output_path(Path::new("notes/page.html"), OutputFormat::HTML),
+            Path::new("notes/page.converted.html")
+        );
+        assert_eq!(
+            default_output_path(Path::new("notes/doc.docx"), OutputFormat::DOCX),
+            Path::new("notes/doc.converted.docx")
+        );
+        assert_eq!(
+            default_output_path(Path::new("notes/readme.md"), OutputFormat::MARKDOWN),
+            Path::new("notes/readme.converted.md")
+        );
+        assert_eq!(
+            default_output_path(Path::new("notes/readme.md"), OutputFormat("gfm")),
+            Path::new("notes/readme.converted.md")
+        );
+    }
+
+    #[test]
+    fn paths_refer_to_same_file_matches_identical_paths() {
+        assert!(paths_refer_to_same_file(
+            Path::new("report.html"),
+            Path::new("report.html")
+        ));
+        assert!(!paths_refer_to_same_file(
+            Path::new("report.html"),
+            Path::new("report.converted.html")
+        ));
+    }
+
+    #[test]
+    fn has_module_reports_registered_ids() {
+        let registry = ConversionRegistry::default();
+        assert!(registry.has_module("pandoc"));
+        assert!(registry.has_module("docling"));
+        assert!(!registry.has_module("pandocx"));
+        assert!(!registry.has_module(""));
+    }
+
+    #[test]
     fn pandoc_output_catalog_has_no_duplicates() {
         let mut ids = OutputFormat::ALL
             .iter()
@@ -537,10 +994,10 @@ mod tests {
                 .id(),
             "defuddle"
         );
-        assert_eq!(
-            registry.available_url_outputs(),
-            vec![OutputFormat::MARKDOWN, OutputFormat::HTML]
-        );
+        let url_outputs = registry.available_url_outputs();
+        assert!(url_outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(url_outputs.contains(&OutputFormat::HTML));
+        assert!(url_outputs.contains(&OutputFormat::DOCX));
     }
 
     #[test]

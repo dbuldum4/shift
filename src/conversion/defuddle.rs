@@ -1,7 +1,10 @@
-use super::{ConversionArtifact, ConversionError, ConversionModule, OutputFormat};
+use super::{
+    ConversionArtifact, ConversionError, ConversionModule, LimitedOutput, OutputFormat,
+    map_spawn_error, max_output_bytes, process_timeout, run_command,
+};
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
 use url::Url;
 
 const EXTENSIONS: &[&str] = &["htm", "html"];
@@ -41,21 +44,18 @@ impl DefuddleModule {
         }
     }
 
-    fn run(&self, source: &str, markdown: bool) -> Result<Output, ConversionError> {
+    fn run(&self, source: &str, markdown: bool) -> Result<LimitedOutput, ConversionError> {
         let mut command = Command::new(&self.executable);
         command.arg("parse").arg(source);
         if markdown {
             command.arg("--markdown");
         }
-        command.output().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ConversionError::new(
-                    "Defuddle is not installed. Install it with `npm install -g defuddle`, \
-                     or set SHIFT_DEFUDDLE_BIN.",
-                )
-            } else {
-                ConversionError::new(format!("could not start Defuddle: {error}"))
-            }
+        run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
+            map_spawn_error(
+                error,
+                "Defuddle is not installed. Install it with `npm install -g defuddle`, \
+                 or set SHIFT_DEFUDDLE_BIN.",
+            )
         })
     }
 
@@ -64,7 +64,7 @@ impl DefuddleModule {
         source_label: &str,
         file_stem: &str,
         output_format: OutputFormat,
-        output: Output,
+        output: LimitedOutput,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -126,6 +126,10 @@ impl ConversionModule for DefuddleModule {
     }
 
     fn output_formats(&self) -> &'static [OutputFormat] {
+        OUTPUTS
+    }
+
+    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
         OUTPUTS
     }
 

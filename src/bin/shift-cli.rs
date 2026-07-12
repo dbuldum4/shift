@@ -1,9 +1,9 @@
 use shift_core::conversion::{
-    ConversionRegistry, OutputFormat, default_output_path, looks_like_url,
+    ConversionRegistry, OutputFormat, default_output_path, looks_like_url, paths_refer_to_same_file,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(error) = run(std::env::args_os().skip(1).collect()) {
@@ -46,6 +46,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
 
     let mut output = None;
     let mut stdout = false;
+    let mut force = false;
     let mut target = OutputFormat::MARKDOWN;
     let mut preferred_module: Option<String> = None;
     while cursor < arguments.len() {
@@ -60,6 +61,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
                 );
             }
             "--stdout" => stdout = true,
+            "--force" => force = true,
             "-t" | "--to" => {
                 cursor += 1;
                 target = arguments
@@ -88,10 +90,21 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         return Err("use either --stdout or --output, not both".to_owned());
     }
 
+    let registry = ConversionRegistry::default();
     let registry = if let Some(module) = preferred_module.as_ref() {
-        ConversionRegistry::default().with_priority(&[module])
+        if !registry.has_module(module) {
+            let known = registry
+                .modules()
+                .map(|module| module.id())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "unknown module `{module}` (known: {known}). Try `shift-cli formats`."
+            ));
+        }
+        registry.with_priority(&[module])
     } else {
-        ConversionRegistry::default().with_priority(&load_module_priority())
+        registry.with_priority(&load_module_priority())
     };
 
     let input_url = url_input(&input);
@@ -111,17 +124,44 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
             .write_all(&artifact.bytes)
             .map_err(|error| format!("could not write output: {error}"))?;
     } else {
-        let output = output.unwrap_or_else(|| {
+        let destination = output.unwrap_or_else(|| {
             if input_url.is_some() {
                 PathBuf::from(&artifact.file_name)
             } else {
                 default_output_path(PathBuf::from(&input).as_path(), target)
             }
         });
+        let source_path = input_url.is_none().then(|| PathBuf::from(&input));
+        prepare_destination(&destination, source_path.as_deref(), force)?;
         artifact
-            .write_to(&output)
+            .write_to(&destination)
             .map_err(|error| error.to_string())?;
-        println!("{}", output.display());
+        println!("{}", destination.display());
+    }
+
+    Ok(())
+}
+
+/// Refuse source overwrite always; require `--force` for other existing files.
+fn prepare_destination(
+    destination: &Path,
+    source: Option<&Path>,
+    force: bool,
+) -> Result<(), String> {
+    if let Some(source) = source {
+        if paths_refer_to_same_file(source, destination) {
+            return Err(format!(
+                "refusing to overwrite source file {} (choose a different -o path)",
+                source.display()
+            ));
+        }
+    }
+
+    if destination.exists() && !force {
+        return Err(format!(
+            "output already exists: {} (pass --force to overwrite)",
+            destination.display()
+        ));
     }
 
     Ok(())
@@ -159,18 +199,48 @@ fn print_formats() {
 fn print_help() {
     println!(
         "Shift converts files and URLs through the same modules as the native app.\n\n\
-         Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--module <ID>]\n  \
-         shift-cli convert <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout]\n  \
+         Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force] [--module <ID>]\n  \
+         shift-cli convert <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force]\n  \
          shift-cli formats\n\n\
          URLs (http/https) are extracted with Defuddle.\n\
          Use `shift-cli formats` to list every installed conversion capability.\n\
-         If no output is supplied, Shift writes beside the source (or the current directory for URLs)."
+         If no output is supplied, Shift writes beside the source (or the current directory for URLs).\n\
+         Existing outputs require --force. The source file is never overwritten."
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    /// Serializes tests that mutate process-wide converter env vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_temp(name: &str) -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "shift-cli-test-{}-{}-{}",
+            std::process::id(),
+            n,
+            name
+        ))
+    }
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[cfg(unix)]
+    fn write_fake_pandoc(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\nprintf '# converted by fake pandoc\\n'").unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
@@ -184,5 +254,195 @@ mod tests {
             PathBuf::from(input).as_os_str().as_bytes(),
             b"report-\xff.pdf"
         );
+    }
+
+    #[test]
+    fn help_and_formats_exit_successfully() {
+        assert!(run(args(&["--help"])).is_ok());
+        assert!(run(args(&["formats"])).is_ok());
+        assert!(run(args(&[])).is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_input() {
+        let error = run(args(&["-t", "html"])).unwrap_err();
+        assert!(error.contains("missing input"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unknown_arguments() {
+        let error = run(args(&["file.md", "--nope"])).unwrap_err();
+        assert!(error.contains("unknown argument"), "{error}");
+    }
+
+    #[test]
+    fn rejects_stdout_with_output() {
+        let error = run(args(&["file.md", "--stdout", "-o", "out.md"])).unwrap_err();
+        assert!(
+            error.contains("--stdout") && error.contains("--output"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_module_ids() {
+        let error = run(args(&["file.md", "--module", "pandocx"])).unwrap_err();
+        assert!(error.contains("unknown module"), "{error}");
+        assert!(error.contains("pandocx"), "{error}");
+    }
+
+    #[test]
+    fn prepare_destination_never_overwrites_source() {
+        let dir = unique_temp("src-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("page.html");
+        std::fs::write(&source, b"<p>src</p>").unwrap();
+
+        let error = prepare_destination(&source, Some(&source), true).unwrap_err();
+        assert!(error.contains("refusing to overwrite source"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepare_destination_requires_force_for_existing_outputs() {
+        let dir = unique_temp("out-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("page.html");
+        let dest = dir.join("page.converted.html");
+        std::fs::write(&source, b"<p>src</p>").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        let error = prepare_destination(&dest, Some(&source), false).unwrap_err();
+        assert!(error.contains("--force"), "{error}");
+
+        assert!(prepare_destination(&dest, Some(&source), true).is_ok());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_output_path_is_distinct_for_same_extension() {
+        let input = Path::new("/tmp/notes/page.html");
+        let output = default_output_path(input, OutputFormat::HTML);
+        assert_ne!(output, input);
+        assert_eq!(output, Path::new("/tmp/notes/page.converted.html"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_writes_beside_source_without_clobbering_it() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("convert-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        let input = dir.join("page.html");
+        std::fs::write(&input, b"<p>hello</p>").unwrap();
+        let expected = dir.join("page.converted.html");
+        let _ = std::fs::remove_file(&expected);
+
+        // SAFETY: test-only env mutation, serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        let result = run(args(&[
+            input.to_str().unwrap(),
+            "-t",
+            "html",
+            "--module",
+            "pandoc",
+        ]));
+
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(result.is_ok(), "convert failed: {result:?}");
+        assert!(
+            expected.is_file(),
+            "expected output at {}",
+            expected.display()
+        );
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), "<p>hello</p>");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "# converted by fake pandoc\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_rejects_explicit_output_equal_to_source() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("overwrite-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        let input = dir.join("page.html");
+        std::fs::write(&input, b"<p>hello</p>").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        let error = run(args(&[
+            input.to_str().unwrap(),
+            "-t",
+            "html",
+            "-o",
+            input.to_str().unwrap(),
+            "--module",
+            "pandoc",
+            "--force",
+        ]))
+        .unwrap_err();
+
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(error.contains("refusing to overwrite source"), "{error}");
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), "<p>hello</p>");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_stdout_emits_bytes_without_writing_files() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("stdout-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        let input = dir.join("notes.md");
+        std::fs::write(&input, b"# hi\n").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        let result = run(args(&[
+            input.to_str().unwrap(),
+            "-t",
+            "html",
+            "--stdout",
+            "--module",
+            "pandoc",
+        ]));
+
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+        // No default sibling file should have been created for --stdout.
+        assert!(!dir.join("notes.html").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
