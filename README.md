@@ -10,9 +10,11 @@ The ingestion module is powered by
 useful document structure such as headings, lists, links, and tables. A second
 module uses [Pandoc](https://pandoc.org/) for its complete reader/writer format
 set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle),
-which removes clutter and returns clean Markdown or HTML. The output menu ranks
-mainstream formats first, followed by authoring, publishing, wiki, presentation,
-and specialized formats.
+which removes clutter and returns clean Markdown or HTML.
+[Docling](https://github.com/docling-project/docling) reads PDFs and other
+documents with layout-aware parsing and exports Markdown, HTML, or plain text
+(including PDF → HTML). The output menu ranks mainstream formats first, followed
+by authoring, publishing, wiki, presentation, and specialized formats.
 
 ## Supported input
 
@@ -67,6 +69,19 @@ npm install -g defuddle
 Set `SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle` when it is not available on
 `PATH`.
 
+- [Docling](https://github.com/docling-project/docling) for layout-aware PDF and
+  office conversion to Markdown, HTML, or plain text:
+
+```sh
+# into the project venv used by MarkItDown, or any environment on PATH
+uv pip install --python .venv/bin/python docling
+# or: pip install docling
+```
+
+Set `SHIFT_DOCLING_BIN=/absolute/path/to/docling` when it is not available on
+`PATH`. First runs may download model weights. Prefer Docling above MarkItDown
+in Settings when you want higher-quality PDF → Markdown.
+
 Shift exposes every writer reported by Pandoc 3.10, including Markdown
 variants, HTML, PDF, Word, PowerPoint, EPUB, ODT, RTF, LaTeX, Typst, AsciiDoc,
 reStructuredText, Jupyter, Org, DocBook, JATS, bibliography formats, wiki
@@ -105,6 +120,12 @@ cargo run --bin shift-cli -- report.docx --module pandoc
 # Extract a web page with Defuddle
 cargo run --bin shift-cli -- https://example.com/article
 
+# PDF → HTML via Docling (MarkItDown only emits Markdown)
+cargo run --bin shift-cli -- scan.pdf --to html --module docling
+
+# Prefer Docling for PDF → Markdown quality
+cargo run --bin shift-cli -- scan.pdf --module docling
+
 # Pipe Markdown to another command
 cargo run --bin shift-cli -- data.xlsx --stdout
 
@@ -120,7 +141,8 @@ same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
 ```text
 GPUI app ─────┐                          ┌─ MarkItDownModule
               ├── ConversionRegistry ───┼─ PandocModule
-shift-cli ────┘                          └─ DefuddleModule  (URLs + HTML)
+shift-cli ────┘                          ├─ DefuddleModule  (URLs + HTML)
+                                         └─ DoclingModule   (PDF/office → md/html/text)
 ```
 
 `src/conversion/` is the product boundary. A module advertises supported

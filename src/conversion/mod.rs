@@ -1,6 +1,7 @@
 //! Format conversion modules and capability-based dispatch.
 
 mod defuddle;
+mod docling;
 mod markitdown;
 mod pandoc;
 
@@ -9,6 +10,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use defuddle::{DefuddleModule, looks_like_url};
+pub use docling::DoclingModule;
 pub use markitdown::MarkItDownModule;
 pub use pandoc::PandocModule;
 
@@ -278,10 +280,14 @@ pub struct ConversionRegistry {
 
 impl Default for ConversionRegistry {
     fn default() -> Self {
+        // MarkItDown stays first for fast broad Markdown. Docling fills PDF →
+        // HTML/plain (and higher-quality Markdown when prioritized above
+        // MarkItDown). Pandoc owns publishing writers; Defuddle owns URLs.
         Self::new()
             .with_module(MarkItDownModule::default())
             .with_module(PandocModule::default())
             .with_module(DefuddleModule::default())
+            .with_module(DoclingModule::default())
     }
 }
 
@@ -451,14 +457,53 @@ mod tests {
     #[test]
     fn output_capabilities_are_filtered_by_input() {
         let registry = ConversionRegistry::default();
-        assert_eq!(
-            registry.available_outputs(Path::new("scan.pdf")),
-            vec![OutputFormat::MARKDOWN]
-        );
+        let pdf_outputs = registry.available_outputs(Path::new("scan.pdf"));
+        // MarkItDown: Markdown. Docling: Markdown, HTML, plain.
+        assert!(pdf_outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(pdf_outputs.contains(&OutputFormat::HTML));
+        assert!(pdf_outputs.contains(&OutputFormat("plain")));
+        assert!(!pdf_outputs.contains(&OutputFormat::DOCX));
+        assert!(!pdf_outputs.contains(&OutputFormat::PDF));
         assert!(
             registry
                 .available_outputs(Path::new("report.docx"))
                 .contains(&OutputFormat::PDF)
+        );
+    }
+
+    #[test]
+    fn pdf_html_routes_to_docling() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for(Path::new("scan.pdf"), OutputFormat::HTML)
+                .unwrap()
+                .id(),
+            "docling"
+        );
+    }
+
+    #[test]
+    fn default_priority_still_prefers_markitdown_over_docling_for_pdf_markdown() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for(Path::new("scan.pdf"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "markitdown"
+        );
+    }
+
+    #[test]
+    fn priority_can_promote_docling_for_pdf_markdown() {
+        let registry = ConversionRegistry::default().with_priority(&["docling", "markitdown"]);
+        assert_eq!(
+            registry
+                .module_for(Path::new("scan.pdf"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "docling"
         );
     }
 

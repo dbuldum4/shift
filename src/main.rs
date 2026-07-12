@@ -670,6 +670,7 @@ fn module_label(id: &str) -> &str {
         "markitdown" => "MarkItDown",
         "pandoc" => "Pandoc",
         "defuddle" => "Defuddle",
+        "docling" => "Docling",
         other => other,
     }
 }
