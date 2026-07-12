@@ -7,6 +7,12 @@ rust-version = "1.85"
 [dependencies]
 gpui = "=0.2.2"
 lyon = "1.0"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
+cocoa = "0.26"
+objc = "0.2"
 
 [profile.release]
 lto = "thin"

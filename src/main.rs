@@ -1,8 +1,10 @@
+mod file_picker;
+
 use gpui::{
     Animation, AnimationExt, App, Application, Bounds, Context, ExternalPaths, KeyBinding, Menu,
-    MenuItem, PathBuilder, PathPromptOptions, PathStyle, Render, Rgba, StrokeOptions,
-    SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas, div,
-    ease_out_quint, point, prelude::*, px, rgb, size,
+    MenuItem, PathBuilder, PathStyle, Render, Rgba, StrokeOptions, SystemMenuType, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, point, prelude::*,
+    px, rgb, size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -94,24 +96,35 @@ struct Shift {
 
 impl Shift {
     fn choose_file(&mut self, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Choose file".into()),
-        });
+        // Ignore clicks while a dialog is already open (prevents multi-panel
+        // races that can hang the open/save panel service).
+        if file_picker::is_busy() {
+            return;
+        }
+
+        let start_dir = self
+            .selected_file
+            .as_ref()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
+
+        let receiver = file_picker::pick_file(start_dir);
 
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let _ = this.update(cx, |this, cx| {
+            let path = receiver.await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                if let Some(path) = path {
                     this.selected_file = Some(path);
-                    cx.notify();
-                });
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
+    }
+
+    fn set_selected_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        file_picker::remember_directory(&path);
+        self.selected_file = Some(path);
+        cx.notify();
     }
 }
 
@@ -177,8 +190,7 @@ impl Render for Shift {
                     .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                         if let Some(path) = paths.paths().first() {
-                            this.selected_file = Some(path.clone());
-                            cx.notify();
+                            this.set_selected_file(path.clone(), cx);
                         }
                     }))
                     .with_animation(
@@ -242,6 +254,9 @@ fn main() {
             },
         )
         .expect("failed to open the main window");
+
+        // Warm the open/save panel service so the first click is fast.
+        file_picker::prewarm();
 
         cx.activate(true);
     });
