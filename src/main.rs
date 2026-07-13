@@ -19,6 +19,9 @@ use text_input::TextInput;
 const APP_NAME: &str = "Shift";
 const DROP_ZONE_COLOR: u32 = 0x171a1f;
 const DROP_ZONE_HOVER_COLOR: u32 = 0x191d23;
+/// Cap session history so large conversion artifacts cannot grow without bound.
+const MAX_HISTORY_ENTRIES: usize = 30;
+const HISTORY_SIDEBAR_WIDTH: f32 = 220.0;
 
 #[derive(Clone)]
 struct FilePreview {
@@ -36,6 +39,31 @@ enum ConversionState {
     /// Shared so render clones stay cheap for large artifacts.
     Ready(Arc<ConversionArtifact>),
     Failed(SharedString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistorySource {
+    File(PathBuf),
+    Url(String),
+}
+
+#[derive(Clone)]
+enum HistoryOutcome {
+    Ready(Arc<ConversionArtifact>),
+    Failed(SharedString),
+}
+
+#[derive(Clone)]
+struct ConversionHistoryEntry {
+    id: u64,
+    source: HistorySource,
+    name: SharedString,
+    detail: SharedString,
+    extension_label: SharedString,
+    badge_color: u32,
+    badge_text_color: u32,
+    output_format: OutputFormat,
+    outcome: HistoryOutcome,
 }
 
 #[derive(Clone)]
@@ -242,6 +270,165 @@ fn empty_drop_prompt() -> impl IntoElement {
                 .text_sm()
                 .text_color(rgb(0x9299a6))
                 .child("or click to browse"),
+        )
+}
+
+fn history_sidebar(
+    history: &[ConversionHistoryEntry],
+    active_history_id: Option<u64>,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let is_empty = history.is_empty();
+
+    div()
+        .id("history-sidebar")
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .w(px(HISTORY_SIDEBAR_WIDTH))
+        .h_full()
+        .bg(rgb(0x12151a))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_4()
+                .pt(px(28.0))
+                .pb_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0x8b929e))
+                        .child("History"),
+                )
+                .when(!is_empty, |header| {
+                    header.child(
+                        div()
+                            .id("clear-history")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(rgb(0x707986))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x1f242b)).text_color(rgb(0xc6ccd5)))
+                            .child("Clear")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_history(cx);
+                                cx.stop_propagation();
+                            })),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .id("history-list")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .px_2()
+                .pb_3()
+                .gap_1()
+                .overflow_y_scroll()
+                .when(is_empty, |list| {
+                    list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .px_3()
+                            .py_4()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x767e8b))
+                                    .child("No conversions yet"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x5d646f))
+                                    .child("Completed work shows up here."),
+                            ),
+                    )
+                })
+                .children(history.iter().cloned().map(|entry| {
+                    let id = entry.id;
+                    let active = active_history_id == Some(id);
+                    let failed = matches!(entry.outcome, HistoryOutcome::Failed(_));
+                    let badge_color = entry.badge_color;
+                    let badge_text_color = entry.badge_text_color;
+
+                    div()
+                        .id(("history-entry", id))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .px_2()
+                        .py_2()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .when(active, |row| {
+                            row.bg(rgb(0x1c242a)).border_1().border_color(rgb(0x2f3f4c))
+                        })
+                        .when(!active, |row| {
+                            row.border_1()
+                                .border_color(rgb(0x12151a))
+                                .hover(|style| style.bg(rgb(0x181c22)))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .justify_center()
+                                .size(px(32.0))
+                                .rounded_md()
+                                .bg(rgb(badge_color))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(badge_text_color))
+                                        .child(entry.extension_label),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(if failed {
+                                            rgb(0xd4a0a7)
+                                        } else {
+                                            rgb(0xe8edf3)
+                                        })
+                                        .truncate()
+                                        .child(entry.name),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6e7582))
+                                        .truncate()
+                                        .child(entry.detail),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.restore_history_entry(id, cx);
+                            cx.stop_propagation();
+                        }))
+                })),
         )
 }
 
@@ -884,6 +1071,9 @@ struct Shift {
     settings_open: bool,
     module_priority: Vec<String>,
     url_input: Entity<TextInput>,
+    history: Vec<ConversionHistoryEntry>,
+    next_history_id: u64,
+    active_history_id: Option<u64>,
 }
 
 impl Shift {
@@ -934,6 +1124,7 @@ impl Shift {
         self.conversion = ConversionState::Converting;
         self.save_status = None;
         self.output_menu_open = false;
+        self.active_history_id = None;
         cx.notify();
 
         let preview_path = path.clone();
@@ -1002,6 +1193,7 @@ impl Shift {
         self.conversion = ConversionState::Converting;
         self.save_status = None;
         self.output_menu_open = false;
+        self.active_history_id = None;
         cx.notify();
         self.start_conversion(cx);
     }
@@ -1027,6 +1219,7 @@ impl Shift {
         let priority = self.module_priority.clone();
         self.conversion = ConversionState::Converting;
         self.save_status = None;
+        self.active_history_id = None;
         cx.notify();
 
         let conversion_path = path.clone();
@@ -1043,8 +1236,16 @@ impl Shift {
                     && this.selected_file.as_ref() == Some(&path)
                 {
                     this.conversion = match result {
-                        Ok(artifact) => ConversionState::Ready(Arc::new(artifact)),
-                        Err(error) => ConversionState::Failed(error.to_string().into()),
+                        Ok(artifact) => {
+                            let artifact = Arc::new(artifact);
+                            this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)));
+                            ConversionState::Ready(artifact)
+                        }
+                        Err(error) => {
+                            let message: SharedString = error.to_string().into();
+                            this.record_history(HistoryOutcome::Failed(message.clone()));
+                            ConversionState::Failed(message)
+                        }
                     };
                     cx.notify();
                 }
@@ -1061,6 +1262,7 @@ impl Shift {
         let priority = self.module_priority.clone();
         self.conversion = ConversionState::Converting;
         self.save_status = None;
+        self.active_history_id = None;
         cx.notify();
 
         let conversion_url = url.clone();
@@ -1077,8 +1279,16 @@ impl Shift {
                     && this.selected_url.as_ref() == Some(&url)
                 {
                     this.conversion = match result {
-                        Ok(artifact) => ConversionState::Ready(Arc::new(artifact)),
-                        Err(error) => ConversionState::Failed(error.to_string().into()),
+                        Ok(artifact) => {
+                            let artifact = Arc::new(artifact);
+                            this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)));
+                            ConversionState::Ready(artifact)
+                        }
+                        Err(error) => {
+                            let message: SharedString = error.to_string().into();
+                            this.record_history(HistoryOutcome::Failed(message.clone()));
+                            ConversionState::Failed(message)
+                        }
                     };
                     cx.notify();
                 }
@@ -1129,6 +1339,110 @@ impl Shift {
         self.conversion = ConversionState::Empty;
         self.save_status = None;
         self.output_menu_open = false;
+        self.active_history_id = None;
+        cx.notify();
+    }
+
+    fn record_history(&mut self, outcome: HistoryOutcome) {
+        let (source, preview) = if let Some(path) = self.selected_file.clone() {
+            let preview = self
+                .file_preview
+                .clone()
+                .unwrap_or_else(|| build_file_preview(&path));
+            (HistorySource::File(path), preview)
+        } else if let Some(url) = self.selected_url.clone() {
+            let preview = self
+                .file_preview
+                .clone()
+                .unwrap_or_else(|| build_url_preview(&url));
+            (HistorySource::Url(url), preview)
+        } else {
+            return;
+        };
+
+        let detail = match &outcome {
+            HistoryOutcome::Ready(artifact) => format!(
+                "{}  ·  via {}",
+                artifact.format.label(),
+                module_label(artifact.module_id)
+            ),
+            HistoryOutcome::Failed(_) => format!("{}  ·  failed", self.output_format.label()),
+        };
+
+        let id = self.next_history_id;
+        self.next_history_id = self.next_history_id.wrapping_add(1);
+        self.history.insert(
+            0,
+            ConversionHistoryEntry {
+                id,
+                source,
+                name: preview.name,
+                detail: detail.into(),
+                extension_label: preview.extension_label,
+                badge_color: preview.badge_color,
+                badge_text_color: preview.badge_text_color,
+                output_format: self.output_format,
+                outcome,
+            },
+        );
+        self.history.truncate(MAX_HISTORY_ENTRIES);
+        self.active_history_id = Some(id);
+    }
+
+    fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(entry) = self.history.iter().find(|entry| entry.id == id).cloned() else {
+            return;
+        };
+
+        // Invalidate any in-flight work so a late conversion cannot overwrite
+        // the restored snapshot.
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.conversion_generation = self.conversion_generation.wrapping_add(1);
+        self.output_menu_open = false;
+        self.save_status = None;
+        self.output_format = entry.output_format;
+        self.active_history_id = Some(entry.id);
+
+        match &entry.source {
+            HistorySource::File(path) => {
+                file_picker::remember_directory(path);
+                self.selected_file = Some(path.clone());
+                self.selected_url = None;
+                self.url_input
+                    .update(cx, |input, cx| input.set_content("", cx));
+                // Prefer a live preview when the source is still on disk; fall
+                // back to the snapshot captured at conversion time.
+                self.file_preview = Some(if path.exists() {
+                    build_file_preview(path)
+                } else {
+                    FilePreview {
+                        name: entry.name.clone(),
+                        subtitle: entry.detail.clone(),
+                        extension_label: entry.extension_label.clone(),
+                        badge_color: entry.badge_color,
+                        badge_text_color: entry.badge_text_color,
+                    }
+                });
+            }
+            HistorySource::Url(url) => {
+                self.selected_file = None;
+                self.selected_url = Some(url.clone());
+                self.url_input
+                    .update(cx, |input, cx| input.set_content(url.clone(), cx));
+                self.file_preview = Some(build_url_preview(url));
+            }
+        }
+
+        self.conversion = match entry.outcome {
+            HistoryOutcome::Ready(artifact) => ConversionState::Ready(artifact),
+            HistoryOutcome::Failed(message) => ConversionState::Failed(message),
+        };
+        cx.notify();
+    }
+
+    fn clear_history(&mut self, cx: &mut Context<Self>) {
+        self.history.clear();
+        self.active_history_id = None;
         cx.notify();
     }
 
@@ -1197,6 +1511,8 @@ impl Render for Shift {
         let module_priority = self.module_priority.clone();
         let preference_error = self.preference_error.clone();
         let url_input = self.url_input.clone();
+        let history = self.history.clone();
+        let active_history_id = self.active_history_id;
 
         div()
             .id("shift-root")
@@ -1211,6 +1527,12 @@ impl Render for Shift {
                     cx.notify();
                 }
             }))
+            .child(history_sidebar(&history, active_history_id, cx))
+            .child(
+                div()
+                    .h_full()
+                    .child(div().w(px(1.0)).h_full().bg(rgb(0x292d34))),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1318,7 +1640,7 @@ fn main() {
             ],
         }]);
 
-        let bounds = Bounds::centered(None, size(px(900.0), px(600.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1120.0), px(640.0)), cx);
 
         cx.open_window(
             WindowOptions {
@@ -1329,7 +1651,7 @@ fn main() {
                     ..Default::default()
                 }),
                 app_id: Some(APP_NAME.into()),
-                window_min_size: Some(size(px(600.0), px(400.0))),
+                window_min_size: Some(size(px(820.0), px(440.0))),
                 ..Default::default()
             },
             |_, cx| {
@@ -1349,6 +1671,9 @@ fn main() {
                         settings_open: false,
                         module_priority: load_module_priority(),
                         url_input,
+                        history: Vec::new(),
+                        next_history_id: 1,
+                        active_history_id: None,
                     }
                 });
 
