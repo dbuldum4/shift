@@ -19,8 +19,27 @@ use std::time::Duration;
 use text_input::TextInput;
 
 const APP_NAME: &str = "Shift";
-const DROP_ZONE_COLOR: u32 = 0x171a1f;
-const DROP_ZONE_HOVER_COLOR: u32 = 0x191d23;
+/// Black-and-white monospaced developer theme (gpui.rs-inspired).
+const FONT_MONO: &str = "Menlo";
+const BG: u32 = 0x000000;
+const BG_RAISED: u32 = 0x0a0a0a;
+const BG_SURFACE: u32 = 0x111111;
+const BG_ELEVATED: u32 = 0x1a1a1a;
+const BG_HOVER: u32 = 0x222222;
+const BG_ACTIVE: u32 = 0x2a2a2a;
+const DROP_ZONE_COLOR: u32 = 0x0a0a0a;
+const DROP_ZONE_HOVER_COLOR: u32 = 0x111111;
+const BORDER: u32 = 0x222222;
+const BORDER_STRONG: u32 = 0x333333;
+const BORDER_FOCUS: u32 = 0x555555;
+const TEXT: u32 = 0xffffff;
+const TEXT_PRIMARY: u32 = 0xe8e8e8;
+const TEXT_SECONDARY: u32 = 0x888888;
+const TEXT_MUTED: u32 = 0x666666;
+const TEXT_DIM: u32 = 0x444444;
+const TEXT_INVERSE: u32 = 0x000000;
+const BADGE_FILL: u32 = 0x1a1a1a;
+const BADGE_TEXT: u32 = 0xcccccc;
 /// Cap session history so large conversion artifacts cannot grow without bound.
 const MAX_HISTORY_ENTRIES: usize = 30;
 const HISTORY_SIDEBAR_WIDTH: f32 = 220.0;
@@ -100,13 +119,14 @@ impl Render for ModuleDrag {
             .px_4()
             .py_3()
             .rounded_lg()
-            .bg(rgb(0x2a3038))
+            .bg(rgb(BG_ELEVATED))
             .border_1()
-            .border_color(rgb(0x46515e))
+            .border_color(rgb(BORDER_STRONG))
             .shadow_lg()
             .text_sm()
+            .font_family(FONT_MONO)
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(0xf0f3f7))
+            .text_color(rgb(TEXT))
             .child(self.label.clone())
     }
 }
@@ -134,25 +154,22 @@ fn extension_badge(path: &Path) -> (String, u32, u32) {
         .map(|e| e.to_ascii_uppercase())
         .unwrap_or_default();
 
-    // Soft badge fills + readable accent text, keyed by common kinds.
-    let (label, fill, text): (&str, u32, u32) = match ext.as_str() {
-        "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "HEIC" | "SVG" | "BMP" | "TIFF" => {
-            ("IMG", 0x24352c, 0x8fd9a8)
-        }
-        "MP4" | "MOV" | "MKV" | "AVI" | "WEBM" => ("VID", 0x35242f, 0xe0a0c0),
-        "MP3" | "WAV" | "AAC" | "FLAC" | "M4A" | "OGG" => ("AUD", 0x2a2840, 0xb8b0f0),
-        "PDF" => ("PDF", 0x3a2424, 0xf0a0a0),
-        "ZIP" | "TAR" | "GZ" | "TGZ" | "7Z" | "RAR" => ("ZIP", 0x3a3020, 0xe8c888),
+    // Monochrome type labels — same fill/text, distinguish by abbreviation only.
+    let label: &str = match ext.as_str() {
+        "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "HEIC" | "SVG" | "BMP" | "TIFF" => "IMG",
+        "MP4" | "MOV" | "MKV" | "AVI" | "WEBM" => "VID",
+        "MP3" | "WAV" | "AAC" | "FLAC" | "M4A" | "OGG" => "AUD",
+        "PDF" => "PDF",
+        "ZIP" | "TAR" | "GZ" | "TGZ" | "7Z" | "RAR" => "ZIP",
         "RS" | "TS" | "TSX" | "JS" | "JSX" | "PY" | "GO" | "SWIFT" | "KT" | "JAVA" | "C"
-        | "CPP" | "H" | "CS" | "RB" | "PHP" => (ext.as_str(), 0x1e2e3a, 0x88c4e8),
-        "MD" | "TXT" | "RTF" | "DOC" | "DOCX" | "PAGES" => (ext.as_str(), 0x243038, 0x9ec4d8),
-        "JSON" | "YAML" | "YML" | "TOML" | "XML" | "CSV" => (ext.as_str(), 0x302a20, 0xe0c090),
-        "" => ("FILE", 0x2a3038, 0xa8b4c4),
-        other if other.len() <= 4 => (other, 0x2a3038, 0xa8b4c4),
-        _ => ("FILE", 0x2a3038, 0xa8b4c4),
+        | "CPP" | "H" | "CS" | "RB" | "PHP" | "MD" | "TXT" | "RTF" | "DOC" | "DOCX" | "PAGES"
+        | "JSON" | "YAML" | "YML" | "TOML" | "XML" | "CSV" => ext.as_str(),
+        "" => "FILE",
+        other if other.len() <= 4 => other,
+        _ => "FILE",
     };
 
-    (label.to_string(), fill, text)
+    (label.to_string(), BADGE_FILL, BADGE_TEXT)
 }
 
 fn build_file_preview_with_size(path: &Path, size_label: String) -> FilePreview {
@@ -244,7 +261,11 @@ fn rounded_dashed_border(accent: bool) -> impl IntoElement {
             path.close();
 
             if let Ok(path) = path.build() {
-                let color = if accent { rgb(0x3d5566) } else { rgb(0x343941) };
+                let color = if accent {
+                    rgb(BORDER_FOCUS)
+                } else {
+                    rgb(BORDER)
+                };
                 window.paint_path(path, color);
             }
         },
@@ -260,7 +281,12 @@ fn empty_drop_prompt() -> impl IntoElement {
         .items_center()
         .justify_center()
         .gap_3()
-        .child(div().text_3xl().text_color(rgb(0x8fa3b8)).child("\u{2191}"))
+        .child(
+            div()
+                .text_3xl()
+                .text_color(rgb(TEXT_SECONDARY))
+                .child("\u{2191}"),
+        )
         .child(
             div()
                 .text_lg()
@@ -270,7 +296,7 @@ fn empty_drop_prompt() -> impl IntoElement {
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(0x9299a6))
+                .text_color(rgb(TEXT_SECONDARY))
                 .child("or click to browse"),
         )
 }
@@ -289,7 +315,7 @@ fn history_sidebar(
         .flex_shrink_0()
         .w(px(HISTORY_SIDEBAR_WIDTH))
         .h_full()
-        .bg(rgb(0x12151a))
+        .bg(rgb(BG))
         .child(
             div()
                 .flex()
@@ -302,7 +328,7 @@ fn history_sidebar(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0x8b929e))
+                        .text_color(rgb(TEXT_SECONDARY))
                         .child("History"),
                 )
                 .when(!is_empty, |header| {
@@ -313,9 +339,11 @@ fn history_sidebar(
                             .py_1()
                             .rounded_md()
                             .text_xs()
-                            .text_color(rgb(0x707986))
+                            .text_color(rgb(TEXT_MUTED))
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x1f242b)).text_color(rgb(0xc6ccd5)))
+                            .hover(|style| {
+                                style.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_SECONDARY))
+                            })
                             .child("Clear")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.clear_history(cx);
@@ -346,13 +374,13 @@ fn history_sidebar(
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(0x767e8b))
+                                    .text_color(rgb(TEXT_MUTED))
                                     .child("No conversions yet"),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x5d646f))
+                                    .text_color(rgb(TEXT_DIM))
                                     .child("Completed work shows up here."),
                             ),
                     )
@@ -375,12 +403,14 @@ fn history_sidebar(
                         .rounded_lg()
                         .cursor_pointer()
                         .when(active, |row| {
-                            row.bg(rgb(0x1c242a)).border_1().border_color(rgb(0x2f3f4c))
+                            row.bg(rgb(BG_ELEVATED))
+                                .border_1()
+                                .border_color(rgb(BORDER_STRONG))
                         })
                         .when(!active, |row| {
                             row.border_1()
-                                .border_color(rgb(0x12151a))
-                                .hover(|style| style.bg(rgb(0x181c22)))
+                                .border_color(rgb(BG))
+                                .hover(|style| style.bg(rgb(BG_SURFACE)))
                         })
                         .child(
                             div()
@@ -411,9 +441,9 @@ fn history_sidebar(
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(if failed {
-                                            rgb(0xd4a0a7)
+                                            rgb(TEXT_SECONDARY)
                                         } else {
-                                            rgb(0xe8edf3)
+                                            rgb(TEXT_PRIMARY)
                                         })
                                         .truncate()
                                         .child(entry.name),
@@ -421,7 +451,7 @@ fn history_sidebar(
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0x6e7582))
+                                        .text_color(rgb(TEXT_MUTED))
                                         .truncate()
                                         .child(entry.detail),
                                 ),
@@ -450,8 +480,8 @@ fn build_url_preview(url: &str) -> FilePreview {
         name: url.trim().to_owned().into(),
         subtitle: format!("URL  ·  {host}").into(),
         extension_label: "WEB".into(),
-        badge_color: 0x243038,
-        badge_text_color: 0x9ec4d8,
+        badge_color: BADGE_FILL,
+        badge_text_color: BADGE_TEXT,
     }
 }
 
@@ -477,11 +507,11 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                 .px_4()
                 .py_3()
                 .rounded_xl()
-                .bg(rgb(0x1c2028))
+                .bg(rgb(BG_SURFACE))
                 .border_1()
-                .border_color(rgb(0x2e343e))
+                .border_color(rgb(BORDER))
                 .shadow(vec![gpui::BoxShadow {
-                    color: hsla(220.0 / 360.0, 0.35, 0.04, 0.55),
+                    color: hsla(0.0, 0.0, 0.0, 0.65),
                     blur_radius: px(24.0),
                     spread_radius: px(0.0),
                     offset: point(px(0.0), px(8.0)),
@@ -518,14 +548,14 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                             div()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xf0f3f7))
+                                .text_color(rgb(TEXT))
                                 .truncate()
                                 .child(preview.name),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x8b929e))
+                                .text_color(rgb(TEXT_SECONDARY))
                                 .truncate()
                                 .child(preview.subtitle),
                         ),
@@ -540,16 +570,16 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                         .justify_center()
                         .size(px(28.0))
                         .rounded_full()
-                        .bg(rgb(0x272c34))
+                        .bg(rgb(BG_HOVER))
                         .border_1()
-                        .border_color(rgb(0x353b45))
-                        .text_color(rgb(0x9aa1ad))
+                        .border_color(rgb(BORDER_STRONG))
+                        .text_color(rgb(TEXT_SECONDARY))
                         .cursor_pointer()
                         .hover(|style| {
                             style
-                                .bg(rgb(0x3a2428))
-                                .border_color(rgb(0x6a3a42))
-                                .text_color(rgb(0xf0b0b8))
+                                .bg(rgb(BG_HOVER))
+                                .border_color(rgb(BORDER_FOCUS))
+                                .text_color(rgb(TEXT))
                         })
                         .active(|style| style.opacity(0.85))
                         .child(
@@ -567,7 +597,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x6e7582))
+                .text_color(rgb(TEXT_MUTED))
                 .child("Click to replace  ·  Drop another file"),
         )
         .with_animation(
@@ -646,23 +676,21 @@ fn chip(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .bg(if selected {
-            rgb(0x2f3a46)
-        } else {
-            rgb(0x1b1f25)
-        })
+        .bg(if selected { rgb(TEXT) } else { rgb(BG_SURFACE) })
         .text_color(if selected {
-            rgb(0xe8edf3)
+            rgb(TEXT_INVERSE)
         } else {
-            rgb(0x8e98a5)
+            rgb(TEXT_SECONDARY)
         })
         .border_1()
-        .border_color(if selected {
-            rgb(0x4d6275)
-        } else {
-            rgb(0x303640)
+        .border_color(if selected { rgb(TEXT) } else { rgb(BORDER) })
+        .hover(|style| {
+            if selected {
+                style
+            } else {
+                style.bg(rgb(BG_HOVER))
+            }
         })
-        .hover(|style| style.bg(rgb(0x252b33)))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -712,9 +740,9 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
         .w_full()
         .p_3()
         .rounded_xl()
-        .bg(rgb(0x15181d))
+        .bg(rgb(BG_RAISED))
         .border_1()
-        .border_color(rgb(0x292e36))
+        .border_color(rgb(BORDER))
         .child(
             div()
                 .flex()
@@ -724,7 +752,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xa7b0bc))
+                        .text_color(rgb(TEXT_SECONDARY))
                         .child("Media options (FFmpeg)"),
                 )
                 .child(
@@ -733,14 +761,14 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x2a3038))
+                        .bg(rgb(BG_ELEVATED))
                         .border_1()
-                        .border_color(rgb(0x46515e))
+                        .border_color(rgb(BORDER_STRONG))
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xe8edf3))
+                        .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x343b45)))
+                        .hover(|style| style.bg(rgb(BG_ACTIVE)))
                         .child("Apply")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.apply_media_options(cx);
@@ -754,7 +782,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                 .flex_wrap()
                 .gap_2()
                 .items_center()
-                .child(div().text_xs().text_color(rgb(0x6e7582)).child("Quality"))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Quality"))
                 .child(chip(
                     "media-quality-balanced",
                     FfmpegQuality::Balanced.label(),
@@ -792,7 +820,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                 .flex_wrap()
                 .gap_2()
                 .items_center()
-                .child(div().text_xs().text_color(rgb(0x6e7582)).child("Encode"))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Encode"))
                 .child(chip(
                     "media-encode-auto",
                     FfmpegEncodeMode::Auto.label(),
@@ -838,7 +866,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x6e7582))
+                                    .text_color(rgb(TEXT_MUTED))
                                     .child("Start (sec)"),
                             )
                             .child(
@@ -846,9 +874,9 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                                     .h(px(32.0))
                                     .px_2()
                                     .rounded_md()
-                                    .bg(rgb(0x1b1f25))
+                                    .bg(rgb(BG_SURFACE))
                                     .border_1()
-                                    .border_color(rgb(0x303640))
+                                    .border_color(rgb(BORDER))
                                     .child(start_input),
                             ),
                     )
@@ -861,7 +889,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x6e7582))
+                                    .text_color(rgb(TEXT_MUTED))
                                     .child("Duration (sec)"),
                             )
                             .child(
@@ -869,9 +897,9 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                                     .h(px(32.0))
                                     .px_2()
                                     .rounded_md()
-                                    .bg(rgb(0x1b1f25))
+                                    .bg(rgb(BG_SURFACE))
                                     .border_1()
-                                    .border_color(rgb(0x303640))
+                                    .border_color(rgb(BORDER))
                                     .child(duration_input),
                             ),
                     ),
@@ -886,7 +914,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x6e7582))
+                            .text_color(rgb(TEXT_MUTED))
                             .child("Frame at (sec)"),
                     )
                     .child(
@@ -894,9 +922,9 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                             .h(px(32.0))
                             .px_2()
                             .rounded_md()
-                            .bg(rgb(0x1b1f25))
+                            .bg(rgb(BG_SURFACE))
                             .border_1()
-                            .border_color(rgb(0x303640))
+                            .border_color(rgb(BORDER))
                             .child(frame_input),
                     ),
             )
@@ -909,7 +937,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                         .flex_wrap()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(rgb(0x6e7582)).child("Audio"))
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Audio"))
                         .child(chip(
                             "media-mono",
                             if mono { "Mono ✓" } else { "Mono" },
@@ -959,7 +987,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x6e7582))
+                                .text_color(rgb(TEXT_MUTED))
                                 .child("Audio stream index"),
                         )
                         .child(
@@ -967,9 +995,9 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(0x1b1f25))
+                                .bg(rgb(BG_SURFACE))
                                 .border_1()
-                                .border_color(rgb(0x303640))
+                                .border_color(rgb(BORDER))
                                 .child(audio_stream_input),
                         ),
                 )
@@ -981,7 +1009,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                     .flex_wrap()
                     .gap_2()
                     .items_center()
-                    .child(div().text_xs().text_color(rgb(0x6e7582)).child("Width"))
+                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width"))
                     .child(chip(
                         "media-scale-auto",
                         "Auto",
@@ -1033,7 +1061,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x6e7582))
+                            .text_color(rgb(TEXT_MUTED))
                             .child("Subtitle stream index"),
                     )
                     .child(
@@ -1041,9 +1069,9 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                             .h(px(32.0))
                             .px_2()
                             .rounded_md()
-                            .bg(rgb(0x1b1f25))
+                            .bg(rgb(BG_SURFACE))
                             .border_1()
-                            .border_color(rgb(0x303640))
+                            .border_color(rgb(BORDER))
                             .child(subtitle_stream_input),
                     ),
             )
@@ -1051,7 +1079,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x5f6773))
+                .text_color(rgb(TEXT_DIM))
                 .child("Edit fields, then Apply. Chips reconvert immediately."),
         )
 }
@@ -1089,14 +1117,14 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xc6ccd5))
+                    .text_color(rgb(TEXT_SECONDARY))
                     .child("Output appears here"),
             )
             .child(
                 div()
                     .max_w(px(280.0))
                     .text_sm()
-                    .text_color(rgb(0x767e8b))
+                    .text_color(rgb(TEXT_MUTED))
                     .child(
                         "Choose a document, media file, or paste a URL — Shift converts it automatically.",
                     ),
@@ -1111,7 +1139,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
             .child(
                 div()
                     .text_2xl()
-                    .text_color(rgb(0x8fb3cc))
+                    .text_color(rgb(TEXT_SECONDARY))
                     .child("↻")
                     .with_animation(
                         "conversion-pulse",
@@ -1123,7 +1151,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(0xb8c0cb))
+                    .text_color(rgb(TEXT_SECONDARY))
                     .child(format!("Converting to {}…", output_format.label())),
             ),
         ConversionState::Failed(message) => div()
@@ -1136,18 +1164,18 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xf0b0b8))
+                    .text_color(rgb(TEXT))
                     .child("Conversion failed"),
             )
             .child(
                 div()
                     .p_4()
                     .rounded_lg()
-                    .bg(rgb(0x251a1d))
+                    .bg(rgb(BG_ELEVATED))
                     .border_1()
-                    .border_color(rgb(0x4a2930))
+                    .border_color(rgb(BORDER_STRONG))
                     .text_sm()
-                    .text_color(rgb(0xd4a0a7))
+                    .text_color(rgb(TEXT_SECONDARY))
                     .child(message),
             ),
         ConversionState::Ready(artifact) => {
@@ -1184,7 +1212,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0x858d99))
+                                        .text_color(rgb(TEXT_SECONDARY))
                                         .child(conversion_detail),
                                 ),
                         )
@@ -1194,14 +1222,14 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 .px_4()
                                 .py_2()
                                 .rounded_lg()
-                                .bg(rgb(0x2a3038))
+                                .bg(rgb(BG_ELEVATED))
                                 .border_1()
-                                .border_color(rgb(0x46515e))
+                                .border_color(rgb(BORDER_STRONG))
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xe8edf3))
+                                .text_color(rgb(TEXT_PRIMARY))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x343b45)).border_color(rgb(0x5a6674)))
+                                .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
                                 .active(|style| style.opacity(0.82))
                                 .child("Download")
                                 .on_click(cx.listener(|this, _, _, cx| this.save_output(cx))),
@@ -1213,16 +1241,16 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .min_h_0()
                         .p_5()
                         .rounded_xl()
-                        .bg(rgb(0x15181d))
+                        .bg(rgb(BG_RAISED))
                         .border_1()
-                        .border_color(rgb(0x292e36))
+                        .border_color(rgb(BORDER))
                         .overflow_hidden()
                         .text_sm()
-                        .text_color(rgb(0xb9c0ca))
+                        .text_color(rgb(TEXT_SECONDARY))
                         .child(excerpt),
                 )
                 .when_some(save_status, |panel, status| {
-                    panel.child(div().text_xs().text_color(rgb(0x8fc9a5)).child(status))
+                    panel.child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(status))
                 })
         }
     };
@@ -1239,12 +1267,12 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .h(px(40.0))
                 .px_3()
                 .rounded_lg()
-                .bg(rgb(0x1b1f25))
+                .bg(rgb(BG_SURFACE))
                 .border_1()
-                .border_color(rgb(0x303640))
+                .border_color(rgb(BORDER))
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x22272e)))
-                .child(div().text_xs().text_color(rgb(0x7e8794)).child("Output"))
+                .hover(|style| style.bg(rgb(BG_HOVER)))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Output"))
                 .child(
                     div()
                         .text_sm()
@@ -1258,7 +1286,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .justify_center()
                         .size(px(18.0))
                         .text_xs()
-                        .text_color(rgb(0x8e98a5))
+                        .text_color(rgb(TEXT_SECONDARY))
                         .child("▾"),
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1279,9 +1307,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .overflow_y_scroll()
                     .p_1()
                     .rounded_lg()
-                    .bg(rgb(0x20242b))
+                    .bg(rgb(BG_ELEVATED))
                     .border_1()
-                    .border_color(rgb(0x353c46))
+                    .border_color(rgb(BORDER_STRONG))
                     .shadow_lg()
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .children(OutputFormat::ALL.iter().copied().enumerate().map(
@@ -1297,13 +1325,13 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 .rounded_md()
                                 .text_sm()
                                 .text_color(if enabled {
-                                    rgb(0xe4e8ed)
+                                    rgb(TEXT_PRIMARY)
                                 } else {
-                                    rgb(0x626a75)
+                                    rgb(TEXT_DIM)
                                 })
                                 .when(enabled, |row| {
                                     row.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(0x2b3139)))
+                                        .hover(|style| style.bg(rgb(BG_HOVER)))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.set_output_format(format, cx);
                                             cx.stop_propagation();
@@ -1311,7 +1339,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 })
                                 .child(format.label())
                                 .when(format == output_format, |row| {
-                                    row.child(div().text_color(rgb(0x91c1df)).child("✓"))
+                                    row.child(div().text_color(rgb(TEXT)).child("✓"))
                                 })
                         },
                     )),
@@ -1362,11 +1390,11 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .flex_1()
                 .min_w_0()
                 .rounded_lg()
-                .bg(rgb(0x1b1f25))
+                .bg(rgb(BG_SURFACE))
                 .border_1()
-                .border_color(rgb(0x303640))
+                .border_color(rgb(BORDER))
                 .text_sm()
-                .text_color(rgb(0xe8edf3))
+                .text_color(rgb(TEXT_PRIMARY))
                 .overflow_hidden()
                 .child(url_input),
         )
@@ -1379,14 +1407,14 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .h(px(40.0))
                 .px_4()
                 .rounded_lg()
-                .bg(rgb(0x2a3038))
+                .bg(rgb(BG_ELEVATED))
                 .border_1()
-                .border_color(rgb(0x46515e))
+                .border_color(rgb(BORDER_STRONG))
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(0xe8edf3))
+                .text_color(rgb(TEXT_PRIMARY))
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x343b45)).border_color(rgb(0x5a6674)))
+                .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
                 .active(|style| style.opacity(0.82))
                 .child("Convert")
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1411,7 +1439,7 @@ fn settings_modal(
         .flex()
         .items_center()
         .justify_center()
-        .bg(hsla(220.0 / 360.0, 0.25, 0.04, 0.78))
+        .bg(hsla(0.0, 0.0, 0.0, 0.82))
         .cursor_default()
         .on_click(cx.listener(|this, _, _, cx| {
             this.settings_open = false;
@@ -1426,21 +1454,32 @@ fn settings_modal(
                 .flex_col()
                 .gap_5()
                 .w(px(440.0))
+                // Clip any child that still tries to paint past the fixed width so
+                // monospaced copy cannot spill outside the rounded card.
+                .overflow_hidden()
                 .p_6()
                 .rounded_xl()
-                .bg(rgb(0x181c22))
+                .bg(rgb(BG_SURFACE))
                 .border_1()
-                .border_color(rgb(0x343b45))
+                .border_color(rgb(BG_ACTIVE))
                 .shadow_lg()
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
+                    // Keep the close control in normal flex flow (not absolute) so the
+                    // title/subtitle column always receives a definite remaining width
+                    // and long monospaced copy wraps instead of overflowing.
                     div()
                         .flex()
                         .items_start()
+                        .gap_3()
+                        .w_full()
+                        .min_w_0()
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
+                                .flex_1()
+                                .min_w_0()
                                 .gap_1()
                                 .child(
                                     div()
@@ -1448,16 +1487,21 @@ fn settings_modal(
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child("Module priority"),
                                 )
-                                .child(div().text_sm().text_color(rgb(0x8d96a3)).child(
-                                    "Drag modules to choose which compatible engine runs first.",
-                                )),
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(
+                                            "Drag modules to choose which compatible engine runs first.",
+                                        ),
+                                ),
                         )
                         .child(
                             div()
                                 .id("close-settings")
-                                .absolute()
-                                .top(px(10.0))
-                                .right(px(10.0))
+                                .flex_shrink_0()
                                 .size(px(24.0))
                                 .flex()
                                 .items_center()
@@ -1465,9 +1509,9 @@ fn settings_modal(
                                 .rounded_full()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xf0f3f7))
+                                .text_color(rgb(TEXT))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x292f37)))
+                                .hover(|style| style.bg(rgb(BG_HOVER)))
                                 .child("×")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.settings_open = false;
@@ -1481,6 +1525,8 @@ fn settings_modal(
                         .flex()
                         .flex_col()
                         .gap_2()
+                        .w_full()
+                        .min_w_0()
                         .children(priority.iter().enumerate().map(|(index, id)| {
                             let label = module_label(id).to_owned();
                             let drag = ModuleDrag::new(index, label.clone());
@@ -1489,16 +1535,18 @@ fn settings_modal(
                                 .flex()
                                 .items_center()
                                 .gap_3()
+                                .w_full()
+                                .min_w_0()
                                 .px_4()
                                 .py_3()
                                 .rounded_lg()
-                                .bg(rgb(0x20252c))
+                                .bg(rgb(BG_ELEVATED))
                                 .border_1()
-                                .border_color(rgb(0x303741))
-                                .text_color(rgb(0xe4e8ed))
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(TEXT_PRIMARY))
                                 .cursor_move()
                                 .drag_over::<ModuleDrag>(|style, _, _, _| {
-                                    style.bg(rgb(0x29323a)).border_color(rgb(0x4c6475))
+                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
                                 .on_drag(drag, |info: &ModuleDrag, position, _, cx| {
                                     cx.new(|_| info.clone().position(position))
@@ -1506,18 +1554,26 @@ fn settings_modal(
                                 .on_drop(cx.listener(move |this, info: &ModuleDrag, _, cx| {
                                     this.move_module(info.index, index, cx);
                                 }))
-                                .child(div().text_color(rgb(0x798390)).child("⠿"))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child("⠿"),
+                                )
                                 .child(
                                     div()
                                         .flex_1()
+                                        .min_w_0()
                                         .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
                                         .child(label),
                                 )
                                 .child(
                                     div()
+                                        .flex_shrink_0()
                                         .text_xs()
-                                        .text_color(rgb(0x707986))
+                                        .text_color(rgb(TEXT_MUTED))
                                         .child(if index == 0 { "First" } else { "Fallback" }),
                                 )
                         })),
@@ -1525,19 +1581,28 @@ fn settings_modal(
                 .when_some(preference_error, |modal, error| {
                     modal.child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .p_3()
                             .rounded_lg()
-                            .bg(rgb(0x251a1d))
+                            .bg(rgb(BG_ELEVATED))
                             .border_1()
-                            .border_color(rgb(0x4a2930))
+                            .border_color(rgb(BORDER_STRONG))
                             .text_xs()
-                            .text_color(rgb(0xd4a0a7))
+                            .text_color(rgb(TEXT_SECONDARY))
                             .child(error),
                     )
                 })
-                .child(div().text_xs().text_color(rgb(0x69727e)).child(
-                    "Priority only applies when multiple modules support the selected conversion.",
-                )),
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Priority only applies when multiple modules support the selected conversion.",
+                        ),
+                ),
         )
 }
 
@@ -2078,8 +2143,9 @@ impl Render for Shift {
             .relative()
             .flex()
             .size_full()
-            .bg(rgb(0x101216))
-            .text_color(rgb(0xf5f7fa))
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .font_family(FONT_MONO)
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.output_menu_open {
                     this.output_menu_open = false;
@@ -2090,7 +2156,7 @@ impl Render for Shift {
             .child(
                 div()
                     .h_full()
-                    .child(div().w(px(1.0)).h_full().bg(rgb(0x292d34))),
+                    .child(div().w(px(1.0)).h_full().bg(rgb(BORDER))),
             )
             .child(
                 div()
@@ -2120,7 +2186,7 @@ impl Render for Shift {
                             .bg(rgb(DROP_ZONE_COLOR))
                             .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
                             .cursor_pointer()
-                            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x1c242a)))
+                            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(BG_ELEVATED)))
                             .child(rounded_dashed_border(has_selection))
                             .when_some(preview, |zone, preview| {
                                 zone.child(file_preview_card(preview, cx))
@@ -2138,14 +2204,14 @@ impl Render for Shift {
                 div()
                     .h_full()
                     .py_8()
-                    .child(div().w(px(1.0)).h_full().bg(rgb(0x292d34))),
+                    .child(div().w(px(1.0)).h_full().bg(rgb(BORDER))),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .bg(rgb(0x101216))
+                    .bg(rgb(BG))
                     .child(output_panel(
                         OutputPanelView {
                             state: conversion,
@@ -2182,12 +2248,12 @@ impl Render for Shift {
                     .justify_center()
                     .size(px(40.0))
                     .rounded_lg()
-                    .bg(rgb(0x1b1f25))
+                    .bg(rgb(BG_SURFACE))
                     .border_1()
-                    .border_color(rgb(0x303640))
-                    .text_color(rgb(0xa7b0bc))
+                    .border_color(rgb(BORDER))
+                    .text_color(rgb(TEXT_SECONDARY))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x292f37)).text_color(rgb(0xe3e7ec)))
+                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
                     .child("⚙")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.output_menu_open = false;

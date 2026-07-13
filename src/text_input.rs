@@ -478,7 +478,8 @@ impl Element for TextElement {
         let (display_text, text_color) = if content.is_empty() {
             (
                 input.placeholder.clone(),
-                hsla(220.0 / 360.0, 0.08, 0.55, 1.0),
+                // Muted gray placeholder — monochrome developer theme.
+                hsla(0.0, 0.0, 0.40, 1.0),
             )
         } else {
             (content, style.color)
@@ -533,7 +534,8 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0x8fb3cc),
+                    // White caret for black-and-white monospaced theme.
+                    rgb(0xffffff),
                 )),
             )
         } else {
@@ -549,7 +551,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    hsla(205.0 / 360.0, 0.55, 0.45, 0.35),
+                    hsla(0.0, 0.0, 0.55, 0.35),
                 )),
                 None,
             )
