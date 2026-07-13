@@ -180,12 +180,25 @@ cargo run --bin shift-cli -- track.wav --to flac --module ffmpeg
 # Pipe Markdown to another command
 cargo run --bin shift-cli -- data.xlsx --stdout
 
+# Batch-convert several files into one folder (shared queue with the app)
+cargo run --bin shift-cli -- batch report.pdf notes.docx -t markdown -O ./out --force
+# Multi-input without the `batch` subcommand also enters batch mode when -O is set:
+cargo run --bin shift-cli -- a.pdf b.docx -O ./out -t html
+
 # Inspect the registered formats
 cargo run --bin shift-cli -- formats
 ```
 
 After `cargo install --path . --bin shift-cli`, use `shift-cli` directly in the
 same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
+In the native app, multi-select or multi-drop opens the queue panel: choose an
+output folder, press Start (or Cancel), and Retry failed items. Files are only
+queued on drop — conversion does not auto-start. Progress, retry, and
+cancellation use the same `run_batch` runner as the CLI (Ctrl-C cancels).
+
+Overwrite policy matches single-file and batch: an existing destination fails
+unless you pass `--force` (app batch does not force-overwrite). Within one
+batch queue, colliding output names are uniquified (`report.md`, `report-1.md`).
 
 ## Architecture
 
@@ -193,7 +206,7 @@ same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
 GPUI app ─────┐                          ┌─ MarkItDownModule
               ├── ConversionRegistry ───┼─ PandocModule
 shift-cli ────┘                          ├─ DefuddleModule  (URLs + HTML)
-                                         ├─ DoclingModule   (PDF/office → md/html/text)
+         └── BatchQueue / run_batch      ├─ DoclingModule   (PDF/office → md/html/text)
                                          └─ FfmpegModule    (audio/video/stills/subs)
 ```
 
@@ -201,7 +214,9 @@ shift-cli ────┘                          ├─ DefuddleModule  (URLs 
 input/output pairs and returns an in-memory `ConversionArtifact`; it does not
 know whether the caller is the GUI or CLI. `ConversionRegistry` owns capability
 filtering and ordered dispatch, so adding another engine does not require
-duplicating workflow code in either surface.
+duplicating workflow code in either surface. Multi-file conversion is owned by
+`src/conversion/batch.rs` so queue state, destinations, retry, and cancel stay
+identical across the app and CLI.
 
 ## Checks
 

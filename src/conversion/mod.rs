@@ -1,5 +1,6 @@
 //! Format conversion modules and capability-based dispatch.
 
+mod batch;
 mod defuddle;
 mod diagnostics;
 mod docling;
@@ -11,7 +12,14 @@ mod process;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+pub use batch::{
+    BatchEnqueueOptions, BatchEvent, BatchItem, BatchItemId, BatchItemState, BatchProgress,
+    BatchQueue, BatchSource, BatchSummary, prepare_batch_destination, resolve_destination,
+    run_batch, suggested_url_file_name, uniquify_destination,
+};
 pub use defuddle::{DefuddleModule, looks_like_url};
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
@@ -27,7 +35,7 @@ pub use pandoc::{PandocModule, pdf_engine_candidates, resolve_pdf_engine};
 pub use process::{
     DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, find_executable, is_runnable,
     max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    resolve_tool_path, run_command,
+    resolve_tool_path, run_command, run_command_cancellable,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -467,10 +475,23 @@ impl std::str::FromStr for OutputFormat {
 }
 
 /// Optional engine knobs passed through the registry to modules that understand them.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct ConversionOptions {
     pub ffmpeg: FfmpegOptions,
+    /// When set and true, external converter processes should abort.
+    ///
+    /// Used by the shared batch runner for cooperative cancellation. Ignored by
+    /// equality checks so option snapshots compare by engine knobs only.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
+
+impl PartialEq for ConversionOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.ffmpeg == other.ffmpeg
+    }
+}
+
+impl Eq for ConversionOptions {}
 
 /// A completed conversion, independent of how it will be presented or saved.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -725,9 +746,10 @@ impl ConversionRegistry {
                 intermediate,
                 second,
             } => {
-                // First hop may be FFmpeg (trim/encode); the second hop uses defaults.
+                // First hop may be FFmpeg (trim/encode); the second hop drops
+                // engine-specific knobs but keeps the cancel flag.
                 let artifact = first.convert(input, intermediate, options)?;
-                self.finish_chain(&artifact, output, second)
+                self.finish_chain(&artifact, output, second, options)
             }
         }
     }
@@ -737,6 +759,7 @@ impl ConversionRegistry {
         intermediate: &ConversionArtifact,
         output: OutputFormat,
         second: &dyn ConversionModule,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         let workspace = unique_temp_dir("shift-conversion")?;
         let _cleanup = TempDirGuard(workspace.clone());
@@ -747,7 +770,11 @@ impl ConversionRegistry {
             .unwrap_or("converted");
         let input = workspace.join(format!("{stem}.{}", intermediate.format.extension()));
         intermediate.write_to(&input)?;
-        second.convert(&input, output, &ConversionOptions::default())
+        let hop_options = ConversionOptions {
+            cancel: options.cancel.clone(),
+            ..ConversionOptions::default()
+        };
+        second.convert(&input, output, &hop_options)
     }
 
     pub fn available_outputs(&self, input: &Path) -> Vec<OutputFormat> {
@@ -842,27 +869,48 @@ impl ConversionRegistry {
                 second,
             } => {
                 let artifact = first.convert_url(url, intermediate, options)?;
-                self.finish_chain(&artifact, output, second)
+                self.finish_chain(&artifact, output, second, options)
             }
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConversionErrorKind {
+    Message,
+    Cancelled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversionError {
+    kind: ConversionErrorKind,
     message: String,
 }
 
 impl ConversionError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            kind: ConversionErrorKind::Message,
             message: message.into(),
+        }
+    }
+
+    /// Cooperative cancellation requested by the batch runner or caller.
+    pub fn cancelled() -> Self {
+        Self {
+            kind: ConversionErrorKind::Cancelled,
+            message: "conversion cancelled".into(),
         }
     }
 
     /// True when process spawn failed because the executable was missing.
     pub fn is_executable_not_found(&self) -> bool {
         self.message.starts_with("executable not found:")
+    }
+
+    /// True when the user or batch runner cancelled the conversion.
+    pub fn is_cancelled(&self) -> bool {
+        self.kind == ConversionErrorKind::Cancelled
     }
 }
 

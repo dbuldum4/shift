@@ -1,7 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, LimitedOutput,
     OutputFormat, map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command,
+    run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -38,13 +38,24 @@ impl DefuddleModule {
         }
     }
 
-    fn run(&self, source: &str, markdown: bool) -> Result<LimitedOutput, ConversionError> {
+    fn run(
+        &self,
+        source: &str,
+        markdown: bool,
+        options: &ConversionOptions,
+    ) -> Result<LimitedOutput, ConversionError> {
         let mut command = Command::new(&self.executable);
         command.arg("parse").arg(source);
         if markdown {
             command.arg("--markdown");
         }
-        run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
+        run_command_cancellable(
+            command,
+            process_timeout(),
+            max_output_bytes(),
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
             map_spawn_error(
                 error,
                 "Defuddle is not installed. Install it with `npm install -g defuddle`, \
@@ -86,6 +97,7 @@ impl DefuddleModule {
         &self,
         url: &str,
         output_format: OutputFormat,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !self.supports_url(output_format) {
             return Err(ConversionError::new(format!(
@@ -101,7 +113,7 @@ impl DefuddleModule {
         }
 
         let markdown = output_format == OutputFormat::MARKDOWN;
-        let output = self.run(url, markdown)?;
+        let output = self.run(url, markdown, options)?;
         self.artifact_from_output(url, &url_file_stem(url), output_format, output)
     }
 }
@@ -135,7 +147,7 @@ impl ConversionModule for DefuddleModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
-        _options: &ConversionOptions,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !OUTPUTS.contains(&output_format) {
             return Err(ConversionError::new(format!(
@@ -148,7 +160,7 @@ impl ConversionModule for DefuddleModule {
         let source = input
             .to_str()
             .ok_or_else(|| ConversionError::new("input path is not valid UTF-8"))?;
-        let output = self.run(source, markdown)?;
+        let output = self.run(source, markdown, options)?;
         let stem = input
             .file_stem()
             .and_then(|value| value.to_str())
@@ -161,9 +173,9 @@ impl ConversionModule for DefuddleModule {
         &self,
         url: &str,
         output_format: OutputFormat,
-        _options: &ConversionOptions,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
-        DefuddleModule::convert_url(self, url, output_format)
+        DefuddleModule::convert_url(self, url, output_format, options)
     }
 }
 
@@ -250,7 +262,11 @@ mod tests {
         std::fs::set_permissions(&executable, permissions).unwrap();
 
         let artifact = DefuddleModule::with_executable(&executable)
-            .convert_url("https://example.com/hello-world", OutputFormat::MARKDOWN)
+            .convert_url(
+                "https://example.com/hello-world",
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
             .unwrap();
 
         assert_eq!(artifact.file_name, "hello-world.md");

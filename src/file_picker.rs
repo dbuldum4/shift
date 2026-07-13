@@ -31,6 +31,13 @@ unsafe extern "C" {
     fn CGShieldingWindowLevel() -> i32;
 }
 
+#[derive(Clone, Copy)]
+enum OpenPanelMode {
+    SingleFile,
+    MultipleFiles,
+    Directory,
+}
+
 /// Pre-create an `NSOpenPanel` so macOS spins up `openAndSavePanelService`
 /// during app launch instead of on the first user click.
 ///
@@ -72,31 +79,63 @@ pub fn remember_directory(path: &Path) {
 ///
 /// Returns a oneshot that resolves to the selected path, or `None` if the user
 /// cancelled / the dialog could not be shown.
+#[allow(dead_code)] // Kept for single-file call sites and tests.
 pub fn pick_file(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Option<PathBuf>> {
     let (tx, rx) = oneshot::channel();
 
-    if DIALOG_OPEN
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !begin_dialog() {
         let _ = tx.send(None);
         return rx;
     }
 
-    let start_dir = starting_directory
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            LAST_DIRECTORY
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .filter(|p| p.is_dir())
-        })
-        .or_else(default_start_directory);
-
+    let start_dir = resolve_start_dir(starting_directory);
     // SAFETY: called from the GPUI main thread (click handler / foreground spawn).
     unsafe {
-        present_open_panel(start_dir, tx);
+        present_open_panel(start_dir, OpenPanelMode::SingleFile, move |paths| {
+            let _ = tx.send(paths.into_iter().next());
+        });
+    }
+
+    rx
+}
+
+/// Present a multi-file open dialog for batch conversion.
+///
+/// Returns selected paths (empty on cancel).
+pub fn pick_files(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Vec<PathBuf>> {
+    let (tx, rx) = oneshot::channel();
+
+    if !begin_dialog() {
+        let _ = tx.send(Vec::new());
+        return rx;
+    }
+
+    let start_dir = resolve_start_dir(starting_directory);
+    // SAFETY: called from the GPUI main thread.
+    unsafe {
+        present_open_panel(start_dir, OpenPanelMode::MultipleFiles, move |paths| {
+            let _ = tx.send(paths);
+        });
+    }
+
+    rx
+}
+
+/// Present a directory chooser for batch output folders.
+pub fn pick_directory(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Option<PathBuf>> {
+    let (tx, rx) = oneshot::channel();
+
+    if !begin_dialog() {
+        let _ = tx.send(None);
+        return rx;
+    }
+
+    let start_dir = resolve_start_dir(starting_directory);
+    // SAFETY: called from the GPUI main thread.
+    unsafe {
+        present_open_panel(start_dir, OpenPanelMode::Directory, move |paths| {
+            let _ = tx.send(paths.into_iter().next());
+        });
     }
 
     rx
@@ -109,24 +148,12 @@ pub fn pick_save_file(
 ) -> oneshot::Receiver<Option<PathBuf>> {
     let (tx, rx) = oneshot::channel();
 
-    if DIALOG_OPEN
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !begin_dialog() {
         let _ = tx.send(None);
         return rx;
     }
 
-    let start_dir = starting_directory
-        .filter(|path| path.is_dir())
-        .or_else(|| {
-            LAST_DIRECTORY
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .filter(|path| path.is_dir())
-        })
-        .or_else(default_start_directory);
+    let start_dir = resolve_start_dir(starting_directory);
 
     // SAFETY: called from the GPUI main thread (click handler).
     unsafe {
@@ -134,6 +161,25 @@ pub fn pick_save_file(
     }
 
     rx
+}
+
+fn begin_dialog() -> bool {
+    DIALOG_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn resolve_start_dir(starting_directory: Option<PathBuf>) -> Option<PathBuf> {
+    starting_directory
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            LAST_DIRECTORY
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|p| p.is_dir())
+        })
+        .or_else(default_start_directory)
 }
 
 fn default_start_directory() -> Option<PathBuf> {
@@ -147,16 +193,36 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-unsafe fn present_open_panel(start_dir: Option<PathBuf>, tx: oneshot::Sender<Option<PathBuf>>) {
+unsafe fn present_open_panel(
+    start_dir: Option<PathBuf>,
+    mode: OpenPanelMode,
+    on_complete: impl FnOnce(Vec<PathBuf>) + Send + 'static,
+) {
     unsafe {
         let panel = NSOpenPanel::openPanel(nil);
         // Retain for the lifetime of the modal; released in the completion handler.
         let panel: id = msg_send![panel, retain];
 
-        panel.setCanChooseFiles_(YES);
-        panel.setCanChooseDirectories_(NO);
-        panel.setAllowsMultipleSelection_(NO);
-        panel.setCanCreateDirectories(NO);
+        match mode {
+            OpenPanelMode::SingleFile => {
+                panel.setCanChooseFiles_(YES);
+                panel.setCanChooseDirectories_(NO);
+                panel.setAllowsMultipleSelection_(NO);
+                panel.setCanCreateDirectories(NO);
+            }
+            OpenPanelMode::MultipleFiles => {
+                panel.setCanChooseFiles_(YES);
+                panel.setCanChooseDirectories_(NO);
+                panel.setAllowsMultipleSelection_(YES);
+                panel.setCanCreateDirectories(NO);
+            }
+            OpenPanelMode::Directory => {
+                panel.setCanChooseFiles_(NO);
+                panel.setCanChooseDirectories_(YES);
+                panel.setAllowsMultipleSelection_(NO);
+                panel.setCanCreateDirectories(YES);
+            }
+        }
         // Resolve Finder aliases / symlinks so callers always get a real path.
         panel.setResolvesAliases_(YES);
 
@@ -164,7 +230,12 @@ unsafe fn present_open_panel(start_dir: Option<PathBuf>, tx: oneshot::Sender<Opt
             set_directory_url(panel, dir);
         }
 
-        let prompt = NSString::alloc(nil).init_str("Choose");
+        let prompt = match mode {
+            OpenPanelMode::Directory => "Choose Folder",
+            OpenPanelMode::MultipleFiles => "Add Files",
+            OpenPanelMode::SingleFile => "Choose",
+        };
+        let prompt = NSString::alloc(nil).init_str(prompt);
         let _: () = msg_send![panel, setPrompt: prompt];
         let _: () = msg_send![prompt, release];
 
@@ -183,25 +254,29 @@ unsafe fn present_open_panel(start_dir: Option<PathBuf>, tx: oneshot::Sender<Opt
 
         let parent = sheet_parent(app);
 
-        let done = Cell::new(Some(CompletionState {
-            tx,
+        let done = Cell::new(Some(OpenCompletionState {
+            on_complete: Some(Box::new(on_complete)),
             panel,
             previous_key,
         }));
 
         let block = block::ConcreteBlock::new(move |response: NSModalResponse| {
-            let Some(state) = done.take() else {
+            let Some(mut state) = done.take() else {
                 return;
             };
 
             let result = if response == NSModalResponse::NSModalResponseOk {
-                first_selected_path(state.panel)
+                selected_paths(state.panel)
             } else {
-                None
+                Vec::new()
             };
 
-            if let Some(ref path) = result {
-                if let Some(parent) = path.parent() {
+            if let Some(path) = result.first() {
+                if path.is_dir() {
+                    if let Ok(mut guard) = LAST_DIRECTORY.lock() {
+                        *guard = Some(path.clone());
+                    }
+                } else if let Some(parent) = path.parent() {
                     if let Ok(mut guard) = LAST_DIRECTORY.lock() {
                         *guard = Some(parent.to_path_buf());
                     }
@@ -218,7 +293,9 @@ unsafe fn present_open_panel(start_dir: Option<PathBuf>, tx: oneshot::Sender<Opt
             }
 
             DIALOG_OPEN.store(false, Ordering::Release);
-            let _ = state.tx.send(result);
+            if let Some(on_complete) = state.on_complete.take() {
+                on_complete(result);
+            }
         });
         let block = block.copy();
 
@@ -267,7 +344,7 @@ unsafe fn present_save_panel(
         }
         let parent = sheet_parent(app);
 
-        let done = Cell::new(Some(CompletionState {
+        let done = Cell::new(Some(SaveCompletionState {
             tx,
             panel,
             previous_key,
@@ -313,14 +390,21 @@ unsafe fn present_save_panel(
     }
 }
 
-struct CompletionState {
+struct OpenCompletionState {
+    on_complete: Option<Box<dyn FnOnce(Vec<PathBuf>) + Send>>,
+    panel: id,
+    previous_key: id,
+}
+
+struct SaveCompletionState {
     tx: oneshot::Sender<Option<PathBuf>>,
     panel: id,
     previous_key: id,
 }
 
 // `id` is a raw pointer; the completion block always runs on the main thread.
-unsafe impl Send for CompletionState {}
+unsafe impl Send for OpenCompletionState {}
+unsafe impl Send for SaveCompletionState {}
 
 unsafe fn sheet_parent(app: id) -> id {
     unsafe {
@@ -353,13 +437,14 @@ unsafe fn set_directory_url(panel: id, dir: &Path) {
     }
 }
 
-fn first_selected_path(panel: id) -> Option<PathBuf> {
+fn selected_paths(panel: id) -> Vec<PathBuf> {
     unsafe {
         let urls = panel.URLs();
         if urls == nil {
-            return None;
+            return Vec::new();
         }
         let count: usize = msg_send![urls, count];
+        let mut paths = Vec::with_capacity(count);
         for i in 0..count {
             let url: id = msg_send![urls, objectAtIndex: i];
             if url == nil {
@@ -370,10 +455,10 @@ fn first_selected_path(panel: id) -> Option<PathBuf> {
                 continue;
             }
             if let Some(path) = ns_url_to_path(url) {
-                return Some(path);
+                paths.push(path);
             }
         }
-        None
+        paths
     }
 }
 

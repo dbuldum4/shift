@@ -1,7 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
     map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command,
+    run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -79,6 +79,7 @@ impl DoclingModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         let to_arg = Self::to_arg(output_format).ok_or_else(|| {
             ConversionError::new(format!(
@@ -109,14 +110,19 @@ impl DoclingModule {
             .arg("--image-export-mode")
             .arg("placeholder")
             .arg("--abort-on-error");
-        let output =
-            run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
-                map_spawn_error(
-                    error,
-                    "Docling is not installed. Install it with `pip install docling`, \
-                     or set SHIFT_DOCLING_BIN.",
-                )
-            })?;
+        let output = run_command_cancellable(
+            command,
+            process_timeout(),
+            max_output_bytes(),
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
+            map_spawn_error(
+                error,
+                "Docling is not installed. Install it with `pip install docling`, \
+                 or set SHIFT_DOCLING_BIN.",
+            )
+        })?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -184,7 +190,7 @@ impl ConversionModule for DoclingModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
-        _options: &ConversionOptions,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !OUTPUTS.contains(&output_format) {
             return Err(ConversionError::new(format!(
@@ -192,7 +198,7 @@ impl ConversionModule for DoclingModule {
                 output_format.label()
             )));
         }
-        self.convert_with_cli(input, output_format)
+        self.convert_with_cli(input, output_format, options)
     }
 }
 

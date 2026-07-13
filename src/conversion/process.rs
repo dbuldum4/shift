@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -35,10 +34,27 @@ pub struct LimitedOutput {
 /// stream exceeds `max_output_bytes`, the process is killed and an error is
 /// returned.
 pub fn run_command(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<LimitedOutput, ConversionError> {
+    run_command_cancellable(command, timeout, max_output_bytes, None)
+}
+
+/// Like [`run_command`], but also aborts when `cancel` becomes true.
+pub fn run_command_cancellable(
+    mut command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<LimitedOutput, ConversionError> {
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    {
+        return Err(ConversionError::cancelled());
+    }
+
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Put the child in its own process group so converters that spawn helpers
@@ -72,7 +88,7 @@ pub fn run_command(
     let stdout_thread = thread::spawn(move || read_process_stream(stdout, max, pid));
     let stderr_thread = thread::spawn(move || read_process_stream(stderr, max, pid));
 
-    let status = match wait_with_timeout(&mut child, timeout) {
+    let status = match wait_with_timeout(&mut child, timeout, cancel.clone()) {
         WaitOutcome::Exited(status) => status,
         WaitOutcome::TimedOut => {
             // Watchdog already signalled and reaped the process group.
@@ -83,6 +99,11 @@ pub fn run_command(
                 timeout.as_secs().max(1)
             )));
         }
+        WaitOutcome::Cancelled => {
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(ConversionError::cancelled());
+        }
         WaitOutcome::Error(error) => {
             force_kill(&mut child);
             let _ = stdout_thread.join();
@@ -92,6 +113,15 @@ pub fn run_command(
             )));
         }
     };
+
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    {
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+        return Err(ConversionError::cancelled());
+    }
 
     let stdout = join_reader(stdout_thread, "stdout", max_output_bytes)?;
     let stderr = join_reader(stderr_thread, "stderr", max_output_bytes)?;
@@ -106,36 +136,40 @@ pub fn run_command(
 enum WaitOutcome {
     Exited(std::process::ExitStatus),
     TimedOut,
+    Cancelled,
     Error(std::io::Error),
 }
 
-/// Block until the child exits or `timeout` elapses.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> WaitOutcome {
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
-    let pid = child.id();
-    let flag = Arc::clone(&timed_out);
-
-    let watchdog = thread::spawn(move || {
-        // `recv_timeout` errors on timeout or if the sender is dropped.
-        if rx.recv_timeout(timeout).is_err() {
-            flag.store(true, Ordering::SeqCst);
-            kill_pid(pid);
+/// Poll until the child exits, `timeout` elapses, or `cancel` is set.
+///
+/// Uses `try_wait` + `child.kill()` so cancel and timeout work on all platforms
+/// (Unix also tears down the process group via [`kill_pid`]).
+fn wait_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+    cancel: Option<Arc<AtomicBool>>,
+) -> WaitOutcome {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return WaitOutcome::Exited(status),
+            Ok(None) => {}
+            Err(error) => return WaitOutcome::Error(error),
         }
-    });
 
-    let wait_result = child.wait();
-    // Cancel the watchdog if we finished first.
-    let _ = tx.send(());
-    let _ = watchdog.join();
-
-    match wait_result {
-        Ok(status) if timed_out.load(Ordering::SeqCst) => {
-            let _ = status;
-            WaitOutcome::TimedOut
+        if start.elapsed() >= timeout {
+            force_kill(child);
+            return WaitOutcome::TimedOut;
         }
-        Ok(status) => WaitOutcome::Exited(status),
-        Err(error) => WaitOutcome::Error(error),
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            force_kill(child);
+            return WaitOutcome::Cancelled;
+        }
+
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -157,6 +191,8 @@ fn kill_pid(pid: u32) {
     }
     #[cfg(not(unix))]
     {
+        // Windows/other: process-group kill is unavailable; [`force_kill`] uses
+        // `Child::kill` on the same thread that owns the child handle.
         let _ = pid;
     }
 }
@@ -164,6 +200,7 @@ fn kill_pid(pid: u32) {
 fn force_kill(child: &mut Child) {
     kill_pid(child.id());
     let _ = child.kill();
+    // Reap so the next try_wait/wait does not race a zombie.
     let _ = child.wait();
 }
 
@@ -478,6 +515,79 @@ mod tests {
         std::fs::write(&path, vec![0_u8; 100]).unwrap();
         let error = read_file_limited(&path, 50).unwrap_err();
         assert!(error.to_string().contains("too large"), "error: {error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_before_spawn_returns_cancelled() {
+        let path =
+            std::env::temp_dir().join(format!("shift-process-pre-cancel-{}", std::process::id()));
+        write_script(&path, "#!/bin/sh\necho should-not-run\n");
+        let cancel = Arc::new(AtomicBool::new(true));
+        let error = run_command_cancellable(
+            Command::new(&path),
+            Duration::from_secs(5),
+            1024,
+            Some(Arc::clone(&cancel)),
+        )
+        .unwrap_err();
+        assert!(error.is_cancelled(), "error: {error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_mid_run_stops_hanging_process() {
+        let path =
+            std::env::temp_dir().join(format!("shift-process-mid-cancel-{}", std::process::id()));
+        write_script(&path, "#!/bin/sh\nsleep 30\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancel);
+        let started = Instant::now();
+        let watcher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_flag.store(true, Ordering::SeqCst);
+        });
+        let error = run_command_cancellable(
+            Command::new(&path),
+            Duration::from_secs(20),
+            1024,
+            Some(Arc::clone(&cancel)),
+        )
+        .unwrap_err();
+        let _ = watcher.join();
+        let elapsed = started.elapsed();
+        assert!(error.is_cancelled(), "error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_is_distinct_from_timeout() {
+        let path =
+            std::env::temp_dir().join(format!("shift-process-cancel-kind-{}", std::process::id()));
+        write_script(&path, "#!/bin/sh\nsleep 30\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancel);
+        let watcher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            cancel_flag.store(true, Ordering::SeqCst);
+        });
+        let error = run_command_cancellable(
+            Command::new(&path),
+            Duration::from_secs(20),
+            1024,
+            Some(cancel),
+        )
+        .unwrap_err();
+        let _ = watcher.join();
+        assert!(error.is_cancelled(), "error: {error}");
+        assert!(
+            !error.to_string().contains("timed out"),
+            "cancel should not surface as timeout: {error}"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

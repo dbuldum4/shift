@@ -1,6 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable, run_command,
+    map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
+    run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -46,10 +47,20 @@ impl MarkItDownModule {
         }
     }
 
-    fn run(&self, input: &Path) -> Result<super::LimitedOutput, ConversionError> {
+    fn run(
+        &self,
+        input: &Path,
+        options: &ConversionOptions,
+    ) -> Result<super::LimitedOutput, ConversionError> {
         let mut command = Command::new(&self.executable);
         command.arg(input);
-        run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
+        run_command_cancellable(
+            command,
+            process_timeout(),
+            max_output_bytes(),
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
             map_spawn_error(
                 error,
                 "MarkItDown is not installed. Install the complete runtime with: \
@@ -84,12 +95,12 @@ impl ConversionModule for MarkItDownModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
-        _options: &ConversionOptions,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if output_format != OutputFormat::MARKDOWN {
             return Err(ConversionError::new("MarkItDown only produces Markdown"));
         }
-        let output = self.run(input)?;
+        let output = self.run(input, options)?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let detail = if detail.is_empty() {

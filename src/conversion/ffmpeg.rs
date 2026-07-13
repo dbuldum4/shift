@@ -3,7 +3,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
     map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command,
+    run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -245,7 +245,7 @@ impl FfmpegModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
-        options: &FfmpegOptions,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !OUTPUTS.contains(&output_format) {
             return Err(ConversionError::new(format!(
@@ -263,15 +263,20 @@ impl FfmpegModule {
         let cleanup = TempDirGuard(work_dir.clone());
         let produced = work_dir.join(Self::output_file_name(stem, output_format));
 
-        let command = self.build_command(input, &produced, output_format, options)?;
-        let output =
-            run_command(command, process_timeout(), max_output_bytes()).map_err(|error| {
-                map_spawn_error(
-                    error,
-                    "FFmpeg is not installed. Install it with `brew install ffmpeg`, \
-                     or set SHIFT_FFMPEG_BIN.",
-                )
-            })?;
+        let command = self.build_command(input, &produced, output_format, &options.ffmpeg)?;
+        let output = run_command_cancellable(
+            command,
+            process_timeout(),
+            max_output_bytes(),
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
+            map_spawn_error(
+                error,
+                "FFmpeg is not installed. Install it with `brew install ffmpeg`, \
+                 or set SHIFT_FFMPEG_BIN.",
+            )
+        })?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -650,7 +655,7 @@ impl ConversionModule for FfmpegModule {
         output_format: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
-        self.convert_with_cli(input, output_format, &options.ffmpeg)
+        self.convert_with_cli(input, output_format, options)
     }
 }
 
@@ -719,7 +724,10 @@ esac
     }
 
     fn opts(ffmpeg: FfmpegOptions) -> ConversionOptions {
-        ConversionOptions { ffmpeg }
+        ConversionOptions {
+            ffmpeg,
+            cancel: None,
+        }
     }
 
     #[test]

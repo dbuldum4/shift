@@ -8,13 +8,16 @@ use gpui::{
     WindowOptions, actions, canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
 };
 use shift_core::conversion::{
-    ConversionArtifact, ConversionOptions, ConversionRegistry, DiagnosticsReport, FfmpegEncodeMode,
-    FfmpegOptions, FfmpegQuality, OutputFormat, Readiness, input_looks_like_media, is_audio_output,
-    is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output, looks_like_url,
+    BatchEnqueueOptions, BatchEvent, BatchItem, BatchItemId, BatchItemState, BatchQueue,
+    BatchSource, ConversionArtifact, ConversionOptions, ConversionRegistry, DiagnosticsReport,
+    FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, OutputFormat, Readiness,
+    input_looks_like_media, is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output,
+    is_video_output, looks_like_url, run_batch,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use text_input::TextInput;
 
@@ -332,13 +335,260 @@ fn empty_drop_prompt() -> impl IntoElement {
             div()
                 .text_lg()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Drop a file here"),
+                .child("Drop files here"),
         )
         .child(
             div()
                 .text_sm()
                 .text_color(rgb(TEXT_SECONDARY))
-                .child("or click to browse"),
+                .child("or click to browse (multi-select)"),
+        )
+}
+
+fn batch_item_status_label(item: &BatchItem) -> SharedString {
+    match &item.state {
+        BatchItemState::Queued => "queued".into(),
+        BatchItemState::Running => "running…".into(),
+        BatchItemState::Succeeded { written_path, .. } => {
+            format!("✓ {}", written_path.display()).into()
+        }
+        BatchItemState::Failed { error } => format!("✗ {error}").into(),
+        BatchItemState::Cancelled => "cancelled".into(),
+    }
+}
+
+fn batch_queue_panel(
+    items: &[BatchItem],
+    output_dir: Option<&Path>,
+    running: bool,
+    status: Option<SharedString>,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let progress_queued = items
+        .iter()
+        .filter(|item| matches!(item.state, BatchItemState::Queued))
+        .count();
+    let progress_failed = items
+        .iter()
+        .filter(|item| matches!(item.state, BatchItemState::Failed { .. }))
+        .count();
+    let can_start = progress_queued > 0 && !running;
+    let can_retry = progress_failed > 0 && !running;
+    let folder_label: SharedString = output_dir
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Beside each source".into())
+        .into();
+
+    div()
+        .id("batch-queue-panel")
+        .flex()
+        .flex_col()
+        .gap_3()
+        .h_full()
+        .p_6()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Queue · {} item(s)", items.len())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("batch-action-folder")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(BG_ELEVATED))
+                                .border_1()
+                                .border_color(rgb(BORDER_STRONG))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .cursor_pointer()
+                                .hover(|style| {
+                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                })
+                                .child("Folder")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.choose_output_folder(cx);
+                                })),
+                        )
+                        .when(can_start, |row| {
+                            row.child(
+                                div()
+                                    .id("batch-action-start")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(BG_ELEVATED))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_STRONG))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                    })
+                                    .child("Start")
+                                    .on_click(cx.listener(|this, _, _, cx| this.start_batch(cx))),
+                            )
+                        })
+                        .when(running, |row| {
+                            row.child(
+                                div()
+                                    .id("batch-action-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(BG_ELEVATED))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_STRONG))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                    })
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_batch(cx))),
+                            )
+                        })
+                        .when(can_retry, |row| {
+                            row.child(
+                                div()
+                                    .id("batch-action-retry")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(BG_ELEVATED))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_STRONG))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                    })
+                                    .child("Retry failed")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.retry_failed_batch(cx)),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("batch-action-clear")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(BG_ELEVATED))
+                                .border_1()
+                                .border_color(rgb(BORDER_STRONG))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .cursor_pointer()
+                                .hover(|style| {
+                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                })
+                                .child("Clear")
+                                .on_click(cx.listener(|this, _, _, cx| this.clear_batch_queue(cx))),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(TEXT_MUTED))
+                .child(format!("Output: {folder_label}")),
+        )
+        .when_some(status, |panel, status| {
+            panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(status),
+            )
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(items.iter().map(|item| {
+                    let id = item.id;
+                    let name: SharedString = item.source.display_name().into();
+                    let detail = batch_item_status_label(item);
+                    let retryable = item.state.is_retryable() && !running;
+                    div()
+                        .id(ElementId::Name(format!("batch-item-{}", id.0).into()))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(BG_RAISED))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .min_w_0()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .truncate()
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .truncate()
+                                        .child(detail),
+                                ),
+                        )
+                        .when(retryable, |row| {
+                            row.child(
+                                div()
+                                    .id(ElementId::Name(format!("batch-retry-{}", id.0).into()))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .child("Retry")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.retry_batch_item(id, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        })
+                })),
         )
 }
 
@@ -639,7 +889,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
             div()
                 .text_xs()
                 .text_color(rgb(TEXT_MUTED))
-                .child("Click to replace  ·  Drop another file"),
+                .child("Click to add files  ·  Drop more for batch"),
         )
         .with_animation(
             "file-preview-in",
@@ -1744,75 +1994,35 @@ fn settings_general_panel(
                             OutputFormat::MARKDOWN.label(),
                             output_format == OutputFormat::MARKDOWN,
                             cx,
-                            |this, cx| {
-                                this.output_format = OutputFormat::MARKDOWN;
-                                this.output_menu_open = false;
-                                if this.selected_file.is_some() || this.selected_url.is_some() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            },
+                            |this, cx| this.set_output_format(OutputFormat::MARKDOWN, cx),
                         ))
                         .child(chip(
                             "default-output-html",
                             OutputFormat::HTML.label(),
                             output_format == OutputFormat::HTML,
                             cx,
-                            |this, cx| {
-                                this.output_format = OutputFormat::HTML;
-                                this.output_menu_open = false;
-                                if this.selected_file.is_some() || this.selected_url.is_some() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            },
+                            |this, cx| this.set_output_format(OutputFormat::HTML, cx),
                         ))
                         .child(chip(
                             "default-output-pdf",
                             OutputFormat::PDF.label(),
                             output_format == OutputFormat::PDF,
                             cx,
-                            |this, cx| {
-                                this.output_format = OutputFormat::PDF;
-                                this.output_menu_open = false;
-                                if this.selected_file.is_some() || this.selected_url.is_some() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            },
+                            |this, cx| this.set_output_format(OutputFormat::PDF, cx),
                         ))
                         .child(chip(
                             "default-output-docx",
                             OutputFormat::DOCX.label(),
                             output_format == OutputFormat::DOCX,
                             cx,
-                            |this, cx| {
-                                this.output_format = OutputFormat::DOCX;
-                                this.output_menu_open = false;
-                                if this.selected_file.is_some() || this.selected_url.is_some() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            },
+                            |this, cx| this.set_output_format(OutputFormat::DOCX, cx),
                         ))
                         .child(chip(
                             "default-output-pptx",
                             OutputFormat::PPTX.label(),
                             output_format == OutputFormat::PPTX,
                             cx,
-                            |this, cx| {
-                                this.output_format = OutputFormat::PPTX;
-                                this.output_menu_open = false;
-                                if this.selected_file.is_some() || this.selected_url.is_some() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            },
+                            |this, cx| this.set_output_format(OutputFormat::PPTX, cx),
                         )),
                 )
                 .child(
@@ -2716,6 +2926,13 @@ struct Shift {
     history: Vec<ConversionHistoryEntry>,
     next_history_id: u64,
     active_history_id: Option<u64>,
+    // Shared batch queue (same runner as shift-cli).
+    batch_queue: BatchQueue,
+    batch_output_dir: Option<PathBuf>,
+    batch_running: bool,
+    batch_generation: u64,
+    batch_cancel: Arc<AtomicBool>,
+    batch_status: Option<SharedString>,
     // FFmpeg media options (shown for media inputs / media outputs).
     ffmpeg_quality: FfmpegQuality,
     ffmpeg_encode_mode: FfmpegEncodeMode,
@@ -2767,21 +2984,337 @@ impl Shift {
         let start_dir = self
             .selected_file
             .as_ref()
-            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+            .or_else(|| self.batch_output_dir.clone());
 
-        let receiver = file_picker::pick_file(start_dir);
+        // Multi-select open panel: one file keeps interactive preview; many
+        // files enter the shared batch queue.
+        let receiver = file_picker::pick_files(start_dir);
 
+        cx.spawn(async move |this, cx| {
+            let paths = receiver.await.unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                if paths.is_empty() {
+                    cx.notify();
+                } else {
+                    this.ingest_paths(paths, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn choose_output_folder(&mut self, cx: &mut Context<Self>) {
+        if file_picker::is_busy() {
+            return;
+        }
+        let start_dir = self.batch_output_dir.clone().or_else(|| {
+            self.selected_file
+                .as_ref()
+                .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+        });
+        let receiver = file_picker::pick_directory(start_dir);
         cx.spawn(async move |this, cx| {
             let path = receiver.await.ok().flatten();
             let _ = this.update(cx, |this, cx| {
                 if let Some(path) = path {
-                    this.set_selected_file(path, cx);
+                    this.set_batch_output_dir(path, cx);
                 } else {
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    fn set_batch_output_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.batch_running {
+            self.batch_status =
+                Some("Cannot change output folder while a batch is running.".into());
+            cx.notify();
+            return;
+        }
+        file_picker::remember_directory(&path);
+        self.batch_output_dir = Some(path.clone());
+        self.batch_queue.set_output_dir(Some(path.as_path()));
+        self.batch_status = Some(format!("Output folder: {}", path.display()).into());
+        cx.notify();
+    }
+
+    fn ingest_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 && self.batch_queue.is_empty() {
+            self.set_selected_file(paths[0].clone(), cx);
+            return;
+        }
+        // Queue only; user picks Folder (optional) then Start.
+        self.enqueue_paths(paths, false, cx);
+    }
+
+    fn enqueue_paths(&mut self, paths: Vec<PathBuf>, auto_start: bool, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.batch_running {
+            self.batch_status =
+                Some("Cannot add files while a batch is running. Wait or Cancel first.".into());
+            cx.notify();
+            return;
+        }
+        for path in &paths {
+            file_picker::remember_directory(path);
+        }
+        let options = match self.build_conversion_options(cx) {
+            Ok(options) => options,
+            Err(error) => {
+                self.batch_status = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        let enqueue = BatchEnqueueOptions {
+            output_format: self.output_format,
+            conversion: options,
+            output_dir: self.batch_output_dir.clone(),
+            force: false,
+        };
+        let sources = paths
+            .into_iter()
+            .map(BatchSource::from_path_or_url)
+            .collect::<Vec<_>>();
+        let count = sources.len();
+        self.batch_queue.enqueue_many(sources, &enqueue);
+        // Focus first file for the drop-zone card when entering batch mode.
+        if let Some(item) = self.batch_queue.items().first() {
+            if let Some(path) = item.source.as_file() {
+                self.selected_file = Some(path.to_path_buf());
+                self.selected_url = None;
+                self.file_preview = Some(build_file_preview(path));
+            }
+        }
+        self.batch_status =
+            Some(format!("Queued {count} file(s). Choose Folder if needed, then Start.").into());
+        self.conversion = ConversionState::Empty;
+        cx.notify();
+        if auto_start {
+            self.start_batch(cx);
+        }
+    }
+
+    fn start_batch(&mut self, cx: &mut Context<Self>) {
+        if self.batch_running {
+            return;
+        }
+        if self.batch_queue.progress().queued == 0 {
+            self.batch_status = Some("Nothing queued to convert.".into());
+            cx.notify();
+            return;
+        }
+
+        // Refresh destinations and options for remaining queued items.
+        let options = match self.build_conversion_options(cx) {
+            Ok(options) => options,
+            Err(error) => {
+                self.batch_status = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        for item in self.batch_queue.items_mut() {
+            if matches!(item.state, BatchItemState::Queued) {
+                item.output_format = self.output_format;
+                item.options = options.clone();
+                item.destination = shift_core::conversion::resolve_destination(
+                    &item.source,
+                    item.output_format,
+                    self.batch_output_dir.as_deref(),
+                );
+            }
+        }
+
+        // Fresh cancel flag per run so a prior Clear/Cancel cannot be undone by
+        // a later start, and so an abandoned worker keeps its own flag.
+        self.batch_cancel = Arc::new(AtomicBool::new(false));
+        self.batch_running = true;
+        self.batch_generation = self.batch_generation.wrapping_add(1);
+        let generation = self.batch_generation;
+        let priority = self.module_priority.clone();
+        let cancel = Arc::clone(&self.batch_cancel);
+        let mut queue = self.batch_queue.clone();
+        self.batch_status = Some("Batch running…".into());
+        cx.notify();
+
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<BatchEvent>();
+        let (done_tx, done_rx) =
+            std::sync::mpsc::channel::<(BatchQueue, shift_core::conversion::BatchSummary)>();
+
+        // Blocking convert/write work on GPUI's background executor (not a raw thread).
+        cx.background_executor()
+            .spawn(async move {
+                let registry = ConversionRegistry::default().with_priority(&priority);
+                let summary = run_batch(&mut queue, &registry, &cancel, |event| {
+                    let _ = event_tx.send(event);
+                });
+                let _ = done_tx.send((queue, summary));
+            })
+            .detach();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                // Drain progress events without blocking the UI thread forever.
+                let mut drained = 0;
+                while let Ok(event) = event_rx.try_recv() {
+                    drained += 1;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.batch_generation != generation {
+                            return;
+                        }
+                        this.apply_batch_event(event);
+                        cx.notify();
+                    });
+                }
+                if let Ok((queue, summary)) = done_rx.try_recv() {
+                    // Apply any trailing events first.
+                    while let Ok(event) = event_rx.try_recv() {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.batch_generation == generation {
+                                this.apply_batch_event(event);
+                                cx.notify();
+                            }
+                        });
+                    }
+                    let _ = this.update(cx, |this, cx| {
+                        if this.batch_generation != generation {
+                            // Cleared or superseded: leave UI queue and running flag alone
+                            // (a newer batch may already own batch_running).
+                            return;
+                        }
+                        this.batch_queue = queue;
+                        this.batch_running = false;
+                        this.batch_status = Some(
+                            format!(
+                                "Batch complete: {} succeeded, {} failed, {} cancelled",
+                                summary.succeeded, summary.failed, summary.cancelled
+                            )
+                            .into(),
+                        );
+                        cx.notify();
+                    });
+                    break;
+                }
+                if drained == 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(40))
+                        .await;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_batch_event(&mut self, event: BatchEvent) {
+        match event {
+            BatchEvent::ItemStarted { id, .. } => {
+                if let Some(item) = self.batch_queue.get_mut(id) {
+                    // attempts is owned by the worker; only mirror Running here.
+                    item.state = BatchItemState::Running;
+                }
+                self.batch_status = Some("Converting…".into());
+            }
+            BatchEvent::ItemSucceeded {
+                id,
+                path,
+                module_id,
+                byte_len,
+                source_name,
+            } => {
+                if let Some(item) = self.batch_queue.get_mut(id) {
+                    item.state = BatchItemState::Succeeded {
+                        written_path: path.clone(),
+                        module_id: module_id.clone(),
+                        byte_len,
+                    };
+                    item.destination = path.clone();
+                }
+                self.batch_status =
+                    Some(format!("Saved {source_name} → {}", path.display()).into());
+            }
+            BatchEvent::ItemFailed {
+                id,
+                error,
+                source_name,
+            } => {
+                if let Some(item) = self.batch_queue.get_mut(id) {
+                    item.state = BatchItemState::Failed {
+                        error: error.clone(),
+                    };
+                }
+                self.batch_status = Some(format!("Failed {source_name}: {error}").into());
+            }
+            BatchEvent::ItemCancelled { id, source_name } => {
+                if let Some(item) = self.batch_queue.get_mut(id) {
+                    item.state = BatchItemState::Cancelled;
+                }
+                self.batch_status = Some(format!("Cancelled {source_name}").into());
+            }
+            BatchEvent::Progress(progress) => {
+                self.batch_status = Some(
+                    format!(
+                        "{}/{} · {} ok · {} failed · {} cancelled",
+                        progress.completed(),
+                        progress.total,
+                        progress.succeeded,
+                        progress.failed,
+                        progress.cancelled
+                    )
+                    .into(),
+                );
+            }
+        }
+    }
+
+    fn cancel_batch(&mut self, cx: &mut Context<Self>) {
+        self.batch_cancel.store(true, Ordering::SeqCst);
+        if !self.batch_running {
+            let n = self.batch_queue.cancel_queued();
+            self.batch_status = Some(format!("Cancelled {n} queued item(s)").into());
+        } else {
+            self.batch_status = Some("Cancelling batch…".into());
+        }
+        cx.notify();
+    }
+
+    fn retry_batch_item(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
+        if self.batch_queue.retry(id) {
+            self.batch_status = Some("Item re-queued.".into());
+            cx.notify();
+            if !self.batch_running {
+                self.start_batch(cx);
+            }
+        }
+    }
+
+    fn retry_failed_batch(&mut self, cx: &mut Context<Self>) {
+        let n = self.batch_queue.retry_failed();
+        self.batch_status = Some(format!("Re-queued {n} item(s)").into());
+        cx.notify();
+        if n > 0 && !self.batch_running {
+            self.start_batch(cx);
+        }
+    }
+
+    fn clear_batch_queue(&mut self, cx: &mut Context<Self>) {
+        if self.batch_running {
+            self.batch_cancel.store(true, Ordering::SeqCst);
+            // Discard the worker result so Clear is durable when the run finishes.
+            self.batch_generation = self.batch_generation.wrapping_add(1);
+            self.batch_running = false;
+        }
+        self.batch_queue.clear();
+        self.batch_status = None;
+        cx.notify();
     }
 
     fn set_selected_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -2879,6 +3412,10 @@ impl Shift {
     }
 
     fn start_conversion(&mut self, cx: &mut Context<Self>) {
+        // Multi-file work goes through start_batch / run_batch only.
+        if !self.batch_queue.is_empty() {
+            return;
+        }
         if let Some(path) = self.selected_file.clone() {
             self.start_file_conversion(path, cx);
             return;
@@ -2919,6 +3456,7 @@ impl Shift {
                 sample_rate_hz: self.ffmpeg_sample_rate_hz,
                 scale_width: self.ffmpeg_scale_width,
             },
+            cancel: None,
         })
     }
 
@@ -3030,12 +3568,26 @@ impl Shift {
 
     fn set_output_format(&mut self, format: OutputFormat, cx: &mut Context<Self>) {
         self.output_menu_open = false;
-        if self.output_format != format {
-            self.output_format = format;
-            self.start_conversion(cx);
-        } else {
+        if self.output_format == format {
             cx.notify();
+            return;
         }
+        if self.batch_running {
+            self.batch_status =
+                Some("Cannot change output format while a batch is running.".into());
+            cx.notify();
+            return;
+        }
+        self.output_format = format;
+        if !self.batch_queue.is_empty() {
+            self.batch_queue
+                .set_output_format_for_queued(format, self.batch_output_dir.as_deref());
+            self.batch_status = Some(format!("Queued items updated to {}.", format.label()).into());
+            cx.notify();
+            // Multi-file mode uses Start / run_batch, not single-file conversion.
+            return;
+        }
+        self.start_conversion(cx);
     }
 
     fn move_module(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
@@ -3259,6 +3811,11 @@ impl Render for Shift {
         let ffmpeg_subtitle_stream_input = self.ffmpeg_subtitle_stream_input.clone();
         let diagnostics = self.diagnostics.clone();
         let diagnostics_loading = self.diagnostics_loading;
+        let batch_items = self.batch_queue.items().to_vec();
+        let show_batch = !batch_items.is_empty();
+        let batch_output_dir = self.batch_output_dir.clone();
+        let batch_running = self.batch_running;
+        let batch_status = self.batch_status.clone();
 
         div()
             .id("shift-root")
@@ -3309,16 +3866,17 @@ impl Render for Shift {
                             .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
                             .cursor_pointer()
                             .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(BG_ELEVATED)))
-                            .child(rounded_dashed_border(has_selection))
+                            .child(rounded_dashed_border(has_selection || show_batch))
                             .when_some(preview, |zone, preview| {
                                 zone.child(file_preview_card(preview, cx))
                             })
-                            .when(!has_selection, |zone| zone.child(empty_drop_prompt()))
+                            .when(!has_selection && !show_batch, |zone| {
+                                zone.child(empty_drop_prompt())
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
                             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                                if let Some(path) = paths.paths().first() {
-                                    this.set_selected_file(path.clone(), cx);
-                                }
+                                let paths = paths.paths().to_vec();
+                                this.ingest_paths(paths, cx);
                             }))
                     }),
             )
@@ -3334,30 +3892,41 @@ impl Render for Shift {
                     .min_w_0()
                     .h_full()
                     .bg(rgb(BG))
-                    .child(output_panel(
-                        OutputPanelView {
-                            state: conversion,
-                            save_status,
-                            output_format,
-                            output_menu_open,
-                            available_outputs,
-                            show_media_options,
-                            media: MediaPanelView {
+                    .when(show_batch, |panel| {
+                        panel.child(batch_queue_panel(
+                            &batch_items,
+                            batch_output_dir.as_deref(),
+                            batch_running,
+                            batch_status,
+                            cx,
+                        ))
+                    })
+                    .when(!show_batch, |panel| {
+                        panel.child(output_panel(
+                            OutputPanelView {
+                                state: conversion,
+                                save_status,
                                 output_format,
-                                quality: ffmpeg_quality,
-                                encode_mode: ffmpeg_encode_mode,
-                                mono: ffmpeg_mono,
-                                sample_rate_hz: ffmpeg_sample_rate_hz,
-                                scale_width: ffmpeg_scale_width,
-                                start_input: ffmpeg_start_input,
-                                duration_input: ffmpeg_duration_input,
-                                frame_input: ffmpeg_frame_input,
-                                audio_stream_input: ffmpeg_audio_stream_input,
-                                subtitle_stream_input: ffmpeg_subtitle_stream_input,
+                                output_menu_open,
+                                available_outputs,
+                                show_media_options,
+                                media: MediaPanelView {
+                                    output_format,
+                                    quality: ffmpeg_quality,
+                                    encode_mode: ffmpeg_encode_mode,
+                                    mono: ffmpeg_mono,
+                                    sample_rate_hz: ffmpeg_sample_rate_hz,
+                                    scale_width: ffmpeg_scale_width,
+                                    start_input: ffmpeg_start_input,
+                                    duration_input: ffmpeg_duration_input,
+                                    frame_input: ffmpeg_frame_input,
+                                    audio_stream_input: ffmpeg_audio_stream_input,
+                                    subtitle_stream_input: ffmpeg_subtitle_stream_input,
+                                },
                             },
-                        },
-                        cx,
-                    )),
+                            cx,
+                        ))
+                    }),
             )
             .child(
                 div()
@@ -3460,6 +4029,12 @@ fn main() {
                         history: Vec::new(),
                         next_history_id: 1,
                         active_history_id: None,
+                        batch_queue: BatchQueue::new(),
+                        batch_output_dir: None,
+                        batch_running: false,
+                        batch_generation: 0,
+                        batch_cancel: Arc::new(AtomicBool::new(false)),
+                        batch_status: None,
                         ffmpeg_quality: FfmpegQuality::default(),
                         ffmpeg_encode_mode: FfmpegEncodeMode::default(),
                         ffmpeg_mono: false,

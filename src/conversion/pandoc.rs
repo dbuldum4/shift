@@ -1,7 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
     find_executable, map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command,
+    run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -124,7 +124,7 @@ impl ConversionModule for PandocModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
-        _options: &ConversionOptions,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         let target = output_format.id();
         let input_format = input
@@ -151,14 +151,18 @@ impl ConversionModule for PandocModule {
             command.arg("--pdf-engine").arg(&engine);
         }
 
-        let output = run_command(command, process_timeout(), max_output_bytes()).map_err(
-            |error| {
-                map_spawn_error(
-                    error,
-                    "Pandoc is not installed. Install it with `brew install pandoc`, or set SHIFT_PANDOC_BIN.",
-                )
-            },
-        )?;
+        let output = run_command_cancellable(
+            command,
+            process_timeout(),
+            max_output_bytes(),
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
+            map_spawn_error(
+                error,
+                "Pandoc is not installed. Install it with `brew install pandoc`, or set SHIFT_PANDOC_BIN.",
+            )
+        })?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();

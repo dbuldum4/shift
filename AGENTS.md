@@ -6,17 +6,23 @@ Shift converts a selected local file into a downloadable artifact. The native
 app and `shift-cli` must expose the same format support and conversion behavior.
 Never implement a converter directly inside a UI event handler or CLI parser.
 
+Multi-file work uses the shared batch queue in `src/conversion/batch.rs`
+(`BatchQueue` + `run_batch`). The app and CLI must not reimplement queue
+ordering, destination resolution, retry, or cancellation.
+
 ## Architecture
 
 - Put conversion contracts and dispatch in `src/conversion/mod.rs`.
 - Put each engine or format family in its own module under `src/conversion/`.
+- Put multi-file orchestration in `src/conversion/batch.rs` and call `run_batch`
+  from both surfaces.
 - Implement `ConversionModule`, including explicit input/output capabilities,
   for new adapters and register them once in `ConversionRegistry::default`.
 - Keep `src/main.rs` focused on GPUI state and presentation.
 - Keep `src/bin/shift-cli.rs` focused on arguments, output selection, and exit
   behavior.
 - Return `ConversionArtifact` values from modules. Callers decide when and where
-  to write them.
+  to write them (single-file) or use the batch runner (multi-file).
 - Conversion work can block and must run on GPUI's background executor.
 - Preserve the selected source file; conversion and download must not mutate it.
 
