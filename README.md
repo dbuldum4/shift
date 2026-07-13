@@ -123,14 +123,25 @@ The first build downloads and compiles GPUI and may take a few minutes. Dropping
 or choosing a supported file starts conversion automatically. Paste an `http(s)`
 URL into the bar above the drop zone and press Enter or Convert to extract the
 page with Defuddle. The source file is never modified. Use the output dropdown
-on the right to choose a format. The settings button opens a module-priority
-list; drag a module above another to make it the preferred engine for
-overlapping conversions. Priority is saved in macOS Application Support and
-shared with `shift-cli`.
+on the right to choose a format. The settings button opens a full-screen
+settings view with a left sidebar (Converters, General, Media, Paths,
+Diagnostics, About). On Converters, drag a module above another to make it the
+preferred engine for overlapping conversions; status badges show whether each
+engine is installed. The Diagnostics page reports versions, install hints, and
+distinguishes registered format support from conversions that are ready on this
+Mac. Priority is saved in macOS Application Support and shared with `shift-cli`.
 
 ## CLI
 
 ```sh
+# Probe external engines
+# exit 0 = at least one conversion engine ready; 1 = none ready
+# Optional engines / PDF backends do not fail the exit code.
+# For a full install gate: doctor --script | grep -q 'complete=true'
+cargo run --bin shift-cli -- doctor
+cargo run --bin shift-cli -- doctor --script   # key=value for scripts
+cargo run --bin shift-cli -- doctor --quiet    # exit code only
+
 # Writes report.md beside report.docx
 cargo run --bin shift-cli -- report.docx
 

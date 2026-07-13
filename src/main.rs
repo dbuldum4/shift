@@ -8,9 +8,9 @@ use gpui::{
     WindowOptions, actions, canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
 };
 use shift_core::conversion::{
-    ConversionArtifact, ConversionOptions, ConversionRegistry, FfmpegEncodeMode, FfmpegOptions,
-    FfmpegQuality, OutputFormat, input_looks_like_media, is_audio_output, is_ffmpeg_output,
-    is_image_output, is_subtitle_output, is_video_output, looks_like_url,
+    ConversionArtifact, ConversionOptions, ConversionRegistry, DiagnosticsReport, FfmpegEncodeMode,
+    FfmpegOptions, FfmpegQuality, OutputFormat, Readiness, input_looks_like_media, is_audio_output,
+    is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output, looks_like_url,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use std::path::{Path, PathBuf};
@@ -40,9 +40,50 @@ const TEXT_DIM: u32 = 0x444444;
 const TEXT_INVERSE: u32 = 0x000000;
 const BADGE_FILL: u32 = 0x1a1a1a;
 const BADGE_TEXT: u32 = 0xcccccc;
+const STATUS_READY_FILL: u32 = 0x1a1a1a;
+const STATUS_READY_TEXT: u32 = 0xe8e8e8;
+const STATUS_READY_BORDER: u32 = 0x555555;
+const STATUS_MISSING_FILL: u32 = 0x111111;
+const STATUS_MISSING_TEXT: u32 = 0x888888;
+const STATUS_MISSING_BORDER: u32 = 0x333333;
 /// Cap session history so large conversion artifacts cannot grow without bound.
 const MAX_HISTORY_ENTRIES: usize = 30;
 const HISTORY_SIDEBAR_WIDTH: f32 = 220.0;
+const SETTINGS_SIDEBAR_WIDTH: f32 = 220.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsSection {
+    Converters,
+    General,
+    Media,
+    Paths,
+    Diagnostics,
+    About,
+}
+
+impl SettingsSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Converters => "Converters",
+            Self::General => "General",
+            Self::Media => "Media",
+            Self::Paths => "Paths",
+            Self::Diagnostics => "Diagnostics",
+            Self::About => "About",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Converters => "Choose which engine runs first when several support a conversion.",
+            Self::General => "Current session output format and history.",
+            Self::Media => "Current session FFmpeg quality and encode options.",
+            Self::Paths => "Where Shift looks for tools and stores preferences.",
+            Self::Diagnostics => "Installed engines, versions, and install guidance.",
+            Self::About => "Version, modules, and project info.",
+        }
+    }
+}
 
 #[derive(Clone)]
 struct FilePreview {
@@ -1378,6 +1419,17 @@ fn module_label(id: &str) -> &str {
     }
 }
 
+fn module_description(id: &str) -> &str {
+    match id {
+        "markitdown" => "Broad document, image, audio, and archive → Markdown.",
+        "pandoc" => "Publishing formats (DOCX, PDF, HTML, wiki, and more).",
+        "defuddle" => "Clean article extraction from URLs and local HTML.",
+        "docling" => "Layout-aware PDF and office documents → Markdown/HTML/text.",
+        "ffmpeg" => "Audio, video, stills, and subtitle conversion.",
+        _ => "Conversion module.",
+    }
+}
+
 fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl IntoElement {
     div()
         .id("url-input-bar")
@@ -1424,102 +1476,622 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
         )
 }
 
-fn settings_modal(
-    priority: &[String],
-    preference_error: Option<SharedString>,
+fn settings_nav_item(
+    section: SettingsSection,
+    active: SettingsSection,
+    index: usize,
     cx: &mut Context<Shift>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
+    let selected = section == active;
     div()
-        .id("settings-backdrop")
-        .absolute()
-        .top_0()
-        .right_0()
-        .bottom_0()
-        .left_0()
+        .id(("settings-nav", index))
         .flex()
         .items_center()
-        .justify_center()
-        .bg(hsla(0.0, 0.0, 0.0, 0.82))
-        .cursor_default()
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.settings_open = false;
+        .w_full()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .cursor_pointer()
+        .bg(if selected { rgb(BG_ELEVATED) } else { rgb(BG) })
+        .border_1()
+        .border_color(if selected { rgb(BORDER) } else { rgb(BG) })
+        .hover(|style| {
+            if selected {
+                style
+            } else {
+                style.bg(rgb(BG_SURFACE))
+            }
+        })
+        .child(
+            div()
+                .text_sm()
+                .font_weight(if selected {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if selected {
+                    rgb(TEXT_PRIMARY)
+                } else {
+                    rgb(TEXT_SECONDARY)
+                })
+                .child(section.label()),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.settings_section = section;
             cx.notify();
             cx.stop_propagation();
         }))
+}
+
+fn settings_section_header(
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w_full()
+        .min_w_0()
         .child(
             div()
-                .id("settings-modal")
-                .relative()
+                .text_xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT))
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(subtitle.into()),
+        )
+}
+
+fn settings_card(title: impl Into<SharedString>, body: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .w_full()
+        .min_w_0()
+        .p_4()
+        .rounded_xl()
+        .bg(rgb(BG_SURFACE))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(title.into()),
+        )
+        .child(body)
+}
+
+fn readiness_badge(readiness: Readiness) -> impl IntoElement {
+    let (fill, text, border, label) = match readiness {
+        Readiness::Ready => (
+            STATUS_READY_FILL,
+            STATUS_READY_TEXT,
+            STATUS_READY_BORDER,
+            "READY",
+        ),
+        Readiness::Missing => (
+            STATUS_MISSING_FILL,
+            STATUS_MISSING_TEXT,
+            STATUS_MISSING_BORDER,
+            "MISSING",
+        ),
+    };
+    div()
+        .flex_shrink_0()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .bg(rgb(fill))
+        .border_1()
+        .border_color(rgb(border))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(text))
+        .child(label)
+}
+
+fn settings_converters_panel(
+    priority: &[String],
+    preference_error: Option<SharedString>,
+    diagnostics: Option<Arc<DiagnosticsReport>>,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "Converters",
+            "Drag modules to choose which compatible engine runs first.",
+        ))
+        .child(div().flex().flex_col().gap_2().w_full().min_w_0().children(
+            priority.iter().enumerate().map(|(index, id)| {
+                let label = module_label(id).to_owned();
+                let description = module_description(id).to_owned();
+                let readiness = diagnostics
+                    .as_ref()
+                    .and_then(|report| report.engine(id))
+                    .map(|engine| engine.readiness);
+                let drag = ModuleDrag::new(index, label.clone());
+                div()
+                    .id(("module-priority", index))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .w_full()
+                    .min_w_0()
+                    .px_4()
+                    .py_3()
+                    .rounded_lg()
+                    .bg(rgb(BG_ELEVATED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .cursor_move()
+                    .drag_over::<ModuleDrag>(|style, _, _, _| {
+                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                    })
+                    .on_drag(drag, |info: &ModuleDrag, position, _, cx| {
+                        cx.new(|_| info.clone().position(position))
+                    })
+                    .on_drop(cx.listener(move |this, info: &ModuleDrag, _, cx| {
+                        this.move_module(info.index, index, cx);
+                    }))
+                    .child(div().flex_shrink_0().text_color(rgb(TEXT_MUTED)).child("⠿"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .truncate()
+                                    .child(description),
+                            ),
+                    )
+                    .when_some(readiness, |row, status| row.child(readiness_badge(status)))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(if index == 0 { "First" } else { "Fallback" }),
+                    )
+            }),
+        ))
+        .when_some(preference_error, |panel, error| {
+            panel.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(BG_ELEVATED))
+                    .border_1()
+                    .border_color(rgb(BORDER_STRONG))
+                    .text_xs()
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(error),
+            )
+        })
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_xs()
+                .text_color(rgb(TEXT_MUTED))
+                .child(
+                    "Priority only applies when multiple modules support the selected conversion. Status badges show whether each engine is installed on this Mac (see Diagnostics).",
+                ),
+        )
+}
+
+fn settings_general_panel(
+    output_format: OutputFormat,
+    history_count: usize,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "General",
+            "Live session options. Changes apply immediately and re-run conversion when a source is open.",
+        ))
+        .child(settings_card(
+            "Current output format",
+            div()
                 .flex()
                 .flex_col()
-                .gap_5()
-                .w(px(440.0))
-                // Clip any child that still tries to paint past the fixed width so
-                // monospaced copy cannot spill outside the rounded card.
-                .overflow_hidden()
-                .p_6()
-                .rounded_xl()
-                .bg(rgb(BG_SURFACE))
-                .border_1()
-                .border_color(rgb(BG_ACTIVE))
-                .shadow_lg()
-                .on_click(|_, _, cx| cx.stop_propagation())
+                .gap_3()
+                .w_full()
                 .child(
-                    // Keep the close control in normal flex flow (not absolute) so the
-                    // title/subtitle column always receives a definite remaining width
-                    // and long monospaced copy wraps instead of overflowing.
                     div()
                         .flex()
-                        .items_start()
-                        .gap_3()
+                        .flex_wrap()
+                        .gap_2()
                         .w_full()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_lg()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Module priority"),
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .child(
-                                            "Drag modules to choose which compatible engine runs first.",
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("close-settings")
-                                .flex_shrink_0()
-                                .size(px(24.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(BG_HOVER)))
-                                .child("×")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_open = false;
+                        .child(chip(
+                            "default-output-md",
+                            OutputFormat::MARKDOWN.label(),
+                            output_format == OutputFormat::MARKDOWN,
+                            cx,
+                            |this, cx| {
+                                this.output_format = OutputFormat::MARKDOWN;
+                                this.output_menu_open = false;
+                                if this.selected_file.is_some() || this.selected_url.is_some() {
+                                    this.start_conversion(cx);
+                                } else {
                                     cx.notify();
-                                    cx.stop_propagation();
-                                })),
-                        ),
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "default-output-html",
+                            OutputFormat::HTML.label(),
+                            output_format == OutputFormat::HTML,
+                            cx,
+                            |this, cx| {
+                                this.output_format = OutputFormat::HTML;
+                                this.output_menu_open = false;
+                                if this.selected_file.is_some() || this.selected_url.is_some() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "default-output-pdf",
+                            OutputFormat::PDF.label(),
+                            output_format == OutputFormat::PDF,
+                            cx,
+                            |this, cx| {
+                                this.output_format = OutputFormat::PDF;
+                                this.output_menu_open = false;
+                                if this.selected_file.is_some() || this.selected_url.is_some() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "default-output-docx",
+                            OutputFormat::DOCX.label(),
+                            output_format == OutputFormat::DOCX,
+                            cx,
+                            |this, cx| {
+                                this.output_format = OutputFormat::DOCX;
+                                this.output_menu_open = false;
+                                if this.selected_file.is_some() || this.selected_url.is_some() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "default-output-pptx",
+                            OutputFormat::PPTX.label(),
+                            output_format == OutputFormat::PPTX,
+                            cx,
+                            |this, cx| {
+                                this.output_format = OutputFormat::PPTX;
+                                this.output_menu_open = false;
+                                if this.selected_file.is_some() || this.selected_url.is_some() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        )),
                 )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Same control as the main output menu. Choosing a format here updates the session and reconverts the current source when one is selected.",
+                        ),
+                ),
+        ))
+        .child(settings_card(
+            "History",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .w_full()
+                .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(format!(
+                    "{history_count} entr{} in this session (max {MAX_HISTORY_ENTRIES}).",
+                    if history_count == 1 { "y" } else { "ies" }
+                )))
+                .child(
+                    div()
+                        .id("settings-clear-history")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(36.0))
+                        .px_4()
+                        .rounded_lg()
+                        .bg(rgb(BG_ELEVATED))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_sm()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                        .child("Clear history")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_history(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                    "History is kept only for the current session and is not saved to disk.",
+                )),
+        ))
+}
+
+fn settings_media_panel(
+    quality: FfmpegQuality,
+    encode_mode: FfmpegEncodeMode,
+    mono: bool,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "Media",
+            "Session media options for FFmpeg. Changes apply immediately when a media conversion is active.",
+        ))
+        .child(settings_card(
+            "Quality",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(chip(
+                            "settings-quality-balanced",
+                            FfmpegQuality::Balanced.label(),
+                            quality == FfmpegQuality::Balanced,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_quality = FfmpegQuality::Balanced;
+                                if this.media_options_visible() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "settings-quality-high",
+                            FfmpegQuality::High.label(),
+                            quality == FfmpegQuality::High,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_quality = FfmpegQuality::High;
+                                if this.media_options_visible() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "settings-quality-small",
+                            FfmpegQuality::Small.label(),
+                            quality == FfmpegQuality::Small,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_quality = FfmpegQuality::Small;
+                                if this.media_options_visible() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Tradeoff when re-encoding: higher quality uses more bitrate / less compression; smaller file does the opposite. Ignored during stream copy.",
+                        ),
+                ),
+        ))
+        .child(settings_card(
+            "Encode mode",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(chip(
+                            "settings-encode-auto",
+                            FfmpegEncodeMode::Auto.label(),
+                            encode_mode == FfmpegEncodeMode::Auto,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_encode_mode = FfmpegEncodeMode::Auto;
+                                if this.media_options_visible() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "settings-encode-copy",
+                            FfmpegEncodeMode::PreferCopy.label(),
+                            encode_mode == FfmpegEncodeMode::PreferCopy,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_encode_mode = FfmpegEncodeMode::PreferCopy;
+                                if this.media_options_visible() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(chip(
+                            "settings-encode-reencode",
+                            FfmpegEncodeMode::Reencode.label(),
+                            encode_mode == FfmpegEncodeMode::Reencode,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_encode_mode = FfmpegEncodeMode::Reencode;
+                                if this.media_options_visible() {
+                                    this.start_conversion(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Auto re-encodes with quality presets. Stream copy remuxes without re-encoding (fast, fails if the container can’t hold the streams). Re-encode always applies quality, mono, sample rate, and scale.",
+                        ),
+                ),
+        ))
+        .child(settings_card(
+            "Audio",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div().flex().flex_wrap().gap_2().child(chip(
+                        "settings-mono",
+                        if mono { "Mono on" } else { "Mono off" },
+                        mono,
+                        cx,
+                        |this, cx| {
+                            this.ffmpeg_mono = !this.ffmpeg_mono;
+                            if this.media_options_visible() {
+                                this.start_conversion(cx);
+                            } else {
+                                cx.notify();
+                            }
+                        },
+                    )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Downmix to a single channel when re-encoding. These values seed the media panel; per-conversion overrides still apply on the main screen.",
+                        ),
+                ),
+        ))
+}
+
+fn settings_paths_panel() -> impl IntoElement + use<> {
+    let home = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Library/Application Support/Shift"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/Library/Application Support/Shift".into());
+
+    let env_rows = [
+        (
+            "SHIFT_MODULE_PRIORITY",
+            "Comma-separated converter order override",
+        ),
+        ("SHIFT_MARKITDOWN_BIN", "Path to the markitdown executable"),
+        ("SHIFT_PANDOC_BIN", "Path to the pandoc executable"),
+        ("SHIFT_DEFUDDLE_BIN", "Path to the defuddle executable"),
+        ("SHIFT_DOCLING_BIN", "Path to the docling executable"),
+        ("SHIFT_FFMPEG_BIN", "Path to the ffmpeg executable"),
+        (
+            "SHIFT_PDF_ENGINE",
+            "PDF engine for Pandoc (typst, xelatex, …)",
+        ),
+    ];
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "Paths",
+            "Where preferences live and how external tools are discovered.",
+        ))
+        .child(settings_card(
+            "Preferences directory",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(home))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("Module priority is stored in module-priority inside this folder."),
+                ),
+        ))
+        .child(settings_card(
+            "Environment overrides",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .w_full()
+                .min_w_0()
                 .child(
                     div()
                         .flex()
@@ -1527,82 +2099,598 @@ fn settings_modal(
                         .gap_2()
                         .w_full()
                         .min_w_0()
-                        .children(priority.iter().enumerate().map(|(index, id)| {
-                            let label = module_label(id).to_owned();
-                            let drag = ModuleDrag::new(index, label.clone());
+                        .children(env_rows.into_iter().map(|(name, hint)| {
                             div()
-                                .id(("module-priority", index))
                                 .flex()
-                                .items_center()
-                                .gap_3()
+                                .flex_col()
+                                .gap_0p5()
                                 .w_full()
                                 .min_w_0()
-                                .px_4()
-                                .py_3()
+                                .px_3()
+                                .py_2()
                                 .rounded_lg()
                                 .bg(rgb(BG_ELEVATED))
                                 .border_1()
                                 .border_color(rgb(BORDER))
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .cursor_move()
-                                .drag_over::<ModuleDrag>(|style, _, _, _| {
-                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
-                                })
-                                .on_drag(drag, |info: &ModuleDrag, position, _, cx| {
-                                    cx.new(|_| info.clone().position(position))
-                                })
-                                .on_drop(cx.listener(move |this, info: &ModuleDrag, _, cx| {
-                                    this.move_module(info.index, index, cx);
-                                }))
                                 .child(
                                     div()
-                                        .flex_shrink_0()
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child("⠿"),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .truncate()
-                                        .child(label),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(if index == 0 { "First" } else { "Fallback" }),
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(name),
                                 )
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(hint))
                         })),
                 )
-                .when_some(preference_error, |modal, error| {
-                    modal.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(BG_ELEVATED))
-                            .border_1()
-                            .border_color(rgb(BORDER_STRONG))
-                            .text_xs()
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .child(error),
-                    )
-                })
                 .child(
                     div()
-                        .w_full()
-                        .min_w_0()
                         .text_xs()
                         .text_color(rgb(TEXT_MUTED))
                         .child(
-                            "Priority only applies when multiple modules support the selected conversion.",
+                            "Optional shell variables that override Shift’s automatic tool discovery. Set them in your terminal profile or launch environment; restart Shift after changing them. Leave unset to use PATH and project-local installs.",
                         ),
                 ),
+        ))
+}
+
+fn settings_diagnostics_panel(
+    diagnostics: Option<Arc<DiagnosticsReport>>,
+    loading: bool,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement + use<> {
+    let summary = diagnostics.as_ref().map(|report| {
+        format!(
+            "{}/{} engines ready · PDF {}",
+            report.ready_engine_count(),
+            report.engines.len(),
+            if report.any_pdf_engine_ready() {
+                "ready"
+            } else {
+                "missing"
+            }
+        )
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "Diagnostics",
+            "Installed engines on this Mac versus formats Shift knows how to convert.",
+        ))
+        .child(settings_card(
+            "Supported vs available",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .child(
+                            "Format supported means a module registers the conversion pair. Conversion currently available means the required external engine is installed and ready.",
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Use `shift-cli formats` for registered capability and `shift-cli doctor` for readiness (exit 0 = at least one engine ready; check complete= in --script for a full install).",
+                        ),
+                )
+                .when_some(summary, |card, text| {
+                    card.child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(text),
+                    )
+                }),
+        ))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .w_full()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child("Conversion engines"),
+                )
+                .child(
+                    div()
+                        .id("settings-diagnostics-refresh")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(32.0))
+                        .px_3()
+                        .rounded_lg()
+                        .bg(rgb(BG_ELEVATED))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_xs()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                        .child(if loading { "Checking…" } else { "Refresh" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_diagnostics(cx);
+                            cx.stop_propagation();
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .children(
+                    diagnostics
+                        .as_ref()
+                        .map(|report| {
+                            report
+                                .engines
+                                .iter()
+                                .map(|engine| {
+                                    let version = engine
+                                        .version
+                                        .clone()
+                                        .unwrap_or_else(|| {
+                                            if engine.readiness.is_ready() {
+                                                "version unknown".into()
+                                            } else {
+                                                "not installed".into()
+                                            }
+                                        });
+                                    let path = engine
+                                        .resolved_path
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_else(|| "—".into());
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .w_full()
+                                        .min_w_0()
+                                        .px_4()
+                                        .py_3()
+                                        .rounded_lg()
+                                        .bg(rgb(BG_ELEVATED))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_3()
+                                                .w_full()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .gap_0p5()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(rgb(TEXT_PRIMARY))
+                                                                .truncate()
+                                                                .child(engine.label),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(TEXT_MUTED))
+                                                                .truncate()
+                                                                .child(format!(
+                                                                    "{version} · {path}"
+                                                                )),
+                                                        ),
+                                                )
+                                                .child(readiness_badge(engine.readiness)),
+                                        )
+                                        .when(!engine.readiness.is_ready(), |card| {
+                                            card.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .child(format!(
+                                                        "Install: {} · or set {}",
+                                                        engine.install_hint, engine.env_override
+                                                    )),
+                                            )
+                                        })
+                                        .when_some(engine.notes.clone(), |card, notes| {
+                                            card.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child(notes),
+                                            )
+                                        })
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| {
+                            vec![div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(if loading {
+                                    "Probing engines…"
+                                } else {
+                                    "No diagnostics yet. Click Refresh."
+                                })
+                                .into_any_element()]
+                        }),
+                ),
+        )
+        .child(settings_card(
+            "PDF engines (Pandoc)",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Pandoc shells out to an external PDF engine. Typst is recommended for new installs (`brew install typst`). Override with SHIFT_PDF_ENGINE.",
+                        ),
+                )
+                .children(
+                    diagnostics
+                        .as_ref()
+                        .map(|report| {
+                            report
+                                .pdf_engines
+                                .iter()
+                                .map(|engine| {
+                                    let version = engine
+                                        .version
+                                        .clone()
+                                        .unwrap_or_else(|| "—".into());
+                                    let selected = if engine.selected { " · selected" } else { "" };
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_lg()
+                                        .bg(rgb(BG_SURFACE))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_0p5()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .child(format!("{}{selected}", engine.name)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .truncate()
+                                                        .child(version),
+                                                ),
+                                        )
+                                        .child(readiness_badge(engine.readiness))
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )
+                .when(
+                    diagnostics
+                        .as_ref()
+                        .is_some_and(|report| !report.any_pdf_engine_ready()),
+                    |card| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(
+                                    "Install: brew install typst  ·  or brew install --cask basictex  ·  or set SHIFT_PDF_ENGINE",
+                                ),
+                        )
+                    },
+                ),
+        ))
+}
+
+fn settings_about_panel(priority: &[String]) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "About",
+            "Shift converts local files and URLs into downloadable artifacts.",
+        ))
+        .child(settings_card(
+            "Application",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .child(format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"))),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(
+                            "Native macOS app and shift-cli share the same conversion modules and dispatch rules.",
+                        ),
+                ),
+        ))
+        .child(settings_card(
+            "Loaded modules",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(priority.iter().map(|id| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(rgb(BG_ELEVATED))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(module_label(id).to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(id.clone()),
+                        )
+                })),
+        ))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(TEXT_MUTED))
+                .child(
+                    "MarkItDown · Pandoc · Defuddle · Docling · FFmpeg",
+                ),
+        )
+}
+
+struct SettingsView {
+    section: SettingsSection,
+    priority: Vec<String>,
+    preference_error: Option<SharedString>,
+    output_format: OutputFormat,
+    history_count: usize,
+    quality: FfmpegQuality,
+    encode_mode: FfmpegEncodeMode,
+    mono: bool,
+    diagnostics: Option<Arc<DiagnosticsReport>>,
+    diagnostics_loading: bool,
+}
+
+fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
+    let SettingsView {
+        section,
+        priority,
+        preference_error,
+        output_format,
+        history_count,
+        quality,
+        encode_mode,
+        mono,
+        diagnostics,
+        diagnostics_loading,
+    } = view;
+
+    div()
+        .id("settings-content")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .overflow_hidden()
+        .bg(rgb(BG))
+        .child(
+            div()
+                .id("settings-content-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .p_8()
+                .child(match *section {
+                    SettingsSection::Converters => settings_converters_panel(
+                        priority,
+                        preference_error.clone(),
+                        diagnostics.clone(),
+                        cx,
+                    )
+                    .into_any_element(),
+                    SettingsSection::General => {
+                        settings_general_panel(*output_format, *history_count, cx)
+                            .into_any_element()
+                    }
+                    SettingsSection::Media => {
+                        settings_media_panel(*quality, *encode_mode, *mono, cx).into_any_element()
+                    }
+                    SettingsSection::Paths => settings_paths_panel().into_any_element(),
+                    SettingsSection::Diagnostics => {
+                        settings_diagnostics_panel(diagnostics.clone(), *diagnostics_loading, cx)
+                            .into_any_element()
+                    }
+                    SettingsSection::About => settings_about_panel(priority).into_any_element(),
+                }),
+        )
+}
+
+fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
+    let section = view.section;
+
+    div()
+        .id("settings-screen")
+        .absolute()
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .flex()
+        .flex_col()
+        .size_full()
+        .bg(rgb(BG))
+        .cursor_default()
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(
+            // Top bar with back control. Extra top padding clears the traffic lights.
+            div()
+                .id("settings-topbar")
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_3()
+                .w_full()
+                .px_4()
+                .pt(px(40.0))
+                .pb_3()
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .id("settings-back")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(36.0))
+                        .px_3()
+                        .rounded_lg()
+                        .bg(rgb(BG_SURFACE))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(BG_HOVER)))
+                        .child(div().text_color(rgb(TEXT_SECONDARY)).child("←"))
+                        .child("Back")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_open = false;
+                            cx.notify();
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(
+                    // Non-clickable breadcrumb: Settings / <current section>
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(div().text_color(rgb(TEXT_SECONDARY)).child("Settings"))
+                        .child(div().text_color(rgb(TEXT_MUTED)).child("/"))
+                        .child(div().text_color(rgb(TEXT_PRIMARY)).child(section.label())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(section.description()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(
+                    // Left sidebar of settings sections.
+                    div()
+                        .id("settings-sidebar")
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .w(px(SETTINGS_SIDEBAR_WIDTH))
+                        .h_full()
+                        .bg(rgb(BG))
+                        .border_r_1()
+                        .border_color(rgb(BORDER))
+                        .px_3()
+                        .py_4()
+                        .gap_1()
+                        .child(settings_nav_item(
+                            SettingsSection::Converters,
+                            section,
+                            0,
+                            cx,
+                        ))
+                        .child(settings_nav_item(SettingsSection::General, section, 1, cx))
+                        .child(settings_nav_item(SettingsSection::Media, section, 2, cx))
+                        .child(settings_nav_item(SettingsSection::Paths, section, 3, cx))
+                        .child(settings_nav_item(
+                            SettingsSection::Diagnostics,
+                            section,
+                            4,
+                            cx,
+                        ))
+                        .child(settings_nav_item(SettingsSection::About, section, 5, cx)),
+                )
+                .child(settings_content(&view, cx)),
         )
 }
 
@@ -1620,7 +2708,10 @@ struct Shift {
     output_format: OutputFormat,
     output_menu_open: bool,
     settings_open: bool,
+    settings_section: SettingsSection,
     module_priority: Vec<String>,
+    diagnostics: Option<Arc<DiagnosticsReport>>,
+    diagnostics_loading: bool,
     url_input: Entity<TextInput>,
     history: Vec<ConversionHistoryEntry>,
     next_history_id: u64,
@@ -1639,6 +2730,33 @@ struct Shift {
 }
 
 impl Shift {
+    fn refresh_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if self.diagnostics_loading {
+            return;
+        }
+        self.diagnostics_loading = true;
+        cx.notify();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { DiagnosticsReport::collect() });
+        cx.spawn(async move |this, cx| {
+            let report = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.diagnostics = Some(Arc::new(report));
+                this.diagnostics_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn ensure_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if self.diagnostics.is_none() && !self.diagnostics_loading {
+            self.refresh_diagnostics(cx);
+        }
+    }
+
     fn choose_file(&mut self, cx: &mut Context<Self>) {
         // Ignore clicks while a dialog is already open (prevents multi-panel
         // races that can hang the open/save panel service).
@@ -2121,10 +3239,12 @@ impl Render for Shift {
         let output_format = self.output_format;
         let output_menu_open = self.output_menu_open;
         let settings_open = self.settings_open;
+        let settings_section = self.settings_section;
         let module_priority = self.module_priority.clone();
         let preference_error = self.preference_error.clone();
         let url_input = self.url_input.clone();
         let history = self.history.clone();
+        let history_count = history.len();
         let active_history_id = self.active_history_id;
         let show_media_options = self.media_options_visible();
         let ffmpeg_quality = self.ffmpeg_quality;
@@ -2137,6 +3257,8 @@ impl Render for Shift {
         let ffmpeg_frame_input = self.ffmpeg_frame_input.clone();
         let ffmpeg_audio_stream_input = self.ffmpeg_audio_stream_input.clone();
         let ffmpeg_subtitle_stream_input = self.ffmpeg_subtitle_stream_input.clone();
+        let diagnostics = self.diagnostics.clone();
+        let diagnostics_loading = self.diagnostics_loading;
 
         div()
             .id("shift-root")
@@ -2258,11 +3380,26 @@ impl Render for Shift {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.output_menu_open = false;
                         this.settings_open = true;
+                        this.ensure_diagnostics(cx);
                         cx.notify();
                     })),
             )
             .when(settings_open, |root| {
-                root.child(settings_modal(&module_priority, preference_error, cx))
+                root.child(settings_screen(
+                    SettingsView {
+                        section: settings_section,
+                        priority: module_priority,
+                        preference_error,
+                        output_format,
+                        history_count,
+                        quality: ffmpeg_quality,
+                        encode_mode: ffmpeg_encode_mode,
+                        mono: ffmpeg_mono,
+                        diagnostics,
+                        diagnostics_loading,
+                    },
+                    cx,
+                ))
             })
     }
 }
@@ -2315,7 +3452,10 @@ fn main() {
                         output_format: OutputFormat::MARKDOWN,
                         output_menu_open: false,
                         settings_open: false,
+                        settings_section: SettingsSection::Converters,
                         module_priority: load_module_priority(),
+                        diagnostics: None,
+                        diagnostics_loading: false,
                         url_input,
                         history: Vec::new(),
                         next_history_id: 1,

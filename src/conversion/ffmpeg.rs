@@ -2,7 +2,8 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, run_command,
+    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    run_command,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -220,8 +221,9 @@ pub struct FfmpegModule {
 impl Default for FfmpegModule {
     fn default() -> Self {
         Self {
-            executable: std::env::var_os("SHIFT_FFMPEG_BIN")
-                .unwrap_or_else(|| OsString::from("ffmpeg")),
+            // Absolute path when found so GUI apps with a minimal PATH match
+            // diagnostics readiness (PATH + common_bin_dirs).
+            executable: resolve_tool_executable("SHIFT_FFMPEG_BIN", "ffmpeg", &[]),
         }
     }
 }

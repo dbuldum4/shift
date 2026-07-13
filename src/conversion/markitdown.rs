@@ -1,9 +1,9 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, run_command,
+    map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable, run_command,
 };
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const EXTENSIONS: &[&str] = &[
@@ -31,18 +31,12 @@ impl Default for MarkItDownModule {
 }
 
 fn discover_executable() -> OsString {
-    if let Some(executable) = std::env::var_os("SHIFT_MARKITDOWN_BIN") {
-        return executable;
-    }
-
     // Prefer Shift's isolated development runtime when it exists. Packaged
     // builds can provide a bundled path through SHIFT_MARKITDOWN_BIN.
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/markitdown");
-    if local.is_file() {
-        return local.into_os_string();
-    }
-
-    OsString::from("markitdown")
+    // Resolves to an absolute path via PATH + common_bin_dirs so GUI apps
+    // with a minimal PATH still spawn the same binary diagnostics reports.
+    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/markitdown");
+    resolve_tool_executable("SHIFT_MARKITDOWN_BIN", "markitdown", &[local])
 }
 
 impl MarkItDownModule {

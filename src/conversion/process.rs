@@ -5,8 +5,9 @@
 //! error messaging for their engine.
 
 use super::ConversionError;
+use std::ffi::OsStr;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -274,6 +275,124 @@ pub fn max_output_bytes() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
         .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+}
+
+/// Whether `path` exists and looks executable (Unix execute bit).
+pub fn is_runnable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Common absolute bin directories probed when `PATH` is minimal (GUI apps on macOS).
+pub fn common_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/Library/TeX/texbin"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+    }
+    dirs
+}
+
+/// Resolve a bare tool name on `PATH` and common install locations.
+///
+/// Absolute paths that are runnable are returned as-is. Relative names are
+/// searched on `PATH`, then in [`common_bin_dirs`].
+pub fn find_executable(name: impl AsRef<OsStr>) -> Option<PathBuf> {
+    let name = name.as_ref();
+    let as_path = Path::new(name);
+    if as_path.is_absolute() || as_path.components().count() > 1 {
+        return is_runnable(as_path).then(|| as_path.to_path_buf());
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if is_runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for dir in common_bin_dirs() {
+        let candidate = dir.join(name);
+        if is_runnable(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Resolve a conversion tool the same way diagnostics and modules do.
+///
+/// Order of preference:
+/// 1. `env_override` when set (absolute path, existing path, or bare name on PATH)
+/// 2. Project-local candidates that are runnable
+/// 3. [`find_executable`] for `default_name` (PATH + [`common_bin_dirs`])
+///
+/// Returns `None` only when nothing is configured and the default name cannot
+/// be resolved. When an env override is set to a broken path, that path is
+/// still returned so callers can surface it as missing/failed.
+pub fn resolve_tool_path(
+    env_override: &str,
+    default_name: &str,
+    local_candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os(env_override) {
+        if !override_path.is_empty() {
+            let path = PathBuf::from(&override_path);
+            if is_runnable(&path) {
+                return Some(path);
+            }
+            // Surface configured-but-broken paths so diagnostics can show them.
+            if path.exists() {
+                return Some(path);
+            }
+            // Bare name (or relative) in the env override.
+            if let Some(found) = find_executable(&override_path) {
+                return Some(found);
+            }
+            return Some(PathBuf::from(override_path));
+        }
+    }
+
+    for candidate in local_candidates {
+        if is_runnable(candidate) {
+            return Some(candidate.clone());
+        }
+    }
+
+    find_executable(default_name)
+}
+
+/// Like [`resolve_tool_path`], but always returns a value suitable for
+/// `Command::new`: an absolute path when discovery succeeds, otherwise the
+/// bare `default_name` so spawn fails with "executable not found".
+pub fn resolve_tool_executable(
+    env_override: &str,
+    default_name: &str,
+    local_candidates: &[PathBuf],
+) -> std::ffi::OsString {
+    resolve_tool_path(env_override, default_name, local_candidates)
+        .map(|path| path.into_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from(default_name))
 }
 
 #[cfg(all(test, unix))]

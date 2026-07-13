@@ -1,6 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, run_command,
+    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    run_command,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -39,17 +40,10 @@ impl Default for DoclingModule {
 }
 
 fn discover_executable() -> OsString {
-    if let Some(executable) = std::env::var_os("SHIFT_DOCLING_BIN") {
-        return executable;
-    }
-
     // Prefer a project-local venv when present (same convention as MarkItDown).
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/docling");
-    if local.is_file() {
-        return local.into_os_string();
-    }
-
-    OsString::from("docling")
+    // Absolute resolution matches diagnostics so GUI PATH quirks stay consistent.
+    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/docling");
+    resolve_tool_executable("SHIFT_DOCLING_BIN", "docling", &[local])
 }
 
 impl DoclingModule {

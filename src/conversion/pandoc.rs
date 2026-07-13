@@ -1,9 +1,10 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, run_command,
+    find_executable, map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
+    run_command,
 };
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::Path;
 use std::process::Command;
 
 const INPUTS: &[&str] = &[
@@ -83,8 +84,9 @@ pub struct PandocModule {
 impl Default for PandocModule {
     fn default() -> Self {
         Self {
-            executable: std::env::var_os("SHIFT_PANDOC_BIN")
-                .unwrap_or_else(|| OsString::from("pandoc")),
+            // Absolute path when found so GUI apps with a minimal PATH match
+            // diagnostics readiness (PATH + common_bin_dirs).
+            executable: resolve_tool_executable("SHIFT_PANDOC_BIN", "pandoc", &[]),
         }
     }
 }
@@ -201,12 +203,17 @@ fn pandoc_input_format(extension: &str) -> &str {
     }
 }
 
+/// PDF engines Pandoc may invoke (public for diagnostics).
+pub fn pdf_engine_candidates() -> &'static [&'static str] {
+    PDF_ENGINE_CANDIDATES
+}
+
 /// Choose a PDF engine for Pandoc.
 ///
 /// Order of preference:
 /// 1. `SHIFT_PDF_ENGINE` when set (name or absolute path)
 /// 2. First candidate found on `PATH` / common install locations
-fn resolve_pdf_engine() -> Result<OsString, ConversionError> {
+pub fn resolve_pdf_engine() -> Result<OsString, ConversionError> {
     if let Some(engine) = std::env::var_os("SHIFT_PDF_ENGINE") {
         if !engine.is_empty() {
             return Ok(engine);
@@ -225,63 +232,6 @@ fn resolve_pdf_engine() -> Result<OsString, ConversionError> {
          distribution such as `brew install --cask basictex`. You can also set \
          SHIFT_PDF_ENGINE to a specific engine binary.",
     ))
-}
-
-fn find_executable(name: &str) -> Option<PathBuf> {
-    let name = OsStr::new(name);
-
-    // Absolute / relative overrides via SHIFT_PDF_ENGINE are handled earlier.
-    // Here we only resolve bare tool names.
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if is_runnable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // GUI-launched macOS apps often inherit a minimal PATH that omits Homebrew
-    // and MacTeX. Probe the usual install locations so PDF engines still resolve.
-    for dir in common_bin_dirs() {
-        let candidate = dir.join(name);
-        if is_runnable(&candidate) {
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
-fn common_bin_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/Library/TeX/texbin"),
-    ];
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        dirs.push(home.join(".local/bin"));
-        dirs.push(home.join(".cargo/bin"));
-    }
-    dirs
-}
-
-fn is_runnable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 #[cfg(test)]

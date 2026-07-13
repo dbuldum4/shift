@@ -1,36 +1,47 @@
 use shift_core::conversion::{
-    ConversionOptions, ConversionRegistry, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    OutputFormat, default_output_path, looks_like_url, paths_refer_to_same_file,
+    ConversionOptions, ConversionRegistry, DiagnosticsReport, FfmpegEncodeMode, FfmpegOptions,
+    FfmpegQuality, OutputFormat, default_output_path, looks_like_url, paths_refer_to_same_file,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-fn main() {
-    if let Err(error) = run(std::env::args_os().skip(1).collect()) {
-        eprintln!("shift-cli: {error}");
-        std::process::exit(1);
+fn main() -> ExitCode {
+    match run(std::env::args_os().skip(1).collect()) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("shift-cli: {error}");
+            ExitCode::from(1)
+        }
     }
 }
 
-fn run(arguments: Vec<OsString>) -> Result<(), String> {
+fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     if arguments.is_empty() {
         print_help();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
-    if arguments.len() == 1 {
-        match arguments[0].to_string_lossy().as_ref() {
-            "-h" | "--help" | "help" => {
-                print_help();
-                return Ok(());
-            }
-            "formats" => {
-                print_formats();
-                return Ok(());
-            }
-            _ => {}
-        }
+    if arguments
+        .first()
+        .is_some_and(|value| matches!(value.to_string_lossy().as_ref(), "-h" | "--help" | "help"))
+        && arguments.len() == 1
+    {
+        print_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if arguments.first().is_some_and(|value| value == "formats") && arguments.len() == 1 {
+        print_formats();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if arguments
+        .first()
+        .is_some_and(|value| value == "doctor" || value == "--doctor")
+    {
+        return run_doctor(&arguments[1..]);
     }
 
     let mut cursor = 0;
@@ -224,7 +235,68 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         println!("{}", destination.display());
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Probe external engines. Exit codes are stable for scripts:
+///
+/// - `0` — at least one conversion engine is ready (usable partial install)
+/// - `1` — no conversion engines are ready (or doctor flags were invalid)
+///
+/// Optional engines and PDF backends do not fail the exit code. Use
+/// `--script` and check `complete=true` or individual `engine.*=ready` lines
+/// when a full install is required.
+///
+/// Pass `--script` for `key=value` lines, or `--quiet` for exit code only.
+fn run_doctor(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut script = false;
+    let mut quiet = false;
+    for argument in arguments {
+        match argument.to_string_lossy().as_ref() {
+            "--script" | "-s" => script = true,
+            "--quiet" | "-q" => quiet = true,
+            "-h" | "--help" => {
+                print_doctor_help();
+                return Ok(ExitCode::SUCCESS);
+            }
+            unknown => {
+                return Err(format!(
+                    "unknown doctor argument: {unknown} (try `shift-cli doctor --help`)"
+                ));
+            }
+        }
+    }
+
+    let report = DiagnosticsReport::collect();
+    if !quiet {
+        if script {
+            print!("{}", report.render_script());
+        } else {
+            print!("{}", report.render_text());
+        }
+    }
+
+    Ok(ExitCode::from(report.exit_code() as u8))
+}
+
+fn print_doctor_help() {
+    println!(
+        "Usage: shift-cli doctor [--script] [--quiet]\n\n\
+         Probe MarkItDown, Pandoc, Defuddle, Docling, FFmpeg, and PDF engines.\n\
+         Reports installed/missing status, detected versions, and install hints.\n\n\
+         Options:\n  \
+         --script, -s   Emit key=value lines for scripts\n  \
+         --quiet,  -q   Suppress output; rely on the exit code only\n\n\
+         Exit codes:\n  \
+         0  at least one conversion engine is ready\n  \
+         1  no conversion engines are ready\n\n\
+         Optional engines (Defuddle, Docling) and PDF backends do not fail the\n\
+         exit code. For a full install gate, use `--script` and require\n\
+         `complete=true` or specific `engine.<id>=ready` lines.\n\n\
+         Registered capability (what modules advertise) is listed by\n\
+         `shift-cli formats`. Doctor reports whether conversion is currently\n\
+         available on this machine."
+    );
 }
 
 /// Refuse source overwrite always; require `--force` for other existing files.
@@ -302,7 +374,8 @@ fn print_help() {
         "Shift converts files and URLs through the same modules as the native app.\n\n\
          Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force] [--module <ID>]\n  \
          shift-cli convert <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force]\n  \
-         shift-cli formats\n\n\
+         shift-cli formats\n  \
+         shift-cli doctor [--script] [--quiet]\n\n\
          Media (FFmpeg) options:\n  \
          --start <SEC>           Seek to timestamp before converting\n  \
          --duration <SEC>        Limit output length\n  \
@@ -315,7 +388,8 @@ fn print_help() {
          --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
          --scale-width <PX>      Scale video/image width (height auto)\n\n\
          URLs (http/https) are extracted with Defuddle.\n\
-         Use `shift-cli formats` to list every installed conversion capability.\n\
+         Use `shift-cli formats` to list registered conversion capability.\n\
+         Use `shift-cli doctor` to see which engines are installed and ready.\n\
          If no output is supplied, Shift writes beside the source (or the current directory for URLs).\n\
          Existing outputs require --force. The source file is never overwritten."
     );
@@ -373,6 +447,113 @@ mod tests {
         assert!(run(args(&["--help"])).is_ok());
         assert!(run(args(&["formats"])).is_ok());
         assert!(run(args(&[])).is_ok());
+    }
+
+    #[test]
+    fn doctor_runs_and_returns_stable_exit_code() {
+        let code = run(args(&["doctor", "--quiet"])).unwrap();
+        // On a fully provisioned machine this is SUCCESS; otherwise failure. Either is valid.
+        assert!(
+            code == ExitCode::SUCCESS || code == ExitCode::from(1),
+            "unexpected doctor exit code"
+        );
+    }
+
+    #[test]
+    fn doctor_script_mode_succeeds_as_result() {
+        // Output goes to stdout; we only assert the command is accepted.
+        assert!(run(args(&["doctor", "--script", "--quiet"])).is_ok());
+    }
+
+    #[test]
+    fn doctor_rejects_unknown_flags() {
+        let error = run(args(&["doctor", "--nope"])).unwrap_err();
+        assert!(error.contains("unknown doctor argument"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_exit_and_script_keys_follow_env_overrides() {
+        use shift_core::conversion::DiagnosticsReport;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("doctor-env");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pandoc = dir.join("fake-pandoc");
+        std::fs::write(&pandoc, "#!/bin/sh\necho 'pandoc 1.2.3'\n").unwrap();
+        let mut permissions = std::fs::metadata(&pandoc).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&pandoc, permissions).unwrap();
+
+        let missing = dir.join("missing-bin");
+        let engine_vars = [
+            "SHIFT_MARKITDOWN_BIN",
+            "SHIFT_PANDOC_BIN",
+            "SHIFT_DEFUDDLE_BIN",
+            "SHIFT_DOCLING_BIN",
+            "SHIFT_FFMPEG_BIN",
+        ];
+
+        unsafe {
+            for key in engine_vars {
+                std::env::set_var(key, &missing);
+            }
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+            std::env::remove_var("SHIFT_PDF_ENGINE");
+        }
+
+        let report = DiagnosticsReport::collect();
+        let script = report.render_script();
+        assert!(
+            script.contains("engine.pandoc=ready"),
+            "expected ready pandoc in script:\n{script}"
+        );
+        assert!(
+            script.contains("version=1.2.3") || script.contains("version=\"1.2.3\""),
+            "expected pandoc version in script:\n{script}"
+        );
+        assert!(
+            script.contains(&format!("path={}", pandoc.display()))
+                || script.contains(&format!("path=\"{}\"", pandoc.display())),
+            "expected pandoc path in script:\n{script}"
+        );
+        assert!(
+            script.contains("engine.ffmpeg=missing"),
+            "expected missing ffmpeg:\n{script}"
+        );
+        assert!(
+            script.contains("exit_code=0"),
+            "partial install should exit 0:\n{script}"
+        );
+        assert!(
+            script.contains("complete=false"),
+            "expected incomplete install:\n{script}"
+        );
+
+        let code = run(args(&["doctor", "--quiet"])).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        // All engines missing → exit 1.
+        unsafe {
+            for key in engine_vars {
+                std::env::set_var(key, &missing);
+            }
+        }
+        let empty = DiagnosticsReport::collect();
+        assert_eq!(empty.exit_code(), 1);
+        assert_eq!(
+            run(args(&["doctor", "--quiet"])).unwrap(),
+            ExitCode::from(1)
+        );
+
+        unsafe {
+            for key in engine_vars {
+                std::env::remove_var(key);
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

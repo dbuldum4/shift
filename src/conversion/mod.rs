@@ -1,6 +1,7 @@
 //! Format conversion modules and capability-based dispatch.
 
 mod defuddle;
+mod diagnostics;
 mod docling;
 mod ffmpeg;
 mod markitdown;
@@ -12,16 +13,21 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use defuddle::{DefuddleModule, looks_like_url};
+pub use diagnostics::{
+    DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
+    available_ready_outputs, available_ready_url_outputs, format_availability, supported_outputs,
+};
 pub use docling::DoclingModule;
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
     is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
 };
 pub use markitdown::MarkItDownModule;
-pub use pandoc::PandocModule;
+pub use pandoc::{PandocModule, pdf_engine_candidates, resolve_pdf_engine};
 pub use process::{
-    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, max_output_bytes,
-    process_timeout, read_file_limited, run_command,
+    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, find_executable, is_runnable,
+    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    resolve_tool_path, run_command,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -683,6 +689,28 @@ impl ConversionRegistry {
         None
     }
 
+    /// Module ids that would run for `input` → `output` (direct or two-step).
+    ///
+    /// Shared with diagnostics so readiness checks cannot drift from dispatch.
+    pub fn route_module_ids(
+        &self,
+        input: &Path,
+        output: OutputFormat,
+    ) -> Option<Vec<&'static str>> {
+        match self.route_for(input, output)? {
+            ConversionRoute::Direct(module) => Some(vec![module.id()]),
+            ConversionRoute::TwoStep { first, second, .. } => Some(vec![first.id(), second.id()]),
+        }
+    }
+
+    /// Module ids that would run for a URL → `output` conversion.
+    pub fn url_route_module_ids(&self, output: OutputFormat) -> Option<Vec<&'static str>> {
+        match self.url_route_for(output)? {
+            ConversionRoute::Direct(module) => Some(vec![module.id()]),
+            ConversionRoute::TwoStep { first, second, .. } => Some(vec![first.id(), second.id()]),
+        }
+    }
+
     fn execute_route(
         &self,
         input: &Path,
@@ -1059,6 +1087,10 @@ mod tests {
                 .available_outputs(&input)
                 .contains(&OutputFormat::PDF)
         );
+        assert_eq!(
+            registry.route_module_ids(&input, OutputFormat::PDF),
+            Some(vec!["first", "second"])
+        );
         let artifact = registry.convert_to(&input, OutputFormat::PDF).unwrap();
         assert_eq!(artifact.bytes, b"final");
         let temporary_input = seen.lock().unwrap().clone().unwrap();
@@ -1333,5 +1365,35 @@ mod tests {
                 .id(),
             "markitdown"
         );
+    }
+
+    #[test]
+    fn route_module_ids_matches_available_outputs_for_default_registry() {
+        let registry = ConversionRegistry::default();
+        for sample in [
+            "notes.txt",
+            "report.docx",
+            "scan.pdf",
+            "clip.mp4",
+            "page.html",
+        ] {
+            let input = Path::new(sample);
+            for output in registry.available_outputs(input) {
+                let ids = registry
+                    .route_module_ids(input, output)
+                    .unwrap_or_else(|| panic!("no route ids for {sample} → {}", output.id()));
+                assert!(
+                    !ids.is_empty(),
+                    "empty route for {sample} → {}",
+                    output.id()
+                );
+            }
+        }
+        for output in registry.available_url_outputs() {
+            let ids = registry
+                .url_route_module_ids(output)
+                .unwrap_or_else(|| panic!("no url route ids for {}", output.id()));
+            assert!(!ids.is_empty());
+        }
     }
 }

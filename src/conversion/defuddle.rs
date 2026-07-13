@@ -1,9 +1,10 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, LimitedOutput,
-    OutputFormat, map_spawn_error, max_output_bytes, process_timeout, run_command,
+    OutputFormat, map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
+    run_command,
 };
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use url::Url;
 
@@ -24,17 +25,10 @@ impl Default for DefuddleModule {
 }
 
 fn discover_executable() -> OsString {
-    if let Some(executable) = std::env::var_os("SHIFT_DEFUDDLE_BIN") {
-        return executable;
-    }
-
-    // Prefer a project-local node_modules binary when present.
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle");
-    if local.is_file() {
-        return local.into_os_string();
-    }
-
-    OsString::from("defuddle")
+    // Prefer a project-local node_modules binary when present. Absolute
+    // resolution matches diagnostics (PATH + common_bin_dirs).
+    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle");
+    resolve_tool_executable("SHIFT_DEFUDDLE_BIN", "defuddle", &[local])
 }
 
 impl DefuddleModule {
