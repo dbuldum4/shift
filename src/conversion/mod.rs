@@ -2,6 +2,7 @@
 
 mod defuddle;
 mod docling;
+mod ffmpeg;
 mod markitdown;
 mod pandoc;
 mod process;
@@ -12,6 +13,10 @@ use std::path::{Path, PathBuf};
 
 pub use defuddle::{DefuddleModule, looks_like_url};
 pub use docling::DoclingModule;
+pub use ffmpeg::{
+    FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
+    is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+};
 pub use markitdown::MarkItDownModule;
 pub use pandoc::PandocModule;
 pub use process::{
@@ -30,9 +35,36 @@ impl OutputFormat {
     pub const PPTX: Self = Self("pptx");
     pub const EPUB: Self = Self("epub");
 
+    // Media containers written by FFmpeg (and accepted as inputs there).
+    pub const MP3: Self = Self("mp3");
+    pub const WAV: Self = Self("wav");
+    pub const FLAC: Self = Self("flac");
+    pub const AAC: Self = Self("aac");
+    pub const M4A: Self = Self("m4a");
+    pub const OGG: Self = Self("ogg");
+    pub const OPUS: Self = Self("opus");
+    pub const AC3: Self = Self("ac3");
+    pub const WMA: Self = Self("wma");
+    pub const CAF: Self = Self("caf");
+    pub const AIFF: Self = Self("aiff");
+    pub const MP4: Self = Self("mp4");
+    pub const WEBM: Self = Self("webm");
+    pub const MKV: Self = Self("mkv");
+    pub const MOV: Self = Self("mov");
+    pub const AVI: Self = Self("avi");
+    pub const GIF: Self = Self("gif");
+    pub const M4V: Self = Self("m4v");
+    pub const MPEG: Self = Self("mpeg");
+    pub const TS: Self = Self("ts");
+    pub const THREEGP: Self = Self("3gp");
+    pub const PNG: Self = Self("png");
+    pub const JPG: Self = Self("jpg");
+    pub const SRT: Self = Self("srt");
+    pub const VTT: Self = Self("vtt");
+
     /// Every writer in Pandoc 3.10, ordered by practical end-user popularity.
     /// Closely related variants follow their best-known parent format.
-    pub const ALL: &'static [Self] = &[
+    pub const PANDOC: &'static [Self] = &[
         Self::MARKDOWN,
         Self::HTML,
         Self::PDF,
@@ -110,6 +142,148 @@ impl OutputFormat {
         Self("bbcode_hubzilla"),
     ];
 
+    /// Audio, video, still-image, and subtitle formats FFmpeg can write.
+    pub const MEDIA: &'static [Self] = &[
+        // Audio
+        Self::MP3,
+        Self::WAV,
+        Self::FLAC,
+        Self::AAC,
+        Self::M4A,
+        Self::OGG,
+        Self::OPUS,
+        Self::AC3,
+        Self::WMA,
+        Self::CAF,
+        Self::AIFF,
+        // Video
+        Self::MP4,
+        Self::WEBM,
+        Self::MKV,
+        Self::MOV,
+        Self::AVI,
+        Self::GIF,
+        Self::M4V,
+        Self::MPEG,
+        Self::TS,
+        Self::THREEGP,
+        // Still frames
+        Self::PNG,
+        Self::JPG,
+        // Subtitles
+        Self::SRT,
+        Self::VTT,
+    ];
+
+    /// Full UI/parse catalog: publishing formats first, then media.
+    ///
+    /// Prefer [`Self::all`] when iterating. This slice exists for call sites that
+    /// need a `'static` list (menus, `available_outputs` filtering).
+    pub const ALL: &'static [Self] = &[
+        // Pandoc writers (must stay in sync with `PANDOC`).
+        Self::MARKDOWN,
+        Self::HTML,
+        Self::PDF,
+        Self::DOCX,
+        Self::PPTX,
+        Self("plain"),
+        Self("gfm"),
+        Self("commonmark"),
+        Self("commonmark_x"),
+        Self::EPUB,
+        Self("epub3"),
+        Self("epub2"),
+        Self("odt"),
+        Self("rtf"),
+        Self("latex"),
+        Self("typst"),
+        Self("asciidoc"),
+        Self("asciidoctor"),
+        Self("asciidoc_legacy"),
+        Self("rst"),
+        Self("ipynb"),
+        Self("org"),
+        Self("revealjs"),
+        Self("beamer"),
+        Self("json"),
+        Self("xml"),
+        Self("opml"),
+        Self("docbook"),
+        Self("docbook5"),
+        Self("docbook4"),
+        Self("jats"),
+        Self("jats_archiving"),
+        Self("jats_articleauthoring"),
+        Self("jats_publishing"),
+        Self("bibtex"),
+        Self("biblatex"),
+        Self("csljson"),
+        Self("mediawiki"),
+        Self("jira"),
+        Self("dokuwiki"),
+        Self("xwiki"),
+        Self("zimwiki"),
+        Self("html5"),
+        Self("html4"),
+        Self("chunkedhtml"),
+        Self("markdown_github"),
+        Self("markdown_mmd"),
+        Self("markdown_phpextra"),
+        Self("markdown_strict"),
+        Self("djot"),
+        Self("textile"),
+        Self("muse"),
+        Self("markua"),
+        Self("fb2"),
+        Self("tei"),
+        Self("icml"),
+        Self("opendocument"),
+        Self("context"),
+        Self("texinfo"),
+        Self("man"),
+        Self("ms"),
+        Self("vimdoc"),
+        Self("haddock"),
+        Self("native"),
+        Self("ansi"),
+        Self("slidy"),
+        Self("slideous"),
+        Self("s5"),
+        Self("dzslides"),
+        Self("bbcode"),
+        Self("bbcode_phpbb"),
+        Self("bbcode_xenforo"),
+        Self("bbcode_steam"),
+        Self("bbcode_fluxbb"),
+        Self("bbcode_hubzilla"),
+        // Media (must stay in sync with `MEDIA`).
+        Self::MP3,
+        Self::WAV,
+        Self::FLAC,
+        Self::AAC,
+        Self::M4A,
+        Self::OGG,
+        Self::OPUS,
+        Self::AC3,
+        Self::WMA,
+        Self::CAF,
+        Self::AIFF,
+        Self::MP4,
+        Self::WEBM,
+        Self::MKV,
+        Self::MOV,
+        Self::AVI,
+        Self::GIF,
+        Self::M4V,
+        Self::MPEG,
+        Self::TS,
+        Self::THREEGP,
+        Self::PNG,
+        Self::JPG,
+        Self::SRT,
+        Self::VTT,
+    ];
+
     pub fn id(self) -> &'static str {
         self.0
     }
@@ -139,6 +313,31 @@ impl OutputFormat {
             "xml" => "Pandoc XML",
             "mediawiki" => "MediaWiki",
             "jira" => "Jira Wiki",
+            "mp3" => "MP3 Audio",
+            "wav" => "WAV Audio",
+            "flac" => "FLAC Audio",
+            "aac" => "AAC Audio",
+            "m4a" => "M4A Audio",
+            "ogg" => "Ogg Audio",
+            "opus" => "Opus Audio",
+            "ac3" => "AC-3 Audio",
+            "wma" => "WMA Audio",
+            "caf" => "Core Audio (CAF)",
+            "aiff" => "AIFF Audio",
+            "mp4" => "MP4 Video",
+            "webm" => "WebM Video",
+            "mkv" => "Matroska (MKV)",
+            "mov" => "QuickTime (MOV)",
+            "avi" => "AVI Video",
+            "gif" => "GIF",
+            "m4v" => "M4V Video",
+            "mpeg" => "MPEG Video",
+            "ts" => "MPEG-TS",
+            "3gp" => "3GP Video",
+            "png" => "PNG Image",
+            "jpg" => "JPEG Image",
+            "srt" => "SubRip (SRT)",
+            "vtt" => "WebVTT",
             other => other,
         }
     }
@@ -177,6 +376,7 @@ impl OutputFormat {
             "icml" => "icml",
             "fb2" => "fb2",
             "plain" | "ansi" => "txt",
+            // Media format ids match their file extensions.
             other => other,
         }
     }
@@ -193,8 +393,49 @@ impl OutputFormat {
             "odt" | "opendocument" => "application/vnd.oasis.opendocument.text",
             "json" | "csljson" => "application/json",
             "xml" | "docbook" | "docbook4" | "docbook5" | "jats" | "tei" => "application/xml",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "flac" => "audio/flac",
+            "aac" => "audio/aac",
+            "m4a" => "audio/mp4",
+            "ogg" => "audio/ogg",
+            "opus" => "audio/opus",
+            "ac3" => "audio/ac3",
+            "wma" => "audio/x-ms-wma",
+            "caf" => "audio/x-caf",
+            "aiff" => "audio/aiff",
+            "mp4" | "m4v" => "video/mp4",
+            "webm" => "video/webm",
+            "mkv" => "video/x-matroska",
+            "mov" => "video/quicktime",
+            "avi" => "video/x-msvideo",
+            "gif" => "image/gif",
+            "mpeg" => "video/mpeg",
+            "ts" => "video/mp2t",
+            "3gp" => "video/3gpp",
+            "png" => "image/png",
+            "jpg" => "image/jpeg",
+            "srt" => "application/x-subrip",
+            "vtt" => "text/vtt",
             _ => "text/plain",
         }
+    }
+
+    /// Text-oriented formats suitable for in-app preview excerpts.
+    pub fn is_text_previewable(self) -> bool {
+        matches!(
+            self.media_type(),
+            "text/markdown"
+                | "text/html"
+                | "text/plain"
+                | "text/vtt"
+                | "application/x-subrip"
+                | "application/json"
+                | "application/xml"
+        ) || matches!(
+            self.id(),
+            "srt" | "vtt" | "plain" | "markdown" | "html" | "gfm"
+        )
     }
 }
 
@@ -202,15 +443,27 @@ impl std::str::FromStr for OutputFormat {
     type Err = ConversionError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let lowered = value.to_ascii_lowercase();
+        let key = match lowered.as_str() {
+            "jpeg" => "jpg",
+            other => other,
+        };
         Self::ALL
             .iter()
             .copied()
             .find(|format| {
-                format.id().eq_ignore_ascii_case(value)
-                    || format.extension().eq_ignore_ascii_case(value)
+                format.id().eq_ignore_ascii_case(key)
+                    || format.extension().eq_ignore_ascii_case(key)
             })
             .ok_or_else(|| ConversionError::new(format!("unknown output format: {value}")))
     }
+}
+
+/// Optional engine knobs passed through the registry to modules that understand them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConversionOptions {
+    pub ffmpeg: FfmpegOptions,
 }
 
 /// A completed conversion, independent of how it will be presented or saved.
@@ -250,6 +503,7 @@ pub trait ConversionModule: Send + Sync {
         &self,
         input: &Path,
         output: OutputFormat,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError>;
 
     fn supports(&self, input: &Path, output: OutputFormat) -> bool {
@@ -272,6 +526,7 @@ pub trait ConversionModule: Send + Sync {
         &self,
         url: &str,
         _output: OutputFormat,
+        _options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         Err(ConversionError::new(format!(
             "{} does not support URL conversion ({url})",
@@ -300,11 +555,13 @@ impl Default for ConversionRegistry {
         // MarkItDown stays first for fast broad Markdown. Docling fills PDF →
         // HTML/plain (and higher-quality Markdown when prioritized above
         // MarkItDown). Pandoc owns publishing writers; Defuddle owns URLs.
+        // FFmpeg owns audio/video container conversion (no document overlap).
         Self::new()
             .with_module(MarkItDownModule::default())
             .with_module(PandocModule::default())
             .with_module(DefuddleModule::default())
             .with_module(DoclingModule::default())
+            .with_module(FfmpegModule::default())
     }
 }
 
@@ -431,15 +688,17 @@ impl ConversionRegistry {
         input: &Path,
         output: OutputFormat,
         route: ConversionRoute<'_>,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         match route {
-            ConversionRoute::Direct(module) => module.convert(input, output),
+            ConversionRoute::Direct(module) => module.convert(input, output, options),
             ConversionRoute::TwoStep {
                 first,
                 intermediate,
                 second,
             } => {
-                let artifact = first.convert(input, intermediate)?;
+                // First hop may be FFmpeg (trim/encode); the second hop uses defaults.
+                let artifact = first.convert(input, intermediate, options)?;
                 self.finish_chain(&artifact, output, second)
             }
         }
@@ -460,7 +719,7 @@ impl ConversionRegistry {
             .unwrap_or("converted");
         let input = workspace.join(format!("{stem}.{}", intermediate.format.extension()));
         intermediate.write_to(&input)?;
-        second.convert(&input, output)
+        second.convert(&input, output, &ConversionOptions::default())
     }
 
     pub fn available_outputs(&self, input: &Path) -> Vec<OutputFormat> {
@@ -488,6 +747,15 @@ impl ConversionRegistry {
         input: impl AsRef<Path>,
         output: OutputFormat,
     ) -> Result<ConversionArtifact, ConversionError> {
+        self.convert_to_with_options(input, output, &ConversionOptions::default())
+    }
+
+    pub fn convert_to_with_options(
+        &self,
+        input: impl AsRef<Path>,
+        output: OutputFormat,
+        options: &ConversionOptions,
+    ) -> Result<ConversionArtifact, ConversionError> {
         let input = input.as_ref();
         if !input.is_file() {
             return Err(ConversionError::new(format!(
@@ -507,13 +775,22 @@ impl ConversionRegistry {
             ))
         })?;
 
-        self.execute_route(input, output, route)
+        self.execute_route(input, output, route, options)
     }
 
     pub fn convert_url(
         &self,
         url: &str,
         output: OutputFormat,
+    ) -> Result<ConversionArtifact, ConversionError> {
+        self.convert_url_with_options(url, output, &ConversionOptions::default())
+    }
+
+    pub fn convert_url_with_options(
+        &self,
+        url: &str,
+        output: OutputFormat,
+        options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         let url = url.trim();
         if !looks_like_url(url) {
@@ -530,13 +807,13 @@ impl ConversionRegistry {
         })?;
 
         match route {
-            ConversionRoute::Direct(module) => module.convert_url(url, output),
+            ConversionRoute::Direct(module) => module.convert_url(url, output, options),
             ConversionRoute::TwoStep {
                 first,
                 intermediate,
                 second,
             } => {
-                let artifact = first.convert_url(url, intermediate)?;
+                let artifact = first.convert_url(url, intermediate, options)?;
                 self.finish_chain(&artifact, output, second)
             }
         }
@@ -694,6 +971,7 @@ mod tests {
             &self,
             input: &Path,
             output: OutputFormat,
+            _options: &ConversionOptions,
         ) -> Result<ConversionArtifact, ConversionError> {
             if let Some(seen) = &self.seen_input {
                 *seen.lock().unwrap() = Some(input.to_owned());
@@ -968,12 +1246,13 @@ mod tests {
         let registry = ConversionRegistry::default();
         assert!(registry.has_module("pandoc"));
         assert!(registry.has_module("docling"));
+        assert!(registry.has_module("ffmpeg"));
         assert!(!registry.has_module("pandocx"));
         assert!(!registry.has_module(""));
     }
 
     #[test]
-    fn pandoc_output_catalog_has_no_duplicates() {
+    fn output_catalog_has_no_duplicates() {
         let mut ids = OutputFormat::ALL
             .iter()
             .map(|format| format.id())
@@ -982,6 +1261,50 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), original_len);
+    }
+
+    #[test]
+    fn all_catalog_matches_pandoc_plus_media() {
+        assert_eq!(
+            OutputFormat::ALL.len(),
+            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len()
+        );
+        for format in OutputFormat::PANDOC {
+            assert!(OutputFormat::ALL.contains(format));
+        }
+        for format in OutputFormat::MEDIA {
+            assert!(OutputFormat::ALL.contains(format));
+        }
+    }
+
+    #[test]
+    fn media_outputs_route_to_ffmpeg() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for(Path::new("clip.mp4"), OutputFormat::MP3)
+                .unwrap()
+                .id(),
+            "ffmpeg"
+        );
+        assert_eq!(
+            registry
+                .module_for(Path::new("track.wav"), OutputFormat::FLAC)
+                .unwrap()
+                .id(),
+            "ffmpeg"
+        );
+        let video_outputs = registry.available_outputs(Path::new("clip.mov"));
+        assert!(video_outputs.contains(&OutputFormat::MP4));
+        assert!(video_outputs.contains(&OutputFormat::MP3));
+        // Video → audio (FFmpeg) → Markdown (MarkItDown) is a valid two-step route.
+        assert!(video_outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(
+            registry
+                .module_for(Path::new("clip.mov"), OutputFormat::MARKDOWN)
+                .is_none(),
+            "Markdown is only available via the FFmpeg → MarkItDown chain"
+        );
     }
 
     #[test]

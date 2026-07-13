@@ -2,13 +2,15 @@ mod file_picker;
 mod text_input;
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Bounds, Context, Entity, ExternalPaths, FontWeight,
-    KeyBinding, Menu, MenuItem, PathBuilder, PathStyle, Pixels, Point, Render, SharedString,
-    StrokeOptions, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
-    canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Application, Bounds, Context, ElementId, Entity, ExternalPaths,
+    FontWeight, KeyBinding, Menu, MenuItem, PathBuilder, PathStyle, Pixels, Point, Render,
+    SharedString, StrokeOptions, SystemMenuType, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
 };
 use shift_core::conversion::{
-    ConversionArtifact, ConversionRegistry, OutputFormat, looks_like_url,
+    ConversionArtifact, ConversionOptions, ConversionRegistry, FfmpegEncodeMode, FfmpegOptions,
+    FfmpegQuality, OutputFormat, input_looks_like_media, is_audio_output, is_ffmpeg_output,
+    is_image_output, is_subtitle_output, is_video_output, looks_like_url,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use std::path::{Path, PathBuf};
@@ -576,9 +578,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
 }
 
 fn markdown_excerpt(artifact: &ConversionArtifact) -> SharedString {
-    let text = artifact
-        .text()
-        .unwrap_or("Markdown output is not valid UTF-8.");
+    let text = artifact.text().unwrap_or("Text output is not valid UTF-8.");
     let mut excerpt: String = text.chars().take(1_200).collect();
     if text.chars().count() > 1_200 {
         excerpt.push_str("\n\n…");
@@ -589,14 +589,493 @@ fn markdown_excerpt(artifact: &ConversionArtifact) -> SharedString {
     excerpt.into()
 }
 
-fn output_panel(
+fn artifact_preview(artifact: &ConversionArtifact) -> SharedString {
+    if artifact.format.is_text_previewable() {
+        return markdown_excerpt(artifact);
+    }
+    let size = format_file_size(artifact.bytes.len() as u64);
+    format!(
+        "{} ready to download.\n\n{} · {size} · via {}\n\nBinary media is not shown inline — use Download to save the file.",
+        artifact.format.label(),
+        artifact.file_name,
+        module_label(artifact.module_id)
+    )
+    .into()
+}
+
+fn parse_optional_secs(value: &str) -> Result<Option<f64>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<f64>()
+        .map_err(|_| format!("expected seconds, got “{value}”"))
+        .and_then(|secs| {
+            if secs.is_finite() && secs >= 0.0 {
+                Ok(Some(secs))
+            } else {
+                Err("seconds must be a non-negative number".into())
+            }
+        })
+}
+
+fn parse_optional_u32(value: &str) -> Result<Option<u32>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("expected a whole number, got “{value}”"))
+}
+
+fn chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &mut Context<Shift>,
+    on_click: impl Fn(&mut Shift, &mut Context<Shift>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .bg(if selected {
+            rgb(0x2f3a46)
+        } else {
+            rgb(0x1b1f25)
+        })
+        .text_color(if selected {
+            rgb(0xe8edf3)
+        } else {
+            rgb(0x8e98a5)
+        })
+        .border_1()
+        .border_color(if selected {
+            rgb(0x4d6275)
+        } else {
+            rgb(0x303640)
+        })
+        .hover(|style| style.bg(rgb(0x252b33)))
+        .child(label.into())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            on_click(this, cx);
+            cx.stop_propagation();
+        }))
+}
+
+struct MediaPanelView {
+    output_format: OutputFormat,
+    quality: FfmpegQuality,
+    encode_mode: FfmpegEncodeMode,
+    mono: bool,
+    sample_rate_hz: Option<u32>,
+    scale_width: Option<u32>,
+    start_input: Entity<TextInput>,
+    duration_input: Entity<TextInput>,
+    frame_input: Entity<TextInput>,
+    audio_stream_input: Entity<TextInput>,
+    subtitle_stream_input: Entity<TextInput>,
+}
+
+fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl IntoElement {
+    let MediaPanelView {
+        output_format,
+        quality,
+        encode_mode,
+        mono,
+        sample_rate_hz,
+        scale_width,
+        start_input,
+        duration_input,
+        frame_input,
+        audio_stream_input,
+        subtitle_stream_input,
+    } = view;
+    let show_audio = is_audio_output(output_format) || is_video_output(output_format);
+    let show_video = is_video_output(output_format) || is_image_output(output_format);
+    let show_frame = is_image_output(output_format);
+    let show_subtitle = is_subtitle_output(output_format);
+    let show_trim = !is_image_output(output_format) && !is_subtitle_output(output_format);
+
+    div()
+        .id("media-options")
+        .flex()
+        .flex_col()
+        .gap_3()
+        .w_full()
+        .p_3()
+        .rounded_xl()
+        .bg(rgb(0x15181d))
+        .border_1()
+        .border_color(rgb(0x292e36))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xa7b0bc))
+                        .child("Media options (FFmpeg)"),
+                )
+                .child(
+                    div()
+                        .id("apply-media-options")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x2a3038))
+                        .border_1()
+                        .border_color(rgb(0x46515e))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xe8edf3))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x343b45)))
+                        .child("Apply")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.apply_media_options(cx);
+                            cx.stop_propagation();
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .items_center()
+                .child(div().text_xs().text_color(rgb(0x6e7582)).child("Quality"))
+                .child(chip(
+                    "media-quality-balanced",
+                    FfmpegQuality::Balanced.label(),
+                    quality == FfmpegQuality::Balanced,
+                    cx,
+                    |this, cx| {
+                        this.ffmpeg_quality = FfmpegQuality::Balanced;
+                        this.start_conversion(cx);
+                    },
+                ))
+                .child(chip(
+                    "media-quality-high",
+                    FfmpegQuality::High.label(),
+                    quality == FfmpegQuality::High,
+                    cx,
+                    |this, cx| {
+                        this.ffmpeg_quality = FfmpegQuality::High;
+                        this.start_conversion(cx);
+                    },
+                ))
+                .child(chip(
+                    "media-quality-small",
+                    FfmpegQuality::Small.label(),
+                    quality == FfmpegQuality::Small,
+                    cx,
+                    |this, cx| {
+                        this.ffmpeg_quality = FfmpegQuality::Small;
+                        this.start_conversion(cx);
+                    },
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .items_center()
+                .child(div().text_xs().text_color(rgb(0x6e7582)).child("Encode"))
+                .child(chip(
+                    "media-encode-auto",
+                    FfmpegEncodeMode::Auto.label(),
+                    encode_mode == FfmpegEncodeMode::Auto,
+                    cx,
+                    |this, cx| {
+                        this.ffmpeg_encode_mode = FfmpegEncodeMode::Auto;
+                        this.start_conversion(cx);
+                    },
+                ))
+                .child(chip(
+                    "media-encode-copy",
+                    FfmpegEncodeMode::PreferCopy.label(),
+                    encode_mode == FfmpegEncodeMode::PreferCopy,
+                    cx,
+                    |this, cx| {
+                        this.ffmpeg_encode_mode = FfmpegEncodeMode::PreferCopy;
+                        this.start_conversion(cx);
+                    },
+                ))
+                .child(chip(
+                    "media-encode-reencode",
+                    FfmpegEncodeMode::Reencode.label(),
+                    encode_mode == FfmpegEncodeMode::Reencode,
+                    cx,
+                    |this, cx| {
+                        this.ffmpeg_encode_mode = FfmpegEncodeMode::Reencode;
+                        this.start_conversion(cx);
+                    },
+                )),
+        )
+        .when(show_trim, |panel| {
+            panel.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x6e7582))
+                                    .child("Start (sec)"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x1b1f25))
+                                    .border_1()
+                                    .border_color(rgb(0x303640))
+                                    .child(start_input),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x6e7582))
+                                    .child("Duration (sec)"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x1b1f25))
+                                    .border_1()
+                                    .border_color(rgb(0x303640))
+                                    .child(duration_input),
+                            ),
+                    ),
+            )
+        })
+        .when(show_frame, |panel| {
+            panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6e7582))
+                            .child("Frame at (sec)"),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .px_2()
+                            .rounded_md()
+                            .bg(rgb(0x1b1f25))
+                            .border_1()
+                            .border_color(rgb(0x303640))
+                            .child(frame_input),
+                    ),
+            )
+        })
+        .when(show_audio, |panel| {
+            panel
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(rgb(0x6e7582)).child("Audio"))
+                        .child(chip(
+                            "media-mono",
+                            if mono { "Mono ✓" } else { "Mono" },
+                            mono,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_mono = !this.ffmpeg_mono;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-rate-auto",
+                            "Rate auto",
+                            sample_rate_hz.is_none(),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_sample_rate_hz = None;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-rate-44100",
+                            "44.1 kHz",
+                            sample_rate_hz == Some(44_100),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_sample_rate_hz = Some(44_100);
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-rate-48000",
+                            "48 kHz",
+                            sample_rate_hz == Some(48_000),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_sample_rate_hz = Some(48_000);
+                                this.start_conversion(cx);
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x6e7582))
+                                .child("Audio stream index"),
+                        )
+                        .child(
+                            div()
+                                .h(px(32.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(rgb(0x1b1f25))
+                                .border_1()
+                                .border_color(rgb(0x303640))
+                                .child(audio_stream_input),
+                        ),
+                )
+        })
+        .when(show_video, |panel| {
+            panel.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_xs().text_color(rgb(0x6e7582)).child("Width"))
+                    .child(chip(
+                        "media-scale-auto",
+                        "Auto",
+                        scale_width.is_none(),
+                        cx,
+                        |this, cx| {
+                            this.ffmpeg_scale_width = None;
+                            this.start_conversion(cx);
+                        },
+                    ))
+                    .child(chip(
+                        "media-scale-720",
+                        "720",
+                        scale_width == Some(720),
+                        cx,
+                        |this, cx| {
+                            this.ffmpeg_scale_width = Some(720);
+                            this.start_conversion(cx);
+                        },
+                    ))
+                    .child(chip(
+                        "media-scale-1280",
+                        "1280",
+                        scale_width == Some(1280),
+                        cx,
+                        |this, cx| {
+                            this.ffmpeg_scale_width = Some(1280);
+                            this.start_conversion(cx);
+                        },
+                    ))
+                    .child(chip(
+                        "media-scale-1920",
+                        "1920",
+                        scale_width == Some(1920),
+                        cx,
+                        |this, cx| {
+                            this.ffmpeg_scale_width = Some(1920);
+                            this.start_conversion(cx);
+                        },
+                    )),
+            )
+        })
+        .when(show_subtitle, |panel| {
+            panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6e7582))
+                            .child("Subtitle stream index"),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .px_2()
+                            .rounded_md()
+                            .bg(rgb(0x1b1f25))
+                            .border_1()
+                            .border_color(rgb(0x303640))
+                            .child(subtitle_stream_input),
+                    ),
+            )
+        })
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x5f6773))
+                .child("Edit fields, then Apply. Chips reconvert immediately."),
+        )
+}
+
+struct OutputPanelView {
     state: ConversionState,
     save_status: Option<SharedString>,
     output_format: OutputFormat,
     output_menu_open: bool,
     available_outputs: Vec<OutputFormat>,
-    cx: &mut Context<Shift>,
-) -> impl IntoElement {
+    show_media_options: bool,
+    media: MediaPanelView,
+}
+
+fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElement {
+    let OutputPanelView {
+        state,
+        save_status,
+        output_format,
+        output_menu_open,
+        available_outputs,
+        show_media_options,
+        media,
+    } = view;
     let content = match state {
         ConversionState::Empty => div()
             .flex()
@@ -611,15 +1090,15 @@ fn output_panel(
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(0xc6ccd5))
-                    .child("Markdown appears here"),
+                    .child("Output appears here"),
             )
             .child(
                 div()
-                    .max_w(px(260.0))
+                    .max_w(px(280.0))
                     .text_sm()
                     .text_color(rgb(0x767e8b))
                     .child(
-                        "Choose a supported file or paste a URL — Shift converts it automatically.",
+                        "Choose a document, media file, or paste a URL — Shift converts it automatically.",
                     ),
             ),
         ConversionState::Converting => div()
@@ -674,7 +1153,7 @@ fn output_panel(
         ConversionState::Ready(artifact) => {
             let file_name: SharedString = artifact.file_name.clone().into();
             let size = format_file_size(artifact.bytes.len() as u64);
-            let excerpt = markdown_excerpt(artifact.as_ref());
+            let excerpt = artifact_preview(artifact.as_ref());
             let conversion_detail = format!(
                 "{}  ·  {size}  ·  via {}",
                 artifact.format.label(),
@@ -844,7 +1323,13 @@ fn output_panel(
         .size_full()
         .p_8()
         .pt(px(78.0))
-        .child(content)
+        .flex()
+        .flex_col()
+        .gap_3()
+        .when(show_media_options, |panel| {
+            panel.child(media_options_panel(media, cx))
+        })
+        .child(div().flex_1().min_h_0().child(content))
         .child(
             div()
                 .absolute()
@@ -860,6 +1345,7 @@ fn module_label(id: &str) -> &str {
         "pandoc" => "Pandoc",
         "defuddle" => "Defuddle",
         "docling" => "Docling",
+        "ffmpeg" => "FFmpeg",
         other => other,
     }
 }
@@ -1074,6 +1560,17 @@ struct Shift {
     history: Vec<ConversionHistoryEntry>,
     next_history_id: u64,
     active_history_id: Option<u64>,
+    // FFmpeg media options (shown for media inputs / media outputs).
+    ffmpeg_quality: FfmpegQuality,
+    ffmpeg_encode_mode: FfmpegEncodeMode,
+    ffmpeg_mono: bool,
+    ffmpeg_sample_rate_hz: Option<u32>,
+    ffmpeg_scale_width: Option<u32>,
+    ffmpeg_start_input: Entity<TextInput>,
+    ffmpeg_duration_input: Entity<TextInput>,
+    ffmpeg_frame_input: Entity<TextInput>,
+    ffmpeg_audio_stream_input: Entity<TextInput>,
+    ffmpeg_subtitle_stream_input: Entity<TextInput>,
 }
 
 impl Shift {
@@ -1211,12 +1708,55 @@ impl Shift {
         cx.notify();
     }
 
+    fn media_options_visible(&self) -> bool {
+        let media_input = self
+            .selected_file
+            .as_ref()
+            .is_some_and(|path| input_looks_like_media(path));
+        media_input || is_ffmpeg_output(self.output_format)
+    }
+
+    fn build_conversion_options(&self, cx: &App) -> Result<ConversionOptions, String> {
+        let start_secs = parse_optional_secs(self.ffmpeg_start_input.read(cx).content())?;
+        let duration_secs = parse_optional_secs(self.ffmpeg_duration_input.read(cx).content())?;
+        let frame_secs = parse_optional_secs(self.ffmpeg_frame_input.read(cx).content())?;
+        let audio_stream = parse_optional_u32(self.ffmpeg_audio_stream_input.read(cx).content())?;
+        let subtitle_stream =
+            parse_optional_u32(self.ffmpeg_subtitle_stream_input.read(cx).content())?;
+        Ok(ConversionOptions {
+            ffmpeg: FfmpegOptions {
+                start_secs,
+                duration_secs,
+                frame_secs,
+                audio_stream,
+                subtitle_stream,
+                encode_mode: self.ffmpeg_encode_mode,
+                quality: self.ffmpeg_quality,
+                mono: self.ffmpeg_mono,
+                sample_rate_hz: self.ffmpeg_sample_rate_hz,
+                scale_width: self.ffmpeg_scale_width,
+            },
+        })
+    }
+
+    fn apply_media_options(&mut self, cx: &mut Context<Self>) {
+        self.start_conversion(cx);
+    }
+
     fn start_file_conversion(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
         let conversion_generation = self.conversion_generation;
         let generation = self.selection_generation;
         let output_format = self.output_format;
         let priority = self.module_priority.clone();
+        let options = match self.build_conversion_options(cx) {
+            Ok(options) => options,
+            Err(error) => {
+                self.conversion = ConversionState::Failed(error.into());
+                cx.notify();
+                return;
+            }
+        };
         self.conversion = ConversionState::Converting;
         self.save_status = None;
         self.active_history_id = None;
@@ -1226,7 +1766,7 @@ impl Shift {
         let conversion_task = cx.background_executor().spawn(async move {
             ConversionRegistry::default()
                 .with_priority(&priority)
-                .convert_to(&conversion_path, output_format)
+                .convert_to_with_options(&conversion_path, output_format, &options)
         });
         cx.spawn(async move |this, cx| {
             let result = conversion_task.await;
@@ -1260,6 +1800,14 @@ impl Shift {
         let generation = self.selection_generation;
         let output_format = self.output_format;
         let priority = self.module_priority.clone();
+        let options = match self.build_conversion_options(cx) {
+            Ok(options) => options,
+            Err(error) => {
+                self.conversion = ConversionState::Failed(error.into());
+                cx.notify();
+                return;
+            }
+        };
         self.conversion = ConversionState::Converting;
         self.save_status = None;
         self.active_history_id = None;
@@ -1269,7 +1817,7 @@ impl Shift {
         let conversion_task = cx.background_executor().spawn(async move {
             ConversionRegistry::default()
                 .with_priority(&priority)
-                .convert_url(&conversion_url, output_format)
+                .convert_url_with_options(&conversion_url, output_format, &options)
         });
         cx.spawn(async move |this, cx| {
             let result = conversion_task.await;
@@ -1513,6 +2061,17 @@ impl Render for Shift {
         let url_input = self.url_input.clone();
         let history = self.history.clone();
         let active_history_id = self.active_history_id;
+        let show_media_options = self.media_options_visible();
+        let ffmpeg_quality = self.ffmpeg_quality;
+        let ffmpeg_encode_mode = self.ffmpeg_encode_mode;
+        let ffmpeg_mono = self.ffmpeg_mono;
+        let ffmpeg_sample_rate_hz = self.ffmpeg_sample_rate_hz;
+        let ffmpeg_scale_width = self.ffmpeg_scale_width;
+        let ffmpeg_start_input = self.ffmpeg_start_input.clone();
+        let ffmpeg_duration_input = self.ffmpeg_duration_input.clone();
+        let ffmpeg_frame_input = self.ffmpeg_frame_input.clone();
+        let ffmpeg_audio_stream_input = self.ffmpeg_audio_stream_input.clone();
+        let ffmpeg_subtitle_stream_input = self.ffmpeg_subtitle_stream_input.clone();
 
         div()
             .id("shift-root")
@@ -1588,11 +2147,27 @@ impl Render for Shift {
                     .h_full()
                     .bg(rgb(0x101216))
                     .child(output_panel(
-                        conversion,
-                        save_status,
-                        output_format,
-                        output_menu_open,
-                        available_outputs,
+                        OutputPanelView {
+                            state: conversion,
+                            save_status,
+                            output_format,
+                            output_menu_open,
+                            available_outputs,
+                            show_media_options,
+                            media: MediaPanelView {
+                                output_format,
+                                quality: ffmpeg_quality,
+                                encode_mode: ffmpeg_encode_mode,
+                                mono: ffmpeg_mono,
+                                sample_rate_hz: ffmpeg_sample_rate_hz,
+                                scale_width: ffmpeg_scale_width,
+                                start_input: ffmpeg_start_input,
+                                duration_input: ffmpeg_duration_input,
+                                frame_input: ffmpeg_frame_input,
+                                audio_stream_input: ffmpeg_audio_stream_input,
+                                subtitle_stream_input: ffmpeg_subtitle_stream_input,
+                            },
+                        },
                         cx,
                     )),
             )
@@ -1640,7 +2215,7 @@ fn main() {
             ],
         }]);
 
-        let bounds = Bounds::centered(None, size(px(1120.0), px(640.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1180.0), px(720.0)), cx);
 
         cx.open_window(
             WindowOptions {
@@ -1651,12 +2226,17 @@ fn main() {
                     ..Default::default()
                 }),
                 app_id: Some(APP_NAME.into()),
-                window_min_size: Some(size(px(820.0), px(440.0))),
+                window_min_size: Some(size(px(900.0), px(520.0))),
                 ..Default::default()
             },
             |_, cx| {
                 let shift_entity = cx.new(|cx| {
                     let url_input = cx.new(|cx| TextInput::new(cx, "Paste a URL to extract…", ""));
+                    let ffmpeg_start_input = cx.new(|cx| TextInput::new(cx, "0", ""));
+                    let ffmpeg_duration_input = cx.new(|cx| TextInput::new(cx, "optional", ""));
+                    let ffmpeg_frame_input = cx.new(|cx| TextInput::new(cx, "0", ""));
+                    let ffmpeg_audio_stream_input = cx.new(|cx| TextInput::new(cx, "0", ""));
+                    let ffmpeg_subtitle_stream_input = cx.new(|cx| TextInput::new(cx, "0", ""));
                     Shift {
                         selected_file: None,
                         selected_url: None,
@@ -1674,6 +2254,16 @@ fn main() {
                         history: Vec::new(),
                         next_history_id: 1,
                         active_history_id: None,
+                        ffmpeg_quality: FfmpegQuality::default(),
+                        ffmpeg_encode_mode: FfmpegEncodeMode::default(),
+                        ffmpeg_mono: false,
+                        ffmpeg_sample_rate_hz: None,
+                        ffmpeg_scale_width: None,
+                        ffmpeg_start_input,
+                        ffmpeg_duration_input,
+                        ffmpeg_frame_input,
+                        ffmpeg_audio_stream_input,
+                        ffmpeg_subtitle_stream_input,
                     }
                 });
 

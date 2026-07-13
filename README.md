@@ -13,8 +13,10 @@ set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle)
 which removes clutter and returns clean Markdown or HTML.
 [Docling](https://github.com/docling-project/docling) reads PDFs and other
 documents with layout-aware parsing and exports Markdown, HTML, or plain text
-(including PDF → HTML). The output menu ranks mainstream formats first, followed
-by authoring, publishing, wiki, presentation, and specialized formats.
+(including PDF → HTML). [FFmpeg](https://ffmpeg.org/) converts audio and video containers, extracts
+still frames and subtitles, and exposes trim/quality/stream options in the app
+and CLI. The output menu ranks mainstream formats first, followed by authoring,
+publishing, wiki, presentation, media, and specialized formats.
 
 ## Supported input
 
@@ -23,7 +25,9 @@ by authoring, publishing, wiki, presentation, and specialized formats.
 - Word (`.docx`)
 - Excel (`.xlsx`, `.xls`)
 - Images (`.bmp`, `.gif`, `.heic`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`)
-- Audio (`.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.wav`)
+- Audio (`.aac`, `.ac3`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.wma`, …)
+- Video (`.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`, `.gif`, `.ts`, `.3gp`, and related containers)
+- Stills used as media sources (`.png`, `.jpg`, `.webp`, …)
 - HTML (`.html`, `.htm`)
 - Text-based data (`.csv`, `.json`, `.xml`, `.txt`, `.md`)
 - ZIP archives (`.zip`, converted by iterating over supported contents)
@@ -48,15 +52,19 @@ Shift discovers this project-local environment automatically. If the executable
 is installed somewhere else, set
 `SHIFT_MARKITDOWN_BIN=/absolute/path/to/markitdown`.
 
-- Pandoc for multi-format output:
+- Pandoc for multi-format output (plus Typst for PDF):
 
 ```sh
-brew install pandoc
+brew install pandoc typst
 ```
 
 Set `SHIFT_PANDOC_BIN=/absolute/path/to/pandoc` when it is not available on
-`PATH`. PDF output may additionally require one of Pandoc's supported PDF
-engines.
+`PATH`. PDF output needs an external engine; Shift auto-selects the first one
+it finds, preferring **Typst** (lightweight, recommended for new installs),
+then Tectonic, then classic LaTeX engines (`xelatex` / `lualatex` /
+`pdflatex`). Override with `SHIFT_PDF_ENGINE=/path/to/engine` if needed.
+Without any engine, DOCX → PDF fails with an install hint instead of Pandoc's
+raw `pdflatex not found` message.
 
 - [Defuddle](https://github.com/kepano/defuddle) for extracting clean article
   content from web pages (URLs) or local HTML:
@@ -82,10 +90,28 @@ Set `SHIFT_DOCLING_BIN=/absolute/path/to/docling` when it is not available on
 `PATH`. First runs may download model weights. Prefer Docling above MarkItDown
 in Settings when you want higher-quality PDF → Markdown.
 
+- [FFmpeg](https://ffmpeg.org/) for audio and video conversion:
+
+```sh
+brew install ffmpeg
+```
+
+Set `SHIFT_FFMPEG_BIN=/absolute/path/to/ffmpeg` when it is not available on
+`PATH`. Media conversions write into a temporary workspace and return the
+artifact without modifying the source file. Large outputs may need a higher
+`SHIFT_CONVERSION_MAX_OUTPUT_BYTES` (default 64 MiB).
+
+In the native app, selecting a media file (or a media output format) reveals a
+**Media options** panel: quality, encode mode, trim start/duration, frame time
+for stills, mono/sample rate, scale width, and audio/subtitle stream indices.
+Use **Apply** after editing text fields; chips reconvert immediately.
+
 Shift exposes every writer reported by Pandoc 3.10, including Markdown
 variants, HTML, PDF, Word, PowerPoint, EPUB, ODT, RTF, LaTeX, Typst, AsciiDoc,
 reStructuredText, Jupyter, Org, DocBook, JATS, bibliography formats, wiki
-formats, web/Beamer slides, ICML, TEI, and Pandoc's specialized serializers.
+formats, web/Beamer slides, ICML, TEI, and Pandoc's specialized serializers,
+plus FFmpeg media outputs (audio, video, PNG/JPEG frames, SRT/VTT
+subtitles).
 
 ## Native app
 
@@ -126,6 +152,20 @@ cargo run --bin shift-cli -- scan.pdf --to html --module docling
 # Prefer Docling for PDF → Markdown quality
 cargo run --bin shift-cli -- scan.pdf --module docling
 
+# Extract audio from a video with FFmpeg
+cargo run --bin shift-cli -- clip.mp4 --to mp3
+
+# Trim, re-encode, and scale
+cargo run --bin shift-cli -- clip.mp4 --to mp4 --start 10 --duration 30 \
+  --quality high --scale-width 1280
+
+# Still frame and subtitles
+cargo run --bin shift-cli -- clip.mkv --to png --frame 12.5
+cargo run --bin shift-cli -- clip.mkv --to srt --subtitle-stream 0
+
+# Convert audio containers
+cargo run --bin shift-cli -- track.wav --to flac --module ffmpeg
+
 # Pipe Markdown to another command
 cargo run --bin shift-cli -- data.xlsx --stdout
 
@@ -142,7 +182,8 @@ same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
 GPUI app ─────┐                          ┌─ MarkItDownModule
               ├── ConversionRegistry ───┼─ PandocModule
 shift-cli ────┘                          ├─ DefuddleModule  (URLs + HTML)
-                                         └─ DoclingModule   (PDF/office → md/html/text)
+                                         ├─ DoclingModule   (PDF/office → md/html/text)
+                                         └─ FfmpegModule    (audio/video/stills/subs)
 ```
 
 `src/conversion/` is the product boundary. A module advertises supported

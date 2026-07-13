@@ -1,6 +1,6 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, LimitedOutput, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, run_command,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, LimitedOutput,
+    OutputFormat, map_spawn_error, max_output_bytes, process_timeout, run_command,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -141,6 +141,7 @@ impl ConversionModule for DefuddleModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
+        _options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !OUTPUTS.contains(&output_format) {
             return Err(ConversionError::new(format!(
@@ -166,6 +167,7 @@ impl ConversionModule for DefuddleModule {
         &self,
         url: &str,
         output_format: OutputFormat,
+        _options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         DefuddleModule::convert_url(self, url, output_format)
     }
@@ -291,7 +293,7 @@ mod tests {
         std::fs::write(&input, "<html><body><p>raw</p></body></html>").unwrap();
 
         let artifact = DefuddleModule::with_executable(&executable)
-            .convert(&input, OutputFormat::HTML)
+            .convert(&input, OutputFormat::HTML, &ConversionOptions::default())
             .unwrap();
 
         assert_eq!(

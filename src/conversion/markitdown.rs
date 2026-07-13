@@ -1,6 +1,6 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, OutputFormat, map_spawn_error,
-    max_output_bytes, process_timeout, run_command,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
+    map_spawn_error, max_output_bytes, process_timeout, run_command,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -90,6 +90,7 @@ impl ConversionModule for MarkItDownModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
+        _options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if output_format != OutputFormat::MARKDOWN {
             return Err(ConversionError::new("MarkItDown only produces Markdown"));
@@ -137,7 +138,11 @@ mod tests {
         std::fs::write(&input, "# Converted\n").unwrap();
 
         let artifact = MarkItDownModule::with_executable("/bin/cat")
-            .convert(&input, OutputFormat::MARKDOWN)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
             .unwrap();
 
         assert_eq!(

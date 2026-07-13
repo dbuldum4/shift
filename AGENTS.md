@@ -27,10 +27,15 @@ handles publishing formats and overlaps on some document-to-Markdown paths.
 Defuddle extracts clean article content from `http(s)` URLs and local HTML
 (Markdown or HTML output). Docling reads PDFs and other documents with strong
 layout awareness and exports Markdown, HTML, or plain text (enabling PDF →
-HTML, which MarkItDown and Pandoc cannot do). Keep capability lists explicit so
+HTML, which MarkItDown and Pandoc cannot do). FFmpeg converts audio and video
+containers, still frames, and subtitle tracks (for example MP4 → MP3, WAV →
+FLAC, video → PNG, MKV → SRT). Optional `ConversionOptions.ffmpeg` knobs cover
+trim, stream selection, encode mode (auto / stream copy / re-encode), quality,
+mono, sample rate, and scale. FFmpeg has no document-format overlap with the
+other modules, but chainable audio and image outputs enable two-step routes such
+as video → MP3 → Markdown via MarkItDown. Keep capability lists explicit so
 unsupported pairs fail before an external process is launched. If a new module
-overlaps an existing conversion pair, document and test the registry
-precedence.
+overlaps an existing conversion pair, document and test the registry precedence.
 
 ## Verification
 

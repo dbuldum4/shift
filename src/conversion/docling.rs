@@ -1,6 +1,6 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, OutputFormat, map_spawn_error,
-    max_output_bytes, process_timeout, read_file_limited, run_command,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
+    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, run_command,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -190,6 +190,7 @@ impl ConversionModule for DoclingModule {
         &self,
         input: &Path,
         output_format: OutputFormat,
+        _options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !OUTPUTS.contains(&output_format) {
             return Err(ConversionError::new(format!(
@@ -279,7 +280,7 @@ printf '%s' "$body" > "$output/$stem.$ext"
         fs::write(&input, b"%PDF-1.4 fake").unwrap();
 
         let artifact = DoclingModule::with_executable(&executable)
-            .convert(&input, OutputFormat::HTML)
+            .convert(&input, OutputFormat::HTML, &ConversionOptions::default())
             .unwrap();
 
         assert_eq!(
@@ -316,11 +317,19 @@ printf '%s' "$body" > "$output/$stem.$ext"
 
         let module = DoclingModule::with_executable(&executable);
 
-        let markdown = module.convert(&input, OutputFormat::MARKDOWN).unwrap();
+        let markdown = module
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
         assert_eq!(markdown.text(), Some("# From Docling"));
         assert!(markdown.file_name.ends_with(".md"));
 
-        let plain = module.convert(&input, OutputFormat("plain")).unwrap();
+        let plain = module
+            .convert(&input, OutputFormat("plain"), &ConversionOptions::default())
+            .unwrap();
         assert_eq!(plain.text(), Some("From Docling"));
         assert!(plain.file_name.ends_with(".txt"));
 
@@ -339,7 +348,11 @@ printf '%s' "$body" > "$output/$stem.$ext"
     #[test]
     fn rejects_unsupported_output_formats() {
         let err = DoclingModule::with_executable("docling")
-            .convert(Path::new("scan.pdf"), OutputFormat::DOCX)
+            .convert(
+                Path::new("scan.pdf"),
+                OutputFormat::DOCX,
+                &ConversionOptions::default(),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("Word") || err.to_string().contains("DOCX"));
     }

@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-const DEFAULT_MODULES: &[&str] = &["markitdown", "pandoc", "defuddle", "docling"];
+const DEFAULT_MODULES: &[&str] = &["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
 
 pub fn default_module_priority() -> Vec<String> {
     DEFAULT_MODULES.iter().map(|id| (*id).to_owned()).collect()
@@ -65,7 +65,7 @@ mod tests {
     fn normalization_removes_unknowns_and_appends_missing_modules() {
         assert_eq!(
             normalize(["pandoc", "unknown", "pandoc"]),
-            vec!["pandoc", "markitdown", "defuddle", "docling"]
+            vec!["pandoc", "markitdown", "defuddle", "docling", "ffmpeg"]
         );
     }
 }

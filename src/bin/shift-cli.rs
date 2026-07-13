@@ -1,5 +1,6 @@
 use shift_core::conversion::{
-    ConversionRegistry, OutputFormat, default_output_path, looks_like_url, paths_refer_to_same_file,
+    ConversionOptions, ConversionRegistry, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
+    OutputFormat, default_output_path, looks_like_url, paths_refer_to_same_file,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -49,6 +50,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     let mut force = false;
     let mut target = OutputFormat::MARKDOWN;
     let mut preferred_module: Option<String> = None;
+    let mut ffmpeg = FfmpegOptions::default();
     while cursor < arguments.len() {
         match arguments[cursor].to_string_lossy().as_ref() {
             "-o" | "--output" => {
@@ -81,6 +83,88 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
                         .into_owned(),
                 );
             }
+            "--start" => {
+                cursor += 1;
+                ffmpeg.start_secs = Some(parse_secs(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--start requires seconds".to_owned())?,
+                    "--start",
+                )?);
+            }
+            "--duration" => {
+                cursor += 1;
+                ffmpeg.duration_secs = Some(parse_secs(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--duration requires seconds".to_owned())?,
+                    "--duration",
+                )?);
+            }
+            "--frame" => {
+                cursor += 1;
+                ffmpeg.frame_secs = Some(parse_secs(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--frame requires seconds".to_owned())?,
+                    "--frame",
+                )?);
+            }
+            "--audio-stream" => {
+                cursor += 1;
+                ffmpeg.audio_stream = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--audio-stream requires an index".to_owned())?,
+                    "--audio-stream",
+                )?);
+            }
+            "--subtitle-stream" => {
+                cursor += 1;
+                ffmpeg.subtitle_stream = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--subtitle-stream requires an index".to_owned())?,
+                    "--subtitle-stream",
+                )?);
+            }
+            "--encode" => {
+                cursor += 1;
+                ffmpeg.encode_mode = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--encode requires auto|copy|reencode".to_owned())?
+                    .to_string_lossy()
+                    .parse::<FfmpegEncodeMode>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--quality" => {
+                cursor += 1;
+                ffmpeg.quality = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--quality requires balanced|high|small".to_owned())?
+                    .to_string_lossy()
+                    .parse::<FfmpegQuality>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--mono" => ffmpeg.mono = true,
+            "--sample-rate" => {
+                cursor += 1;
+                ffmpeg.sample_rate_hz = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--sample-rate requires Hz".to_owned())?,
+                    "--sample-rate",
+                )?);
+            }
+            "--scale-width" => {
+                cursor += 1;
+                ffmpeg.scale_width = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--scale-width requires pixels".to_owned())?,
+                    "--scale-width",
+                )?);
+            }
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
         cursor += 1;
@@ -107,14 +191,15 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         registry.with_priority(&load_module_priority())
     };
 
+    let options = ConversionOptions { ffmpeg };
     let input_url = url_input(&input);
     let artifact = if let Some(url) = input_url {
         registry
-            .convert_url(url, target)
+            .convert_url_with_options(url, target, &options)
             .map_err(|error| error.to_string())?
     } else {
         registry
-            .convert_to(PathBuf::from(&input), target)
+            .convert_to_with_options(PathBuf::from(&input), target, &options)
             .map_err(|error| error.to_string())?
     };
 
@@ -196,12 +281,39 @@ fn print_formats() {
     }
 }
 
+fn parse_secs(value: &OsStr, flag: &str) -> Result<f64, String> {
+    value
+        .to_str()
+        .ok_or_else(|| format!("{flag} value is not valid UTF-8"))?
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} expects a number of seconds"))
+}
+
+fn parse_u32(value: &OsStr, flag: &str) -> Result<u32, String> {
+    value
+        .to_str()
+        .ok_or_else(|| format!("{flag} value is not valid UTF-8"))?
+        .parse::<u32>()
+        .map_err(|_| format!("{flag} expects a non-negative integer"))
+}
+
 fn print_help() {
     println!(
         "Shift converts files and URLs through the same modules as the native app.\n\n\
          Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force] [--module <ID>]\n  \
          shift-cli convert <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force]\n  \
          shift-cli formats\n\n\
+         Media (FFmpeg) options:\n  \
+         --start <SEC>           Seek to timestamp before converting\n  \
+         --duration <SEC>        Limit output length\n  \
+         --frame <SEC>           Still-image frame time (png/jpg/webp)\n  \
+         --audio-stream <N>      Audio stream index (0-based among audio streams)\n  \
+         --subtitle-stream <N>   Subtitle stream index for srt/vtt\n  \
+         --encode auto|copy|reencode\n  \
+         --quality balanced|high|small\n  \
+         --mono                  Downmix to mono when re-encoding\n  \
+         --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
+         --scale-width <PX>      Scale video/image width (height auto)\n\n\
          URLs (http/https) are extracted with Defuddle.\n\
          Use `shift-cli formats` to list every installed conversion capability.\n\
          If no output is supplied, Shift writes beside the source (or the current directory for URLs).\n\
