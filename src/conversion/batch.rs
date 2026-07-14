@@ -491,7 +491,7 @@ pub fn prepare_batch_destination(
 
     if destination.exists() && !force {
         return Err(ConversionError::new(format!(
-            "output already exists: {} (pass force to overwrite)",
+            "output already exists: {} (pass --force / enable Overwrite to replace)",
             destination.display()
         )));
     }
@@ -546,7 +546,18 @@ fn uniquify_against_claimed(preferred: &Path, claimed: &[PathBuf], check_disk: b
             return candidate;
         }
     }
-    preferred.to_path_buf()
+    // Exhausted the short numeric namespace; fall back to a unique token so we
+    // never return a path still present in `claimed` or on disk.
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = if extension.is_empty() {
+        format!("{stem}-{token}")
+    } else {
+        format!("{stem}-{token}.{extension}")
+    };
+    parent.join(name)
 }
 
 fn convert_source(
@@ -667,15 +678,10 @@ pub fn run_batch(
 
         match result {
             Ok((path, module_id, byte_len)) => {
-                if cancel.load(Ordering::SeqCst) {
-                    // Convert finished after cancel; do not treat as success if
-                    // the user already asked to stop (file may still exist).
-                    if let Some(item) = queue.get_mut(id) {
-                        item.state = BatchItemState::Cancelled;
-                    }
-                    summary.cancelled += 1;
-                    on_event(BatchEvent::ItemCancelled { id, source_name });
-                } else if let Some(item) = queue.get_mut(id) {
+                // Write already committed: always report success so cancel-then-retry
+                // does not leave an on-disk file marked Cancelled (which would fail
+                // with "already exists" under force: false).
+                if let Some(item) = queue.get_mut(id) {
                     item.state = BatchItemState::Succeeded {
                         written_path: path.clone(),
                         module_id: module_id.clone(),
@@ -1083,5 +1089,171 @@ mod tests {
         assert_eq!(progress.succeeded, 1);
         assert_eq!(progress.failed, 1);
         assert!(progress.is_idle());
+    }
+
+    #[test]
+    fn cancel_after_successful_write_still_counts_as_success() {
+        // Convert finishes, then cancel is set before the runner records state.
+        // The file is already on disk — reporting Cancelled would strand retry
+        // under force: false with "already exists".
+        let dir = unique_dir("cancel-after-write");
+        let input = dir.join("doc.txt");
+        std::fs::write(&input, b"x").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "fake",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN],
+            payload: b"# ok\n",
+            fail_once: None,
+            delay_ms: 0,
+        });
+
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out.clone()),
+            force: false,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        let id = queue.enqueue(BatchSource::File(input), &opts);
+        let dest = out.join("doc.md");
+        queue.items_mut()[0].destination = dest.clone();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancel);
+        let summary = run_batch(&mut queue, &registry, &cancel, |event| {
+            if matches!(event, BatchEvent::ItemSucceeded { .. }) {
+                // Simulate a late cancel arriving after the write committed.
+                cancel_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert_eq!(
+            summary.succeeded, 1,
+            "post-write cancel must not demote success"
+        );
+        assert_eq!(summary.cancelled, 0);
+        assert!(matches!(
+            queue.get(id).unwrap().state,
+            BatchItemState::Succeeded { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"# ok\n");
+
+        // Retry is unnecessary; force:false still works for a fresh item path.
+        let input2 = dir.join("other.txt");
+        std::fs::write(&input2, b"y").unwrap();
+        let id2 = queue.enqueue(BatchSource::File(input2), &opts);
+        queue
+            .items_mut()
+            .iter_mut()
+            .find(|item| item.id == id2)
+            .unwrap()
+            .destination = out.join("other.md");
+        cancel.store(false, Ordering::SeqCst);
+        let summary2 = run_batch(&mut queue, &registry, &cancel, |_| {});
+        assert_eq!(summary2.succeeded, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancel_before_write_does_not_leave_output() {
+        let dir = unique_dir("cancel-before-write");
+        let input = dir.join("doc.txt");
+        std::fs::write(&input, b"x").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Module that sets cancel during convert so write never runs.
+        struct CancelDuringConvert {
+            flag: Arc<AtomicBool>,
+        }
+        impl ConversionModule for CancelDuringConvert {
+            fn id(&self) -> &'static str {
+                "cancel-mid"
+            }
+            fn label(&self) -> &'static str {
+                "cancel-mid"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                _output: OutputFormat,
+                options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                self.flag.store(true, Ordering::SeqCst);
+                if options
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::SeqCst))
+                {
+                    return Err(ConversionError::cancelled());
+                }
+                Ok(ConversionArtifact {
+                    file_name: "out.md".into(),
+                    media_type: "text/markdown",
+                    bytes: b"should-not-write".to_vec(),
+                    format: OutputFormat::MARKDOWN,
+                    module_id: "cancel-mid",
+                })
+            }
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let registry = ConversionRegistry::new().with_module(CancelDuringConvert {
+            flag: Arc::clone(&cancel),
+        });
+
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out.clone()),
+            force: false,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        queue.enqueue(BatchSource::File(input), &opts);
+        let dest = out.join("doc.md");
+        queue.items_mut()[0].destination = dest.clone();
+
+        let summary = run_batch(&mut queue, &registry, &cancel, |_| {});
+        assert_eq!(summary.cancelled, 1);
+        assert_eq!(summary.succeeded, 0);
+        assert!(!dest.exists(), "cancelled convert must not write output");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uniquify_against_claimed_never_returns_taken_path() {
+        let preferred = PathBuf::from("/out/report.md");
+        // Claim preferred and every numeric suffix the short loop tries.
+        let mut claimed = vec![preferred.clone()];
+        for index in 1..10_000 {
+            claimed.push(PathBuf::from(format!("/out/report-{index}.md")));
+        }
+        let resolved = uniquify_against_claimed(&preferred, &claimed, false);
+        assert!(
+            !claimed.contains(&resolved),
+            "resolved path must not collide with claimed set: {}",
+            resolved.display()
+        );
+        assert!(
+            resolved
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("report-") && n.ends_with(".md")),
+            "unexpected name: {}",
+            resolved.display()
+        );
     }
 }

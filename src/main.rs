@@ -11,8 +11,9 @@ use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchItem, BatchItemId, BatchItemState, BatchQueue,
     BatchSource, ConversionArtifact, ConversionOptions, ConversionRegistry, DiagnosticsReport,
     FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, OutputFormat, Readiness,
-    input_looks_like_media, is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output,
-    is_video_output, looks_like_url, run_batch,
+    available_ready_outputs, available_ready_url_outputs, input_looks_like_media, is_audio_output,
+    is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output, looks_like_url,
+    paths_refer_to_same_file, run_batch,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use std::path::{Path, PathBuf};
@@ -51,6 +52,8 @@ const STATUS_MISSING_TEXT: u32 = 0x888888;
 const STATUS_MISSING_BORDER: u32 = 0x333333;
 /// Cap session history so large conversion artifacts cannot grow without bound.
 const MAX_HISTORY_ENTRIES: usize = 30;
+/// Full artifact bytes retained per history entry; larger results store metadata only.
+const MAX_HISTORY_ARTIFACT_BYTES: usize = 512 * 1024;
 const HISTORY_SIDEBAR_WIDTH: f32 = 220.0;
 const SETTINGS_SIDEBAR_WIDTH: f32 = 220.0;
 
@@ -115,6 +118,11 @@ enum HistorySource {
 #[derive(Clone)]
 enum HistoryOutcome {
     Ready(Arc<ConversionArtifact>),
+    /// Large media/document not retained in RAM; restore re-runs conversion.
+    ReadyLarge {
+        module_id: SharedString,
+        byte_len: usize,
+    },
     Failed(SharedString),
 }
 
@@ -361,6 +369,7 @@ fn batch_queue_panel(
     items: &[BatchItem],
     output_dir: Option<&Path>,
     running: bool,
+    force: bool,
     status: Option<SharedString>,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
@@ -378,6 +387,11 @@ fn batch_queue_panel(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "Beside each source".into())
         .into();
+    let force_label: SharedString = if force {
+        "Overwrite: on".into()
+    } else {
+        "Overwrite: off".into()
+    };
 
     div()
         .id("batch-queue-panel")
@@ -420,6 +434,35 @@ fn batch_queue_panel(
                                 .child("Folder")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.choose_output_folder(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("batch-action-force")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if force {
+                                    rgb(BG_ACTIVE)
+                                } else {
+                                    rgb(BG_ELEVATED)
+                                })
+                                .border_1()
+                                .border_color(if force {
+                                    rgb(BORDER_FOCUS)
+                                } else {
+                                    rgb(BORDER_STRONG)
+                                })
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .cursor_pointer()
+                                .hover(|style| {
+                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                })
+                                .child(force_label)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_batch_force(cx);
                                 })),
                         )
                         .when(can_start, |row| {
@@ -1381,6 +1424,8 @@ struct OutputPanelView {
     output_format: OutputFormat,
     output_menu_open: bool,
     available_outputs: Vec<OutputFormat>,
+    /// Formats whose engines are installed and ready (subset of available when diagnostics known).
+    ready_outputs: Option<Vec<OutputFormat>>,
     show_media_options: bool,
     media: MediaPanelView,
 }
@@ -1392,6 +1437,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
         output_format,
         output_menu_open,
         available_outputs,
+        ready_outputs,
         show_media_options,
         media,
     } = view;
@@ -1444,6 +1490,23 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(format!("Converting to {}…", output_format.label())),
+            )
+            .child(
+                div()
+                    .id("cancel-conversion")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(BG_ELEVATED))
+                    .border_1()
+                    .border_color(rgb(BORDER_STRONG))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+                    .child("Cancel")
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_conversion(cx))),
             ),
         ConversionState::Failed(message) => div()
             .flex()
@@ -1606,6 +1669,17 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .children(OutputFormat::ALL.iter().copied().enumerate().map(
                         |(index, format)| {
                             let enabled = available_outputs.contains(&format);
+                            let engine_ready = ready_outputs
+                                .as_ref()
+                                .map(|ready| ready.contains(&format))
+                                .unwrap_or(true);
+                            let label_color = if !enabled {
+                                rgb(TEXT_DIM)
+                            } else if !engine_ready {
+                                rgb(TEXT_MUTED)
+                            } else {
+                                rgb(TEXT_PRIMARY)
+                            };
                             div()
                                 .id(("output-format", index))
                                 .flex()
@@ -1615,11 +1689,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 .py_2()
                                 .rounded_md()
                                 .text_sm()
-                                .text_color(if enabled {
-                                    rgb(TEXT_PRIMARY)
-                                } else {
-                                    rgb(TEXT_DIM)
-                                })
+                                .text_color(label_color)
                                 .when(enabled, |row| {
                                     row.cursor_pointer()
                                         .hover(|style| style.bg(rgb(BG_HOVER)))
@@ -1628,7 +1698,21 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                             cx.stop_propagation();
                                         }))
                                 })
-                                .child(format.label())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(format.label())
+                                        .when(enabled && !engine_ready, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_DIM))
+                                                    .child("missing"),
+                                            )
+                                        }),
+                                )
                                 .when(format == output_format, |row| {
                                     row.child(div().text_color(rgb(TEXT)).child("✓"))
                                 })
@@ -2933,6 +3017,10 @@ struct Shift {
     batch_generation: u64,
     batch_cancel: Arc<AtomicBool>,
     batch_status: Option<SharedString>,
+    /// When true, batch writes overwrite existing outputs (CLI `--force` parity).
+    batch_force: bool,
+    /// Cooperative cancel for the active single-file / single-URL conversion.
+    conversion_cancel: Arc<AtomicBool>,
     // FFmpeg media options (shown for media inputs / media outputs).
     ffmpeg_quality: FfmpegQuality,
     ffmpeg_encode_mode: FfmpegEncodeMode,
@@ -3078,7 +3166,7 @@ impl Shift {
             output_format: self.output_format,
             conversion: options,
             output_dir: self.batch_output_dir.clone(),
-            force: false,
+            force: self.batch_force,
         };
         let sources = paths
             .into_iter()
@@ -3126,6 +3214,7 @@ impl Shift {
             if matches!(item.state, BatchItemState::Queued) {
                 item.output_format = self.output_format;
                 item.options = options.clone();
+                item.force = self.batch_force;
                 item.destination = shift_core::conversion::resolve_destination(
                     &item.source,
                     item.output_format,
@@ -3187,8 +3276,18 @@ impl Shift {
                     }
                     let _ = this.update(cx, |this, cx| {
                         if this.batch_generation != generation {
-                            // Cleared or superseded: leave UI queue and running flag alone
-                            // (a newer batch may already own batch_running).
+                            // Abandoned by Clear: release the running lock so a new
+                            // batch can start. Do not restore the worker's queue onto
+                            // the UI (user already cleared it).
+                            this.batch_running = false;
+                            if this
+                                .batch_status
+                                .as_ref()
+                                .is_some_and(|s| s.as_ref().starts_with("Clearing"))
+                            {
+                                this.batch_status = Some("Queue cleared.".into());
+                            }
+                            cx.notify();
                             return;
                         }
                         this.batch_queue = queue;
@@ -3212,6 +3311,30 @@ impl Shift {
             }
         })
         .detach();
+    }
+
+    fn toggle_batch_force(&mut self, cx: &mut Context<Self>) {
+        if self.batch_running {
+            self.batch_status = Some("Cannot change Overwrite while a batch is running.".into());
+            cx.notify();
+            return;
+        }
+        self.batch_force = !self.batch_force;
+        // Keep already-queued items in sync with the toggle.
+        for item in self.batch_queue.items_mut() {
+            if matches!(item.state, BatchItemState::Queued) {
+                item.force = self.batch_force;
+            }
+        }
+        self.batch_status = Some(
+            if self.batch_force {
+                "Overwrite existing outputs: on (CLI --force)."
+            } else {
+                "Overwrite existing outputs: off."
+            }
+            .into(),
+        );
+        cx.notify();
     }
 
     fn apply_batch_event(&mut self, event: BatchEvent) {
@@ -3309,16 +3432,21 @@ impl Shift {
         if self.batch_running {
             self.batch_cancel.store(true, Ordering::SeqCst);
             // Discard the worker result so Clear is durable when the run finishes.
+            // Keep batch_running true until that worker exits so start_batch cannot
+            // spawn a second concurrent run_batch against overlapping destinations.
             self.batch_generation = self.batch_generation.wrapping_add(1);
-            self.batch_running = false;
+            self.batch_status = Some("Clearing queue…".into());
+        } else {
+            self.batch_status = None;
         }
         self.batch_queue.clear();
-        self.batch_status = None;
         cx.notify();
     }
 
     fn set_selected_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         file_picker::remember_directory(&path);
+        self.cancel_active_conversion();
+        self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
 
@@ -3375,6 +3503,7 @@ impl Shift {
         if !looks_like_url(&url) {
             // Invalidate any in-flight conversion so a late success cannot
             // replace this validation error with an unrelated Ready state.
+            self.cancel_active_conversion();
             self.selection_generation = self.selection_generation.wrapping_add(1);
             self.conversion_generation = self.conversion_generation.wrapping_add(1);
             self.selected_file = None;
@@ -3389,6 +3518,8 @@ impl Shift {
             return;
         }
 
+        self.cancel_active_conversion();
+        self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selected_file = None;
         self.selected_url = Some(url.clone());
@@ -3460,17 +3591,37 @@ impl Shift {
         })
     }
 
+    /// Signal any in-flight single conversion to abort its external process.
+    fn cancel_active_conversion(&mut self) {
+        self.conversion_cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// User-facing cancel for the active single-file / single-URL conversion.
+    fn cancel_conversion(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.conversion, ConversionState::Converting) {
+            return;
+        }
+        self.cancel_active_conversion();
+        self.conversion_generation = self.conversion_generation.wrapping_add(1);
+        self.conversion = ConversionState::Failed("Conversion cancelled.".into());
+        self.save_status = None;
+        cx.notify();
+    }
+
     fn apply_media_options(&mut self, cx: &mut Context<Self>) {
         self.start_conversion(cx);
     }
 
     fn start_file_conversion(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // Kill any previous single convert before starting a new one.
+        self.cancel_active_conversion();
+        self.conversion_cancel = Arc::new(AtomicBool::new(false));
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
         let conversion_generation = self.conversion_generation;
         let generation = self.selection_generation;
         let output_format = self.output_format;
         let priority = self.module_priority.clone();
-        let options = match self.build_conversion_options(cx) {
+        let mut options = match self.build_conversion_options(cx) {
             Ok(options) => options,
             Err(error) => {
                 self.conversion = ConversionState::Failed(error.into());
@@ -3478,6 +3629,7 @@ impl Shift {
                 return;
             }
         };
+        options.cancel = Some(Arc::clone(&self.conversion_cancel));
         self.conversion = ConversionState::Converting;
         self.save_status = None;
         self.active_history_id = None;
@@ -3502,6 +3654,9 @@ impl Shift {
                             this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)));
                             ConversionState::Ready(artifact)
                         }
+                        Err(error) if error.is_cancelled() => {
+                            ConversionState::Failed("Conversion cancelled.".into())
+                        }
                         Err(error) => {
                             let message: SharedString = error.to_string().into();
                             this.record_history(HistoryOutcome::Failed(message.clone()));
@@ -3516,12 +3671,14 @@ impl Shift {
     }
 
     fn start_url_conversion(&mut self, url: String, cx: &mut Context<Self>) {
+        self.cancel_active_conversion();
+        self.conversion_cancel = Arc::new(AtomicBool::new(false));
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
         let conversion_generation = self.conversion_generation;
         let generation = self.selection_generation;
         let output_format = self.output_format;
         let priority = self.module_priority.clone();
-        let options = match self.build_conversion_options(cx) {
+        let mut options = match self.build_conversion_options(cx) {
             Ok(options) => options,
             Err(error) => {
                 self.conversion = ConversionState::Failed(error.into());
@@ -3529,6 +3686,7 @@ impl Shift {
                 return;
             }
         };
+        options.cancel = Some(Arc::clone(&self.conversion_cancel));
         self.conversion = ConversionState::Converting;
         self.save_status = None;
         self.active_history_id = None;
@@ -3552,6 +3710,9 @@ impl Shift {
                             let artifact = Arc::new(artifact);
                             this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)));
                             ConversionState::Ready(artifact)
+                        }
+                        Err(error) if error.is_cancelled() => {
+                            ConversionState::Failed("Conversion cancelled.".into())
                         }
                         Err(error) => {
                             let message: SharedString = error.to_string().into();
@@ -3613,6 +3774,7 @@ impl Shift {
     }
 
     fn clear_selected_file(&mut self, cx: &mut Context<Self>) {
+        self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selected_file = None;
         self.selected_url = None;
@@ -3643,11 +3805,34 @@ impl Shift {
             return;
         };
 
+        // Cap retained payload so media conversions cannot pin gigabytes in history.
+        let outcome = match outcome {
+            HistoryOutcome::Ready(artifact)
+                if artifact.bytes.len() > MAX_HISTORY_ARTIFACT_BYTES =>
+            {
+                HistoryOutcome::ReadyLarge {
+                    module_id: artifact.module_id.into(),
+                    byte_len: artifact.bytes.len(),
+                }
+            }
+            other => other,
+        };
+
         let detail = match &outcome {
             HistoryOutcome::Ready(artifact) => format!(
                 "{}  ·  via {}",
                 artifact.format.label(),
                 module_label(artifact.module_id)
+            ),
+            HistoryOutcome::ReadyLarge {
+                module_id,
+                byte_len,
+                ..
+            } => format!(
+                "{}  ·  {}  ·  via {} (re-convert to restore)",
+                self.output_format.label(),
+                format_file_size(*byte_len as u64),
+                module_label(module_id)
             ),
             HistoryOutcome::Failed(_) => format!("{}  ·  failed", self.output_format.label()),
         };
@@ -3679,6 +3864,7 @@ impl Shift {
 
         // Invalidate any in-flight work so a late conversion cannot overwrite
         // the restored snapshot.
+        self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
         self.output_menu_open = false;
@@ -3716,11 +3902,22 @@ impl Shift {
             }
         }
 
-        self.conversion = match entry.outcome {
-            HistoryOutcome::Ready(artifact) => ConversionState::Ready(artifact),
-            HistoryOutcome::Failed(message) => ConversionState::Failed(message),
-        };
-        cx.notify();
+        match entry.outcome {
+            HistoryOutcome::Ready(artifact) => {
+                self.conversion = ConversionState::Ready(artifact);
+                cx.notify();
+            }
+            HistoryOutcome::ReadyLarge { .. } => {
+                // Full bytes were not retained; re-run conversion for this source.
+                self.conversion = ConversionState::Converting;
+                cx.notify();
+                self.start_conversion(cx);
+            }
+            HistoryOutcome::Failed(message) => {
+                self.conversion = ConversionState::Failed(message);
+                cx.notify();
+            }
+        }
     }
 
     fn clear_history(&mut self, cx: &mut Context<Self>) {
@@ -3739,8 +3936,8 @@ impl Shift {
         let artifact = Arc::clone(artifact);
         let selection_generation = self.selection_generation;
         let conversion_generation = self.conversion_generation;
-        let directory = self
-            .selected_file
+        let source_path = self.selected_file.clone();
+        let directory = source_path
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf));
         let receiver = file_picker::pick_save_file(&artifact.file_name, directory);
@@ -3753,6 +3950,29 @@ impl Shift {
                 .file_name()
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
+
+            // Mirror CLI / batch: never overwrite the selected source file.
+            if let Some(source) = source_path.as_ref() {
+                if paths_refer_to_same_file(source, &path) {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.selection_generation != selection_generation
+                            || this.conversion_generation != conversion_generation
+                        {
+                            return;
+                        }
+                        this.save_status = Some(
+                            format!(
+                                "Refusing to overwrite source file {} — choose a different path.",
+                                source.display()
+                            )
+                            .into(),
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+
             let result = cx
                 .background_executor()
                 .spawn(async move { artifact.write_to(&path) })
@@ -3781,13 +4001,25 @@ impl Render for Shift {
         let has_selection = self.selected_file.is_some() || self.selected_url.is_some();
         let conversion = self.conversion.clone();
         let save_status = self.save_status.clone();
+        let registry = ConversionRegistry::default();
         let available_outputs = if self.selected_url.is_some() {
-            ConversionRegistry::default().available_url_outputs()
+            registry.available_url_outputs()
         } else if let Some(path) = self.selected_file.as_ref() {
-            ConversionRegistry::default().available_outputs(path)
+            registry.available_outputs(path)
         } else {
             OutputFormat::ALL.to_vec()
         };
+        // When diagnostics are loaded for a concrete source, badge formats whose
+        // engines are missing so users see install hints before converting.
+        let ready_outputs = self.diagnostics.as_ref().and_then(|report| {
+            if self.selected_url.is_some() {
+                Some(available_ready_url_outputs(&registry, report))
+            } else {
+                self.selected_file
+                    .as_ref()
+                    .map(|path| available_ready_outputs(&registry, report, path))
+            }
+        });
         let output_format = self.output_format;
         let output_menu_open = self.output_menu_open;
         let settings_open = self.settings_open;
@@ -3815,6 +4047,7 @@ impl Render for Shift {
         let show_batch = !batch_items.is_empty();
         let batch_output_dir = self.batch_output_dir.clone();
         let batch_running = self.batch_running;
+        let batch_force = self.batch_force;
         let batch_status = self.batch_status.clone();
 
         div()
@@ -3897,6 +4130,7 @@ impl Render for Shift {
                             &batch_items,
                             batch_output_dir.as_deref(),
                             batch_running,
+                            batch_force,
                             batch_status,
                             cx,
                         ))
@@ -3909,6 +4143,7 @@ impl Render for Shift {
                                 output_format,
                                 output_menu_open,
                                 available_outputs,
+                                ready_outputs,
                                 show_media_options,
                                 media: MediaPanelView {
                                     output_format,
@@ -4035,6 +4270,8 @@ fn main() {
                         batch_generation: 0,
                         batch_cancel: Arc::new(AtomicBool::new(false)),
                         batch_status: None,
+                        batch_force: false,
+                        conversion_cancel: Arc::new(AtomicBool::new(false)),
                         ffmpeg_quality: FfmpegQuality::default(),
                         ffmpeg_encode_mode: FfmpegEncodeMode::default(),
                         ffmpeg_mono: false,

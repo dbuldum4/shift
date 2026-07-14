@@ -20,7 +20,9 @@ pub use batch::{
     BatchQueue, BatchSource, BatchSummary, prepare_batch_destination, resolve_destination,
     run_batch, suggested_url_file_name, uniquify_destination,
 };
-pub use defuddle::{DefuddleModule, looks_like_url};
+pub use defuddle::{
+    DefuddleModule, block_private_urls, looks_like_url, url_targets_non_public_host,
+};
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
     available_ready_outputs, available_ready_url_outputs, format_availability, supported_outputs,

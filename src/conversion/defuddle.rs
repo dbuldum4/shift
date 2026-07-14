@@ -93,6 +93,11 @@ impl DefuddleModule {
     }
 
     /// Convert a web page URL to a cleaned document via the Defuddle CLI.
+    ///
+    /// **Network:** Defuddle performs an outbound HTTP(S) fetch to the given
+    /// address. Shift is a user-driven desktop tool, so private and loopback
+    /// hosts are allowed by default. Set `SHIFT_BLOCK_PRIVATE_URLS=1` to refuse
+    /// non-public targets (SSRF hardening for automation / untrusted inputs).
     pub fn convert_url(
         &self,
         url: &str,
@@ -109,6 +114,11 @@ impl DefuddleModule {
         if !looks_like_url(url) {
             return Err(ConversionError::new(format!(
                 "not a valid http(s) URL: {url}"
+            )));
+        }
+        if block_private_urls() && url_targets_non_public_host(url) {
+            return Err(ConversionError::new(format!(
+                "refusing non-public URL host (SHIFT_BLOCK_PRIVATE_URLS is set): {url}"
             )));
         }
 
@@ -180,9 +190,57 @@ impl ConversionModule for DefuddleModule {
 }
 
 /// True for absolute http(s) URLs used as conversion sources.
+///
+/// Accepts any host, including localhost and private ranges. Callers that
+/// fetch the URL (Defuddle) should treat this as an intentional outbound
+/// network request; see [`url_targets_non_public_host`] and
+/// `SHIFT_BLOCK_PRIVATE_URLS` for optional hardening.
 pub fn looks_like_url(value: &str) -> bool {
     Url::parse(value.trim())
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+}
+
+/// True when `SHIFT_BLOCK_PRIVATE_URLS` is set to a truthy value (`1`, `true`, `yes`).
+pub fn block_private_urls() -> bool {
+    matches!(
+        std::env::var("SHIFT_BLOCK_PRIVATE_URLS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// True when the URL host is loopback, private, link-local, or a localhost-style name.
+///
+/// Used for optional SSRF hardening when Shift is driven by untrusted inputs.
+pub fn url_targets_non_public_host(value: &str) -> bool {
+    let Ok(parsed) = Url::parse(value.trim()) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == "localhost"
+                || domain.ends_with(".localhost")
+                || domain.ends_with(".local")
+                || domain == "0.0.0.0"
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || {
+                    // Link-local unicast fe80::/10
+                    let segments = ip.segments();
+                    (segments[0] & 0xffc0) == 0xfe80
+                }
+                || ip.is_unspecified()
+        }
+        None => false,
+    }
 }
 
 fn url_file_stem(url: &str) -> String {
@@ -231,6 +289,17 @@ mod tests {
         assert!(!looks_like_url("not a url"));
         assert!(!looks_like_url("report.docx"));
         assert!(!looks_like_url("https://?path.example"));
+    }
+
+    #[test]
+    fn detects_non_public_url_hosts() {
+        assert!(url_targets_non_public_host("http://localhost:3000/x"));
+        assert!(url_targets_non_public_host("http://127.0.0.1/"));
+        assert!(url_targets_non_public_host("http://192.168.1.1/"));
+        assert!(url_targets_non_public_host("http://10.0.0.5/a"));
+        assert!(url_targets_non_public_host("http://[::1]/"));
+        assert!(!url_targets_non_public_host("https://example.com/article"));
+        assert!(!url_targets_non_public_host("https://8.8.8.8/"));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionOptions,
     ConversionRegistry, DiagnosticsReport, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    OutputFormat, default_output_path, looks_like_url, paths_refer_to_same_file, run_batch,
+    OutputFormat, default_output_path, looks_like_url, prepare_batch_destination, run_batch,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -261,7 +261,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
         });
         let source_path = input_url.is_none().then(|| PathBuf::from(input));
-        prepare_destination(&destination, source_path.as_deref(), force)?;
+        // Shared with batch: refuse source overwrite, honor --force, create parents.
+        prepare_batch_destination(&destination, source_path.as_deref(), force)
+            .map_err(|error| error.to_string())?;
         artifact
             .write_to(&destination)
             .map_err(|error| error.to_string())?;
@@ -467,31 +469,6 @@ fn print_doctor_help() {
     );
 }
 
-/// Refuse source overwrite always; require `--force` for other existing files.
-fn prepare_destination(
-    destination: &Path,
-    source: Option<&Path>,
-    force: bool,
-) -> Result<(), String> {
-    if let Some(source) = source {
-        if paths_refer_to_same_file(source, destination) {
-            return Err(format!(
-                "refusing to overwrite source file {} (choose a different -o path)",
-                source.display()
-            ));
-        }
-    }
-
-    if destination.exists() && !force {
-        return Err(format!(
-            "output already exists: {} (pass --force to overwrite)",
-            destination.display()
-        ));
-    }
-
-    Ok(())
-}
-
 fn url_input(input: &OsStr) -> Option<&str> {
     input.to_str().filter(|value| looks_like_url(value))
 }
@@ -553,7 +530,7 @@ fn print_help() {
          Media (FFmpeg) options:\n  \
          --start <SEC>           Seek to timestamp before converting\n  \
          --duration <SEC>        Limit output length\n  \
-         --frame <SEC>           Still-image frame time (png/jpg/webp)\n  \
+         --frame <SEC>           Still-image frame time (png/jpg)\n  \
          --audio-stream <N>      Audio stream index (0-based among audio streams)\n  \
          --subtitle-stream <N>   Subtitle stream index for srt/vtt\n  \
          --encode auto|copy|reencode\n  \
@@ -561,12 +538,15 @@ fn print_help() {
          --mono                  Downmix to mono when re-encoding\n  \
          --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
          --scale-width <PX>      Scale video/image width (height auto)\n\n\
-         URLs (http/https) are extracted with Defuddle.\n\
+         URLs (http/https) are extracted with Defuddle (outbound fetch to the\n\
+         given host; set SHIFT_BLOCK_PRIVATE_URLS=1 to refuse loopback/private\n\
+         addresses when feeding untrusted URLs).\n\
          Use `shift-cli formats` to list registered conversion capability.\n\
          Use `shift-cli doctor` to see which engines are installed and ready.\n\
          Overwrite policy (single-file and batch):\n  \
          - Existing outputs require --force (otherwise the item fails).\n  \
          - The source file is never overwritten.\n  \
+         - Missing parent directories of -o / -O paths are created.\n  \
          - Batch only: when two inputs resolve to the same output name in one\n    \
          queue, later items get stem-1.ext, stem-2.ext, … so both can succeed.\n  \
          Single-file: if no -o is supplied, Shift writes beside the source.\n  \
@@ -577,6 +557,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -813,8 +794,11 @@ mod tests {
         let source = dir.join("page.html");
         std::fs::write(&source, b"<p>src</p>").unwrap();
 
-        let error = prepare_destination(&source, Some(&source), true).unwrap_err();
-        assert!(error.contains("refusing to overwrite source"), "{error}");
+        let error = prepare_batch_destination(&source, Some(&source), true).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to overwrite source"),
+            "{error}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -828,10 +812,24 @@ mod tests {
         std::fs::write(&source, b"<p>src</p>").unwrap();
         std::fs::write(&dest, b"old").unwrap();
 
-        let error = prepare_destination(&dest, Some(&source), false).unwrap_err();
-        assert!(error.contains("--force"), "{error}");
+        let error = prepare_batch_destination(&dest, Some(&source), false).unwrap_err();
+        assert!(error.to_string().contains("--force"), "{error}");
 
-        assert!(prepare_destination(&dest, Some(&source), true).is_ok());
+        assert!(prepare_batch_destination(&dest, Some(&source), true).is_ok());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepare_destination_creates_missing_parents() {
+        let dir = unique_temp("parents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("page.html");
+        std::fs::write(&source, b"<p>src</p>").unwrap();
+        let dest = dir.join("nested").join("deep").join("out.md");
+
+        assert!(prepare_batch_destination(&dest, Some(&source), false).is_ok());
+        assert!(dest.parent().unwrap().is_dir());
 
         let _ = std::fs::remove_dir_all(dir);
     }

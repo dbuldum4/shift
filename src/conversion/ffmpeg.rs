@@ -166,12 +166,12 @@ impl FfmpegOptions {
     }
 
     /// True when options require decoding/filters (stream copy is not possible).
+    ///
+    /// Matches the constraints enforced by [`apply_encode_settings`]: mono,
+    /// sample-rate, and scale all need re-encode. Quality only applies when
+    /// re-encoding and does not by itself force it.
     pub fn forces_reencode(&self) -> bool {
-        self.mono
-            || self.sample_rate_hz.is_some()
-            || self.scale_width.is_some()
-            || self.quality != FfmpegQuality::Balanced
-                && self.encode_mode != FfmpegEncodeMode::PreferCopy
+        self.mono || self.sample_rate_hz.is_some() || self.scale_width.is_some()
     }
 }
 
@@ -440,9 +440,7 @@ fn apply_encode_settings(
 
     let want_copy = options.encode_mode == FfmpegEncodeMode::PreferCopy
         && !is_image_output(output_format)
-        && !options.mono
-        && options.sample_rate_hz.is_none()
-        && options.scale_width.is_none();
+        && !options.forces_reencode();
 
     if want_copy {
         command.arg("-c").arg("copy");

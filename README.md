@@ -122,8 +122,12 @@ cargo dev
 The first build downloads and compiles GPUI and may take a few minutes. Dropping
 or choosing a supported file starts conversion automatically. Paste an `http(s)`
 URL into the bar above the drop zone and press Enter or Convert to extract the
-page with Defuddle. The source file is never modified. Use the output dropdown
-on the right to choose a format. The settings button opens a full-screen
+page with Defuddle (this performs an outbound fetch to the given host; set
+`SHIFT_BLOCK_PRIVATE_URLS=1` to refuse loopback/private addresses when feeding
+untrusted URLs). The source file is never modified; Download refuses to overwrite
+the selected source. Use the output dropdown on the right to choose a format
+(formats whose engines are missing are labeled). Multi-file queue supports
+**Overwrite** (CLI `--force` parity). The settings button opens a full-screen
 settings view with a left sidebar (Converters, General, Media, Paths,
 Diagnostics, About). On Converters, drag a module above another to make it the
 preferred engine for overlapping conversions; status badges show whether each
