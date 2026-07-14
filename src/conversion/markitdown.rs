@@ -18,6 +18,16 @@ const EXTENSIONS: &[&str] = &[
 ];
 const OUTPUTS: &[OutputFormat] = &[OutputFormat::MARKDOWN];
 
+/// Optional knobs for MarkItDown. Empty/default matches a plain `markitdown <input>`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MarkItDownOptions {
+    /// Keep base64 data URIs in the Markdown (`--keep-data-uris`).
+    ///
+    /// Off by default because embedded images can inflate artifacts past the
+    /// process output cap.
+    pub keep_data_uris: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct MarkItDownModule {
     executable: OsString,
@@ -54,6 +64,9 @@ impl MarkItDownModule {
     ) -> Result<super::LimitedOutput, ConversionError> {
         let mut command = Command::new(&self.executable);
         command.arg(input);
+        if options.markitdown.keep_data_uris {
+            command.arg("--keep-data-uris");
+        }
         run_command_cancellable(
             command,
             process_timeout(),
@@ -126,6 +139,8 @@ impl ConversionModule for MarkItDownModule {
             bytes: output.stdout,
             format: OutputFormat::MARKDOWN,
             module_id: self.id(),
+            pipeline: Vec::new(),
+            invocations: Vec::new(),
         })
     }
 }
@@ -158,5 +173,41 @@ mod tests {
         assert_eq!(artifact.text(), Some("# Converted\n"));
 
         std::fs::remove_file(input).unwrap();
+    }
+
+    #[test]
+    fn passes_keep_data_uris_when_enabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let executable = directory.join(format!("shift-markitdown-opts-{suffix}"));
+        let input = directory.join(format!("shift-markitdown-input-{suffix}.txt"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '# ok\\n'",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "source").unwrap();
+
+        let options = ConversionOptions {
+            markitdown: MarkItDownOptions {
+                keep_data_uris: true,
+            },
+            ..ConversionOptions::default()
+        };
+        MarkItDownModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap();
+
+        let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("--keep-data-uris"), "args: {args}");
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        let _ = std::fs::remove_file(&input);
     }
 }

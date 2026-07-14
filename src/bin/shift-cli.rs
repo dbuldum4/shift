@@ -1,11 +1,13 @@
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionOptions,
-    ConversionRegistry, DiagnosticsReport, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    OutputFormat, default_output_path, looks_like_url, prepare_batch_destination, run_batch,
+    BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionArtifact,
+    ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
+    DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
+    FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions,
+    default_output_path, expand_input_paths, looks_like_url, prepare_batch_destination, run_batch,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,30 +49,177 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         return run_doctor(&arguments[1..]);
     }
 
+    let parsed = parse_convert_args(&arguments)?;
+    let inputs = resolve_cli_inputs(parsed.inputs, parsed.recursive)?;
+
+    if inputs.is_empty() {
+        return Err("missing input file or URL (try `shift-cli --help`)".to_owned());
+    }
+
+    if parsed.stdout && (parsed.output.is_some() || parsed.output_dir.is_some()) {
+        return Err("use either --stdout or an output path, not both".to_owned());
+    }
+
+    if parsed.output.is_some() && parsed.output_dir.is_some() {
+        return Err("use either --output or --output-dir, not both".to_owned());
+    }
+
+    let use_batch = parsed.batch_explicit || inputs.len() > 1 || parsed.output_dir.is_some();
+    if use_batch && parsed.stdout {
+        return Err("batch conversion cannot write to --stdout (use -O/--output-dir)".to_owned());
+    }
+    if use_batch && parsed.output.is_some() && inputs.len() > 1 {
+        return Err(
+            "batch conversion with multiple inputs requires -O/--output-dir, not -o/--output"
+                .to_owned(),
+        );
+    }
+
+    let registry = build_registry(parsed.preferred_module.as_deref())?;
+    let mut options = ConversionOptions {
+        ffmpeg: parsed.ffmpeg,
+        markitdown: parsed.markitdown,
+        pandoc: parsed.pandoc,
+        defuddle: parsed.defuddle,
+        docling: parsed.docling,
+        pdf: parsed.pdf,
+        cancel: None,
+        progress: None,
+    };
+    if parsed.progress {
+        options.progress = Some(Arc::new(|progress| match progress {
+            ConversionProgress::Phase(label) => {
+                eprintln!("  {label}");
+            }
+            ConversionProgress::Fraction { fraction, label } => {
+                eprint!("\r  {label} ({:.0}%)", fraction * 100.0);
+            }
+        }));
+    }
+
+    if use_batch {
+        return run_batch_cli(
+            inputs,
+            parsed.target,
+            options,
+            parsed.output_dir,
+            parsed.output,
+            parsed.force,
+            &registry,
+            parsed.verbose,
+        );
+    }
+
+    // Single-file / single-URL path (in-memory convert, then write or stdout).
+    let input = &inputs[0];
+    let input_url = url_input(input);
+    let artifact = if let Some(url) = input_url {
+        registry
+            .convert_url_with_options(url, parsed.target, &options)
+            .map_err(|error| error.to_string())?
+    } else {
+        registry
+            .convert_to_with_options(PathBuf::from(input), parsed.target, &options)
+            .map_err(|error| error.to_string())?
+    };
+
+    if parsed.progress {
+        // Clear any in-progress line before final output.
+        eprintln!();
+    }
+    if parsed.verbose {
+        print_invocations(&artifact);
+    }
+
+    if parsed.stdout {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(&artifact.bytes)
+            .map_err(|error| format!("could not write output: {error}"))?;
+    } else {
+        let destination = parsed.output.unwrap_or_else(|| {
+            if input_url.is_some() {
+                PathBuf::from(&artifact.file_name)
+            } else {
+                default_output_path(PathBuf::from(input).as_path(), parsed.target)
+            }
+        });
+        let source_path = input_url.is_none().then(|| PathBuf::from(input));
+        // Shared with batch: refuse source overwrite, honor --force, create parents.
+        prepare_batch_destination(&destination, source_path.as_deref(), parsed.force)
+            .map_err(|error| error.to_string())?;
+        artifact
+            .write_to(&destination)
+            .map_err(|error| error.to_string())?;
+        println!("{}", destination.display());
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parsed convert/batch arguments (engine knobs + I/O flags). Extracted for unit tests.
+#[derive(Clone, Debug, PartialEq)]
+struct ParsedConvertArgs {
+    inputs: Vec<OsString>,
+    output: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    stdout: bool,
+    force: bool,
+    target: OutputFormat,
+    preferred_module: Option<String>,
+    ffmpeg: FfmpegOptions,
+    markitdown: MarkItDownOptions,
+    pandoc: PandocOptions,
+    defuddle: DefuddleOptions,
+    docling: DoclingOptions,
+    pdf: PdfInputOptions,
+    recursive: bool,
+    verbose: bool,
+    progress: bool,
+    batch_explicit: bool,
+}
+
+impl Default for ParsedConvertArgs {
+    fn default() -> Self {
+        Self {
+            inputs: Vec::new(),
+            output: None,
+            output_dir: None,
+            stdout: false,
+            force: false,
+            target: OutputFormat::MARKDOWN,
+            preferred_module: None,
+            ffmpeg: FfmpegOptions::default(),
+            markitdown: MarkItDownOptions::default(),
+            pandoc: PandocOptions::default(),
+            defuddle: DefuddleOptions::default(),
+            docling: DoclingOptions::default(),
+            pdf: PdfInputOptions::default(),
+            recursive: false,
+            verbose: false,
+            progress: false,
+            batch_explicit: false,
+        }
+    }
+}
+
+fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, String> {
     let mut cursor = 0;
-    let mut batch_explicit = false;
+    let mut parsed = ParsedConvertArgs::default();
+
     if arguments.first().is_some_and(|value| value == "convert") {
         cursor += 1;
     } else if arguments.first().is_some_and(|value| value == "batch") {
         cursor += 1;
-        batch_explicit = true;
+        parsed.batch_explicit = true;
     }
-
-    let mut inputs: Vec<OsString> = Vec::new();
-    let mut output = None;
-    let mut output_dir = None;
-    let mut stdout = false;
-    let mut force = false;
-    let mut target = OutputFormat::MARKDOWN;
-    let mut preferred_module: Option<String> = None;
-    let mut ffmpeg = FfmpegOptions::default();
 
     while cursor < arguments.len() {
         let arg = arguments[cursor].to_string_lossy();
         match arg.as_ref() {
             "-o" | "--output" => {
                 cursor += 1;
-                output = Some(
+                parsed.output = Some(
                     arguments
                         .get(cursor)
                         .map(PathBuf::from)
@@ -79,18 +228,21 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "-O" | "--output-dir" => {
                 cursor += 1;
-                output_dir = Some(
+                parsed.output_dir = Some(
                     arguments
                         .get(cursor)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--output-dir requires a directory".to_owned())?,
                 );
             }
-            "--stdout" => stdout = true,
-            "--force" => force = true,
+            "--stdout" => parsed.stdout = true,
+            "--force" => parsed.force = true,
+            "--recursive" => parsed.recursive = true,
+            "--verbose" | "-v" => parsed.verbose = true,
+            "--progress" => parsed.progress = true,
             "-t" | "--to" => {
                 cursor += 1;
-                target = arguments
+                parsed.target = arguments
                     .get(cursor)
                     .ok_or_else(|| "--to requires a format".to_owned())?
                     .to_string_lossy()
@@ -99,7 +251,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--module" => {
                 cursor += 1;
-                preferred_module = Some(
+                parsed.preferred_module = Some(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--module requires an id".to_owned())?
@@ -109,7 +261,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--start" => {
                 cursor += 1;
-                ffmpeg.start_secs = Some(parse_secs(
+                parsed.ffmpeg.start_secs = Some(parse_secs(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--start requires seconds".to_owned())?,
@@ -118,7 +270,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--duration" => {
                 cursor += 1;
-                ffmpeg.duration_secs = Some(parse_secs(
+                parsed.ffmpeg.duration_secs = Some(parse_secs(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--duration requires seconds".to_owned())?,
@@ -127,16 +279,25 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--frame" => {
                 cursor += 1;
-                ffmpeg.frame_secs = Some(parse_secs(
+                parsed.ffmpeg.frame_secs = Some(parse_secs(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--frame requires seconds".to_owned())?,
                     "--frame",
                 )?);
             }
+            "--frame-interval" => {
+                cursor += 1;
+                parsed.ffmpeg.frame_interval_secs = Some(parse_secs(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--frame-interval requires seconds".to_owned())?,
+                    "--frame-interval",
+                )?);
+            }
             "--audio-stream" => {
                 cursor += 1;
-                ffmpeg.audio_stream = Some(parse_u32(
+                parsed.ffmpeg.audio_stream = Some(parse_u32(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--audio-stream requires an index".to_owned())?,
@@ -145,7 +306,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--subtitle-stream" => {
                 cursor += 1;
-                ffmpeg.subtitle_stream = Some(parse_u32(
+                parsed.ffmpeg.subtitle_stream = Some(parse_u32(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--subtitle-stream requires an index".to_owned())?,
@@ -154,7 +315,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--encode" => {
                 cursor += 1;
-                ffmpeg.encode_mode = arguments
+                parsed.ffmpeg.encode_mode = arguments
                     .get(cursor)
                     .ok_or_else(|| "--encode requires auto|copy|reencode".to_owned())?
                     .to_string_lossy()
@@ -163,17 +324,29 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--quality" => {
                 cursor += 1;
-                ffmpeg.quality = arguments
+                parsed.ffmpeg.quality = arguments
                     .get(cursor)
                     .ok_or_else(|| "--quality requires balanced|high|small".to_owned())?
                     .to_string_lossy()
                     .parse::<FfmpegQuality>()
                     .map_err(|error| error.to_string())?;
             }
-            "--mono" => ffmpeg.mono = true,
+            "--mono" => parsed.ffmpeg.mono = true,
+            "--mute" => parsed.ffmpeg.mute = true,
+            "--normalize-audio" => parsed.ffmpeg.normalize_audio = true,
+            "--burn-subtitles" => parsed.ffmpeg.burn_subtitles = true,
+            "--fps" => {
+                cursor += 1;
+                parsed.ffmpeg.fps = Some(parse_secs(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--fps requires a frame rate".to_owned())?,
+                    "--fps",
+                )?);
+            }
             "--sample-rate" => {
                 cursor += 1;
-                ffmpeg.sample_rate_hz = Some(parse_u32(
+                parsed.ffmpeg.sample_rate_hz = Some(parse_u32(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--sample-rate requires Hz".to_owned())?,
@@ -182,95 +355,226 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
             "--scale-width" => {
                 cursor += 1;
-                ffmpeg.scale_width = Some(parse_u32(
+                parsed.ffmpeg.scale_width = Some(parse_u32(
                     arguments
                         .get(cursor)
                         .ok_or_else(|| "--scale-width requires pixels".to_owned())?,
                     "--scale-width",
                 )?);
             }
+            "--keep-data-uris" => parsed.markitdown.keep_data_uris = true,
+            "--standalone" => parsed.pandoc.standalone = true,
+            "--toc" => parsed.pandoc.toc = true,
+            "--pdf-engine" => {
+                cursor += 1;
+                parsed.pandoc.pdf_engine = Some(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--pdf-engine requires a name or path".to_owned())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--reference-doc" => {
+                cursor += 1;
+                parsed.pandoc.reference_doc = Some(
+                    arguments
+                        .get(cursor)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--reference-doc requires a path".to_owned())?,
+                );
+            }
+            "--frontmatter" => parsed.defuddle.frontmatter = true,
+            "--lang" => {
+                cursor += 1;
+                parsed.defuddle.lang = Some(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--lang requires a BCP 47 code".to_owned())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--docling-images" => {
+                cursor += 1;
+                parsed.docling.image_export_mode = arguments
+                    .get(cursor)
+                    .ok_or_else(|| {
+                        "--docling-images requires placeholder|embedded|referenced".to_owned()
+                    })?
+                    .to_string_lossy()
+                    .parse::<DoclingImageExportMode>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--docling-ocr" => parsed.docling.ocr = true,
+            "--no-docling-ocr" => parsed.docling.ocr = false,
+            "--docling-tables" => parsed.docling.tables = true,
+            "--no-docling-tables" => parsed.docling.tables = false,
+            "--docling-table-mode" => {
+                cursor += 1;
+                parsed.docling.table_mode = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--docling-table-mode requires fast|accurate".to_owned())?
+                    .to_string_lossy()
+                    .parse::<DoclingTableMode>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--ocr-lang" => {
+                cursor += 1;
+                parsed.docling.ocr_lang = Some(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--ocr-lang requires a language code".to_owned())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--pdf-password" => {
+                cursor += 1;
+                parsed.pdf.password = Some(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--pdf-password requires a value".to_owned())?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--page-from" => {
+                cursor += 1;
+                parsed.pdf.page_from = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--page-from requires a 1-based page number".to_owned())?,
+                    "--page-from",
+                )?);
+            }
+            "--page-to" => {
+                cursor += 1;
+                parsed.pdf.page_to = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--page-to requires a 1-based page number".to_owned())?,
+                    "--page-to",
+                )?);
+            }
+            "--pages" => {
+                cursor += 1;
+                let value = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--pages requires FROM-TO (e.g. 2-5)".to_owned())?;
+                let (from, to) = parse_pages_range(value, "--pages")?;
+                parsed.pdf.page_from = from;
+                parsed.pdf.page_to = to;
+            }
             value if value.starts_with('-') => {
                 return Err(format!("unknown argument: {value}"));
             }
             _ => {
-                inputs.push(arguments[cursor].clone());
+                parsed.inputs.push(arguments[cursor].clone());
             }
         }
         cursor += 1;
     }
 
-    if inputs.is_empty() {
+    if parsed.inputs.is_empty() {
         return Err("missing input file or URL (try `shift-cli --help`)".to_owned());
     }
 
-    if stdout && (output.is_some() || output_dir.is_some()) {
-        return Err("use either --stdout or an output path, not both".to_owned());
-    }
+    Ok(parsed)
+}
 
-    if output.is_some() && output_dir.is_some() {
-        return Err("use either --output or --output-dir, not both".to_owned());
-    }
-
-    let use_batch = batch_explicit || inputs.len() > 1 || output_dir.is_some();
-    if use_batch && stdout {
-        return Err("batch conversion cannot write to --stdout (use -O/--output-dir)".to_owned());
-    }
-    if use_batch && output.is_some() && inputs.len() > 1 {
-        return Err(
-            "batch conversion with multiple inputs requires -O/--output-dir, not -o/--output"
-                .to_owned(),
-        );
-    }
-
-    let registry = build_registry(preferred_module.as_deref())?;
-    let options = ConversionOptions {
-        ffmpeg,
-        cancel: None,
-    };
-
-    if use_batch {
-        return run_batch_cli(
-            inputs, target, options, output_dir, output, force, &registry,
-        );
-    }
-
-    // Single-file / single-URL path (in-memory convert, then write or stdout).
-    let input = &inputs[0];
-    let input_url = url_input(input);
-    let artifact = if let Some(url) = input_url {
-        registry
-            .convert_url_with_options(url, target, &options)
-            .map_err(|error| error.to_string())?
-    } else {
-        registry
-            .convert_to_with_options(PathBuf::from(input), target, &options)
-            .map_err(|error| error.to_string())?
-    };
-
-    if stdout {
-        use std::io::Write;
-        std::io::stdout()
-            .write_all(&artifact.bytes)
-            .map_err(|error| format!("could not write output: {error}"))?;
-    } else {
-        let destination = output.unwrap_or_else(|| {
-            if input_url.is_some() {
-                PathBuf::from(&artifact.file_name)
-            } else {
-                default_output_path(PathBuf::from(input).as_path(), target)
+/// Expand directories when `--recursive`, or reject bare directory inputs.
+fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsString>, String> {
+    if recursive {
+        let mut out = Vec::new();
+        for input in inputs {
+            if url_input(&input).is_some() {
+                out.push(input);
+                continue;
             }
-        });
-        let source_path = input_url.is_none().then(|| PathBuf::from(input));
-        // Shared with batch: refuse source overwrite, honor --force, create parents.
-        prepare_batch_destination(&destination, source_path.as_deref(), force)
-            .map_err(|error| error.to_string())?;
-        artifact
-            .write_to(&destination)
-            .map_err(|error| error.to_string())?;
-        println!("{}", destination.display());
+            let path = PathBuf::from(&input);
+            let expanded =
+                expand_input_paths(&[path.as_path()], true).map_err(|error| error.to_string())?;
+            if expanded.is_empty() {
+                // Keep the original path so conversion can report a useful error
+                // (unsupported extension, missing file, etc.).
+                if path.is_dir() {
+                    return Err(format!(
+                        "no convertible files found under {}",
+                        path.display()
+                    ));
+                }
+                out.push(input);
+            } else {
+                out.extend(expanded.into_iter().map(PathBuf::into_os_string));
+            }
+        }
+        if out.is_empty() {
+            return Err("no convertible inputs after expanding directories".to_owned());
+        }
+        Ok(out)
+    } else {
+        for input in &inputs {
+            if url_input(input).is_some() {
+                continue;
+            }
+            let path = Path::new(input);
+            if path.is_dir() {
+                return Err(format!(
+                    "{} is a directory; pass --recursive to expand folders",
+                    path.display()
+                ));
+            }
+        }
+        Ok(inputs)
+    }
+}
+
+fn print_invocations(artifact: &ConversionArtifact) {
+    if artifact.invocations.is_empty() {
+        eprintln!("# invocations: (none recorded)");
+        return;
+    }
+    for record in &artifact.invocations {
+        eprintln!("# {} {}", record.module_id, record.argv_display);
+    }
+}
+
+fn parse_pages_range(value: &OsStr, flag: &str) -> Result<(Option<u32>, Option<u32>), String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{flag} value is not valid UTF-8"))?
+        .trim();
+    if text.is_empty() {
+        return Err(format!("{flag} expects FROM-TO (e.g. 1-3)"));
     }
 
-    Ok(ExitCode::SUCCESS)
+    let (from_text, to_text) = if let Some((from, to)) = text.split_once('-') {
+        (from.trim(), to.trim())
+    } else {
+        // Single page number: N → pages N-N.
+        (text, text)
+    };
+
+    if from_text.is_empty() || to_text.is_empty() {
+        return Err(format!("{flag} expects FROM-TO (e.g. 1-3)"));
+    }
+
+    let from = from_text
+        .parse::<u32>()
+        .map_err(|_| format!("{flag} expects 1-based page numbers (got `{text}`)"))?;
+    let to = to_text
+        .parse::<u32>()
+        .map_err(|_| format!("{flag} expects 1-based page numbers (got `{text}`)"))?;
+
+    if from == 0 || to == 0 {
+        return Err(format!("{flag} page numbers are 1-based"));
+    }
+    if from > to {
+        return Err(format!("{flag} FROM must be <= TO"));
+    }
+
+    Ok((Some(from), Some(to)))
 }
 
 fn build_registry(preferred_module: Option<&str>) -> Result<ConversionRegistry, String> {
@@ -292,6 +596,7 @@ fn build_registry(preferred_module: Option<&str>) -> Result<ConversionRegistry, 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_batch_cli(
     inputs: Vec<OsString>,
     target: OutputFormat,
@@ -300,6 +605,7 @@ fn run_batch_cli(
     single_output: Option<PathBuf>,
     force: bool,
     registry: &ConversionRegistry,
+    verbose: bool,
 ) -> Result<ExitCode, String> {
     let mut queue = BatchQueue::new();
     let mut enqueue = BatchEnqueueOptions::new(target);
@@ -330,7 +636,12 @@ fn run_batch_cli(
         } => {
             eprintln!("… {source_name} → {}", destination.display());
         }
-        BatchEvent::ItemSucceeded { path, .. } => {
+        BatchEvent::ItemSucceeded {
+            path, module_id, ..
+        } => {
+            if verbose {
+                eprintln!("# module {module_id}");
+            }
             println!("{}", path.display());
         }
         BatchEvent::ItemFailed {
@@ -340,6 +651,15 @@ fn run_batch_cli(
         }
         BatchEvent::ItemCancelled { source_name, .. } => {
             eprintln!("shift-cli: cancelled {source_name}");
+        }
+        BatchEvent::ItemProgress {
+            fraction, label, ..
+        } => {
+            if let Some(fraction) = fraction {
+                eprint!("\r  {label} ({:.0}%)", fraction * 100.0);
+            } else {
+                eprint!("\r  {label}");
+            }
         }
         BatchEvent::Progress(progress) => {
             if progress.total > 1 {
@@ -523,14 +843,26 @@ fn print_help() {
          shift-cli <INPUT>… -O <DIR> [-t <FORMAT>]   # multi-file batch (shared queue)\n  \
          shift-cli formats\n  \
          shift-cli doctor [--script] [--quiet]\n\n\
-         Batch options:\n  \
-         -O, --output-dir <DIR>  Write every output into DIR (creates if needed)\n  \
+         General options:\n  \
+         -t, --to <FORMAT>       Output format id (default: markdown)\n  \
+         -o, --output <PATH>     Write a single output to PATH\n  \
+         -O, --output-dir <DIR>  Write every batch output into DIR\n  \
+         --stdout                Write bytes to stdout (single input only)\n  \
          --force                 Overwrite existing outputs\n  \
-         Ctrl-C                  Cancel the active item and remaining queue\n\n\
+         --module <ID>           Prefer a conversion module (see `formats`)\n  \
+         --recursive             Expand directory inputs into convertible files\n  \
+         --verbose, -v           Print redacted converter invocations on stderr\n  \
+         --progress              Print per-conversion progress on stderr\n  \
+         Ctrl-C                  Cancel the active batch item and remaining queue\n\n\
          Media (FFmpeg) options:\n  \
          --start <SEC>           Seek to timestamp before converting\n  \
          --duration <SEC>        Limit output length\n  \
          --frame <SEC>           Still-image frame time (png/jpg)\n  \
+         --frame-interval <SEC>  Seconds between frames (png-sequence-zip)\n  \
+         --fps <N>               Force constant frame rate when re-encoding\n  \
+         --mute                  Drop audio on video outputs\n  \
+         --normalize-audio       Apply loudness normalization when re-encoding\n  \
+         --burn-subtitles        Burn embedded subtitles into video\n  \
          --audio-stream <N>      Audio stream index (0-based among audio streams)\n  \
          --subtitle-stream <N>   Subtitle stream index for srt/vtt\n  \
          --encode auto|copy|reencode\n  \
@@ -538,9 +870,31 @@ fn print_help() {
          --mono                  Downmix to mono when re-encoding\n  \
          --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
          --scale-width <PX>      Scale video/image width (height auto)\n\n\
+         PDF input options:\n  \
+         --pdf-password <SECRET> Password for encrypted PDFs\n  \
+         --pages <FROM-TO>       1-based inclusive page range (e.g. 2-5)\n  \
+         --page-from <N>         1-based start page\n  \
+         --page-to <N>           1-based end page\n\n\
+         MarkItDown options:\n  \
+         --keep-data-uris        Keep base64 data URIs in Markdown output\n\n\
+         Pandoc options:\n  \
+         --standalone            Produce a standalone document (-s)\n  \
+         --toc                   Include a table of contents\n  \
+         --pdf-engine <NAME>     PDF engine override (else SHIFT_PDF_ENGINE / auto)\n  \
+         --reference-doc <PATH>  Style reference for docx/odt writers\n\n\
+         Defuddle options:\n  \
+         --frontmatter           Prepend YAML frontmatter\n  \
+         --lang <CODE>           Preferred language (BCP 47, e.g. en)\n\n\
+         Docling options:\n  \
+         --docling-images placeholder|embedded|referenced\n  \
+         --docling-ocr / --no-docling-ocr\n  \
+         --ocr-lang <CODE>       OCR language(s), e.g. eng or eng+deu\n  \
+         --docling-tables / --no-docling-tables\n  \
+         --docling-table-mode fast|accurate\n\n\
          URLs (http/https) are extracted with Defuddle (outbound fetch to the\n\
          given host; set SHIFT_BLOCK_PRIVATE_URLS=1 to refuse loopback/private\n\
          addresses when feeding untrusted URLs).\n\
+         Directory inputs require --recursive (union of registered extensions).\n\
          Use `shift-cli formats` to list registered conversion capability.\n\
          Use `shift-cli doctor` to see which engines are installed and ready.\n\
          Overwrite policy (single-file and batch):\n  \
@@ -921,6 +1275,90 @@ mod tests {
         assert!(error.contains("refusing to overwrite source"), "{error}");
         assert_eq!(std::fs::read_to_string(&input).unwrap(), "<p>hello</p>");
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_media_flags_into_ffmpeg_options() {
+        let parsed = parse_convert_args(&args(&[
+            "clip.mp4",
+            "--mute",
+            "--fps",
+            "30",
+            "--normalize-audio",
+            "--burn-subtitles",
+            "--frame-interval",
+            "0.5",
+            "-t",
+            "png-sequence-zip",
+        ]))
+        .unwrap();
+        assert!(parsed.ffmpeg.mute);
+        assert_eq!(parsed.ffmpeg.fps, Some(30.0));
+        assert!(parsed.ffmpeg.normalize_audio);
+        assert!(parsed.ffmpeg.burn_subtitles);
+        assert_eq!(parsed.ffmpeg.frame_interval_secs, Some(0.5));
+        assert_eq!(parsed.target, OutputFormat::PNG_SEQUENCE_ZIP);
+    }
+
+    #[test]
+    fn parse_pdf_docling_and_pandoc_flags() {
+        let parsed = parse_convert_args(&args(&[
+            "report.pdf",
+            "--ocr-lang",
+            "eng+deu",
+            "--pdf-password",
+            "s3cret",
+            "--pages",
+            "2-5",
+            "--reference-doc",
+            "/refs/style.docx",
+            "--verbose",
+            "--progress",
+            "--recursive",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.docling.ocr_lang.as_deref(), Some("eng+deu"));
+        assert_eq!(parsed.pdf.password.as_deref(), Some("s3cret"));
+        assert_eq!(parsed.pdf.page_from, Some(2));
+        assert_eq!(parsed.pdf.page_to, Some(5));
+        assert_eq!(
+            parsed.pandoc.reference_doc.as_deref(),
+            Some(Path::new("/refs/style.docx"))
+        );
+        assert!(parsed.verbose);
+        assert!(parsed.progress);
+        assert!(parsed.recursive);
+    }
+
+    #[test]
+    fn parse_page_from_to_flags() {
+        let parsed =
+            parse_convert_args(&args(&["doc.pdf", "--page-from", "3", "--page-to", "7"])).unwrap();
+        assert_eq!(parsed.pdf.page_from, Some(3));
+        assert_eq!(parsed.pdf.page_to, Some(7));
+    }
+
+    #[test]
+    fn parse_pages_single_number() {
+        let (from, to) = parse_pages_range(OsStr::new("4"), "--pages").unwrap();
+        assert_eq!(from, Some(4));
+        assert_eq!(to, Some(4));
+    }
+
+    #[test]
+    fn parse_pages_rejects_inverted_range() {
+        let error = parse_pages_range(OsStr::new("9-2"), "--pages").unwrap_err();
+        assert!(error.contains("FROM must be <="), "{error}");
+    }
+
+    #[test]
+    fn rejects_directory_input_without_recursive() {
+        let dir = unique_temp("dir-input");
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = run(args(&[dir.to_str().unwrap(), "-t", "markdown"])).unwrap_err();
+        assert!(error.contains("directory"), "{error}");
+        assert!(error.contains("--recursive"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

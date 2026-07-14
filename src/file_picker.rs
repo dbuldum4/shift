@@ -20,6 +20,7 @@ use std::cell::Cell;
 use std::ffi::{CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -161,6 +162,16 @@ pub fn pick_save_file(
     }
 
     rx
+}
+
+/// Reveal `path` in Finder (selects the file when it exists).
+pub fn reveal_in_finder(path: &Path) {
+    let _ = Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
+}
+
+/// Open `path` with the default application (`open`).
+pub fn open_path(path: &Path) {
+    let _ = Command::new("/usr/bin/open").arg(path).spawn();
 }
 
 fn begin_dialog() -> bool {

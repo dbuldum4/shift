@@ -7,38 +7,48 @@ mod docling;
 mod ffmpeg;
 mod markitdown;
 mod pandoc;
+mod pdf_slice;
 mod process;
+mod sources;
+mod suggest;
 
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub use batch::{
-    BatchEnqueueOptions, BatchEvent, BatchItem, BatchItemId, BatchItemState, BatchProgress,
-    BatchQueue, BatchSource, BatchSummary, prepare_batch_destination, resolve_destination,
-    run_batch, suggested_url_file_name, uniquify_destination,
+    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
+    BatchProgress, BatchQueue, BatchSource, BatchSummary, prepare_batch_destination,
+    resolve_destination, run_batch, suggested_url_file_name, uniquify_destination,
 };
 pub use defuddle::{
-    DefuddleModule, block_private_urls, looks_like_url, url_targets_non_public_host,
+    DefuddleModule, DefuddleOptions, block_private_urls, looks_like_url,
+    url_targets_non_public_host,
 };
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
     available_ready_outputs, available_ready_url_outputs, format_availability, supported_outputs,
 };
-pub use docling::DoclingModule;
+pub use docling::{DoclingImageExportMode, DoclingModule, DoclingOptions, DoclingTableMode};
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
     is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
 };
-pub use markitdown::MarkItDownModule;
-pub use pandoc::{PandocModule, pdf_engine_candidates, resolve_pdf_engine};
+pub use markitdown::{MarkItDownModule, MarkItDownOptions};
+pub use pandoc::{PandocModule, PandocOptions, pdf_engine_candidates, resolve_pdf_engine};
+pub use pdf_slice::extract_pdf_pages;
 pub use process::{
     DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, find_executable, is_runnable,
     max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
     resolve_tool_path, run_command, run_command_cancellable,
 };
+pub use sources::{
+    MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
+};
+pub use suggest::{suggested_output_for_path, suggested_output_for_url};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OutputFormat(&'static str);
@@ -77,6 +87,8 @@ impl OutputFormat {
     pub const JPG: Self = Self("jpg");
     pub const SRT: Self = Self("srt");
     pub const VTT: Self = Self("vtt");
+    /// PNG frame sequence packaged as a single ZIP (FFmpeg).
+    pub const PNG_SEQUENCE_ZIP: Self = Self("png-sequence-zip");
 
     /// Every writer in Pandoc 3.10, ordered by practical end-user popularity.
     /// Closely related variants follow their best-known parent format.
@@ -186,6 +198,7 @@ impl OutputFormat {
         // Still frames
         Self::PNG,
         Self::JPG,
+        Self::PNG_SEQUENCE_ZIP,
         // Subtitles
         Self::SRT,
         Self::VTT,
@@ -296,6 +309,7 @@ impl OutputFormat {
         Self::THREEGP,
         Self::PNG,
         Self::JPG,
+        Self::PNG_SEQUENCE_ZIP,
         Self::SRT,
         Self::VTT,
     ];
@@ -354,6 +368,7 @@ impl OutputFormat {
             "jpg" => "JPEG Image",
             "srt" => "SubRip (SRT)",
             "vtt" => "WebVTT",
+            "png-sequence-zip" => "PNG Sequence (ZIP)",
             other => other,
         }
     }
@@ -392,6 +407,7 @@ impl OutputFormat {
             "icml" => "icml",
             "fb2" => "fb2",
             "plain" | "ansi" => "txt",
+            "png-sequence-zip" => "zip",
             // Media format ids match their file extensions.
             other => other,
         }
@@ -433,6 +449,7 @@ impl OutputFormat {
             "jpg" => "image/jpeg",
             "srt" => "application/x-subrip",
             "vtt" => "text/vtt",
+            "png-sequence-zip" => "application/zip",
             _ => "text/plain",
         }
     }
@@ -463,6 +480,7 @@ impl std::str::FromStr for OutputFormat {
         let lowered = value.to_ascii_lowercase();
         let key = match lowered.as_str() {
             "jpeg" => "jpg",
+            "png-zip" | "png_sequence" | "frames-zip" | "png-sequence-zip" => "png-sequence-zip",
             other => other,
         };
         Self::ALL
@@ -477,23 +495,102 @@ impl std::str::FromStr for OutputFormat {
 }
 
 /// Optional engine knobs passed through the registry to modules that understand them.
-#[derive(Clone, Debug, Default)]
+///
+/// Each module reads only its own nested options; foreign knobs are ignored.
+/// Defaults match the historical fixed CLI invocations so existing callers keep
+/// the same conversion behavior.
+/// PDF-input preprocess knobs shared by Docling / MarkItDown PDF routes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PdfInputOptions {
+    /// Password for encrypted PDFs (Docling `--pdf-password`). Never persisted.
+    pub password: Option<String>,
+    /// 1-based inclusive page range start (requires qpdf when set with end).
+    pub page_from: Option<u32>,
+    /// 1-based inclusive page range end.
+    pub page_to: Option<u32>,
+}
+
+impl PdfInputOptions {
+    pub fn needs_slice(&self) -> bool {
+        self.page_from.is_some() || self.page_to.is_some()
+    }
+
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Optional engine knobs passed through the registry to modules that understand them.
+///
+/// Each module reads only its own nested options; foreign knobs are ignored.
+/// Defaults match the historical fixed CLI invocations so existing callers keep
+/// the same conversion behavior.
+#[derive(Clone, Default)]
 pub struct ConversionOptions {
     pub ffmpeg: FfmpegOptions,
+    pub markitdown: MarkItDownOptions,
+    pub pandoc: PandocOptions,
+    pub defuddle: DefuddleOptions,
+    pub docling: DoclingOptions,
+    pub pdf: PdfInputOptions,
     /// When set and true, external converter processes should abort.
     ///
     /// Used by the shared batch runner for cooperative cancellation. Ignored by
     /// equality checks so option snapshots compare by engine knobs only.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Optional progress sink (not compared for equality).
+    pub progress: Option<ProgressSink>,
+}
+
+impl std::fmt::Debug for ConversionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversionOptions")
+            .field("ffmpeg", &self.ffmpeg)
+            .field("markitdown", &self.markitdown)
+            .field("pandoc", &self.pandoc)
+            .field("defuddle", &self.defuddle)
+            .field("docling", &self.docling)
+            .field("pdf", &self.pdf)
+            .field("cancel", &self.cancel.as_ref().map(|_| "<AtomicBool>"))
+            .field(
+                "progress",
+                &self.progress.as_ref().map(|_| "<ProgressSink>"),
+            )
+            .finish()
+    }
 }
 
 impl PartialEq for ConversionOptions {
     fn eq(&self, other: &Self) -> bool {
         self.ffmpeg == other.ffmpeg
+            && self.markitdown == other.markitdown
+            && self.pandoc == other.pandoc
+            && self.defuddle == other.defuddle
+            && self.docling == other.docling
+            && self.pdf == other.pdf
     }
 }
 
 impl Eq for ConversionOptions {}
+
+/// One redacted argv line for UI / `--verbose` (never secrets).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationRecord {
+    pub module_id: &'static str,
+    pub argv_display: String,
+}
+
+/// Conversion progress for UI / CLI (side channel; not on the artifact).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConversionProgress {
+    /// Indeterminate phase label (any engine).
+    Phase(String),
+    /// Determinate fraction in `0.0..=1.0` when known (FFmpeg).
+    Fraction { fraction: f32, label: String },
+}
+
+/// Thread-safe progress callback used by modules and the batch runner.
+pub type ProgressSink = Arc<dyn Fn(ConversionProgress) + Send + Sync>;
 
 /// A completed conversion, independent of how it will be presented or saved.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -503,6 +600,10 @@ pub struct ConversionArtifact {
     pub bytes: Vec<u8>,
     pub format: OutputFormat,
     pub module_id: &'static str,
+    /// Module ids that ran, first hop first (direct = one id).
+    pub pipeline: Vec<&'static str>,
+    /// Redacted invocations, same order as pipeline hops when available.
+    pub invocations: Vec<InvocationRecord>,
 }
 
 impl ConversionArtifact {
@@ -517,6 +618,66 @@ impl ConversionArtifact {
                 path.as_ref().display()
             ))
         })
+    }
+
+    /// Fill pipeline/invocations for a single-module conversion when unset.
+    pub fn with_module_provenance(
+        mut self,
+        module_id: &'static str,
+        invocation: Option<InvocationRecord>,
+    ) -> Self {
+        if self.pipeline.is_empty() {
+            self.pipeline = vec![module_id];
+        }
+        if self.invocations.is_empty() {
+            if let Some(record) = invocation {
+                self.invocations = vec![record];
+            }
+        }
+        self.module_id = module_id;
+        self
+    }
+}
+
+/// Join argv for display; caller must already redact secrets.
+pub fn format_argv_display(argv: &[impl AsRef<str>]) -> String {
+    argv.iter()
+        .map(|part| {
+            let part = part.as_ref();
+            if part.is_empty()
+                || part
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\''))
+            {
+                format!("\"{}\"", part.replace('"', "\\\""))
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collect program + args from a [`Command`] as owned strings for display.
+pub fn command_argv_parts(command: &Command) -> Vec<String> {
+    let mut parts = Vec::new();
+    parts.push(command.get_program().to_string_lossy().into_owned());
+    for arg in command.get_args() {
+        parts.push(arg.to_string_lossy().into_owned());
+    }
+    parts
+}
+
+/// Replace the value following `flag` in an argv list (e.g. password → `••••`).
+pub fn redact_flag_value(parts: &mut [String], flag: &str, replacement: &str) {
+    let mut index = 0;
+    while index + 1 < parts.len() {
+        if parts[index] == flag {
+            parts[index + 1] = replacement.to_owned();
+            index += 2;
+        } else {
+            index += 1;
+        }
     }
 }
 
@@ -741,17 +902,43 @@ impl ConversionRegistry {
         route: ConversionRoute<'_>,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        // PDF page-range preprocess (qpdf). Password without a slice still flows
+        // through `options.pdf` to modules that understand it (Docling).
+        let mut slice_guard: Option<TempDirGuard> = None;
+        let convert_input = if is_pdf_path(input) && options.pdf.needs_slice() {
+            let sliced = extract_pdf_pages(
+                input,
+                options.pdf.page_from.unwrap_or(1),
+                options.pdf.page_to,
+                options.pdf.password.as_deref(),
+                options.cancel.clone(),
+            )?;
+            if let Some(parent) = sliced.parent() {
+                slice_guard = Some(TempDirGuard(parent.to_path_buf()));
+            }
+            sliced
+        } else {
+            input.to_path_buf()
+        };
+        let _slice_cleanup = slice_guard;
+        let input = convert_input.as_path();
+
         match route {
-            ConversionRoute::Direct(module) => module.convert(input, output, options),
+            ConversionRoute::Direct(module) => {
+                let artifact = module.convert(input, output, options)?;
+                Ok(ensure_direct_provenance(artifact, module.id()))
+            }
             ConversionRoute::TwoStep {
                 first,
                 intermediate,
                 second,
             } => {
-                // First hop may be FFmpeg (trim/encode); the second hop drops
-                // engine-specific knobs but keeps the cancel flag.
-                let artifact = first.convert(input, intermediate, options)?;
-                self.finish_chain(&artifact, output, second, options)
+                // First hop may be FFmpeg (trim/encode). Pass the full options
+                // snapshot on hop 2 so second-module knobs (e.g. MarkItDown
+                // keep-data-uris) still apply; modules ignore foreign fields.
+                let hop1 = first.convert(input, intermediate, options)?;
+                let hop1 = ensure_direct_provenance(hop1, first.id());
+                self.finish_chain(&hop1, output, second, options)
             }
         }
     }
@@ -772,11 +959,9 @@ impl ConversionRegistry {
             .unwrap_or("converted");
         let input = workspace.join(format!("{stem}.{}", intermediate.format.extension()));
         intermediate.write_to(&input)?;
-        let hop_options = ConversionOptions {
-            cancel: options.cancel.clone(),
-            ..ConversionOptions::default()
-        };
-        second.convert(&input, output, &hop_options)
+        let hop2 = second.convert(&input, output, options)?;
+        let hop2 = ensure_direct_provenance(hop2, second.id());
+        Ok(merge_chain_provenance(intermediate, hop2))
     }
 
     pub fn available_outputs(&self, input: &Path) -> Vec<OutputFormat> {
@@ -864,17 +1049,66 @@ impl ConversionRegistry {
         })?;
 
         match route {
-            ConversionRoute::Direct(module) => module.convert_url(url, output, options),
+            ConversionRoute::Direct(module) => {
+                let artifact = module.convert_url(url, output, options)?;
+                Ok(ensure_direct_provenance(artifact, module.id()))
+            }
             ConversionRoute::TwoStep {
                 first,
                 intermediate,
                 second,
             } => {
-                let artifact = first.convert_url(url, intermediate, options)?;
-                self.finish_chain(&artifact, output, second, options)
+                let hop1 = first.convert_url(url, intermediate, options)?;
+                let hop1 = ensure_direct_provenance(hop1, first.id());
+                self.finish_chain(&hop1, output, second, options)
             }
         }
     }
+}
+
+fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+/// Ensure a single-module artifact has pipeline/invocations and module_id set.
+fn ensure_direct_provenance(
+    mut artifact: ConversionArtifact,
+    module_id: &'static str,
+) -> ConversionArtifact {
+    if artifact.pipeline.is_empty() {
+        artifact.pipeline = vec![module_id];
+    }
+    artifact.module_id = *artifact.pipeline.last().unwrap_or(&module_id);
+    artifact
+}
+
+/// Merge hop-1 provenance into the hop-2 artifact (final module_id = hop 2).
+fn merge_chain_provenance(
+    hop1: &ConversionArtifact,
+    mut hop2: ConversionArtifact,
+) -> ConversionArtifact {
+    let mut pipeline = hop1.pipeline.clone();
+    if pipeline.is_empty() {
+        pipeline.push(hop1.module_id);
+    }
+    let hop2_id = if hop2.pipeline.is_empty() {
+        hop2.module_id
+    } else {
+        *hop2.pipeline.last().unwrap_or(&hop2.module_id)
+    };
+    if hop2.pipeline.is_empty() {
+        pipeline.push(hop2_id);
+    } else {
+        pipeline.extend(hop2.pipeline.iter().copied());
+    }
+    let mut invocations = hop1.invocations.clone();
+    invocations.append(&mut hop2.invocations);
+    hop2.pipeline = pipeline;
+    hop2.invocations = invocations;
+    hop2.module_id = hop2_id;
+    hop2
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1061,6 +1295,8 @@ mod tests {
                 bytes: self.marker.to_vec(),
                 format: output,
                 module_id: self.id,
+                pipeline: vec![self.id],
+                invocations: Vec::new(),
             })
         }
     }
@@ -1445,5 +1681,37 @@ mod tests {
                 .unwrap_or_else(|| panic!("no url route ids for {}", output.id()));
             assert!(!ids.is_empty());
         }
+    }
+
+    #[test]
+    fn two_step_merges_pipeline_provenance() {
+        let registry = ConversionRegistry::new()
+            .with_module(fake(
+                "first",
+                &["src"],
+                &[OutputFormat::MARKDOWN],
+                &[OutputFormat::MARKDOWN],
+                b"intermediate",
+            ))
+            .with_module(fake("second", &["md"], &[OutputFormat::PDF], &[], b"final"));
+        let input = std::env::temp_dir().join(format!("shift-pipeline-{}.src", std::process::id()));
+        std::fs::write(&input, b"source").unwrap();
+        let artifact = registry.convert_to(&input, OutputFormat::PDF).unwrap();
+        assert_eq!(artifact.pipeline, vec!["first", "second"]);
+        assert_eq!(artifact.module_id, "second");
+        std::fs::remove_file(input).unwrap();
+    }
+
+    #[test]
+    fn redact_flag_value_masks_password() {
+        let mut parts = vec![
+            "docling".into(),
+            "--pdf-password".into(),
+            "s3cret".into(),
+            "--ocr".into(),
+        ];
+        redact_flag_value(&mut parts, "--pdf-password", "••••");
+        assert_eq!(parts[2], "••••");
+        assert!(!parts.iter().any(|p| p == "s3cret"));
     }
 }

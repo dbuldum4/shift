@@ -2,20 +2,32 @@ mod file_picker;
 mod text_input;
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Bounds, Context, ElementId, Entity, ExternalPaths,
-    FontWeight, KeyBinding, Menu, MenuItem, PathBuilder, PathStyle, Pixels, Point, Render,
-    SharedString, StrokeOptions, SystemMenuType, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Application, Bounds, ClipboardItem, Context, ElementId, Entity,
+    ExternalPaths, FocusHandle, FontWeight, KeyBinding, Menu, MenuItem, PathBuilder, PathStyle,
+    Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, hsla, point, prelude::*, px,
+    rgb, size,
 };
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchItem, BatchItemId, BatchItemState, BatchQueue,
-    BatchSource, ConversionArtifact, ConversionOptions, ConversionRegistry, DiagnosticsReport,
-    FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, OutputFormat, Readiness,
-    available_ready_outputs, available_ready_url_outputs, input_looks_like_media, is_audio_output,
+    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
+    BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
+    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingImageExportMode, DoclingOptions,
+    DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES,
+    MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions, Readiness,
+    available_ready_outputs, available_ready_url_outputs, expand_input_paths, is_audio_output,
     is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output, looks_like_url,
-    paths_refer_to_same_file, run_batch,
+    paths_refer_to_same_file, pdf_engine_candidates, run_batch, suggested_output_for_path,
+    suggested_output_for_url,
+};
+use shift_core::history::{
+    LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_ENTRIES, StoredHistoryEntry,
+    StoredOutcome, StoredSource, clear_history_store, intern_module_id, load_history, save_history,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
+use shift_core::{
+    cache_artifact_bytes, load_default_session_settings, save_default_session_settings,
+};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,10 +62,6 @@ const STATUS_READY_BORDER: u32 = 0x555555;
 const STATUS_MISSING_FILL: u32 = 0x111111;
 const STATUS_MISSING_TEXT: u32 = 0x888888;
 const STATUS_MISSING_BORDER: u32 = 0x333333;
-/// Cap session history so large conversion artifacts cannot grow without bound.
-const MAX_HISTORY_ENTRIES: usize = 30;
-/// Full artifact bytes retained per history entry; larger results store metadata only.
-const MAX_HISTORY_ARTIFACT_BYTES: usize = 512 * 1024;
 const HISTORY_SIDEBAR_WIDTH: f32 = 220.0;
 const SETTINGS_SIDEBAR_WIDTH: f32 = 220.0;
 
@@ -61,7 +69,7 @@ const SETTINGS_SIDEBAR_WIDTH: f32 = 220.0;
 enum SettingsSection {
     Converters,
     General,
-    Media,
+    Options,
     Paths,
     Diagnostics,
     About,
@@ -72,7 +80,7 @@ impl SettingsSection {
         match self {
             Self::Converters => "Converters",
             Self::General => "General",
-            Self::Media => "Media",
+            Self::Options => "Options",
             Self::Paths => "Paths",
             Self::Diagnostics => "Diagnostics",
             Self::About => "About",
@@ -82,9 +90,11 @@ impl SettingsSection {
     fn description(self) -> &'static str {
         match self {
             Self::Converters => "Choose which engine runs first when several support a conversion.",
-            Self::General => "Current session output format and history.",
-            Self::Media => "Current session FFmpeg quality and encode options.",
-            Self::Paths => "Where Shift looks for tools and stores preferences.",
+            Self::General => "Session output format and retained conversion history.",
+            Self::Options => {
+                "Session conversion knobs for FFmpeg, Docling, Defuddle, Pandoc, and MarkItDown."
+            }
+            Self::Paths => "Where Shift looks for tools, preferences, and history.",
             Self::Diagnostics => "Installed engines, versions, and install guidance.",
             Self::About => "Version, modules, and project info.",
         }
@@ -371,6 +381,7 @@ fn batch_queue_panel(
     running: bool,
     force: bool,
     status: Option<SharedString>,
+    item_progress: &HashMap<u64, (Option<f32>, SharedString)>,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let progress_queued = items
@@ -576,8 +587,33 @@ fn batch_queue_panel(
                 .children(items.iter().map(|item| {
                     let id = item.id;
                     let name: SharedString = item.source.display_name().into();
-                    let detail = batch_item_status_label(item);
+                    let mut detail = batch_item_status_label(item).to_string();
+                    if matches!(item.state, BatchItemState::Running) {
+                        if let Some((fraction, label)) = item_progress.get(&id.0) {
+                            detail = match fraction {
+                                Some(value) => {
+                                    format!("{label} ({:.0}%)", value.clamp(0.0, 1.0) * 100.0)
+                                }
+                                None => label.to_string(),
+                            };
+                        }
+                    }
+                    let format_label: SharedString = match item.format_selection {
+                        BatchFormatSelection::Inherit => {
+                            format!("{} · inherit", item.output_format.label()).into()
+                        }
+                        BatchFormatSelection::Override(format) => {
+                            format!("{} · override", format.label()).into()
+                        }
+                    };
                     let retryable = item.state.is_retryable() && !running;
+                    let can_override = matches!(item.state, BatchItemState::Queued) && !running;
+                    let success_path = match &item.state {
+                        BatchItemState::Succeeded { written_path, .. } => {
+                            Some(written_path.clone())
+                        }
+                        _ => None,
+                    };
                     div()
                         .id(ElementId::Name(format!("batch-item-{}", id.0).into()))
                         .flex()
@@ -611,8 +647,52 @@ fn batch_queue_panel(
                                         .text_color(rgb(TEXT_MUTED))
                                         .truncate()
                                         .child(detail),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_DIM))
+                                        .child(format_label),
                                 ),
                         )
+                        .when(can_override, |row| {
+                            let is_override =
+                                matches!(item.format_selection, BatchFormatSelection::Override(_));
+                            row.child(
+                                div()
+                                    .id(ElementId::Name(format!("batch-format-{}", id.0).into()))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .child(if is_override { "Inherit" } else { "Override" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_batch_item_format(id, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        })
+                        .when_some(success_path, |row, path| {
+                            row.child(
+                                div()
+                                    .id(ElementId::Name(format!("batch-reveal-{}", id.0).into()))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .child("Reveal")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        file_picker::reveal_in_finder(&path);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        })
                         .when(retryable, |row| {
                             row.child(
                                 div()
@@ -715,7 +795,7 @@ fn history_sidebar(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_DIM))
-                                    .child("Completed work shows up here."),
+                                    .child("Completed work is kept across launches."),
                             ),
                     )
                 })
@@ -1032,42 +1112,100 @@ fn chip(
         }))
 }
 
-struct MediaPanelView {
+struct ConversionPanelView {
+    active_modules: Vec<&'static str>,
     output_format: OutputFormat,
     quality: FfmpegQuality,
     encode_mode: FfmpegEncodeMode,
     mono: bool,
+    mute: bool,
+    normalize_audio: bool,
+    burn_subtitles: bool,
     sample_rate_hz: Option<u32>,
     scale_width: Option<u32>,
     start_input: Entity<TextInput>,
     duration_input: Entity<TextInput>,
     frame_input: Entity<TextInput>,
+    fps_input: Entity<TextInput>,
+    frame_interval_input: Entity<TextInput>,
     audio_stream_input: Entity<TextInput>,
     subtitle_stream_input: Entity<TextInput>,
+    docling_images: DoclingImageExportMode,
+    docling_ocr: bool,
+    docling_tables: bool,
+    docling_table_mode: DoclingTableMode,
+    docling_ocr_lang_input: Entity<TextInput>,
+    defuddle_frontmatter: bool,
+    defuddle_lang_input: Entity<TextInput>,
+    pandoc_standalone: bool,
+    pandoc_toc: bool,
+    pandoc_pdf_engine: Option<String>,
+    pandoc_reference_doc: Option<PathBuf>,
+    pdf_page_from_input: Entity<TextInput>,
+    pdf_page_to_input: Entity<TextInput>,
+    pdf_password_input: Entity<TextInput>,
+    markitdown_keep_data_uris: bool,
 }
 
-fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl IntoElement {
-    let MediaPanelView {
+fn conversion_options_panel(
+    view: ConversionPanelView,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let ConversionPanelView {
+        active_modules,
         output_format,
         quality,
         encode_mode,
         mono,
+        mute,
+        normalize_audio,
+        burn_subtitles,
         sample_rate_hz,
         scale_width,
         start_input,
         duration_input,
         frame_input,
+        fps_input,
+        frame_interval_input,
         audio_stream_input,
         subtitle_stream_input,
+        docling_images,
+        docling_ocr,
+        docling_tables,
+        docling_table_mode,
+        docling_ocr_lang_input,
+        defuddle_frontmatter,
+        defuddle_lang_input,
+        pandoc_standalone,
+        pandoc_toc,
+        pandoc_pdf_engine,
+        pandoc_reference_doc,
+        pdf_page_from_input,
+        pdf_page_to_input,
+        pdf_password_input,
+        markitdown_keep_data_uris,
     } = view;
+    let show_ffmpeg = active_modules.contains(&"ffmpeg");
+    let show_docling = active_modules.contains(&"docling");
+    let show_defuddle = active_modules.contains(&"defuddle");
+    let show_pandoc = active_modules.contains(&"pandoc");
+    let show_markitdown = active_modules.contains(&"markitdown");
+    let show_pdf_pages = show_docling || show_markitdown;
     let show_audio = is_audio_output(output_format) || is_video_output(output_format);
     let show_video = is_video_output(output_format) || is_image_output(output_format);
     let show_frame = is_image_output(output_format);
+    let show_sequence = output_format == OutputFormat::PNG_SEQUENCE_ZIP;
     let show_subtitle = is_subtitle_output(output_format);
     let show_trim = !is_image_output(output_format) && !is_subtitle_output(output_format);
+    let show_pdf_engine = output_format == OutputFormat::PDF;
+    let ref_doc_label: SharedString = pandoc_reference_doc
+        .as_ref()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "Pick reference…".into())
+        .into();
 
     div()
-        .id("media-options")
+        .id("conversion-options")
         .flex()
         .flex_col()
         .gap_3()
@@ -1087,11 +1225,11 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_SECONDARY))
-                        .child("Media options (FFmpeg)"),
+                        .child("Conversion options"),
                 )
                 .child(
                     div()
-                        .id("apply-media-options")
+                        .id("apply-conversion-options")
                         .px_3()
                         .py_1()
                         .rounded_md()
@@ -1105,210 +1243,505 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                         .hover(|style| style.bg(rgb(BG_ACTIVE)))
                         .child("Apply")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.apply_media_options(cx);
+                            this.apply_conversion_options(cx);
                             cx.stop_propagation();
                         })),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .items_center()
-                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Quality"))
-                .child(chip(
-                    "media-quality-balanced",
-                    FfmpegQuality::Balanced.label(),
-                    quality == FfmpegQuality::Balanced,
-                    cx,
-                    |this, cx| {
-                        this.ffmpeg_quality = FfmpegQuality::Balanced;
-                        this.start_conversion(cx);
-                    },
-                ))
-                .child(chip(
-                    "media-quality-high",
-                    FfmpegQuality::High.label(),
-                    quality == FfmpegQuality::High,
-                    cx,
-                    |this, cx| {
-                        this.ffmpeg_quality = FfmpegQuality::High;
-                        this.start_conversion(cx);
-                    },
-                ))
-                .child(chip(
-                    "media-quality-small",
-                    FfmpegQuality::Small.label(),
-                    quality == FfmpegQuality::Small,
-                    cx,
-                    |this, cx| {
-                        this.ffmpeg_quality = FfmpegQuality::Small;
-                        this.start_conversion(cx);
-                    },
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .items_center()
-                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Encode"))
-                .child(chip(
-                    "media-encode-auto",
-                    FfmpegEncodeMode::Auto.label(),
-                    encode_mode == FfmpegEncodeMode::Auto,
-                    cx,
-                    |this, cx| {
-                        this.ffmpeg_encode_mode = FfmpegEncodeMode::Auto;
-                        this.start_conversion(cx);
-                    },
-                ))
-                .child(chip(
-                    "media-encode-copy",
-                    FfmpegEncodeMode::PreferCopy.label(),
-                    encode_mode == FfmpegEncodeMode::PreferCopy,
-                    cx,
-                    |this, cx| {
-                        this.ffmpeg_encode_mode = FfmpegEncodeMode::PreferCopy;
-                        this.start_conversion(cx);
-                    },
-                ))
-                .child(chip(
-                    "media-encode-reencode",
-                    FfmpegEncodeMode::Reencode.label(),
-                    encode_mode == FfmpegEncodeMode::Reencode,
-                    cx,
-                    |this, cx| {
-                        this.ffmpeg_encode_mode = FfmpegEncodeMode::Reencode;
-                        this.start_conversion(cx);
-                    },
-                )),
-        )
-        .when(show_trim, |panel| {
+        .when(show_ffmpeg, |panel| {
             panel.child(
                 div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child("Start (sec)"),
-                            )
-                            .child(
-                                div()
-                                    .h(px(32.0))
-                                    .px_2()
-                                    .rounded_md()
-                                    .bg(rgb(BG_SURFACE))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .child(start_input),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child("Duration (sec)"),
-                            )
-                            .child(
-                                div()
-                                    .h(px(32.0))
-                                    .px_2()
-                                    .rounded_md()
-                                    .bg(rgb(BG_SURFACE))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .child(duration_input),
-                            ),
-                    ),
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT_MUTED))
+                    .child("FFmpeg"),
             )
         })
-        .when(show_frame, |panel| {
-            panel.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
-                            .child("Frame at (sec)"),
-                    )
-                    .child(
-                        div()
-                            .h(px(32.0))
-                            .px_2()
-                            .rounded_md()
-                            .bg(rgb(BG_SURFACE))
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .child(frame_input),
-                    ),
-            )
-        })
-        .when(show_audio, |panel| {
-            panel
+        .when(show_ffmpeg, |panel| {
+            let mut section = panel
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Audio"))
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Quality"))
                         .child(chip(
-                            "media-mono",
-                            if mono { "Mono ✓" } else { "Mono" },
-                            mono,
+                            "media-quality-balanced",
+                            FfmpegQuality::Balanced.label(),
+                            quality == FfmpegQuality::Balanced,
                             cx,
                             |this, cx| {
-                                this.ffmpeg_mono = !this.ffmpeg_mono;
+                                this.ffmpeg_quality = FfmpegQuality::Balanced;
                                 this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
-                            "media-rate-auto",
-                            "Rate auto",
-                            sample_rate_hz.is_none(),
+                            "media-quality-high",
+                            FfmpegQuality::High.label(),
+                            quality == FfmpegQuality::High,
                             cx,
                             |this, cx| {
-                                this.ffmpeg_sample_rate_hz = None;
+                                this.ffmpeg_quality = FfmpegQuality::High;
                                 this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
-                            "media-rate-44100",
-                            "44.1 kHz",
-                            sample_rate_hz == Some(44_100),
+                            "media-quality-small",
+                            FfmpegQuality::Small.label(),
+                            quality == FfmpegQuality::Small,
                             cx,
                             |this, cx| {
-                                this.ffmpeg_sample_rate_hz = Some(44_100);
+                                this.ffmpeg_quality = FfmpegQuality::Small;
+                                this.start_conversion(cx);
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Encode"))
+                        .child(chip(
+                            "media-encode-auto",
+                            FfmpegEncodeMode::Auto.label(),
+                            encode_mode == FfmpegEncodeMode::Auto,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_encode_mode = FfmpegEncodeMode::Auto;
                                 this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
-                            "media-rate-48000",
-                            "48 kHz",
-                            sample_rate_hz == Some(48_000),
+                            "media-encode-copy",
+                            FfmpegEncodeMode::PreferCopy.label(),
+                            encode_mode == FfmpegEncodeMode::PreferCopy,
                             cx,
                             |this, cx| {
-                                this.ffmpeg_sample_rate_hz = Some(48_000);
+                                this.ffmpeg_encode_mode = FfmpegEncodeMode::PreferCopy;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-encode-reencode",
+                            FfmpegEncodeMode::Reencode.label(),
+                            encode_mode == FfmpegEncodeMode::Reencode,
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_encode_mode = FfmpegEncodeMode::Reencode;
+                                this.start_conversion(cx);
+                            },
+                        )),
+                );
+            if show_trim {
+                section = section.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child("Start (sec)"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(rgb(BG_SURFACE))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(start_input.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child("Duration (sec)"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(rgb(BG_SURFACE))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(duration_input.clone()),
+                                ),
+                        ),
+                );
+            }
+            if show_frame {
+                section = section.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Frame at (sec)"),
+                        )
+                        .child(
+                            div()
+                                .h(px(32.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(rgb(BG_SURFACE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .child(frame_input.clone()),
+                        ),
+                );
+            }
+            if show_audio {
+                section = section
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Audio"))
+                            .child(chip(
+                                "media-mono",
+                                if mono { "Mono ✓" } else { "Mono" },
+                                mono,
+                                cx,
+                                |this, cx| {
+                                    this.ffmpeg_mono = !this.ffmpeg_mono;
+                                    this.persist_session_settings(cx);
+                                    this.start_conversion(cx);
+                                },
+                            ))
+                            .child(chip(
+                                "media-mute",
+                                if mute { "Mute ✓" } else { "Mute" },
+                                mute,
+                                cx,
+                                |this, cx| {
+                                    this.ffmpeg_mute = !this.ffmpeg_mute;
+                                    this.persist_session_settings(cx);
+                                    this.start_conversion(cx);
+                                },
+                            ))
+                            .child(chip(
+                                "media-normalize",
+                                if normalize_audio {
+                                    "Normalize ✓"
+                                } else {
+                                    "Normalize"
+                                },
+                                normalize_audio,
+                                cx,
+                                |this, cx| {
+                                    this.ffmpeg_normalize = !this.ffmpeg_normalize;
+                                    this.persist_session_settings(cx);
+                                    this.start_conversion(cx);
+                                },
+                            ))
+                            .child(chip(
+                                "media-rate-auto",
+                                "Rate auto",
+                                sample_rate_hz.is_none(),
+                                cx,
+                                |this, cx| {
+                                    this.ffmpeg_sample_rate_hz = None;
+                                    this.persist_session_settings(cx);
+                                    this.start_conversion(cx);
+                                },
+                            ))
+                            .child(chip(
+                                "media-rate-44100",
+                                "44.1 kHz",
+                                sample_rate_hz == Some(44_100),
+                                cx,
+                                |this, cx| {
+                                    this.ffmpeg_sample_rate_hz = Some(44_100);
+                                    this.start_conversion(cx);
+                                },
+                            ))
+                            .child(chip(
+                                "media-rate-48000",
+                                "48 kHz",
+                                sample_rate_hz == Some(48_000),
+                                cx,
+                                |this, cx| {
+                                    this.ffmpeg_sample_rate_hz = Some(48_000);
+                                    this.start_conversion(cx);
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child("Audio stream index"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(BG_SURFACE))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .child(audio_stream_input.clone()),
+                            ),
+                    );
+            }
+            if show_video {
+                section = section.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width"))
+                        .child(chip(
+                            "media-scale-auto",
+                            "Auto",
+                            scale_width.is_none(),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_scale_width = None;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-scale-720",
+                            "720",
+                            scale_width == Some(720),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_scale_width = Some(720);
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-scale-1280",
+                            "1280",
+                            scale_width == Some(1280),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_scale_width = Some(1280);
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "media-scale-1920",
+                            "1920",
+                            scale_width == Some(1920),
+                            cx,
+                            |this, cx| {
+                                this.ffmpeg_scale_width = Some(1920);
+                                this.persist_session_settings(cx);
+                                this.start_conversion(cx);
+                            },
+                        )),
+                );
+                section = section
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("FPS"))
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(BG_SURFACE))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .child(fps_input.clone()),
+                            ),
+                    )
+                    .child(div().flex().flex_wrap().gap_2().items_center().child(chip(
+                        "media-burn-subs",
+                        if burn_subtitles {
+                            "Burn subs ✓"
+                        } else {
+                            "Burn subs"
+                        },
+                        burn_subtitles,
+                        cx,
+                        |this, cx| {
+                            this.ffmpeg_burn_subs = !this.ffmpeg_burn_subs;
+                            this.persist_session_settings(cx);
+                            this.start_conversion(cx);
+                        },
+                    )));
+            }
+            if show_sequence {
+                section = section.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Frame interval (sec)"),
+                        )
+                        .child(
+                            div()
+                                .h(px(32.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(rgb(BG_SURFACE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .child(frame_interval_input.clone()),
+                        ),
+                );
+            }
+            if show_subtitle {
+                section = section.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Subtitle stream index"),
+                        )
+                        .child(
+                            div()
+                                .h(px(32.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(rgb(BG_SURFACE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .child(subtitle_stream_input.clone()),
+                        ),
+                );
+            }
+            section
+        })
+        .when(show_docling, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("Docling"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Images"))
+                        .child(chip(
+                            "docling-images-placeholder",
+                            DoclingImageExportMode::Placeholder.label(),
+                            docling_images == DoclingImageExportMode::Placeholder,
+                            cx,
+                            |this, cx| {
+                                this.docling_images = DoclingImageExportMode::Placeholder;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "docling-images-embedded",
+                            DoclingImageExportMode::Embedded.label(),
+                            docling_images == DoclingImageExportMode::Embedded,
+                            cx,
+                            |this, cx| {
+                                this.docling_images = DoclingImageExportMode::Embedded;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "docling-images-referenced",
+                            DoclingImageExportMode::Referenced.label(),
+                            docling_images == DoclingImageExportMode::Referenced,
+                            cx,
+                            |this, cx| {
+                                this.docling_images = DoclingImageExportMode::Referenced;
+                                this.start_conversion(cx);
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(chip(
+                            "docling-ocr",
+                            if docling_ocr { "OCR ✓" } else { "OCR" },
+                            docling_ocr,
+                            cx,
+                            |this, cx| {
+                                this.docling_ocr = !this.docling_ocr;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "docling-tables",
+                            if docling_tables {
+                                "Tables ✓"
+                            } else {
+                                "Tables"
+                            },
+                            docling_tables,
+                            cx,
+                            |this, cx| {
+                                this.docling_tables = !this.docling_tables;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "docling-table-fast",
+                            DoclingTableMode::Fast.label(),
+                            docling_table_mode == DoclingTableMode::Fast,
+                            cx,
+                            |this, cx| {
+                                this.docling_table_mode = DoclingTableMode::Fast;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "docling-table-accurate",
+                            DoclingTableMode::Accurate.label(),
+                            docling_table_mode == DoclingTableMode::Accurate,
+                            cx,
+                            |this, cx| {
+                                this.docling_table_mode = DoclingTableMode::Accurate;
+                                this.persist_session_settings(cx);
                                 this.start_conversion(cx);
                             },
                         )),
@@ -1322,7 +1755,7 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                             div()
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
-                                .child("Audio stream index"),
+                                .child("OCR language (e.g. eng)"),
                         )
                         .child(
                             div()
@@ -1332,83 +1765,296 @@ fn media_options_panel(view: MediaPanelView, cx: &mut Context<Shift>) -> impl In
                                 .bg(rgb(BG_SURFACE))
                                 .border_1()
                                 .border_color(rgb(BORDER))
-                                .child(audio_stream_input),
+                                .child(docling_ocr_lang_input),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("Embedded images can produce large artifacts."),
+                )
+        })
+        .when(show_pdf_pages, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("PDF pages"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child("From page"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(rgb(BG_SURFACE))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(pdf_page_from_input),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_1()
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("To page"))
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(rgb(BG_SURFACE))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(pdf_page_to_input),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("PDF password (session only)"),
+                        )
+                        .child(
+                            div()
+                                .h(px(32.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(rgb(BG_SURFACE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .child(pdf_password_input),
                         ),
                 )
         })
-        .when(show_video, |panel| {
-            panel.child(
+        .when(show_defuddle, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("Defuddle"),
+                )
+                .child(div().flex().flex_wrap().gap_2().items_center().child(chip(
+                    "defuddle-frontmatter",
+                    if defuddle_frontmatter {
+                        "Frontmatter ✓"
+                    } else {
+                        "Frontmatter"
+                    },
+                    defuddle_frontmatter,
+                    cx,
+                    |this, cx| {
+                        this.defuddle_frontmatter = !this.defuddle_frontmatter;
+                        this.start_conversion(cx);
+                    },
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("Language (BCP 47)"),
+                        )
+                        .child(
+                            div()
+                                .h(px(32.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(rgb(BG_SURFACE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .child(defuddle_lang_input),
+                        ),
+                )
+        })
+        .when(show_pandoc, |panel| {
+            let mut section = panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("Pandoc"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(chip(
+                            "pandoc-standalone",
+                            if pandoc_standalone {
+                                "Standalone ✓"
+                            } else {
+                                "Standalone"
+                            },
+                            pandoc_standalone,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_standalone = !this.pandoc_standalone;
+                                this.start_conversion(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "pandoc-toc",
+                            if pandoc_toc { "TOC ✓" } else { "TOC" },
+                            pandoc_toc,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_toc = !this.pandoc_toc;
+                                this.start_conversion(cx);
+                            },
+                        )),
+                );
+            if show_pdf_engine {
+                let mut engines = div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("PDF engine"),
+                    )
+                    .child(chip(
+                        "pandoc-pdf-auto",
+                        "Auto",
+                        pandoc_pdf_engine.is_none(),
+                        cx,
+                        |this, cx| {
+                            this.pandoc_pdf_engine = None;
+                            this.start_conversion(cx);
+                        },
+                    ));
+                for (index, name) in pdf_engine_candidates().iter().take(5).enumerate() {
+                    let selected = pandoc_pdf_engine.as_deref() == Some(*name);
+                    let label = (*name).to_owned();
+                    engines = engines.child(chip(
+                        ("pandoc-pdf-engine", index),
+                        *name,
+                        selected,
+                        cx,
+                        move |this, cx| {
+                            this.pandoc_pdf_engine = Some(label.clone());
+                            this.persist_session_settings(cx);
+                            this.start_conversion(cx);
+                        },
+                    ));
+                }
+                section = section.child(engines);
+            }
+            section = section.child(
                 div()
                     .flex()
                     .flex_wrap()
                     .gap_2()
                     .items_center()
-                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width"))
-                    .child(chip(
-                        "media-scale-auto",
-                        "Auto",
-                        scale_width.is_none(),
-                        cx,
-                        |this, cx| {
-                            this.ffmpeg_scale_width = None;
-                            this.start_conversion(cx);
-                        },
-                    ))
-                    .child(chip(
-                        "media-scale-720",
-                        "720",
-                        scale_width == Some(720),
-                        cx,
-                        |this, cx| {
-                            this.ffmpeg_scale_width = Some(720);
-                            this.start_conversion(cx);
-                        },
-                    ))
-                    .child(chip(
-                        "media-scale-1280",
-                        "1280",
-                        scale_width == Some(1280),
-                        cx,
-                        |this, cx| {
-                            this.ffmpeg_scale_width = Some(1280);
-                            this.start_conversion(cx);
-                        },
-                    ))
-                    .child(chip(
-                        "media-scale-1920",
-                        "1920",
-                        scale_width == Some(1920),
-                        cx,
-                        |this, cx| {
-                            this.ffmpeg_scale_width = Some(1920);
-                            this.start_conversion(cx);
-                        },
-                    )),
-            )
-        })
-        .when(show_subtitle, |panel| {
-            panel.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED))
-                            .child("Subtitle stream index"),
+                            .child("Reference doc"),
                     )
                     .child(
                         div()
-                            .h(px(32.0))
-                            .px_2()
+                            .id("pandoc-reference-doc")
+                            .px_3()
+                            .py_1()
                             .rounded_md()
-                            .bg(rgb(BG_SURFACE))
+                            .bg(rgb(BG_ELEVATED))
                             .border_1()
-                            .border_color(rgb(BORDER))
-                            .child(subtitle_stream_input),
-                    ),
-            )
+                            .border_color(rgb(BORDER_STRONG))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                            .child(ref_doc_label)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_reference_doc(cx);
+                                cx.stop_propagation();
+                            })),
+                    )
+                    .when(pandoc_reference_doc.is_some(), |row| {
+                        row.child(chip(
+                            "pandoc-reference-clear",
+                            "Clear",
+                            false,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_reference_doc = None;
+                                this.persist_session_settings(cx);
+                                this.start_conversion(cx);
+                            },
+                        ))
+                    }),
+            );
+            section
+        })
+        .when(show_markitdown, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("MarkItDown"),
+                )
+                .child(div().flex().flex_wrap().gap_2().items_center().child(chip(
+                    "markitdown-keep-data-uris",
+                    if markitdown_keep_data_uris {
+                        "Keep data URIs ✓"
+                    } else {
+                        "Keep data URIs"
+                    },
+                    markitdown_keep_data_uris,
+                    cx,
+                    |this, cx| {
+                        this.markitdown_keep_data_uris = !this.markitdown_keep_data_uris;
+                        this.start_conversion(cx);
+                    },
+                )))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("Keeping data URIs can produce large Markdown files."),
+                )
         })
         .child(
             div()
@@ -1423,11 +2069,16 @@ struct OutputPanelView {
     save_status: Option<SharedString>,
     output_format: OutputFormat,
     output_menu_open: bool,
+    format_filter_input: Entity<TextInput>,
+    format_filter: String,
     available_outputs: Vec<OutputFormat>,
     /// Formats whose engines are installed and ready (subset of available when diagnostics known).
     ready_outputs: Option<Vec<OutputFormat>>,
-    show_media_options: bool,
-    media: MediaPanelView,
+    show_conversion_options: bool,
+    conversion_options: ConversionPanelView,
+    conversion_progress: Option<(Option<f32>, SharedString)>,
+    show_command_inspect: bool,
+    install_hints: Vec<(SharedString, SharedString)>,
 }
 
 fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElement {
@@ -1436,11 +2087,17 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
         save_status,
         output_format,
         output_menu_open,
+        format_filter_input,
+        format_filter,
         available_outputs,
         ready_outputs,
-        show_media_options,
-        media,
+        show_conversion_options,
+        conversion_options,
+        conversion_progress,
+        show_command_inspect,
+        install_hints,
     } = view;
+    let filter_lower = format_filter.to_ascii_lowercase();
     let content = match state {
         ConversionState::Empty => div()
             .flex()
@@ -1466,48 +2123,83 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         "Choose a document, media file, or paste a URL — Shift converts it automatically.",
                     ),
             ),
-        ConversionState::Converting => div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .h_full()
-            .child(
-                div()
-                    .text_2xl()
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child("↻")
-                    .with_animation(
-                        "conversion-pulse",
-                        Animation::new(Duration::from_millis(900)).repeat(),
-                        |element, progress| element.opacity(0.35 + progress * 0.65),
-                    ),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(format!("Converting to {}…", output_format.label())),
-            )
-            .child(
-                div()
-                    .id("cancel-conversion")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(BG_ELEVATED))
-                    .border_1()
-                    .border_color(rgb(BORDER_STRONG))
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT_PRIMARY))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-                    .child("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel_conversion(cx))),
-            ),
+        ConversionState::Converting => {
+            let progress_label = conversion_progress
+                .as_ref()
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| format!("Converting to {}…", output_format.label()).into());
+            let fraction = conversion_progress
+                .as_ref()
+                .and_then(|(fraction, _)| *fraction);
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .h_full()
+                .child(
+                    div()
+                        .text_2xl()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child("↻")
+                        .with_animation(
+                            "conversion-pulse",
+                            Animation::new(Duration::from_millis(900)).repeat(),
+                            |element, progress| element.opacity(0.35 + progress * 0.65),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(progress_label),
+                )
+                .when_some(fraction, |panel, value| {
+                    let clamped = value.clamp(0.0, 1.0);
+                    panel
+                        .child(
+                            div()
+                                .w(px(220.0))
+                                .h(px(6.0))
+                                .rounded_full()
+                                .bg(rgb(BG_ELEVATED))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded_full()
+                                        .bg(rgb(TEXT_SECONDARY))
+                                        .w(px(220.0 * clamped)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("{:.0}%", clamped * 100.0)),
+                        )
+                })
+                .child(
+                    div()
+                        .id("cancel-conversion")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(BG_ELEVATED))
+                        .border_1()
+                        .border_color(rgb(BORDER_STRONG))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_conversion(cx))),
+                )
+        }
         ConversionState::Failed(message) => div()
             .flex()
             .flex_col()
@@ -1531,16 +2223,81 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .text_sm()
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(message),
-            ),
+            )
+            .children(install_hints.into_iter().enumerate().map(|(index, (label, hint))| {
+                let hint_for_copy = hint.clone();
+                div()
+                    .id(("install-hint", index as u64))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(BG_RAISED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(hint.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(("copy-install", index as u64))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(BG_ELEVATED))
+                            .border_1()
+                            .border_color(rgb(BORDER_STRONG))
+                            .text_xs()
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                            .child("Copy install command")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    hint_for_copy.to_string(),
+                                ));
+                                this.save_status = Some("Install command copied.".into());
+                                cx.notify();
+                                cx.stop_propagation();
+                            })),
+                    )
+            })),
         ConversionState::Ready(artifact) => {
             let file_name: SharedString = artifact.file_name.clone().into();
             let size = format_file_size(artifact.bytes.len() as u64);
             let excerpt = artifact_preview(artifact.as_ref());
+            let is_text = artifact.format.is_text_previewable();
+            let pipeline_badge: SharedString = if artifact.pipeline.is_empty() {
+                module_label(artifact.module_id).into()
+            } else {
+                artifact
+                    .pipeline
+                    .iter()
+                    .map(|id| module_label(id))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+                    .into()
+            };
             let conversion_detail = format!(
-                "{}  ·  {size}  ·  via {}",
-                artifact.format.label(),
-                module_label(artifact.module_id)
+                "{}  ·  {size}  ·  via {pipeline_badge}",
+                artifact.format.label()
             );
+            let commands: Vec<SharedString> = artifact
+                .invocations
+                .iter()
+                .map(|inv| format!("{}: {}", inv.module_id, inv.argv_display).into())
+                .collect();
             div()
                 .flex()
                 .flex_col()
@@ -1551,12 +2308,14 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap_2()
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap_1()
                                 .min_w_0()
+                                .flex_1()
                                 .child(
                                     div()
                                         .text_lg()
@@ -1568,41 +2327,151 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                         .text_xs()
                                         .text_color(rgb(TEXT_SECONDARY))
                                         .child(conversion_detail),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(BADGE_FILL))
+                                                .text_xs()
+                                                .text_color(rgb(BADGE_TEXT))
+                                                .child(pipeline_badge),
+                                        ),
                                 ),
                         )
                         .child(
                             div()
-                                .id("save-conversion")
-                                .px_4()
-                                .py_2()
-                                .rounded_lg()
-                                .bg(rgb(BG_ELEVATED))
-                                .border_1()
-                                .border_color(rgb(BORDER_STRONG))
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-                                .active(|style| style.opacity(0.82))
-                                .child("Download")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_output(cx))),
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(action_chip("save-conversion", "Download", cx, |this, cx| {
+                                    this.save_output(cx);
+                                }))
+                                .child(action_chip("copy-conversion", "Copy", cx, |this, cx| {
+                                    this.copy_output(cx);
+                                }))
+                                .child(action_chip("reveal-conversion", "Reveal", cx, |this, cx| {
+                                    this.reveal_output(cx);
+                                }))
+                                .child(action_chip("open-conversion", "Open", cx, |this, cx| {
+                                    this.open_output(cx);
+                                }))
+                                .when(!commands.is_empty(), |row| {
+                                    row.child(action_chip(
+                                        "show-command",
+                                        if show_command_inspect {
+                                            "Hide cmd"
+                                        } else {
+                                            "Show cmd"
+                                        },
+                                        cx,
+                                        |this, cx| {
+                                            this.show_command_inspect = !this.show_command_inspect;
+                                            cx.notify();
+                                        },
+                                    ))
+                                }),
                         ),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .p_5()
-                        .rounded_xl()
-                        .bg(rgb(BG_RAISED))
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .overflow_hidden()
-                        .text_sm()
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child(excerpt),
-                )
+                .when(!is_text, |panel| {
+                    panel.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_4()
+                            .rounded_xl()
+                            .bg(rgb(BG_ELEVATED))
+                            .border_1()
+                            .border_color(rgb(BORDER_STRONG))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Binary artifact"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(format!(
+                                        "{} · {size} · not shown inline",
+                                        artifact.format.label()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(action_chip(
+                                        "binary-copy-path",
+                                        "Copy path",
+                                        cx,
+                                        |this, cx| this.copy_output(cx),
+                                    ))
+                                    .child(action_chip(
+                                        "binary-reveal",
+                                        "Reveal",
+                                        cx,
+                                        |this, cx| this.reveal_output(cx),
+                                    ))
+                                    .child(action_chip(
+                                        "binary-open",
+                                        "Open",
+                                        cx,
+                                        |this, cx| this.open_output(cx),
+                                    )),
+                            ),
+                    )
+                })
+                .when(is_text, |panel| {
+                    panel.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .p_5()
+                            .rounded_xl()
+                            .bg(rgb(BG_RAISED))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(excerpt),
+                    )
+                })
+                .when(show_command_inspect && !commands.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(BG_RAISED))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child("Command"),
+                            )
+                            .children(commands.into_iter().map(|line| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(line)
+                            })),
+                    )
+                })
                 .when_some(save_status, |panel, status| {
                     panel.child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(status))
                 })
@@ -1656,7 +2525,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .absolute()
                     .top(px(42.0))
                     .right_0()
-                    .w(px(190.0))
+                    .w(px(220.0))
                     .max_h(px(420.0))
                     .overflow_y_scroll()
                     .p_1()
@@ -1666,58 +2535,80 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .border_color(rgb(BORDER_STRONG))
                     .shadow_lg()
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .children(OutputFormat::ALL.iter().copied().enumerate().map(
-                        |(index, format)| {
-                            let enabled = available_outputs.contains(&format);
-                            let engine_ready = ready_outputs
-                                .as_ref()
-                                .map(|ready| ready.contains(&format))
-                                .unwrap_or(true);
-                            let label_color = if !enabled {
-                                rgb(TEXT_DIM)
-                            } else if !engine_ready {
-                                rgb(TEXT_MUTED)
-                            } else {
-                                rgb(TEXT_PRIMARY)
-                            };
-                            div()
-                                .id(("output-format", index))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px_3()
-                                .py_2()
-                                .rounded_md()
-                                .text_sm()
-                                .text_color(label_color)
-                                .when(enabled, |row| {
-                                    row.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(BG_HOVER)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_output_format(format, cx);
-                                            cx.stop_propagation();
-                                        }))
-                                })
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(format.label())
-                                        .when(enabled && !engine_ready, |row| {
-                                            row.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(TEXT_DIM))
-                                                    .child("missing"),
-                                            )
-                                        }),
-                                )
-                                .when(format == output_format, |row| {
-                                    row.child(div().text_color(rgb(TEXT)).child("✓"))
-                                })
-                        },
-                    )),
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .px_2()
+                            .mb_1()
+                            .rounded_md()
+                            .bg(rgb(BG_SURFACE))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .child(format_filter_input),
+                    )
+                    .children(
+                        OutputFormat::ALL
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(_, format)| {
+                                if filter_lower.is_empty() {
+                                    return true;
+                                }
+                                format.label().to_ascii_lowercase().contains(&filter_lower)
+                                    || format.id().to_ascii_lowercase().contains(&filter_lower)
+                            })
+                            .map(|(index, format)| {
+                                let enabled = available_outputs.contains(&format);
+                                let engine_ready = ready_outputs
+                                    .as_ref()
+                                    .map(|ready| ready.contains(&format))
+                                    .unwrap_or(true);
+                                let label_color = if !enabled {
+                                    rgb(TEXT_DIM)
+                                } else if !engine_ready {
+                                    rgb(TEXT_MUTED)
+                                } else {
+                                    rgb(TEXT_PRIMARY)
+                                };
+                                div()
+                                    .id(("output-format", index))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .text_color(label_color)
+                                    .when(enabled, |row| {
+                                        row.cursor_pointer()
+                                            .hover(|style| style.bg(rgb(BG_HOVER)))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.set_output_format(format, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(format.label())
+                                            .when(enabled && !engine_ready, |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(TEXT_DIM))
+                                                        .child("missing"),
+                                                )
+                                            }),
+                                    )
+                                    .when(format == output_format, |row| {
+                                        row.child(div().text_color(rgb(TEXT)).child("✓"))
+                                    })
+                            }),
+                    ),
             )
         });
 
@@ -1729,8 +2620,8 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
         .flex()
         .flex_col()
         .gap_3()
-        .when(show_media_options, |panel| {
-            panel.child(media_options_panel(media, cx))
+        .when(show_conversion_options, |panel| {
+            panel.child(conversion_options_panel(conversion_options, cx))
         })
         .child(div().flex_1().min_h_0().child(content))
         .child(
@@ -1740,6 +2631,32 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .right(px(72.0))
                 .child(selector),
         )
+}
+
+fn action_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    cx: &mut Context<Shift>,
+    on_click: impl Fn(&mut Shift, &mut Context<Shift>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(BG_ELEVATED))
+        .border_1()
+        .border_color(rgb(BORDER_STRONG))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(TEXT_PRIMARY))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+        .child(label.into())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            on_click(this, cx);
+            cx.stop_propagation();
+        }))
 }
 
 fn module_label(id: &str) -> &str {
@@ -1762,6 +2679,100 @@ fn module_description(id: &str) -> &str {
         "ffmpeg" => "Audio, video, stills, and subtitle conversion.",
         _ => "Conversion module.",
     }
+}
+
+fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEntry {
+    let source = match &entry.source {
+        HistorySource::File(path) => StoredSource::File(path.clone()),
+        HistorySource::Url(url) => StoredSource::Url(url.clone()),
+    };
+    let outcome = match &entry.outcome {
+        HistoryOutcome::Ready(artifact) => StoredOutcome::Ready {
+            module_id: artifact.module_id.to_owned(),
+            file_name: artifact.file_name.clone(),
+            format: artifact.format.id().to_owned(),
+            bytes: artifact.bytes.clone(),
+        },
+        HistoryOutcome::ReadyLarge {
+            module_id,
+            byte_len,
+        } => StoredOutcome::ReadyLarge {
+            module_id: module_id.to_string(),
+            byte_len: *byte_len,
+        },
+        HistoryOutcome::Failed(message) => StoredOutcome::Failed(message.to_string()),
+    };
+    StoredHistoryEntry {
+        id: entry.id,
+        source,
+        name: entry.name.to_string(),
+        detail: entry.detail.to_string(),
+        extension_label: entry.extension_label.to_string(),
+        badge_color: entry.badge_color,
+        badge_text_color: entry.badge_text_color,
+        output_format: entry.output_format.id().to_owned(),
+        outcome,
+    }
+}
+
+fn from_stored_entry(entry: StoredHistoryEntry) -> Option<ConversionHistoryEntry> {
+    let output_format = entry.output_format.parse().ok()?;
+    let source = match entry.source {
+        StoredSource::File(path) => HistorySource::File(path),
+        StoredSource::Url(url) => HistorySource::Url(url),
+    };
+    let outcome = match entry.outcome {
+        StoredOutcome::Ready {
+            module_id,
+            file_name,
+            format,
+            bytes,
+        } => {
+            let format: OutputFormat = format.parse().ok().unwrap_or(output_format);
+            HistoryOutcome::Ready(Arc::new(ConversionArtifact {
+                file_name,
+                media_type: format.media_type(),
+                bytes,
+                format,
+                module_id: intern_module_id(&module_id),
+                pipeline: Vec::new(),
+                invocations: Vec::new(),
+            }))
+        }
+        StoredOutcome::ReadyLarge {
+            module_id,
+            byte_len,
+        } => HistoryOutcome::ReadyLarge {
+            module_id: module_id.into(),
+            byte_len,
+        },
+        StoredOutcome::Failed(message) => HistoryOutcome::Failed(message.into()),
+    };
+    Some(ConversionHistoryEntry {
+        id: entry.id,
+        source,
+        name: entry.name.into(),
+        detail: entry.detail.into(),
+        extension_label: entry.extension_label.into(),
+        badge_color: entry.badge_color,
+        badge_text_color: entry.badge_text_color,
+        output_format,
+        outcome,
+    })
+}
+
+fn history_from_store(loaded: LoadedHistory) -> (Vec<ConversionHistoryEntry>, u64) {
+    let mut max_id = 0u64;
+    let entries: Vec<_> = loaded
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            max_id = max_id.max(entry.id);
+            from_stored_entry(entry)
+        })
+        .collect();
+    let next_id = loaded.next_id.max(max_id.saturating_add(1)).max(1);
+    (entries, next_id)
 }
 
 fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl IntoElement {
@@ -2058,7 +3069,7 @@ fn settings_general_panel(
         .min_w_0()
         .child(settings_section_header(
             "General",
-            "Live session options. Changes apply immediately and re-run conversion when a source is open.",
+            "Output format applies to this session. History is retained on this Mac across launches.",
         ))
         .child(settings_card(
             "Current output format",
@@ -2126,7 +3137,7 @@ fn settings_general_panel(
                 .gap_3()
                 .w_full()
                 .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(format!(
-                    "{history_count} entr{} in this session (max {MAX_HISTORY_ENTRIES}).",
+                    "{history_count} entr{} retained (max {MAX_HISTORY_ENTRIES}).",
                     if history_count == 1 { "y" } else { "ies" }
                 )))
                 .child(
@@ -2152,15 +3163,24 @@ fn settings_general_panel(
                         })),
                 )
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                    "History is kept only for the current session and is not saved to disk.",
+                    "History is saved under Application Support and restored when you reopen Shift. Clear removes it from this Mac.",
                 )),
         ))
 }
 
-fn settings_media_panel(
+#[allow(clippy::too_many_arguments)]
+fn settings_options_panel(
     quality: FfmpegQuality,
     encode_mode: FfmpegEncodeMode,
     mono: bool,
+    docling_images: DoclingImageExportMode,
+    docling_ocr: bool,
+    docling_tables: bool,
+    docling_table_mode: DoclingTableMode,
+    defuddle_frontmatter: bool,
+    pandoc_standalone: bool,
+    pandoc_toc: bool,
+    markitdown_keep_data_uris: bool,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement + use<> {
     div()
@@ -2170,11 +3190,11 @@ fn settings_media_panel(
         .w_full()
         .min_w_0()
         .child(settings_section_header(
-            "Media",
-            "Session media options for FFmpeg. Changes apply immediately when a media conversion is active.",
+            "Options",
+            "Session conversion knobs. Changes apply immediately when a matching conversion is active. Saved across launches (passwords never are).",
         ))
         .child(settings_card(
-            "Quality",
+            "FFmpeg quality",
             div()
                 .flex()
                 .flex_col()
@@ -2191,11 +3211,7 @@ fn settings_media_panel(
                             cx,
                             |this, cx| {
                                 this.ffmpeg_quality = FfmpegQuality::Balanced;
-                                if this.media_options_visible() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
+                                this.apply_session_option_change(cx);
                             },
                         ))
                         .child(chip(
@@ -2205,11 +3221,7 @@ fn settings_media_panel(
                             cx,
                             |this, cx| {
                                 this.ffmpeg_quality = FfmpegQuality::High;
-                                if this.media_options_visible() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
+                                this.apply_session_option_change(cx);
                             },
                         ))
                         .child(chip(
@@ -2219,11 +3231,7 @@ fn settings_media_panel(
                             cx,
                             |this, cx| {
                                 this.ffmpeg_quality = FfmpegQuality::Small;
-                                if this.media_options_visible() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
+                                this.apply_session_option_change(cx);
                             },
                         )),
                 )
@@ -2231,13 +3239,11 @@ fn settings_media_panel(
                     div()
                         .text_xs()
                         .text_color(rgb(TEXT_MUTED))
-                        .child(
-                            "Tradeoff when re-encoding: higher quality uses more bitrate / less compression; smaller file does the opposite. Ignored during stream copy.",
-                        ),
+                        .child("Tradeoff when re-encoding media. Ignored during stream copy."),
                 ),
         ))
         .child(settings_card(
-            "Encode mode",
+            "FFmpeg encode mode",
             div()
                 .flex()
                 .flex_col()
@@ -2254,11 +3260,7 @@ fn settings_media_panel(
                             cx,
                             |this, cx| {
                                 this.ffmpeg_encode_mode = FfmpegEncodeMode::Auto;
-                                if this.media_options_visible() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
+                                this.apply_session_option_change(cx);
                             },
                         ))
                         .child(chip(
@@ -2268,11 +3270,7 @@ fn settings_media_panel(
                             cx,
                             |this, cx| {
                                 this.ffmpeg_encode_mode = FfmpegEncodeMode::PreferCopy;
-                                if this.media_options_visible() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
+                                this.apply_session_option_change(cx);
                             },
                         ))
                         .child(chip(
@@ -2282,11 +3280,7 @@ fn settings_media_panel(
                             cx,
                             |this, cx| {
                                 this.ffmpeg_encode_mode = FfmpegEncodeMode::Reencode;
-                                if this.media_options_visible() {
-                                    this.start_conversion(cx);
-                                } else {
-                                    cx.notify();
-                                }
+                                this.apply_session_option_change(cx);
                             },
                         )),
                 )
@@ -2295,12 +3289,12 @@ fn settings_media_panel(
                         .text_xs()
                         .text_color(rgb(TEXT_MUTED))
                         .child(
-                            "Auto re-encodes with quality presets. Stream copy remuxes without re-encoding (fast, fails if the container can’t hold the streams). Re-encode always applies quality, mono, sample rate, and scale.",
+                            "Auto re-encodes with quality presets. Stream copy remuxes without re-encoding. Re-encode always applies quality, mono, sample rate, and scale.",
                         ),
                 ),
         ))
         .child(settings_card(
-            "Audio",
+            "FFmpeg audio",
             div()
                 .flex()
                 .flex_col()
@@ -2313,21 +3307,161 @@ fn settings_media_panel(
                         cx,
                         |this, cx| {
                             this.ffmpeg_mono = !this.ffmpeg_mono;
-                            if this.media_options_visible() {
-                                this.start_conversion(cx);
-                            } else {
-                                cx.notify();
-                            }
+                            this.apply_session_option_change(cx);
                         },
                     )),
-                )
+                ),
+        ))
+        .child(settings_card(
+            "Docling",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
-                        .child(
-                            "Downmix to a single channel when re-encoding. These values seed the media panel; per-conversion overrides still apply on the main screen.",
-                        ),
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(chip(
+                            "settings-docling-placeholder",
+                            DoclingImageExportMode::Placeholder.label(),
+                            docling_images == DoclingImageExportMode::Placeholder,
+                            cx,
+                            |this, cx| {
+                                this.docling_images = DoclingImageExportMode::Placeholder;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-embedded",
+                            DoclingImageExportMode::Embedded.label(),
+                            docling_images == DoclingImageExportMode::Embedded,
+                            cx,
+                            |this, cx| {
+                                this.docling_images = DoclingImageExportMode::Embedded;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-referenced",
+                            DoclingImageExportMode::Referenced.label(),
+                            docling_images == DoclingImageExportMode::Referenced,
+                            cx,
+                            |this, cx| {
+                                this.docling_images = DoclingImageExportMode::Referenced;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-ocr",
+                            if docling_ocr { "OCR ✓" } else { "OCR" },
+                            docling_ocr,
+                            cx,
+                            |this, cx| {
+                                this.docling_ocr = !this.docling_ocr;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-tables",
+                            if docling_tables {
+                                "Tables ✓"
+                            } else {
+                                "Tables"
+                            },
+                            docling_tables,
+                            cx,
+                            |this, cx| {
+                                this.docling_tables = !this.docling_tables;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-table-fast",
+                            DoclingTableMode::Fast.label(),
+                            docling_table_mode == DoclingTableMode::Fast,
+                            cx,
+                            |this, cx| {
+                                this.docling_table_mode = DoclingTableMode::Fast;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-table-accurate",
+                            DoclingTableMode::Accurate.label(),
+                            docling_table_mode == DoclingTableMode::Accurate,
+                            cx,
+                            |this, cx| {
+                                this.docling_table_mode = DoclingTableMode::Accurate;
+                                this.apply_session_option_change(cx);
+                            },
+                        )),
+                ),
+        ))
+        .child(settings_card(
+            "Defuddle / Pandoc / MarkItDown",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(chip(
+                            "settings-defuddle-frontmatter",
+                            if defuddle_frontmatter {
+                                "Frontmatter ✓"
+                            } else {
+                                "Frontmatter"
+                            },
+                            defuddle_frontmatter,
+                            cx,
+                            |this, cx| {
+                                this.defuddle_frontmatter = !this.defuddle_frontmatter;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-pandoc-standalone",
+                            if pandoc_standalone {
+                                "Standalone ✓"
+                            } else {
+                                "Standalone"
+                            },
+                            pandoc_standalone,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_standalone = !this.pandoc_standalone;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-pandoc-toc",
+                            if pandoc_toc { "TOC ✓" } else { "TOC" },
+                            pandoc_toc,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_toc = !this.pandoc_toc;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-markitdown-uris",
+                            if markitdown_keep_data_uris {
+                                "Keep data URIs ✓"
+                            } else {
+                                "Keep data URIs"
+                            },
+                            markitdown_keep_data_uris,
+                            cx,
+                            |this, cx| {
+                                this.markitdown_keep_data_uris = !this.markitdown_keep_data_uris;
+                                this.apply_session_option_change(cx);
+                            },
+                        )),
                 ),
         ))
 }
@@ -2375,7 +3509,9 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
                     div()
                         .text_xs()
                         .text_color(rgb(TEXT_MUTED))
-                        .child("Module priority is stored in module-priority inside this folder."),
+                        .child(
+                            "Module priority is stored in module-priority; conversion history is stored in history.",
+                        ),
                 ),
         ))
         .child(settings_card(
@@ -2809,6 +3945,14 @@ struct SettingsView {
     quality: FfmpegQuality,
     encode_mode: FfmpegEncodeMode,
     mono: bool,
+    docling_images: DoclingImageExportMode,
+    docling_ocr: bool,
+    docling_tables: bool,
+    docling_table_mode: DoclingTableMode,
+    defuddle_frontmatter: bool,
+    pandoc_standalone: bool,
+    pandoc_toc: bool,
+    markitdown_keep_data_uris: bool,
     diagnostics: Option<Arc<DiagnosticsReport>>,
     diagnostics_loading: bool,
 }
@@ -2823,6 +3967,14 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         quality,
         encode_mode,
         mono,
+        docling_images,
+        docling_ocr,
+        docling_tables,
+        docling_table_mode,
+        defuddle_frontmatter,
+        pandoc_standalone,
+        pandoc_toc,
+        markitdown_keep_data_uris,
         diagnostics,
         diagnostics_loading,
     } = view;
@@ -2858,9 +4010,21 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                         settings_general_panel(*output_format, *history_count, cx)
                             .into_any_element()
                     }
-                    SettingsSection::Media => {
-                        settings_media_panel(*quality, *encode_mode, *mono, cx).into_any_element()
-                    }
+                    SettingsSection::Options => settings_options_panel(
+                        *quality,
+                        *encode_mode,
+                        *mono,
+                        *docling_images,
+                        *docling_ocr,
+                        *docling_tables,
+                        *docling_table_mode,
+                        *defuddle_frontmatter,
+                        *pandoc_standalone,
+                        *pandoc_toc,
+                        *markitdown_keep_data_uris,
+                        cx,
+                    )
+                    .into_any_element(),
                     SettingsSection::Paths => settings_paths_panel().into_any_element(),
                     SettingsSection::Diagnostics => {
                         settings_diagnostics_panel(diagnostics.clone(), *diagnostics_loading, cx)
@@ -2974,7 +4138,7 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                             cx,
                         ))
                         .child(settings_nav_item(SettingsSection::General, section, 1, cx))
-                        .child(settings_nav_item(SettingsSection::Media, section, 2, cx))
+                        .child(settings_nav_item(SettingsSection::Options, section, 2, cx))
                         .child(settings_nav_item(SettingsSection::Paths, section, 3, cx))
                         .child(settings_nav_item(
                             SettingsSection::Diagnostics,
@@ -2988,9 +4152,28 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
         )
 }
 
-actions!(shift, [Quit]);
+actions!(
+    shift,
+    [
+        Quit,
+        SaveOutput,
+        CopyOutput,
+        RevealOutput,
+        ToggleFormatMenu,
+        OpenSettings,
+        ShowShortcuts,
+        CancelWork,
+    ]
+);
+
+/// Pending folder expansion confirmation before batch enqueue.
+#[derive(Clone)]
+struct FolderExpandConfirm {
+    expanded: Vec<PathBuf>,
+}
 
 struct Shift {
+    focus_handle: FocusHandle,
     selected_file: Option<PathBuf>,
     selected_url: Option<String>,
     file_preview: Option<FilePreview>,
@@ -3000,9 +4183,14 @@ struct Shift {
     save_status: Option<SharedString>,
     preference_error: Option<SharedString>,
     output_format: OutputFormat,
+    /// When false, selecting a new source may apply a suggested format.
+    user_chose_format: bool,
     output_menu_open: bool,
+    format_filter_input: Entity<TextInput>,
     settings_open: bool,
     settings_section: SettingsSection,
+    shortcuts_help_open: bool,
+    show_command_inspect: bool,
     module_priority: Vec<String>,
     diagnostics: Option<Arc<DiagnosticsReport>>,
     diagnostics_loading: bool,
@@ -3019,19 +4207,47 @@ struct Shift {
     batch_status: Option<SharedString>,
     /// When true, batch writes overwrite existing outputs (CLI `--force` parity).
     batch_force: bool,
+    /// Per-item progress labels/fractions from the batch runner.
+    batch_item_progress: HashMap<u64, (Option<f32>, SharedString)>,
+    /// Pending recursive folder expansion (confirm before enqueue).
+    folder_confirm: Option<FolderExpandConfirm>,
     /// Cooperative cancel for the active single-file / single-URL conversion.
     conversion_cancel: Arc<AtomicBool>,
-    // FFmpeg media options (shown for media inputs / media outputs).
+    /// Live conversion progress (fraction when known + label).
+    conversion_progress: Option<(Option<f32>, SharedString)>,
+    /// Cached path for the ready artifact (binary copy / reveal / open).
+    cached_ready_path: Option<PathBuf>,
+    // Session conversion options (shown for engines on the active route).
     ffmpeg_quality: FfmpegQuality,
     ffmpeg_encode_mode: FfmpegEncodeMode,
     ffmpeg_mono: bool,
+    ffmpeg_mute: bool,
+    ffmpeg_normalize: bool,
+    ffmpeg_burn_subs: bool,
     ffmpeg_sample_rate_hz: Option<u32>,
     ffmpeg_scale_width: Option<u32>,
     ffmpeg_start_input: Entity<TextInput>,
     ffmpeg_duration_input: Entity<TextInput>,
     ffmpeg_frame_input: Entity<TextInput>,
+    ffmpeg_fps_input: Entity<TextInput>,
+    ffmpeg_frame_interval_input: Entity<TextInput>,
     ffmpeg_audio_stream_input: Entity<TextInput>,
     ffmpeg_subtitle_stream_input: Entity<TextInput>,
+    docling_images: DoclingImageExportMode,
+    docling_ocr: bool,
+    docling_tables: bool,
+    docling_table_mode: DoclingTableMode,
+    docling_ocr_lang_input: Entity<TextInput>,
+    defuddle_frontmatter: bool,
+    defuddle_lang_input: Entity<TextInput>,
+    pandoc_standalone: bool,
+    pandoc_toc: bool,
+    pandoc_pdf_engine: Option<String>,
+    pandoc_reference_doc: Option<PathBuf>,
+    pdf_page_from_input: Entity<TextInput>,
+    pdf_page_to_input: Entity<TextInput>,
+    pdf_password_input: Entity<TextInput>,
+    markitdown_keep_data_uris: bool,
 }
 
 impl Shift {
@@ -3126,11 +4342,44 @@ impl Shift {
         self.batch_output_dir = Some(path.clone());
         self.batch_queue.set_output_dir(Some(path.as_path()));
         self.batch_status = Some(format!("Output folder: {}", path.display()).into());
+        self.persist_session_settings(cx);
         cx.notify();
     }
 
     fn ingest_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if paths.is_empty() {
+            return;
+        }
+        let has_dir = paths.iter().any(|path| path.is_dir());
+        if has_dir {
+            match expand_input_paths(&paths, true) {
+                Ok(expanded) => {
+                    if expanded.is_empty() {
+                        self.batch_status =
+                            Some("No convertible files found in the selected folder(s).".into());
+                        self.folder_confirm = None;
+                        cx.notify();
+                        return;
+                    }
+                    self.folder_confirm = Some(FolderExpandConfirm {
+                        expanded: expanded.clone(),
+                    });
+                    self.batch_status = Some(
+                        format!(
+                            "Expand folders? {} file(s) (cap {}). Confirm to queue or dismiss.",
+                            expanded.len(),
+                            MAX_EXPAND_FILES
+                        )
+                        .into(),
+                    );
+                    cx.notify();
+                }
+                Err(error) => {
+                    self.folder_confirm = None;
+                    self.batch_status = Some(error.to_string().into());
+                    cx.notify();
+                }
+            }
             return;
         }
         if paths.len() == 1 && self.batch_queue.is_empty() {
@@ -3139,6 +4388,46 @@ impl Shift {
         }
         // Queue only; user picks Folder (optional) then Start.
         self.enqueue_paths(paths, false, cx);
+    }
+
+    fn confirm_folder_expand(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.folder_confirm.take() else {
+            return;
+        };
+        self.enqueue_paths(confirm.expanded, false, cx);
+    }
+
+    fn dismiss_folder_confirm(&mut self, cx: &mut Context<Self>) {
+        self.folder_confirm = None;
+        self.batch_status = Some("Folder expansion cancelled.".into());
+        cx.notify();
+    }
+
+    fn toggle_batch_item_format(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
+        if self.batch_running {
+            return;
+        }
+        let Some(item) = self.batch_queue.get(id) else {
+            return;
+        };
+        let selection = match item.format_selection {
+            BatchFormatSelection::Inherit => BatchFormatSelection::Override(self.output_format),
+            BatchFormatSelection::Override(_) => BatchFormatSelection::Inherit,
+        };
+        if self.batch_queue.set_item_format_selection(
+            id,
+            selection,
+            self.output_format,
+            self.batch_output_dir.as_deref(),
+        ) {
+            self.batch_status = Some(match selection {
+                BatchFormatSelection::Inherit => "Item format: inherit global.".into(),
+                BatchFormatSelection::Override(format) => {
+                    format!("Item format pinned to {}.", format.label()).into()
+                }
+            });
+            cx.notify();
+        }
     }
 
     fn enqueue_paths(&mut self, paths: Vec<PathBuf>, auto_start: bool, cx: &mut Context<Self>) {
@@ -3202,6 +4491,7 @@ impl Shift {
         }
 
         // Refresh destinations and options for remaining queued items.
+        // Override items keep their pinned format; inherit items follow global.
         let options = match self.build_conversion_options(cx) {
             Ok(options) => options,
             Err(error) => {
@@ -3210,18 +4500,15 @@ impl Shift {
                 return;
             }
         };
+        self.batch_queue
+            .refresh_inherited_formats(self.output_format, self.batch_output_dir.as_deref());
         for item in self.batch_queue.items_mut() {
             if matches!(item.state, BatchItemState::Queued) {
-                item.output_format = self.output_format;
                 item.options = options.clone();
                 item.force = self.batch_force;
-                item.destination = shift_core::conversion::resolve_destination(
-                    &item.source,
-                    item.output_format,
-                    self.batch_output_dir.as_deref(),
-                );
             }
         }
+        self.batch_item_progress.clear();
 
         // Fresh cancel flag per run so a prior Clear/Cancel cannot be undone by
         // a later start, and so an abandoned worker keeps its own flag.
@@ -3334,6 +4621,7 @@ impl Shift {
             }
             .into(),
         );
+        self.persist_session_settings(cx);
         cx.notify();
     }
 
@@ -3381,6 +4669,18 @@ impl Shift {
                     item.state = BatchItemState::Cancelled;
                 }
                 self.batch_status = Some(format!("Cancelled {source_name}").into());
+            }
+            BatchEvent::ItemProgress {
+                id,
+                fraction,
+                label,
+            } => {
+                self.batch_item_progress
+                    .insert(id.0, (fraction, label.clone().into()));
+                self.batch_status = Some(match fraction {
+                    Some(value) => format!("{label} ({:.0}%)", value * 100.0).into(),
+                    None => label.into(),
+                });
             }
             BatchEvent::Progress(progress) => {
                 self.batch_status = Some(
@@ -3456,13 +4756,26 @@ impl Shift {
         self.file_preview = Some(build_file_preview_with_size(&path, "…".into()));
         self.selected_file = Some(path.clone());
         let available_outputs = ConversionRegistry::default().available_outputs(&path);
-        if !available_outputs.contains(&self.output_format) {
+        if !self.user_chose_format {
+            let suggested = suggested_output_for_path(&path);
+            if available_outputs.contains(&suggested) {
+                self.output_format = suggested;
+            } else if !available_outputs.contains(&self.output_format) {
+                self.output_format = available_outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(OutputFormat::MARKDOWN);
+            }
+        } else if !available_outputs.contains(&self.output_format) {
             self.output_format = available_outputs
                 .first()
                 .copied()
                 .unwrap_or(OutputFormat::MARKDOWN);
         }
         self.conversion = ConversionState::Converting;
+        self.conversion_progress = None;
+        self.cached_ready_path = None;
+        self.show_command_inspect = false;
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
@@ -3528,13 +4841,26 @@ impl Shift {
             .update(cx, |input, cx| input.set_content(url.clone(), cx));
 
         let available_outputs = ConversionRegistry::default().available_url_outputs();
-        if !available_outputs.contains(&self.output_format) {
+        if !self.user_chose_format {
+            let suggested = suggested_output_for_url();
+            if available_outputs.contains(&suggested) {
+                self.output_format = suggested;
+            } else if !available_outputs.contains(&self.output_format) {
+                self.output_format = available_outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(OutputFormat::MARKDOWN);
+            }
+        } else if !available_outputs.contains(&self.output_format) {
             self.output_format = available_outputs
                 .first()
                 .copied()
                 .unwrap_or(OutputFormat::MARKDOWN);
         }
         self.conversion = ConversionState::Converting;
+        self.conversion_progress = None;
+        self.cached_ready_path = None;
+        self.show_command_inspect = false;
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
@@ -3547,6 +4873,8 @@ impl Shift {
         if !self.batch_queue.is_empty() {
             return;
         }
+        // Keep session knobs durable when options change reconverts.
+        self.persist_session_settings(cx);
         if let Some(path) = self.selected_file.clone() {
             self.start_file_conversion(path, cx);
             return;
@@ -3559,26 +4887,68 @@ impl Shift {
         cx.notify();
     }
 
-    fn media_options_visible(&self) -> bool {
-        let media_input = self
-            .selected_file
-            .as_ref()
-            .is_some_and(|path| input_looks_like_media(path));
-        media_input || is_ffmpeg_output(self.output_format)
+    fn active_option_modules(&self) -> Vec<&'static str> {
+        let registry = ConversionRegistry::default().with_priority(&self.module_priority);
+        if self.selected_url.is_some() {
+            return registry
+                .url_route_module_ids(self.output_format)
+                .unwrap_or_default();
+        }
+        if let Some(path) = self.selected_file.as_ref() {
+            return registry
+                .route_module_ids(path, self.output_format)
+                .unwrap_or_default();
+        }
+        // No source yet: still surface FFmpeg knobs when the chosen output is media.
+        if is_ffmpeg_output(self.output_format) {
+            vec!["ffmpeg"]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn conversion_options_visible(&self) -> bool {
+        !self.active_option_modules().is_empty()
     }
 
     fn build_conversion_options(&self, cx: &App) -> Result<ConversionOptions, String> {
         let start_secs = parse_optional_secs(self.ffmpeg_start_input.read(cx).content())?;
         let duration_secs = parse_optional_secs(self.ffmpeg_duration_input.read(cx).content())?;
         let frame_secs = parse_optional_secs(self.ffmpeg_frame_input.read(cx).content())?;
+        let frame_interval_secs =
+            parse_optional_secs(self.ffmpeg_frame_interval_input.read(cx).content())?;
+        let fps = parse_optional_secs(self.ffmpeg_fps_input.read(cx).content())?;
         let audio_stream = parse_optional_u32(self.ffmpeg_audio_stream_input.read(cx).content())?;
         let subtitle_stream =
             parse_optional_u32(self.ffmpeg_subtitle_stream_input.read(cx).content())?;
+        let page_from = parse_optional_u32(self.pdf_page_from_input.read(cx).content())?;
+        let page_to = parse_optional_u32(self.pdf_page_to_input.read(cx).content())?;
+        let password = {
+            let value = self.pdf_password_input.read(cx).content().trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        };
+        let lang = self
+            .defuddle_lang_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
+        let defuddle_lang = if lang.is_empty() { None } else { Some(lang) };
+        let ocr_lang = {
+            let value = self
+                .docling_ocr_lang_input
+                .read(cx)
+                .content()
+                .trim()
+                .to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        };
         Ok(ConversionOptions {
             ffmpeg: FfmpegOptions {
                 start_secs,
                 duration_secs,
                 frame_secs,
+                frame_interval_secs,
                 audio_stream,
                 subtitle_stream,
                 encode_mode: self.ffmpeg_encode_mode,
@@ -3586,9 +4956,156 @@ impl Shift {
                 mono: self.ffmpeg_mono,
                 sample_rate_hz: self.ffmpeg_sample_rate_hz,
                 scale_width: self.ffmpeg_scale_width,
+                fps,
+                mute: self.ffmpeg_mute,
+                normalize_audio: self.ffmpeg_normalize,
+                burn_subtitles: self.ffmpeg_burn_subs,
+            },
+            markitdown: MarkItDownOptions {
+                keep_data_uris: self.markitdown_keep_data_uris,
+            },
+            pandoc: PandocOptions {
+                pdf_engine: self.pandoc_pdf_engine.clone(),
+                standalone: self.pandoc_standalone,
+                toc: self.pandoc_toc,
+                reference_doc: self.pandoc_reference_doc.clone(),
+            },
+            defuddle: DefuddleOptions {
+                frontmatter: self.defuddle_frontmatter,
+                lang: defuddle_lang,
+            },
+            docling: DoclingOptions {
+                image_export_mode: self.docling_images,
+                ocr: self.docling_ocr,
+                ocr_lang,
+                tables: self.docling_tables,
+                table_mode: self.docling_table_mode,
+            },
+            pdf: PdfInputOptions {
+                password,
+                page_from,
+                page_to,
             },
             cancel: None,
+            progress: None,
         })
+    }
+
+    fn persist_session_settings(&self, cx: &App) {
+        let mut settings = load_default_session_settings();
+        settings.set_output_format(self.output_format);
+        settings.batch_output_dir = self.batch_output_dir.clone();
+        settings.batch_force = self.batch_force;
+        if let Ok(options) = self.build_conversion_options(cx) {
+            settings.apply_conversion_options(&options);
+        }
+        let _ = save_default_session_settings(&settings);
+    }
+
+    fn install_hints_for_failure(&self) -> Vec<(SharedString, SharedString)> {
+        let Some(report) = self.diagnostics.as_ref() else {
+            return Vec::new();
+        };
+        let modules = self.active_option_modules();
+        report
+            .engines
+            .iter()
+            .filter(|engine| !engine.readiness.is_ready())
+            .filter(|engine| modules.is_empty() || modules.contains(&engine.id))
+            .map(|engine| {
+                (
+                    format!("Install {}", engine.label).into(),
+                    engine.install_hint.clone().into(),
+                )
+            })
+            .collect()
+    }
+
+    fn ensure_cached_ready_path(&mut self) -> Option<PathBuf> {
+        if let Some(path) = self.cached_ready_path.clone() {
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let ConversionState::Ready(artifact) = &self.conversion else {
+            return None;
+        };
+        match cache_artifact_bytes(&artifact.file_name, &artifact.bytes) {
+            Ok(path) => {
+                self.cached_ready_path = Some(path.clone());
+                Some(path)
+            }
+            Err(error) => {
+                self.save_status = Some(format!("Could not cache artifact: {error}").into());
+                None
+            }
+        }
+    }
+
+    fn copy_output(&mut self, cx: &mut Context<Self>) {
+        let ConversionState::Ready(artifact) = &self.conversion else {
+            return;
+        };
+        if artifact.format.is_text_previewable() {
+            if let Some(text) = artifact.text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+                self.save_status = Some("Copied text to clipboard.".into());
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(path) = self.ensure_cached_ready_path() {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+            self.save_status = Some("Copied artifact path to clipboard.".into());
+            cx.notify();
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn reveal_output(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.ensure_cached_ready_path() {
+            file_picker::reveal_in_finder(&path);
+            self.save_status = Some("Revealed in Finder.".into());
+        }
+        cx.notify();
+    }
+
+    fn open_output(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.ensure_cached_ready_path() {
+            file_picker::open_path(&path);
+            self.save_status = Some("Opened with default app.".into());
+        }
+        cx.notify();
+    }
+
+    fn pick_reference_doc(&mut self, cx: &mut Context<Self>) {
+        if file_picker::is_busy() {
+            return;
+        }
+        let start_dir = self
+            .pandoc_reference_doc
+            .as_ref()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+            .or_else(|| {
+                self.selected_file
+                    .as_ref()
+                    .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+            });
+        let receiver = file_picker::pick_file(start_dir);
+        cx.spawn(async move |this, cx| {
+            let path = receiver.await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                if let Some(path) = path {
+                    this.pandoc_reference_doc = Some(path);
+                    this.persist_session_settings(cx);
+                    this.start_conversion(cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Signal any in-flight single conversion to abort its external process.
@@ -3598,18 +5115,33 @@ impl Shift {
 
     /// User-facing cancel for the active single-file / single-URL conversion.
     fn cancel_conversion(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.conversion, ConversionState::Converting) {
+        if matches!(self.conversion, ConversionState::Converting) {
+            self.cancel_active_conversion();
+            self.conversion_generation = self.conversion_generation.wrapping_add(1);
+            self.conversion = ConversionState::Failed("Conversion cancelled.".into());
+            self.conversion_progress = None;
+            self.save_status = None;
+            cx.notify();
             return;
         }
-        self.cancel_active_conversion();
-        self.conversion_generation = self.conversion_generation.wrapping_add(1);
-        self.conversion = ConversionState::Failed("Conversion cancelled.".into());
-        self.save_status = None;
-        cx.notify();
+        if self.batch_running || !self.batch_queue.is_empty() {
+            self.cancel_batch(cx);
+        }
     }
 
-    fn apply_media_options(&mut self, cx: &mut Context<Self>) {
+    fn apply_conversion_options(&mut self, cx: &mut Context<Self>) {
+        self.persist_session_settings(cx);
         self.start_conversion(cx);
+    }
+
+    /// Apply a session option change from Settings (reconvert only when relevant).
+    fn apply_session_option_change(&mut self, cx: &mut Context<Self>) {
+        self.persist_session_settings(cx);
+        if self.conversion_options_visible() {
+            self.start_conversion(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn start_file_conversion(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -3630,42 +5162,82 @@ impl Shift {
             }
         };
         options.cancel = Some(Arc::clone(&self.conversion_cancel));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<ConversionProgress>();
+        options.progress = Some(Arc::new(move |progress| {
+            let _ = progress_tx.send(progress);
+        }));
         self.conversion = ConversionState::Converting;
+        self.conversion_progress = Some((
+            None,
+            format!("Converting to {}…", output_format.label()).into(),
+        ));
+        self.cached_ready_path = None;
         self.save_status = None;
         self.active_history_id = None;
         cx.notify();
 
         let conversion_path = path.clone();
-        let conversion_task = cx.background_executor().spawn(async move {
-            ConversionRegistry::default()
-                .with_priority(&priority)
-                .convert_to_with_options(&conversion_path, output_format, &options)
-        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        cx.background_executor()
+            .spawn(async move {
+                let result = ConversionRegistry::default()
+                    .with_priority(&priority)
+                    .convert_to_with_options(&conversion_path, output_format, &options);
+                let _ = done_tx.send(result);
+            })
+            .detach();
+
         cx.spawn(async move |this, cx| {
-            let result = conversion_task.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.selection_generation == generation
-                    && this.conversion_generation == conversion_generation
-                    && this.selected_file.as_ref() == Some(&path)
-                {
-                    this.conversion = match result {
-                        Ok(artifact) => {
-                            let artifact = Arc::new(artifact);
-                            this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)));
-                            ConversionState::Ready(artifact)
+            loop {
+                while let Ok(progress) = progress_rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.selection_generation != generation
+                            || this.conversion_generation != conversion_generation
+                        {
+                            return;
                         }
-                        Err(error) if error.is_cancelled() => {
-                            ConversionState::Failed("Conversion cancelled.".into())
-                        }
-                        Err(error) => {
-                            let message: SharedString = error.to_string().into();
-                            this.record_history(HistoryOutcome::Failed(message.clone()));
-                            ConversionState::Failed(message)
-                        }
-                    };
-                    cx.notify();
+                        this.conversion_progress = Some(match progress {
+                            ConversionProgress::Phase(label) => (None, label.into()),
+                            ConversionProgress::Fraction { fraction, label } => {
+                                (Some(fraction), label.into())
+                            }
+                        });
+                        cx.notify();
+                    });
                 }
-            });
+                if let Ok(result) = done_rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.selection_generation == generation
+                            && this.conversion_generation == conversion_generation
+                            && this.selected_file.as_ref() == Some(&path)
+                        {
+                            this.conversion_progress = None;
+                            this.conversion = match result {
+                                Ok(artifact) => {
+                                    let artifact = Arc::new(artifact);
+                                    this.record_history(HistoryOutcome::Ready(Arc::clone(
+                                        &artifact,
+                                    )));
+                                    ConversionState::Ready(artifact)
+                                }
+                                Err(error) if error.is_cancelled() => {
+                                    ConversionState::Failed("Conversion cancelled.".into())
+                                }
+                                Err(error) => {
+                                    let message: SharedString = error.to_string().into();
+                                    this.record_history(HistoryOutcome::Failed(message.clone()));
+                                    ConversionState::Failed(message)
+                                }
+                            };
+                            cx.notify();
+                        }
+                    });
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+            }
         })
         .detach();
     }
@@ -3687,48 +5259,89 @@ impl Shift {
             }
         };
         options.cancel = Some(Arc::clone(&self.conversion_cancel));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<ConversionProgress>();
+        options.progress = Some(Arc::new(move |progress| {
+            let _ = progress_tx.send(progress);
+        }));
         self.conversion = ConversionState::Converting;
+        self.conversion_progress = Some((
+            None,
+            format!("Converting to {}…", output_format.label()).into(),
+        ));
+        self.cached_ready_path = None;
         self.save_status = None;
         self.active_history_id = None;
         cx.notify();
 
         let conversion_url = url.clone();
-        let conversion_task = cx.background_executor().spawn(async move {
-            ConversionRegistry::default()
-                .with_priority(&priority)
-                .convert_url_with_options(&conversion_url, output_format, &options)
-        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        cx.background_executor()
+            .spawn(async move {
+                let result = ConversionRegistry::default()
+                    .with_priority(&priority)
+                    .convert_url_with_options(&conversion_url, output_format, &options);
+                let _ = done_tx.send(result);
+            })
+            .detach();
+
         cx.spawn(async move |this, cx| {
-            let result = conversion_task.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.selection_generation == generation
-                    && this.conversion_generation == conversion_generation
-                    && this.selected_url.as_ref() == Some(&url)
-                {
-                    this.conversion = match result {
-                        Ok(artifact) => {
-                            let artifact = Arc::new(artifact);
-                            this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)));
-                            ConversionState::Ready(artifact)
+            loop {
+                while let Ok(progress) = progress_rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.selection_generation != generation
+                            || this.conversion_generation != conversion_generation
+                        {
+                            return;
                         }
-                        Err(error) if error.is_cancelled() => {
-                            ConversionState::Failed("Conversion cancelled.".into())
-                        }
-                        Err(error) => {
-                            let message: SharedString = error.to_string().into();
-                            this.record_history(HistoryOutcome::Failed(message.clone()));
-                            ConversionState::Failed(message)
-                        }
-                    };
-                    cx.notify();
+                        this.conversion_progress = Some(match progress {
+                            ConversionProgress::Phase(label) => (None, label.into()),
+                            ConversionProgress::Fraction { fraction, label } => {
+                                (Some(fraction), label.into())
+                            }
+                        });
+                        cx.notify();
+                    });
                 }
-            });
+                if let Ok(result) = done_rx.try_recv() {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.selection_generation == generation
+                            && this.conversion_generation == conversion_generation
+                            && this.selected_url.as_ref() == Some(&url)
+                        {
+                            this.conversion_progress = None;
+                            this.conversion = match result {
+                                Ok(artifact) => {
+                                    let artifact = Arc::new(artifact);
+                                    this.record_history(HistoryOutcome::Ready(Arc::clone(
+                                        &artifact,
+                                    )));
+                                    ConversionState::Ready(artifact)
+                                }
+                                Err(error) if error.is_cancelled() => {
+                                    ConversionState::Failed("Conversion cancelled.".into())
+                                }
+                                Err(error) => {
+                                    let message: SharedString = error.to_string().into();
+                                    this.record_history(HistoryOutcome::Failed(message.clone()));
+                                    ConversionState::Failed(message)
+                                }
+                            };
+                            cx.notify();
+                        }
+                    });
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+            }
         })
         .detach();
     }
 
     fn set_output_format(&mut self, format: OutputFormat, cx: &mut Context<Self>) {
         self.output_menu_open = false;
+        self.user_chose_format = true;
         if self.output_format == format {
             cx.notify();
             return;
@@ -3740,6 +5353,7 @@ impl Shift {
             return;
         }
         self.output_format = format;
+        self.persist_session_settings(cx);
         if !self.batch_queue.is_empty() {
             self.batch_queue
                 .set_output_format_for_queued(format, self.batch_output_dir.as_deref());
@@ -3782,10 +5396,87 @@ impl Shift {
             .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = None;
         self.conversion = ConversionState::Empty;
+        self.conversion_progress = None;
+        self.cached_ready_path = None;
+        self.show_command_inspect = false;
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
         cx.notify();
+    }
+
+    fn action_save_output(&mut self, _: &SaveOutput, _window: &mut Window, cx: &mut Context<Self>) {
+        self.save_output(cx);
+    }
+
+    fn action_copy_output(&mut self, _: &CopyOutput, _window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_output(cx);
+    }
+
+    fn action_reveal_output(
+        &mut self,
+        _: &RevealOutput,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_output(cx);
+    }
+
+    fn action_toggle_format(
+        &mut self,
+        _: &ToggleFormatMenu,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.output_menu_open = !self.output_menu_open;
+        cx.notify();
+    }
+
+    fn action_open_settings(
+        &mut self,
+        _: &OpenSettings,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.output_menu_open = false;
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.ensure_diagnostics(cx);
+        }
+        cx.notify();
+    }
+
+    fn action_show_shortcuts(
+        &mut self,
+        _: &ShowShortcuts,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shortcuts_help_open = !self.shortcuts_help_open;
+        cx.notify();
+    }
+
+    fn action_cancel_work(&mut self, _: &CancelWork, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcuts_help_open {
+            self.shortcuts_help_open = false;
+            cx.notify();
+            return;
+        }
+        if self.settings_open {
+            self.settings_open = false;
+            cx.notify();
+            return;
+        }
+        if self.folder_confirm.is_some() {
+            self.dismiss_folder_confirm(cx);
+            return;
+        }
+        if self.output_menu_open {
+            self.output_menu_open = false;
+            cx.notify();
+            return;
+        }
+        self.cancel_conversion(cx);
     }
 
     fn record_history(&mut self, outcome: HistoryOutcome) {
@@ -3855,6 +5546,13 @@ impl Shift {
         );
         self.history.truncate(MAX_HISTORY_ENTRIES);
         self.active_history_id = Some(id);
+        self.persist_history();
+    }
+
+    fn persist_history(&self) {
+        let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
+        // Best-effort: keep the in-memory list if the disk write fails.
+        let _ = save_history(&stored, self.next_history_id);
     }
 
     fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -3870,6 +5568,10 @@ impl Shift {
         self.output_menu_open = false;
         self.save_status = None;
         self.output_format = entry.output_format;
+        self.user_chose_format = true;
+        self.cached_ready_path = None;
+        self.conversion_progress = None;
+        self.show_command_inspect = false;
         self.active_history_id = Some(entry.id);
 
         match &entry.source {
@@ -3923,6 +5625,7 @@ impl Shift {
     fn clear_history(&mut self, cx: &mut Context<Self>) {
         self.history.clear();
         self.active_history_id = None;
+        let _ = clear_history_store();
         cx.notify();
     }
 
@@ -4022,7 +5725,18 @@ impl Render for Shift {
         });
         let output_format = self.output_format;
         let output_menu_open = self.output_menu_open;
+        let format_filter_input = self.format_filter_input.clone();
+        let format_filter = self.format_filter_input.read(cx).content().to_owned();
         let settings_open = self.settings_open;
+        let shortcuts_help_open = self.shortcuts_help_open;
+        let show_command_inspect = self.show_command_inspect;
+        let conversion_progress = self.conversion_progress.clone();
+        let install_hints = if matches!(self.conversion, ConversionState::Failed(_)) {
+            self.install_hints_for_failure()
+        } else {
+            Vec::new()
+        };
+        let folder_confirm = self.folder_confirm.clone();
         let settings_section = self.settings_section;
         let module_priority = self.module_priority.clone();
         let preference_error = self.preference_error.clone();
@@ -4030,17 +5744,38 @@ impl Render for Shift {
         let history = self.history.clone();
         let history_count = history.len();
         let active_history_id = self.active_history_id;
-        let show_media_options = self.media_options_visible();
+        let active_option_modules = self.active_option_modules();
+        let show_conversion_options = !active_option_modules.is_empty();
         let ffmpeg_quality = self.ffmpeg_quality;
         let ffmpeg_encode_mode = self.ffmpeg_encode_mode;
         let ffmpeg_mono = self.ffmpeg_mono;
+        let ffmpeg_mute = self.ffmpeg_mute;
+        let ffmpeg_normalize = self.ffmpeg_normalize;
+        let ffmpeg_burn_subs = self.ffmpeg_burn_subs;
         let ffmpeg_sample_rate_hz = self.ffmpeg_sample_rate_hz;
         let ffmpeg_scale_width = self.ffmpeg_scale_width;
         let ffmpeg_start_input = self.ffmpeg_start_input.clone();
         let ffmpeg_duration_input = self.ffmpeg_duration_input.clone();
         let ffmpeg_frame_input = self.ffmpeg_frame_input.clone();
+        let ffmpeg_fps_input = self.ffmpeg_fps_input.clone();
+        let ffmpeg_frame_interval_input = self.ffmpeg_frame_interval_input.clone();
         let ffmpeg_audio_stream_input = self.ffmpeg_audio_stream_input.clone();
         let ffmpeg_subtitle_stream_input = self.ffmpeg_subtitle_stream_input.clone();
+        let docling_images = self.docling_images;
+        let docling_ocr = self.docling_ocr;
+        let docling_tables = self.docling_tables;
+        let docling_table_mode = self.docling_table_mode;
+        let docling_ocr_lang_input = self.docling_ocr_lang_input.clone();
+        let defuddle_frontmatter = self.defuddle_frontmatter;
+        let defuddle_lang_input = self.defuddle_lang_input.clone();
+        let pandoc_standalone = self.pandoc_standalone;
+        let pandoc_toc = self.pandoc_toc;
+        let pandoc_pdf_engine = self.pandoc_pdf_engine.clone();
+        let pandoc_reference_doc = self.pandoc_reference_doc.clone();
+        let pdf_page_from_input = self.pdf_page_from_input.clone();
+        let pdf_page_to_input = self.pdf_page_to_input.clone();
+        let pdf_password_input = self.pdf_password_input.clone();
+        let markitdown_keep_data_uris = self.markitdown_keep_data_uris;
         let diagnostics = self.diagnostics.clone();
         let diagnostics_loading = self.diagnostics_loading;
         let batch_items = self.batch_queue.items().to_vec();
@@ -4049,9 +5784,20 @@ impl Render for Shift {
         let batch_running = self.batch_running;
         let batch_force = self.batch_force;
         let batch_status = self.batch_status.clone();
+        let batch_item_progress = self.batch_item_progress.clone();
+        let focus_handle = self.focus_handle.clone();
 
         div()
             .id("shift-root")
+            .key_context("Shift")
+            .track_focus(&focus_handle)
+            .on_action(cx.listener(Self::action_save_output))
+            .on_action(cx.listener(Self::action_copy_output))
+            .on_action(cx.listener(Self::action_reveal_output))
+            .on_action(cx.listener(Self::action_toggle_format))
+            .on_action(cx.listener(Self::action_open_settings))
+            .on_action(cx.listener(Self::action_show_shortcuts))
+            .on_action(cx.listener(Self::action_cancel_work))
             .relative()
             .flex()
             .size_full()
@@ -4132,6 +5878,7 @@ impl Render for Shift {
                             batch_running,
                             batch_force,
                             batch_status,
+                            &batch_item_progress,
                             cx,
                         ))
                     })
@@ -4142,22 +5889,48 @@ impl Render for Shift {
                                 save_status,
                                 output_format,
                                 output_menu_open,
+                                format_filter_input,
+                                format_filter,
                                 available_outputs,
                                 ready_outputs,
-                                show_media_options,
-                                media: MediaPanelView {
+                                show_conversion_options,
+                                conversion_options: ConversionPanelView {
+                                    active_modules: active_option_modules,
                                     output_format,
                                     quality: ffmpeg_quality,
                                     encode_mode: ffmpeg_encode_mode,
                                     mono: ffmpeg_mono,
+                                    mute: ffmpeg_mute,
+                                    normalize_audio: ffmpeg_normalize,
+                                    burn_subtitles: ffmpeg_burn_subs,
                                     sample_rate_hz: ffmpeg_sample_rate_hz,
                                     scale_width: ffmpeg_scale_width,
                                     start_input: ffmpeg_start_input,
                                     duration_input: ffmpeg_duration_input,
                                     frame_input: ffmpeg_frame_input,
+                                    fps_input: ffmpeg_fps_input,
+                                    frame_interval_input: ffmpeg_frame_interval_input,
                                     audio_stream_input: ffmpeg_audio_stream_input,
                                     subtitle_stream_input: ffmpeg_subtitle_stream_input,
+                                    docling_images,
+                                    docling_ocr,
+                                    docling_tables,
+                                    docling_table_mode,
+                                    docling_ocr_lang_input,
+                                    defuddle_frontmatter,
+                                    defuddle_lang_input,
+                                    pandoc_standalone,
+                                    pandoc_toc,
+                                    pandoc_pdf_engine,
+                                    pandoc_reference_doc,
+                                    pdf_page_from_input,
+                                    pdf_page_to_input,
+                                    pdf_password_input,
+                                    markitdown_keep_data_uris,
                                 },
+                                conversion_progress,
+                                show_command_inspect,
+                                install_hints,
                             },
                             cx,
                         ))
@@ -4188,6 +5961,137 @@ impl Render for Shift {
                         cx.notify();
                     })),
             )
+            .when_some(folder_confirm, |root, confirm| {
+                let count = confirm.expanded.len();
+                root.child(
+                    div()
+                        .id("folder-confirm-overlay")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(hsla(0.0, 0.0, 0.0, 0.72))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.dismiss_folder_confirm(cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            div()
+                                .id("folder-confirm-dialog")
+                                .w(px(420.0))
+                                .p_6()
+                                .rounded_xl()
+                                .bg(rgb(BG_ELEVATED))
+                                .border_1()
+                                .border_color(rgb(BORDER_STRONG))
+                                .flex()
+                                .flex_col()
+                                .gap_4()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Expand folders?"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(format!(
+                                            "Queue {count} convertible file(s) (cap {MAX_EXPAND_FILES})."
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(action_chip(
+                                            "folder-confirm-cancel",
+                                            "Cancel",
+                                            cx,
+                                            |this, cx| this.dismiss_folder_confirm(cx),
+                                        ))
+                                        .child(action_chip(
+                                            "folder-confirm-ok",
+                                            "Queue files",
+                                            cx,
+                                            |this, cx| this.confirm_folder_expand(cx),
+                                        )),
+                                ),
+                        ),
+                )
+            })
+            .when(shortcuts_help_open, |root| {
+                root.child(
+                    div()
+                        .id("shortcuts-help-overlay")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(hsla(0.0, 0.0, 0.0, 0.72))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.shortcuts_help_open = false;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            div()
+                                .id("shortcuts-help-dialog")
+                                .w(px(420.0))
+                                .p_6()
+                                .rounded_xl()
+                                .bg(rgb(BG_ELEVATED))
+                                .border_1()
+                                .border_color(rgb(BORDER_STRONG))
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Keyboard shortcuts"),
+                                )
+                                .children(
+                                    [
+                                        ("⌘S", "Download / save output"),
+                                        ("⌘C", "Copy output (text or path)"),
+                                        ("⌘R", "Reveal output in Finder"),
+                                        ("⌘⇧F", "Toggle output format menu"),
+                                        ("⌘,", "Open settings"),
+                                        ("⌘/", "Show this help"),
+                                        ("Esc", "Cancel / close overlays"),
+                                    ]
+                                    .into_iter()
+                                    .map(|(key, desc)| {
+                                        div()
+                                            .flex()
+                                            .justify_between()
+                                            .gap_4()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .child(key),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .child(desc),
+                                            )
+                                    }),
+                                ),
+                        ),
+                )
+            })
             .when(settings_open, |root| {
                 root.child(settings_screen(
                     SettingsView {
@@ -4199,6 +6103,14 @@ impl Render for Shift {
                         quality: ffmpeg_quality,
                         encode_mode: ffmpeg_encode_mode,
                         mono: ffmpeg_mono,
+                        docling_images,
+                        docling_ocr,
+                        docling_tables,
+                        docling_table_mode,
+                        defuddle_frontmatter,
+                        pandoc_standalone,
+                        pandoc_toc,
+                        markitdown_keep_data_uris,
                         diagnostics,
                         diagnostics_loading,
                     },
@@ -4211,7 +6123,16 @@ impl Render for Shift {
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-s", SaveOutput, Some("Shift")),
+            KeyBinding::new("cmd-c", CopyOutput, Some("Shift")),
+            KeyBinding::new("cmd-r", RevealOutput, Some("Shift")),
+            KeyBinding::new("cmd-shift-f", ToggleFormatMenu, Some("Shift")),
+            KeyBinding::new("cmd-,", OpenSettings, Some("Shift")),
+            KeyBinding::new("cmd-/", ShowShortcuts, Some("Shift")),
+            KeyBinding::new("escape", CancelWork, Some("Shift")),
+        ]);
         text_input::bind_keys(cx);
         cx.set_menus(vec![Menu {
             name: APP_NAME.into(),
@@ -4236,15 +6157,136 @@ fn main() {
                 window_min_size: Some(size(px(900.0), px(520.0))),
                 ..Default::default()
             },
-            |_, cx| {
+            |window, cx| {
                 let shift_entity = cx.new(|cx| {
+                    let session = load_default_session_settings();
+                    let options = session.to_conversion_options();
                     let url_input = cx.new(|cx| TextInput::new(cx, "Paste a URL to extract…", ""));
-                    let ffmpeg_start_input = cx.new(|cx| TextInput::new(cx, "0", ""));
-                    let ffmpeg_duration_input = cx.new(|cx| TextInput::new(cx, "optional", ""));
-                    let ffmpeg_frame_input = cx.new(|cx| TextInput::new(cx, "0", ""));
-                    let ffmpeg_audio_stream_input = cx.new(|cx| TextInput::new(cx, "0", ""));
-                    let ffmpeg_subtitle_stream_input = cx.new(|cx| TextInput::new(cx, "0", ""));
+                    let format_filter_input =
+                        cx.new(|cx| TextInput::new(cx, "Filter formats…", ""));
+                    let ffmpeg_start_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "0",
+                            options
+                                .ffmpeg
+                                .start_secs
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let ffmpeg_duration_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "optional",
+                            options
+                                .ffmpeg
+                                .duration_secs
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let ffmpeg_frame_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "0",
+                            options
+                                .ffmpeg
+                                .frame_secs
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let ffmpeg_fps_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "optional",
+                            options
+                                .ffmpeg
+                                .fps
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let ffmpeg_frame_interval_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "1.0",
+                            options
+                                .ffmpeg
+                                .frame_interval_secs
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let ffmpeg_audio_stream_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "0",
+                            options
+                                .ffmpeg
+                                .audio_stream
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let ffmpeg_subtitle_stream_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "0",
+                            options
+                                .ffmpeg
+                                .subtitle_stream
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let docling_ocr_lang_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "e.g. eng",
+                            options.docling.ocr_lang.clone().unwrap_or_default(),
+                        )
+                    });
+                    let defuddle_lang_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "optional, e.g. en",
+                            options.defuddle.lang.clone().unwrap_or_default(),
+                        )
+                    });
+                    let pdf_page_from_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "from",
+                            options
+                                .pdf
+                                .page_from
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let pdf_page_to_input = cx.new(|cx| {
+                        TextInput::new(
+                            cx,
+                            "to",
+                            options
+                                .pdf
+                                .page_to
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let pdf_password_input =
+                        cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+                    let (history, next_history_id) = history_from_store(load_history());
+                    let mut batch_queue = BatchQueue::new();
+                    if let Some(dir) = session.batch_output_dir.as_ref() {
+                        batch_queue.set_output_dir(Some(dir.as_path()));
+                    }
+                    let focus_handle = cx.focus_handle();
                     Shift {
+                        focus_handle,
                         selected_file: None,
                         selected_url: None,
                         file_preview: None,
@@ -4253,37 +6295,67 @@ fn main() {
                         conversion: ConversionState::Empty,
                         save_status: None,
                         preference_error: None,
-                        output_format: OutputFormat::MARKDOWN,
+                        output_format: session.output_format(),
+                        user_chose_format: false,
                         output_menu_open: false,
+                        format_filter_input,
                         settings_open: false,
                         settings_section: SettingsSection::Converters,
+                        shortcuts_help_open: false,
+                        show_command_inspect: false,
                         module_priority: load_module_priority(),
                         diagnostics: None,
                         diagnostics_loading: false,
                         url_input,
-                        history: Vec::new(),
-                        next_history_id: 1,
+                        history,
+                        next_history_id,
                         active_history_id: None,
-                        batch_queue: BatchQueue::new(),
-                        batch_output_dir: None,
+                        batch_queue,
+                        batch_output_dir: session.batch_output_dir.clone(),
                         batch_running: false,
                         batch_generation: 0,
                         batch_cancel: Arc::new(AtomicBool::new(false)),
                         batch_status: None,
-                        batch_force: false,
+                        batch_force: session.batch_force,
+                        batch_item_progress: HashMap::new(),
+                        folder_confirm: None,
                         conversion_cancel: Arc::new(AtomicBool::new(false)),
-                        ffmpeg_quality: FfmpegQuality::default(),
-                        ffmpeg_encode_mode: FfmpegEncodeMode::default(),
-                        ffmpeg_mono: false,
-                        ffmpeg_sample_rate_hz: None,
-                        ffmpeg_scale_width: None,
+                        conversion_progress: None,
+                        cached_ready_path: None,
+                        ffmpeg_quality: options.ffmpeg.quality,
+                        ffmpeg_encode_mode: options.ffmpeg.encode_mode,
+                        ffmpeg_mono: options.ffmpeg.mono,
+                        ffmpeg_mute: options.ffmpeg.mute,
+                        ffmpeg_normalize: options.ffmpeg.normalize_audio,
+                        ffmpeg_burn_subs: options.ffmpeg.burn_subtitles,
+                        ffmpeg_sample_rate_hz: options.ffmpeg.sample_rate_hz,
+                        ffmpeg_scale_width: options.ffmpeg.scale_width,
                         ffmpeg_start_input,
                         ffmpeg_duration_input,
                         ffmpeg_frame_input,
+                        ffmpeg_fps_input,
+                        ffmpeg_frame_interval_input,
                         ffmpeg_audio_stream_input,
                         ffmpeg_subtitle_stream_input,
+                        docling_images: options.docling.image_export_mode,
+                        docling_ocr: options.docling.ocr,
+                        docling_tables: options.docling.tables,
+                        docling_table_mode: options.docling.table_mode,
+                        docling_ocr_lang_input,
+                        defuddle_frontmatter: options.defuddle.frontmatter,
+                        defuddle_lang_input,
+                        pandoc_standalone: options.pandoc.standalone,
+                        pandoc_toc: options.pandoc.toc,
+                        pandoc_pdf_engine: options.pandoc.pdf_engine.clone(),
+                        pandoc_reference_doc: options.pandoc.reference_doc.clone(),
+                        pdf_page_from_input,
+                        pdf_page_to_input,
+                        pdf_password_input,
+                        markitdown_keep_data_uris: options.markitdown.keep_data_uris,
                     }
                 });
+
+                window.focus(&shift_entity.read(cx).focus_handle);
 
                 // Route Enter in the URL field back to the app entity.
                 let parent = shift_entity.downgrade();
@@ -4305,6 +6377,7 @@ fn main() {
 
         // Warm the open/save panel service so the first click is fast.
         file_picker::prewarm();
+        let _ = shift_core::purge_artifact_cache_defaults();
 
         cx.activate(true);
     });

@@ -1,6 +1,7 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
+    OutputFormat, command_argv_parts, format_argv_display, map_spawn_error, max_output_bytes,
+    process_timeout, read_file_limited, redact_flag_value, resolve_tool_executable,
     run_command_cancellable,
 };
 use std::ffi::OsString;
@@ -25,6 +26,124 @@ const OUTPUTS: &[OutputFormat] = &[
     OutputFormat::HTML,
     OutputFormat("plain"),
 ];
+
+/// How Docling places figures in Markdown/HTML exports.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DoclingImageExportMode {
+    /// Mark image positions only (small/fast desktop default).
+    #[default]
+    Placeholder,
+    /// Embed images as base64 (larger artifacts).
+    Embedded,
+    /// Write PNGs beside the document and reference them.
+    Referenced,
+}
+
+impl DoclingImageExportMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Placeholder => "placeholder",
+            Self::Embedded => "embedded",
+            Self::Referenced => "referenced",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Placeholder => "Placeholder",
+            Self::Embedded => "Embedded",
+            Self::Referenced => "Referenced",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Placeholder, Self::Embedded, Self::Referenced]
+    }
+}
+
+impl std::str::FromStr for DoclingImageExportMode {
+    type Err = ConversionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "placeholder" => Ok(Self::Placeholder),
+            "embedded" | "embed" => Ok(Self::Embedded),
+            "referenced" | "reference" | "refs" => Ok(Self::Referenced),
+            other => Err(ConversionError::new(format!(
+                "unknown Docling image export mode: {other} (try placeholder, embedded, referenced)"
+            ))),
+        }
+    }
+}
+
+/// Table structure extraction mode for Docling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DoclingTableMode {
+    #[default]
+    Fast,
+    Accurate,
+}
+
+impl DoclingTableMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Accurate => "accurate",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Accurate => "Accurate",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Fast, Self::Accurate]
+    }
+}
+
+impl std::str::FromStr for DoclingTableMode {
+    type Err = ConversionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Ok(Self::Fast),
+            "accurate" | "hq" | "high" => Ok(Self::Accurate),
+            other => Err(ConversionError::new(format!(
+                "unknown Docling table mode: {other} (try fast, accurate)"
+            ))),
+        }
+    }
+}
+
+/// Optional knobs for Docling. Defaults keep desktop conversions small/fast.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DoclingOptions {
+    pub image_export_mode: DoclingImageExportMode,
+    /// Run OCR when the pipeline needs it (`--ocr` / `--no-ocr`).
+    pub ocr: bool,
+    /// OCR language codes when set (`--ocr-lang`), e.g. `eng` or `eng+deu`.
+    pub ocr_lang: Option<String>,
+    /// Extract table structure (`--tables` / `--no-tables`).
+    pub tables: bool,
+    pub table_mode: DoclingTableMode,
+}
+
+impl Default for DoclingOptions {
+    fn default() -> Self {
+        Self {
+            // Shift prefers placeholder over Docling's upstream "embedded"
+            // default so desktop artifacts stay small and conversions stay fast.
+            image_export_mode: DoclingImageExportMode::Placeholder,
+            ocr: true,
+            ocr_lang: None,
+            tables: true,
+            table_mode: DoclingTableMode::Fast,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DoclingModule {
@@ -98,7 +217,7 @@ impl DoclingModule {
 
         // Docling writes files into --output; it does not stream to stdout.
         // Explicit `convert` keeps the invocation stable if more subcommands are added.
-        // `placeholder` images keep artifacts small and conversions faster for desktop use.
+        let knobs = &options.docling;
         let mut command = Command::new(&self.executable);
         command
             .arg("convert")
@@ -108,8 +227,42 @@ impl DoclingModule {
             .arg("--output")
             .arg(&work_dir)
             .arg("--image-export-mode")
-            .arg("placeholder")
+            .arg(knobs.image_export_mode.id())
+            .arg(if knobs.ocr { "--ocr" } else { "--no-ocr" })
+            .arg(if knobs.tables {
+                "--tables"
+            } else {
+                "--no-tables"
+            })
+            .arg("--table-mode")
+            .arg(knobs.table_mode.id())
             .arg("--abort-on-error");
+        if let Some(lang) = knobs
+            .ocr_lang
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            command.arg("--ocr-lang").arg(lang);
+        }
+        // PDF password lives on shared PdfInputOptions (never persisted / never shown).
+        if let Some(password) = options
+            .pdf
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            command.arg("--pdf-password").arg(password);
+        }
+
+        let mut display_parts = command_argv_parts(&command);
+        redact_flag_value(&mut display_parts, "--pdf-password", "••••");
+        let invocation = InvocationRecord {
+            module_id: self.id(),
+            argv_display: format_argv_display(&display_parts),
+        };
+
         let output = run_command_cancellable(
             command,
             process_timeout(),
@@ -161,6 +314,8 @@ impl DoclingModule {
             bytes,
             format: output_format,
             module_id: self.id(),
+            pipeline: vec![self.id()],
+            invocations: vec![invocation],
         })
     }
 }
@@ -249,7 +404,8 @@ while [ "$#" -gt 0 ]; do
     convert) shift; continue ;;
     --to) to="$2"; shift 2; continue ;;
     --output) output="$2"; shift 2; continue ;;
-    --image-export-mode|--abort-on-error) shift; [ "$1" = "placeholder" ] && shift; continue ;;
+    --image-export-mode|--table-mode|--ocr-lang|--pdf-password) shift 2; continue ;;
+    --ocr|--no-ocr|--tables|--no-tables|--abort-on-error) shift; continue ;;
     --*) shift; continue ;;
     *) input="$1"; shift; continue ;;
   esac
@@ -299,7 +455,66 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert!(args.contains("--output"), "args: {args}");
         assert!(args.contains("--image-export-mode"), "args: {args}");
         assert!(args.contains("placeholder"), "args: {args}");
+        assert!(args.contains("--ocr"), "args: {args}");
+        assert!(args.contains("--tables"), "args: {args}");
+        assert!(args.contains("--table-mode"), "args: {args}");
+        assert!(args.contains("fast"), "args: {args}");
         assert!(args.contains("--abort-on-error"), "args: {args}");
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn honors_docling_options_in_cli_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-opts", std::process::id());
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let options = ConversionOptions {
+            docling: DoclingOptions {
+                image_export_mode: DoclingImageExportMode::Embedded,
+                ocr: false,
+                ocr_lang: Some("eng+deu".into()),
+                tables: false,
+                table_mode: DoclingTableMode::Accurate,
+            },
+            pdf: super::super::PdfInputOptions {
+                password: Some("s3cret".into()),
+                ..Default::default()
+            },
+            ..ConversionOptions::default()
+        };
+        let artifact = DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap();
+        assert_eq!(artifact.text(), Some("# From Docling"));
+
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("embedded"), "args: {args}");
+        assert!(args.contains("--no-ocr"), "args: {args}");
+        assert!(args.contains("--no-tables"), "args: {args}");
+        assert!(args.contains("accurate"), "args: {args}");
+        assert!(args.contains("--ocr-lang"), "args: {args}");
+        assert!(args.contains("eng+deu"), "args: {args}");
+        assert!(args.contains("--pdf-password"), "args: {args}");
+        assert!(args.contains("s3cret"), "args: {args}");
+        // Password must never appear in the redacted invocation display.
+        assert_eq!(artifact.invocations.len(), 1);
+        assert!(
+            artifact.invocations[0].argv_display.contains("••••"),
+            "display: {}",
+            artifact.invocations[0].argv_display
+        );
+        assert!(
+            !artifact.invocations[0].argv_display.contains("s3cret"),
+            "display leaked password: {}",
+            artifact.invocations[0].argv_display
+        );
 
         let _ = fs::remove_file(&executable);
         let _ = fs::remove_file(format!("{}.args", executable.display()));

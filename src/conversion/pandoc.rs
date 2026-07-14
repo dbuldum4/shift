@@ -1,10 +1,10 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    find_executable, map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command_cancellable,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
+    OutputFormat, command_argv_parts, find_executable, format_argv_display, map_spawn_error,
+    max_output_bytes, process_timeout, resolve_tool_executable, run_command_cancellable,
 };
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const INPUTS: &[&str] = &[
@@ -76,6 +76,21 @@ const PDF_ENGINE_CANDIDATES: &[&str] = &[
     "context",
 ];
 
+/// Optional knobs for Pandoc writers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PandocOptions {
+    /// Per-conversion PDF engine override (`--pdf-engine`).
+    ///
+    /// When set, wins over `SHIFT_PDF_ENGINE` and auto-discovery.
+    pub pdf_engine: Option<String>,
+    /// Produce a standalone document (`-s` / `--standalone`).
+    pub standalone: bool,
+    /// Include a table of contents (`--toc`).
+    pub toc: bool,
+    /// Reference DOCX/ODT for styles when writing those formats (`--reference-doc`).
+    pub reference_doc: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PandocModule {
     executable: OsString,
@@ -142,14 +157,29 @@ impl ConversionModule for PandocModule {
             .arg("--output")
             .arg("-");
 
+        if options.pandoc.standalone {
+            command.arg("--standalone");
+        }
+        if options.pandoc.toc {
+            command.arg("--toc");
+        }
+        if let Some(reference) = options.pandoc.reference_doc.as_ref() {
+            command.arg("--reference-doc").arg(reference);
+        }
+
         // Pandoc's PDF writer always shells out to an external engine. Default
         // is pdflatex, which is rarely present on a fresh machine. Resolve a
         // lighter engine (Typst first) so DOCX → PDF works after a normal
         // `brew install pandoc typst` setup.
         if output_format == OutputFormat::PDF {
-            let engine = resolve_pdf_engine()?;
+            let engine = resolve_pdf_engine(options.pandoc.pdf_engine.as_deref())?;
             command.arg("--pdf-engine").arg(&engine);
         }
+
+        let invocation = InvocationRecord {
+            module_id: self.id(),
+            argv_display: format_argv_display(&command_argv_parts(&command)),
+        };
 
         let output = run_command_cancellable(
             command,
@@ -189,6 +219,8 @@ impl ConversionModule for PandocModule {
             bytes: output.stdout,
             format: output_format,
             module_id: self.id(),
+            pipeline: vec![self.id()],
+            invocations: vec![invocation],
         })
     }
 }
@@ -215,9 +247,17 @@ pub fn pdf_engine_candidates() -> &'static [&'static str] {
 /// Choose a PDF engine for Pandoc.
 ///
 /// Order of preference:
-/// 1. `SHIFT_PDF_ENGINE` when set (name or absolute path)
-/// 2. First candidate found on `PATH` / common install locations
-pub fn resolve_pdf_engine() -> Result<OsString, ConversionError> {
+/// 1. Per-conversion override (`PandocOptions::pdf_engine`) when non-empty
+/// 2. `SHIFT_PDF_ENGINE` when set (name or absolute path)
+/// 3. First candidate found on `PATH` / common install locations
+pub fn resolve_pdf_engine(override_engine: Option<&str>) -> Result<OsString, ConversionError> {
+    if let Some(engine) = override_engine
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(OsString::from(engine));
+    }
+
     if let Some(engine) = std::env::var_os("SHIFT_PDF_ENGINE") {
         if !engine.is_empty() {
             return Ok(engine);
@@ -301,6 +341,53 @@ mod tests {
         std::fs::remove_file(input).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn passes_standalone_and_toc_options() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-opts", std::process::id());
+        let executable = directory.join(format!("shift-pandoc-opts-{suffix}"));
+        let input = directory.join(format!("shift-pandoc-input-{suffix}.md"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '<p>ok</p>'",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "# hi").unwrap();
+
+        let reference = directory.join(format!("shift-pandoc-ref-{suffix}.docx"));
+        std::fs::write(&reference, "ref").unwrap();
+        let options = ConversionOptions {
+            pandoc: PandocOptions {
+                standalone: true,
+                toc: true,
+                pdf_engine: None,
+                reference_doc: Some(reference.clone()),
+            },
+            ..ConversionOptions::default()
+        };
+        PandocModule::with_executable(&executable)
+            .convert(&input, OutputFormat::HTML, &options)
+            .unwrap();
+
+        let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("--standalone"), "args: {args}");
+        assert!(args.contains("--toc"), "args: {args}");
+        assert!(args.contains("--reference-doc"), "args: {args}");
+        assert!(
+            args.contains(reference.to_string_lossy().as_ref()),
+            "args: {args}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&reference);
+    }
+
     #[test]
     fn pdf_engine_env_override_wins() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -308,8 +395,11 @@ mod tests {
         unsafe {
             std::env::set_var("SHIFT_PDF_ENGINE", "/custom/bin/typst");
         }
-        let engine = resolve_pdf_engine().unwrap();
+        let engine = resolve_pdf_engine(None).unwrap();
         assert_eq!(engine, OsString::from("/custom/bin/typst"));
+        // Per-conversion override wins over env.
+        let engine = resolve_pdf_engine(Some("xelatex")).unwrap();
+        assert_eq!(engine, OsString::from("xelatex"));
         unsafe {
             std::env::remove_var("SHIFT_PDF_ENGINE");
         }

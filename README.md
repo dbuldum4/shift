@@ -101,17 +101,42 @@ Set `SHIFT_FFMPEG_BIN=/absolute/path/to/ffmpeg` when it is not available on
 artifact without modifying the source file. Large outputs may need a higher
 `SHIFT_CONVERSION_MAX_OUTPUT_BYTES` (default 64 MiB).
 
-In the native app, selecting a media file (or a media output format) reveals a
-**Media options** panel: quality, encode mode, trim start/duration, frame time
-for stills, mono/sample rate, scale width, and audio/subtitle stream indices.
-Use **Apply** after editing text fields; chips reconvert immediately.
+In the native app, selecting a source reveals a **Conversion options** panel
+with sections for engines on the active route:
+
+- **FFmpeg** — quality, encode mode, trim, frame time, mono/sample rate, scale,
+  FPS, mute, loudness normalize, burn embedded subtitles, stream indices, frame
+  interval for **PNG Sequence (ZIP)**
+- **Docling** — image export mode, OCR, OCR language, tables, table mode
+- **PDF input** — page range (requires [qpdf](https://qpdf.sourceforge.io/)),
+  password (session only; never written to disk)
+- **Defuddle** — frontmatter, language
+- **Pandoc** — standalone, TOC, PDF engine, reference DOCX/PPTX
+- **MarkItDown** — keep data URIs
+
+Settings → Options holds core session knobs. Use **Apply** after editing text
+fields; chips reconvert immediately. Session format and options (except secrets)
+persist under Application Support (`session-settings.json`).
+
+**Result actions:** Download, Copy (text to clipboard, or path for binary),
+Reveal in Finder, Open, engine pipeline badge, Show command (redacted argv).
+FFmpeg long encodes can show determinate progress; other engines stay
+indeterminate. Failed conversions surface install hints when an engine is
+missing.
+
+**Batch:** drop or open multiple files or folders (confirm expansion caps);
+per-item format can **Override** the session format; Overwrite, cancel, retry,
+and Reveal on success. CLI uses `--recursive` for directories.
+
+**Keyboard (main window):** ⌘S download, ⌘C copy, ⌘R reveal, ⌘⇧F format menu,
+⌘, settings, ⌘/ shortcuts help, Esc cancel/close.
 
 Shift exposes every writer reported by Pandoc 3.10, including Markdown
 variants, HTML, PDF, Word, PowerPoint, EPUB, ODT, RTF, LaTeX, Typst, AsciiDoc,
 reStructuredText, Jupyter, Org, DocBook, JATS, bibliography formats, wiki
 formats, web/Beamer slides, ICML, TEI, and Pandoc's specialized serializers,
-plus FFmpeg media outputs (audio, video, PNG/JPEG frames, SRT/VTT
-subtitles).
+plus FFmpeg media outputs (audio, video, PNG/JPEG frames, PNG sequence ZIP,
+SRT/VTT subtitles).
 
 ## Native app
 
@@ -120,20 +145,23 @@ cargo dev
 ```
 
 The first build downloads and compiles GPUI and may take a few minutes. Dropping
-or choosing a supported file starts conversion automatically. Paste an `http(s)`
-URL into the bar above the drop zone and press Enter or Convert to extract the
-page with Defuddle (this performs an outbound fetch to the given host; set
-`SHIFT_BLOCK_PRIVATE_URLS=1` to refuse loopback/private addresses when feeding
-untrusted URLs). The source file is never modified; Download refuses to overwrite
-the selected source. Use the output dropdown on the right to choose a format
-(formats whose engines are missing are labeled). Multi-file queue supports
-**Overwrite** (CLI `--force` parity). The settings button opens a full-screen
-settings view with a left sidebar (Converters, General, Media, Paths,
-Diagnostics, About). On Converters, drag a module above another to make it the
-preferred engine for overlapping conversions; status badges show whether each
-engine is installed. The Diagnostics page reports versions, install hints, and
-distinguishes registered format support from conversions that are ready on this
-Mac. Priority is saved in macOS Application Support and shared with `shift-cli`.
+or choosing a supported file starts conversion automatically and may suggest an
+output format (video → MP4, audio → MP3, documents → Markdown) until you pick
+one yourself. Paste an `http(s)` URL into the bar above the drop zone and press
+Enter or Convert to extract the page with Defuddle (this performs an outbound
+fetch to the given host; set `SHIFT_BLOCK_PRIVATE_URLS=1` to refuse
+loopback/private addresses when feeding untrusted URLs). The source file is
+never modified; Download refuses to overwrite the selected source. Use the
+output dropdown (with search) on the right to choose a format (formats whose
+engines are missing are labeled). Multi-file queue supports **Overwrite** (CLI
+`--force` parity). The settings button opens a full-screen settings view with a
+left sidebar (Converters, General, Options, Paths, Diagnostics, About). On
+Converters, drag a module above another to make it the preferred engine for
+overlapping conversions; status badges show whether each engine is installed.
+The Diagnostics page reports versions, install hints, and distinguishes
+registered format support from conversions that are ready on this Mac. Module
+priority, conversion history, and session options are saved under macOS
+Application Support; priority is shared with `shift-cli`.
 
 ## CLI
 
@@ -170,13 +198,26 @@ cargo run --bin shift-cli -- scan.pdf --module docling
 # Extract audio from a video with FFmpeg
 cargo run --bin shift-cli -- clip.mp4 --to mp3
 
-# Trim, re-encode, and scale
+# Trim, re-encode, scale, mute, normalize
 cargo run --bin shift-cli -- clip.mp4 --to mp4 --start 10 --duration 30 \
-  --quality high --scale-width 1280
+  --quality high --scale-width 1280 --fps 30 --mute --normalize-audio
 
-# Still frame and subtitles
+# Still frame, subtitle extract, PNG sequence ZIP
 cargo run --bin shift-cli -- clip.mkv --to png --frame 12.5
 cargo run --bin shift-cli -- clip.mkv --to srt --subtitle-stream 0
+cargo run --bin shift-cli -- clip.mp4 --to png-sequence-zip --frame-interval 1
+
+# PDF pages (needs qpdf) and OCR language (Docling)
+cargo run --bin shift-cli -- scan.pdf --module docling --pages 2-5 --ocr-lang eng
+
+# Pandoc reference template
+cargo run --bin shift-cli -- notes.md --to docx --reference-doc ~/Templates/ref.docx
+
+# Recursive folder batch
+cargo run --bin shift-cli -- ./inbox --recursive -O ./out -t markdown --force
+
+# Verbose redacted command lines + progress on stderr
+cargo run --bin shift-cli -- clip.mp4 --to mp3 --verbose --progress
 
 # Convert audio containers
 cargo run --bin shift-cli -- track.wav --to flac --module ffmpeg

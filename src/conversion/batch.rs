@@ -6,8 +6,8 @@
 //! this module owns queue state transitions and convert-then-write execution.
 
 use super::{
-    ConversionArtifact, ConversionError, ConversionOptions, ConversionRegistry, OutputFormat,
-    default_output_path, looks_like_url, paths_refer_to_same_file,
+    ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
+    OutputFormat, ProgressSink, default_output_path, looks_like_url, paths_refer_to_same_file,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -105,18 +105,47 @@ impl BatchItemState {
     }
 }
 
+/// Whether a batch item follows the shared enqueue format or a per-item override.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BatchFormatSelection {
+    /// Use the queue's inherited / enqueue format.
+    #[default]
+    Inherit,
+    /// Pin this item to a specific output format.
+    Override(OutputFormat),
+}
+
+impl BatchFormatSelection {
+    /// Resolve the effective format given the current inherited default.
+    pub fn resolve(self, inherited: OutputFormat) -> OutputFormat {
+        match self {
+            Self::Inherit => inherited,
+            Self::Override(format) => format,
+        }
+    }
+}
+
 /// One unit of work in the batch queue.
 #[derive(Clone, Debug)]
 pub struct BatchItem {
     pub id: BatchItemId,
     pub source: BatchSource,
     pub output_format: OutputFormat,
+    /// Inherit vs per-item override; [`Self::output_format`] is the resolved value.
+    pub format_selection: BatchFormatSelection,
     pub options: ConversionOptions,
     /// Planned destination (may be adjusted on write for collisions).
     pub destination: PathBuf,
     pub force: bool,
     pub state: BatchItemState,
     pub attempts: u32,
+}
+
+impl BatchItem {
+    /// Effective format: override when set, otherwise the stored/enqueue format.
+    pub fn resolved_format(&self) -> OutputFormat {
+        self.format_selection.resolve(self.output_format)
+    }
 }
 
 /// Shared knobs applied when enqueuing items.
@@ -193,6 +222,12 @@ pub enum BatchEvent {
         source_name: String,
         destination: PathBuf,
     },
+    /// Best-effort per-item conversion progress (e.g. FFmpeg fraction).
+    ItemProgress {
+        id: BatchItemId,
+        fraction: Option<f32>,
+        label: String,
+    },
     ItemSucceeded {
         id: BatchItemId,
         source_name: String,
@@ -266,6 +301,8 @@ impl BatchQueue {
     }
 
     /// Enqueue one source using shared enqueue options.
+    ///
+    /// New items default to [`BatchFormatSelection::Inherit`].
     pub fn enqueue(&mut self, source: BatchSource, opts: &BatchEnqueueOptions) -> BatchItemId {
         let destination =
             resolve_destination(&source, opts.output_format, opts.output_dir.as_deref());
@@ -275,6 +312,7 @@ impl BatchQueue {
             id,
             source,
             output_format: opts.output_format,
+            format_selection: BatchFormatSelection::Inherit,
             options: opts.conversion.clone(),
             destination,
             force: opts.force,
@@ -365,17 +403,61 @@ impl BatchQueue {
     }
 
     /// Apply a new format to queued items and refresh destinations.
+    ///
+    /// Items with [`BatchFormatSelection::Override`] keep their pinned format;
+    /// inherited items adopt `format`.
     pub fn set_output_format_for_queued(
         &mut self,
         format: OutputFormat,
         output_dir: Option<&Path>,
     ) {
+        self.refresh_inherited_formats(format, output_dir);
+    }
+
+    /// Refresh destinations (and format) for queued items that inherit the
+    /// shared batch format. Override items only re-resolve their destination.
+    pub fn refresh_inherited_formats(
+        &mut self,
+        inherited: OutputFormat,
+        output_dir: Option<&Path>,
+    ) {
         for item in &mut self.items {
-            if matches!(item.state, BatchItemState::Queued) {
-                item.output_format = format;
-                item.destination = resolve_destination(&item.source, format, output_dir);
+            if !matches!(item.state, BatchItemState::Queued) {
+                continue;
             }
+            let format = match item.format_selection {
+                BatchFormatSelection::Inherit => {
+                    item.output_format = inherited;
+                    inherited
+                }
+                BatchFormatSelection::Override(format) => {
+                    item.output_format = format;
+                    format
+                }
+            };
+            item.destination = resolve_destination(&item.source, format, output_dir);
         }
+    }
+
+    /// Pin a queued item to an explicit format (or clear the pin with Inherit).
+    pub fn set_item_format_selection(
+        &mut self,
+        id: BatchItemId,
+        selection: BatchFormatSelection,
+        inherited: OutputFormat,
+        output_dir: Option<&Path>,
+    ) -> bool {
+        let Some(item) = self.get_mut(id) else {
+            return false;
+        };
+        if !matches!(item.state, BatchItemState::Queued) {
+            return false;
+        }
+        item.format_selection = selection;
+        let format = selection.resolve(inherited);
+        item.output_format = format;
+        item.destination = resolve_destination(&item.source, format, output_dir);
+        true
     }
 
     /// Ensure queued items do not share planned destinations with each other
@@ -635,13 +717,30 @@ pub fn run_batch(
             break;
         };
         let source = item.source.clone();
-        let format = item.output_format;
+        let format = item.resolved_format();
         let mut options = item.options.clone();
         let destination = item.destination.clone();
         let force = item.force;
         let source_name = item.source.display_name();
 
         options.cancel = Some(Arc::clone(cancel));
+        // Bridge module progress into batch events while conversion is running.
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<BatchEvent>();
+        let progress_id = id;
+        let progress_tx_sink = progress_tx.clone();
+        let sink: ProgressSink = Arc::new(move |progress| {
+            let (fraction, label) = match progress {
+                ConversionProgress::Phase(label) => (None, label),
+                ConversionProgress::Fraction { fraction, label } => (Some(fraction), label),
+            };
+            let _ = progress_tx_sink.send(BatchEvent::ItemProgress {
+                id: progress_id,
+                fraction,
+                label,
+            });
+        });
+        options.progress = Some(sink);
+        drop(progress_tx);
 
         let Some(item) = queue.get_mut(id) else {
             break;
@@ -668,12 +767,30 @@ pub fn run_batch(
             continue;
         }
 
-        let result = convert_source(registry, &source, format, &options).and_then(|artifact| {
-            if cancel.load(Ordering::SeqCst) {
-                return Err(ConversionError::cancelled());
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                convert_source(registry, &source, format, &options).and_then(|artifact| {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(ConversionError::cancelled());
+                    }
+                    write_artifact(&artifact, &destination, source.as_file(), force)
+                        .map(|path| (path, artifact.module_id.to_owned(), artifact.bytes.len()))
+                })
+            });
+
+            while !worker.is_finished() {
+                match progress_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(event) => on_event(event),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
-            write_artifact(&artifact, &destination, source.as_file(), force)
-                .map(|path| (path, artifact.module_id.to_owned(), artifact.bytes.len()))
+            for event in progress_rx.try_iter() {
+                on_event(event);
+            }
+            worker
+                .join()
+                .unwrap_or_else(|_| Err(ConversionError::new("conversion worker panicked")))
         });
 
         match result {
@@ -790,6 +907,8 @@ mod tests {
                 bytes: self.payload.to_vec(),
                 format: output,
                 module_id: self.label,
+                pipeline: Vec::new(),
+                invocations: Vec::new(),
             })
         }
     }
@@ -877,6 +996,91 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, BatchEvent::ItemSucceeded { .. }))
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forwards_item_progress_before_conversion_finishes() {
+        struct ProgressModule {
+            delivered: Arc<AtomicBool>,
+        }
+
+        impl ConversionModule for ProgressModule {
+            fn id(&self) -> &'static str {
+                "progress-fake"
+            }
+            fn label(&self) -> &'static str {
+                "Progress fake"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                output: OutputFormat,
+                options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                options
+                    .progress
+                    .as_ref()
+                    .expect("batch runner should install a progress sink")(
+                    ConversionProgress::Phase("halfway".into()),
+                );
+                for _ in 0..100 {
+                    if self.delivered.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                if !self.delivered.load(Ordering::SeqCst) {
+                    return Err(ConversionError::new(
+                        "progress was not delivered until after conversion",
+                    ));
+                }
+                Ok(ConversionArtifact {
+                    file_name: "out.md".into(),
+                    media_type: output.media_type(),
+                    bytes: b"done".to_vec(),
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+
+        let dir = unique_dir("live-progress");
+        let input = dir.join("input.txt");
+        std::fs::write(&input, b"source").unwrap();
+        let delivered = Arc::new(AtomicBool::new(false));
+        let registry = ConversionRegistry::new().with_module(ProgressModule {
+            delivered: Arc::clone(&delivered),
+        });
+        let mut queue = BatchQueue::new();
+        let mut opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        opts.force = true;
+        queue.enqueue(BatchSource::File(input), &opts);
+
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |event| {
+                if matches!(event, BatchEvent::ItemProgress { .. }) {
+                    delivered.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        assert_eq!(summary.succeeded, 1);
+        assert!(delivered.load(Ordering::SeqCst));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1092,6 +1296,39 @@ mod tests {
     }
 
     #[test]
+    fn format_selection_inherit_and_override() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let id_a = queue.enqueue(BatchSource::File(PathBuf::from("/a/doc.pdf")), &opts);
+        let id_b = queue.enqueue(BatchSource::File(PathBuf::from("/b/doc.pdf")), &opts);
+        assert_eq!(
+            queue.get(id_a).unwrap().format_selection,
+            BatchFormatSelection::Inherit
+        );
+
+        assert!(queue.set_item_format_selection(
+            id_b,
+            BatchFormatSelection::Override(OutputFormat::HTML),
+            OutputFormat::MARKDOWN,
+            Some(Path::new("/out")),
+        ));
+        assert_eq!(queue.get(id_b).unwrap().output_format, OutputFormat::HTML);
+        assert_eq!(
+            queue.get(id_b).unwrap().destination,
+            PathBuf::from("/out/doc.html")
+        );
+
+        queue.refresh_inherited_formats(OutputFormat::DOCX, Some(Path::new("/out")));
+        assert_eq!(queue.get(id_a).unwrap().output_format, OutputFormat::DOCX);
+        assert_eq!(
+            queue.get(id_a).unwrap().destination,
+            PathBuf::from("/out/doc.docx")
+        );
+        // Override stays HTML.
+        assert_eq!(queue.get(id_b).unwrap().output_format, OutputFormat::HTML);
+    }
+
+    #[test]
     fn cancel_after_successful_write_still_counts_as_success() {
         // Convert finishes, then cancel is set before the runner records state.
         // The file is already on disk — reporting Cancelled would strand retry
@@ -1206,6 +1443,8 @@ mod tests {
                     bytes: b"should-not-write".to_vec(),
                     format: OutputFormat::MARKDOWN,
                     module_id: "cancel-mid",
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
                 })
             }
         }

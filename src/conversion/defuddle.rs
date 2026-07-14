@@ -11,6 +11,15 @@ use url::Url;
 const EXTENSIONS: &[&str] = &["htm", "html"];
 const OUTPUTS: &[OutputFormat] = &[OutputFormat::MARKDOWN, OutputFormat::HTML];
 
+/// Optional knobs for Defuddle article extraction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DefuddleOptions {
+    /// Prepend YAML frontmatter (`--frontmatter`).
+    pub frontmatter: bool,
+    /// Preferred language BCP 47 code (`--lang`).
+    pub lang: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DefuddleModule {
     executable: OsString,
@@ -48,6 +57,18 @@ impl DefuddleModule {
         command.arg("parse").arg(source);
         if markdown {
             command.arg("--markdown");
+        }
+        if options.defuddle.frontmatter {
+            command.arg("--frontmatter");
+        }
+        if let Some(lang) = options
+            .defuddle
+            .lang
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            command.arg("--lang").arg(lang);
         }
         run_command_cancellable(
             command,
@@ -89,6 +110,8 @@ impl DefuddleModule {
             bytes: output.stdout,
             format: output_format,
             module_id: self.id(),
+            pipeline: Vec::new(),
+            invocations: Vec::new(),
         })
     }
 
@@ -388,5 +411,42 @@ mod tests {
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_file(format!("{}.args", executable.display()));
         let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn honors_frontmatter_and_lang_options() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-opts", std::process::id());
+        let executable = directory.join(format!("shift-defuddle-opts-{suffix}"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '# Hello\\n'",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let options = ConversionOptions {
+            defuddle: DefuddleOptions {
+                frontmatter: true,
+                lang: Some("en".into()),
+            },
+            ..ConversionOptions::default()
+        };
+        DefuddleModule::with_executable(&executable)
+            .convert_url("https://example.com/post", OutputFormat::MARKDOWN, &options)
+            .unwrap();
+
+        let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("--frontmatter"), "args: {args}");
+        assert!(args.contains("--lang"), "args: {args}");
+        assert!(args.contains("en"), "args: {args}");
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
     }
 }

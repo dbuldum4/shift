@@ -1,14 +1,18 @@
 //! FFmpeg adapter: audio/video/image/subtitle conversion with optional encode knobs.
 
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
+    InvocationRecord, OutputFormat, command_argv_parts, format_argv_display, map_spawn_error,
+    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
     run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 /// Broad demux surface FFmpeg handles without exotic builds.
 const INPUTS: &[&str] = &[
@@ -146,6 +150,8 @@ pub struct FfmpegOptions {
     pub duration_secs: Option<f64>,
     /// Frame timestamp for still extraction (defaults to `start_secs` or 0).
     pub frame_secs: Option<f64>,
+    /// Interval between frames for [`OutputFormat::PNG_SEQUENCE_ZIP`] (seconds).
+    pub frame_interval_secs: Option<f64>,
     /// Audio stream index among audio streams (`0:a:N`).
     pub audio_stream: Option<u32>,
     /// Subtitle stream index (`0:s:N`).
@@ -158,7 +164,18 @@ pub struct FfmpegOptions {
     pub sample_rate_hz: Option<u32>,
     /// Scale video width (height auto) when re-encoding video / GIF / stills.
     pub scale_width: Option<u32>,
+    /// Force constant frame rate when re-encoding video.
+    pub fps: Option<f64>,
+    /// Drop audio on video outputs (`-an`).
+    pub mute: bool,
+    /// Apply loudness normalization (`-af loudnorm`) when re-encoding audio.
+    pub normalize_audio: bool,
+    /// Burn embedded subtitle stream into video (forces re-encode).
+    pub burn_subtitles: bool,
 }
+
+/// Maximum PNG frames written into a sequence ZIP.
+pub const MAX_SEQUENCE_FRAMES: u32 = 300;
 
 impl FfmpegOptions {
     pub fn is_default(&self) -> bool {
@@ -166,12 +183,15 @@ impl FfmpegOptions {
     }
 
     /// True when options require decoding/filters (stream copy is not possible).
-    ///
-    /// Matches the constraints enforced by [`apply_encode_settings`]: mono,
-    /// sample-rate, and scale all need re-encode. Quality only applies when
-    /// re-encoding and does not by itself force it.
     pub fn forces_reencode(&self) -> bool {
-        self.mono || self.sample_rate_hz.is_some() || self.scale_width.is_some()
+        self.mono
+            || self.sample_rate_hz.is_some()
+            || self.scale_width.is_some()
+            || self.fps.is_some()
+            || self.mute
+            || self.normalize_audio
+            || self.burn_subtitles
+            || self.frame_interval_secs.is_some()
     }
 }
 
@@ -259,18 +279,42 @@ impl FfmpegModule {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| std::ffi::OsStr::new("converted"));
 
+        if output_format == OutputFormat::PNG_SEQUENCE_ZIP {
+            return self.convert_png_sequence_zip(input, stem, options);
+        }
+
         let work_dir = unique_temp_dir("shift-ffmpeg")?;
         let cleanup = TempDirGuard(work_dir.clone());
         let produced = work_dir.join(Self::output_file_name(stem, output_format));
 
-        let command = self.build_command(input, &produced, output_format, &options.ffmpeg)?;
+        let mut command = self.build_command(input, &produced, output_format, &options.ffmpeg)?;
+        let progress_path = if options.progress.is_some() {
+            let path = work_dir.join("ffmpeg-progress.txt");
+            // Truncate so a stale file cannot confuse the reader.
+            fs::write(&path, b"").ok();
+            command.arg("-progress").arg(&path);
+            command.arg("-stats_period").arg("0.5");
+            Some(path)
+        } else {
+            None
+        };
+
+        let invocation = InvocationRecord {
+            module_id: self.id(),
+            argv_display: format_argv_display(&command_argv_parts(&command)),
+        };
+
+        report_phase(options, "FFmpeg converting…");
+        let progress_stop = spawn_progress_watcher(progress_path.clone(), options);
+
         let output = run_command_cancellable(
             command,
             process_timeout(),
             max_output_bytes(),
             options.cancel.clone(),
-        )
-        .map_err(|error| {
+        );
+        stop_progress_watcher(progress_stop);
+        let output = output.map_err(|error| {
             map_spawn_error(
                 error,
                 "FFmpeg is not installed. Install it with `brew install ffmpeg`, \
@@ -314,6 +358,128 @@ impl FfmpegModule {
             bytes,
             format: output_format,
             module_id: self.id(),
+            pipeline: vec![self.id()],
+            invocations: vec![invocation],
+        })
+    }
+
+    fn convert_png_sequence_zip(
+        &self,
+        input: &Path,
+        stem: &std::ffi::OsStr,
+        options: &ConversionOptions,
+    ) -> Result<ConversionArtifact, ConversionError> {
+        validate_options(&options.ffmpeg)?;
+        let interval = options.ffmpeg.frame_interval_secs.unwrap_or(1.0);
+        if !interval.is_finite() || interval <= 0.0 {
+            return Err(ConversionError::new(
+                "FFmpeg frame interval must be a positive number of seconds",
+            ));
+        }
+        if options.ffmpeg.encode_mode == FfmpegEncodeMode::PreferCopy {
+            return Err(ConversionError::new(
+                "stream copy cannot produce a PNG frame sequence; choose Auto/Re-encode",
+            ));
+        }
+
+        let work_dir = unique_temp_dir("shift-ffmpeg-seq")?;
+        let cleanup = TempDirGuard(work_dir.clone());
+        let frames_dir = work_dir.join("frames");
+        fs::create_dir_all(&frames_dir).map_err(|error| {
+            ConversionError::new(format!(
+                "could not create frame directory {}: {error}",
+                frames_dir.display()
+            ))
+        })?;
+        let pattern = frames_dir.join("frame_%04d.png");
+
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y");
+
+        if let Some(secs) = options.ffmpeg.start_secs {
+            command.arg("-ss").arg(format_timestamp(secs));
+        }
+        command.arg("-i").arg(input);
+        if let Some(secs) = options.ffmpeg.duration_secs {
+            command.arg("-t").arg(format_timestamp(secs));
+        }
+
+        let fps = 1.0 / interval;
+        let mut filters = vec![format!("fps={fps}")];
+        if let Some(width) = options.ffmpeg.scale_width {
+            filters.push(format!("scale={width}:-2"));
+        }
+        command.arg("-vf").arg(filters.join(","));
+        command
+            .arg("-frames:v")
+            .arg(MAX_SEQUENCE_FRAMES.to_string());
+        command.arg(&pattern);
+
+        let invocation = InvocationRecord {
+            module_id: self.id(),
+            argv_display: format_argv_display(&command_argv_parts(&command)),
+        };
+
+        report_phase(options, "FFmpeg extracting frames…");
+        let output = run_command_cancellable(
+            command,
+            process_timeout(),
+            max_output_bytes(),
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
+            map_spawn_error(
+                error,
+                "FFmpeg is not installed. Install it with `brew install ffmpeg`, \
+                 or set SHIFT_FFMPEG_BIN.",
+            )
+        })?;
+
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(ConversionError::new(format!(
+                "FFmpeg could not extract frame sequence from {}: {}",
+                input.display(),
+                if detail.is_empty() {
+                    output.status.to_string()
+                } else {
+                    detail
+                }
+            )));
+        }
+
+        let stem_str = {
+            let value = stem.to_string_lossy();
+            if value.is_empty() {
+                "converted".to_owned()
+            } else {
+                value.into_owned()
+            }
+        };
+        let zip_path = work_dir.join(format!("{stem_str}.zip"));
+        zip_png_frames(&frames_dir, &zip_path)?;
+        let bytes = read_file_limited(&zip_path, max_output_bytes()).map_err(|error| {
+            ConversionError::new(format!(
+                "FFmpeg frame ZIP was not readable at {}: {error}",
+                zip_path.display()
+            ))
+        })?;
+
+        drop(cleanup);
+
+        Ok(ConversionArtifact {
+            file_name: format!("{stem_str}.zip"),
+            media_type: OutputFormat::PNG_SEQUENCE_ZIP.media_type(),
+            bytes,
+            format: OutputFormat::PNG_SEQUENCE_ZIP,
+            module_id: self.id(),
+            pipeline: vec![self.id()],
+            invocations: vec![invocation],
         })
     }
 
@@ -353,7 +519,7 @@ impl FfmpegModule {
         }
 
         apply_stream_maps(&mut command, output_format, options);
-        apply_encode_settings(&mut command, output_format, options)?;
+        apply_encode_settings(&mut command, input, output_format, options)?;
 
         command.arg(produced);
         Ok(command)
@@ -374,6 +540,20 @@ fn validate_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
             }
         }
     }
+    if let Some(secs) = options.frame_interval_secs {
+        if !secs.is_finite() || secs <= 0.0 {
+            return Err(ConversionError::new(
+                "FFmpeg frame interval must be a positive number of seconds",
+            ));
+        }
+    }
+    if let Some(fps) = options.fps {
+        if !fps.is_finite() || fps <= 0.0 || fps > 240.0 {
+            return Err(ConversionError::new(
+                "FFmpeg fps must be between 0 and 240 (exclusive of 0)",
+            ));
+        }
+    }
     if let Some(rate) = options.sample_rate_hz {
         if !(8000..=192_000).contains(&rate) {
             return Err(ConversionError::new(
@@ -388,6 +568,132 @@ fn validate_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
             ));
         }
     }
+    Ok(())
+}
+
+fn report_phase(options: &ConversionOptions, label: &str) {
+    if let Some(sink) = options.progress.as_ref() {
+        sink(ConversionProgress::Phase(label.to_owned()));
+    }
+}
+
+struct ProgressWatchStop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+fn spawn_progress_watcher(
+    progress_path: Option<PathBuf>,
+    options: &ConversionOptions,
+) -> Option<ProgressWatchStop> {
+    let sink = options.progress.clone()?;
+    let path = progress_path?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let duration_hint = options.ffmpeg.duration_secs;
+    thread::spawn(move || {
+        let mut last_out_time_ms: Option<u64> = None;
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(file) = fs::File::open(&path) {
+                let mut out_time_ms = last_out_time_ms;
+                for line in BufReader::new(file).lines().map_while(Result::ok) {
+                    if let Some(value) = line.strip_prefix("out_time_ms=") {
+                        if let Ok(ms) = value.trim().parse::<u64>() {
+                            out_time_ms = Some(ms);
+                        }
+                    } else if let Some(value) = line.strip_prefix("out_time_us=") {
+                        // Prefer microseconds when present (newer FFmpeg).
+                        if let Ok(us) = value.trim().parse::<u64>() {
+                            out_time_ms = Some(us / 1000);
+                        }
+                    } else if line == "progress=end" {
+                        sink(ConversionProgress::Fraction {
+                            fraction: 1.0,
+                            label: "FFmpeg finished".into(),
+                        });
+                    }
+                }
+                if let Some(ms) = out_time_ms {
+                    if last_out_time_ms != Some(ms) {
+                        last_out_time_ms = Some(ms);
+                        let secs = ms as f32 / 1000.0;
+                        if let Some(total) = duration_hint.filter(|d| *d > 0.0) {
+                            let fraction = (secs / total as f32).clamp(0.0, 0.99);
+                            sink(ConversionProgress::Fraction {
+                                fraction,
+                                label: format!("FFmpeg {secs:.1}s"),
+                            });
+                        } else {
+                            sink(ConversionProgress::Phase(format!("FFmpeg {secs:.1}s")));
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+    Some(ProgressWatchStop(stop))
+}
+
+fn stop_progress_watcher(stop: Option<ProgressWatchStop>) {
+    if let Some(ProgressWatchStop(flag)) = stop {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn zip_png_frames(frames_dir: &Path, zip_path: &Path) -> Result<(), ConversionError> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(frames_dir)
+        .map_err(|error| {
+            ConversionError::new(format!(
+                "could not list frames in {}: {error}",
+                frames_dir.display()
+            ))
+        })?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        return Err(ConversionError::new(
+            "FFmpeg did not produce any PNG frames for the sequence ZIP",
+        ));
+    }
+    if entries.len() > MAX_SEQUENCE_FRAMES as usize {
+        entries.truncate(MAX_SEQUENCE_FRAMES as usize);
+    }
+
+    let file = fs::File::create(zip_path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create ZIP {}: {error}",
+            zip_path.display()
+        ))
+    })?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for path in &entries {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("frame.png");
+        let bytes = fs::read(path).map_err(|error| {
+            ConversionError::new(format!("could not read frame {}: {error}", path.display()))
+        })?;
+        zip.start_file(name, options).map_err(|error| {
+            ConversionError::new(format!("could not add {name} to ZIP: {error}"))
+        })?;
+        use std::io::Write;
+        zip.write_all(&bytes).map_err(|error| {
+            ConversionError::new(format!("could not write {name} into ZIP: {error}"))
+        })?;
+    }
+    zip.finish().map_err(|error| {
+        ConversionError::new(format!(
+            "could not finalize ZIP {}: {error}",
+            zip_path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -421,7 +727,13 @@ fn apply_stream_maps(command: &mut Command, output_format: OutputFormat, options
         return;
     }
 
-    // Video (and GIF): optional explicit audio stream pick.
+    // Video (and GIF): optional explicit audio stream pick / mute.
+    if options.mute {
+        command.arg("-map").arg("0:v:0");
+        command.arg("-an");
+        return;
+    }
+
     if let Some(index) = options.audio_stream {
         command.arg("-map").arg("0:v:0");
         command.arg("-map").arg(format!("0:a:{index}"));
@@ -430,6 +742,7 @@ fn apply_stream_maps(command: &mut Command, output_format: OutputFormat, options
 
 fn apply_encode_settings(
     command: &mut Command,
+    input: &Path,
     output_format: OutputFormat,
     options: &FfmpegOptions,
 ) -> Result<(), ConversionError> {
@@ -449,32 +762,54 @@ fn apply_encode_settings(
 
     if options.encode_mode == FfmpegEncodeMode::PreferCopy {
         return Err(ConversionError::new(
-            "stream copy cannot be combined with mono, sample-rate, scale, or still-image output; \
+            "stream copy cannot be combined with mono, sample-rate, scale, fps, mute, \
+             normalize-audio, burn-subtitles, frame interval, or still-image output; \
              choose Auto/Re-encode or clear those options",
         ));
     }
 
-    // Filters first, then codecs.
+    // Video filters first, then codecs.
     let mut filters = Vec::new();
     if let Some(width) = options.scale_width {
         if is_video_output(output_format) || is_image_output(output_format) {
             filters.push(format!("scale={width}:-2"));
         }
     }
+    if let Some(fps) = options.fps {
+        if is_video_output(output_format) || is_image_output(output_format) {
+            filters.push(format!("fps={fps}"));
+        }
+    }
+    if options.burn_subtitles && is_video_output(output_format) {
+        // Escape path for the subtitles filter (\, :, ').
+        let path = input.to_string_lossy();
+        let escaped = path
+            .replace('\\', "\\\\")
+            .replace(':', "\\:")
+            .replace('\'', "\\'");
+        filters.push(format!("subtitles='{escaped}'"));
+    }
     if output_format == OutputFormat::GIF {
         // Compact animated GIF; scale if not already requested.
-        if options.scale_width.is_none() {
+        if options.scale_width.is_none() && options.fps.is_none() {
             match options.quality {
                 FfmpegQuality::High => filters.push("fps=15,scale=640:-2:flags=lanczos".into()),
                 FfmpegQuality::Balanced => filters.push("fps=10,scale=480:-2:flags=lanczos".into()),
                 FfmpegQuality::Small => filters.push("fps=8,scale=320:-2:flags=lanczos".into()),
             }
-        } else {
+        } else if options.fps.is_none() {
             filters.push("fps=10".into());
         }
     }
     if !filters.is_empty() {
         command.arg("-vf").arg(filters.join(","));
+    }
+
+    // Audio filters (loudnorm).
+    if options.normalize_audio
+        && (is_audio_output(output_format) || (is_video_output(output_format) && !options.mute))
+    {
+        command.arg("-af").arg("loudnorm");
     }
 
     if is_audio_output(output_format) {
@@ -483,13 +818,19 @@ fn apply_encode_settings(
         apply_image_encode(command, output_format, options);
     } else if is_video_output(output_format) {
         apply_video_encode(command, output_format, options);
+        if options.mute {
+            // Belt-and-suspenders if maps did not already drop audio.
+            command.arg("-an");
+        }
     }
 
-    if options.mono {
+    if options.mono && !options.mute {
         command.arg("-ac").arg("1");
     }
     if let Some(rate) = options.sample_rate_hz {
-        command.arg("-ar").arg(rate.to_string());
+        if !options.mute {
+            command.arg("-ar").arg(rate.to_string());
+        }
     }
 
     Ok(())
@@ -590,8 +931,10 @@ fn apply_video_encode(command: &mut Command, output_format: OutputFormat, option
             command.arg("-c:v").arg("libvpx-vp9");
             command.arg("-crf").arg(crf);
             command.arg("-b:v").arg("0");
-            command.arg("-c:a").arg("libopus");
-            command.arg("-b:a").arg(audio_bitrate);
+            if !options.mute {
+                command.arg("-c:a").arg("libopus");
+                command.arg("-b:a").arg(audio_bitrate);
+            }
         }
         "mp4" | "m4v" | "mov" | "mkv" | "avi" | "mpeg" | "ts" | "3gp" => {
             command.arg("-c:v").arg("libx264");
@@ -601,16 +944,18 @@ fn apply_video_encode(command: &mut Command, output_format: OutputFormat, option
                 FfmpegQuality::Small => "veryfast",
             });
             command.arg("-crf").arg(crf);
-            command.arg("-c:a").arg(if output_format.id() == "mpeg" {
-                "mp2"
-            } else {
-                "aac"
-            });
-            command.arg("-b:a").arg(audio_bitrate);
+            if !options.mute {
+                command.arg("-c:a").arg(if output_format.id() == "mpeg" {
+                    "mp2"
+                } else {
+                    "aac"
+                });
+                command.arg("-b:a").arg(audio_bitrate);
+            }
             if matches!(output_format.id(), "mp4" | "m4v" | "mov") {
                 command.arg("-movflags").arg("+faststart");
             }
-            if output_format.id() == "3gp" {
+            if output_format.id() == "3gp" && !options.mute {
                 // 3GP is picky; force baseline-friendly audio rate if user did not.
                 if options.sample_rate_hz.is_none() {
                     command.arg("-ar").arg("8000");
@@ -697,7 +1042,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -i) shift 2; continue ;;
     -hide_banner|-nostdin|-y|-vn|-an) shift; continue ;;
-    -loglevel|-ss|-t|-map|-c|-c:a|-c:v|-b:a|-b:v|-crf|-preset|-vf|-frames:v|-q:v|-quality|-compression_level|-ac|-ar|-movflags) shift 2; continue ;;
+    -loglevel|-ss|-t|-map|-c|-c:a|-c:v|-b:a|-b:v|-crf|-preset|-vf|-af|-frames:v|-q:v|-quality|-compression_level|-ac|-ar|-movflags|-progress|-stats_period) shift 2; continue ;;
     -*) shift; continue ;;
     *) output="$1"; shift; continue ;;
   esac
@@ -708,6 +1053,11 @@ case "$output" in
   *.flac) printf 'fLaCfake' > "$output" ;;
   *.mp4) printf 'ftypfake-mp4' > "$output" ;;
   *.png) printf 'PNGfake' > "$output" ;;
+  frame_%04d.png|*/frame_%04d.png)
+    dir=$(dirname "$output")
+    printf 'PNGfake' > "$dir/frame_0001.png"
+    printf 'PNGfake' > "$dir/frame_0002.png"
+    ;;
   *.jpg) printf 'JPEGfake' > "$output" ;;
   *.srt) printf '1\n00:00:00,000 --> 00:00:01,000\nHi\n' > "$output" ;;
   *.vtt) printf 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHi\n' > "$output" ;;
@@ -724,7 +1074,7 @@ esac
     fn opts(ffmpeg: FfmpegOptions) -> ConversionOptions {
         ConversionOptions {
             ffmpeg,
-            cancel: None,
+            ..ConversionOptions::default()
         }
     }
 
@@ -907,8 +1257,110 @@ esac
         assert!(module.supports(Path::new("clip.mov"), OutputFormat::SRT));
         assert!(module.supports(Path::new("track.ac3"), OutputFormat::FLAC));
         assert!(module.supports(Path::new("photo.webp"), OutputFormat::JPG));
+        assert!(module.supports(Path::new("clip.mp4"), OutputFormat::PNG_SEQUENCE_ZIP));
         assert!(!module.supports(Path::new("report.docx"), OutputFormat::MP3));
         assert!(input_looks_like_media(Path::new("a.webm")));
         assert!(!input_looks_like_media(Path::new("a.docx")));
+    }
+
+    #[test]
+    fn applies_mute_fps_normalize_and_burn_flags() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let options = FfmpegOptions {
+            mute: true,
+            fps: Some(24.0),
+            normalize_audio: true,
+            burn_subtitles: true,
+            encode_mode: FfmpegEncodeMode::Reencode,
+            ..FfmpegOptions::default()
+        };
+        let command = module
+            .build_command(
+                Path::new("/tmp/clip.mp4"),
+                Path::new("/tmp/out.mp4"),
+                OutputFormat::MP4,
+                &options,
+            )
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|a| a == "-an"), "args: {args:?}");
+        assert!(args.iter().any(|a| a.contains("fps=24")), "args: {args:?}");
+        // mute skips loudnorm on video
+        assert!(!args.iter().any(|a| a == "loudnorm"), "args: {args:?}");
+        assert!(
+            args.iter().any(|a| a.contains("subtitles=")),
+            "args: {args:?}"
+        );
+
+        let with_audio = FfmpegOptions {
+            normalize_audio: true,
+            encode_mode: FfmpegEncodeMode::Reencode,
+            ..FfmpegOptions::default()
+        };
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.mp3"),
+                OutputFormat::MP3,
+                &with_audio,
+            )
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2).any(|w| w == ["-af", "loudnorm"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_stream_copy_with_burn_subtitles() {
+        let err = FfmpegModule::with_executable("ffmpeg")
+            .convert(
+                Path::new("clip.mp4"),
+                OutputFormat::MP4,
+                &opts(FfmpegOptions {
+                    encode_mode: FfmpegEncodeMode::PreferCopy,
+                    burn_subtitles: true,
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("stream copy"), "error: {err}");
+    }
+
+    #[test]
+    fn extracts_png_sequence_zip() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-seq", std::process::id());
+        let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        write_fake_ffmpeg(&executable);
+        fs::write(&input, b"fake").unwrap();
+
+        let artifact = FfmpegModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::PNG_SEQUENCE_ZIP,
+                &opts(FfmpegOptions {
+                    frame_interval_secs: Some(1.0),
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(artifact.format, OutputFormat::PNG_SEQUENCE_ZIP);
+        assert!(artifact.file_name.ends_with(".zip"));
+        assert!(!artifact.bytes.is_empty());
+        assert!(!artifact.invocations.is_empty());
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
     }
 }

@@ -122,7 +122,7 @@ impl DiagnosticsReport {
             ]
         });
 
-        let selected = resolve_pdf_engine()
+        let selected = resolve_pdf_engine(None)
             .ok()
             .map(|value| value.to_string_lossy().into_owned());
         let selected_normalized = selected.as_ref().map(|value| normalize_tool_name(value));
@@ -1016,6 +1016,8 @@ mod tests {
                     bytes: b"# hi".to_vec(),
                     format: output,
                     module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
                 })
             }
         }
