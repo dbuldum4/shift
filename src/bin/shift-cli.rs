@@ -2,10 +2,10 @@ use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionArtifact,
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
-    FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions,
-    default_output_path, ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url,
-    materialize_paste_token, parse_magic_paste, prepare_batch_destination, run_batch,
-    url_display_host,
+    FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
+    PdfInputOptions, default_output_path, ensure_public_url_fetch_allowed, expand_input_paths,
+    looks_like_url, materialize_paste_token, parse_magic_paste, prepare_batch_destination,
+    run_batch, url_display_host,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -124,8 +124,12 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
 
     // Single-file / single-URL path (in-memory convert, then write or stdout).
     let input = &inputs[0];
-    let source = resolve_input_to_source(input)?;
-    confirm_network_sources(std::slice::from_ref(&source), parsed.yes)?;
+    let classified = classify_cli_input(input)?;
+    confirm_network_urls(
+        network_urls_from_classified(std::slice::from_ref(&classified)),
+        parsed.yes,
+    )?;
+    let source = materialize_cli_input(classified)?;
     let artifact = match &source {
         BatchSource::Url(url) => {
             eprintln!("shift-cli: fetching {}", url_display_host(url));
@@ -178,7 +182,7 @@ struct ParsedConvertArgs {
     output_dir: Option<PathBuf>,
     stdout: bool,
     force: bool,
-    /// Skip interactive sharp-edge confirms (network fetch). Does not allow private URLs.
+    /// Skip interactive network confirms / allow non-TTY network. Does not allow private URLs.
     yes: bool,
     /// Opt into localhost/LAN URL fetches (default: public internet only).
     allow_private_urls: bool,
@@ -551,23 +555,58 @@ fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsSt
     }
 }
 
-/// Classify one CLI argument into a file path or page URL (downloads remote files).
-fn resolve_input_to_source(input: &OsStr) -> Result<BatchSource, String> {
+/// Classified CLI argument before any network I/O.
+#[derive(Debug)]
+enum ClassifiedInput {
+    Token(PasteToken),
+    /// Non-UTF-8 or unclassified token treated as a filesystem path.
+    Path(PathBuf),
+}
+
+/// Classify one CLI argument without downloading remote files.
+fn classify_cli_input(input: &OsStr) -> Result<ClassifiedInput, String> {
     if let Some(text) = input.to_str() {
         match parse_magic_paste(text) {
-            MagicPaste::Single(token) => {
-                return materialize_paste_token(&token).map_err(|error| error.to_string());
-            }
+            MagicPaste::Single(token) => return Ok(ClassifiedInput::Token(token)),
             MagicPaste::Multiple(_) => {
                 return Err(format!(
                     "each argument must be a single path or URL (got multiple tokens): {text}"
                 ));
             }
-            MagicPaste::Empty => {}
+            MagicPaste::Empty => {
+                let trimmed = text.trim();
+                if trimmed.to_ascii_lowercase().starts_with("file:") {
+                    return Err(format!(
+                        "invalid file:// URL (use a local path or a valid file:// path): {trimmed}"
+                    ));
+                }
+            }
         }
     }
     // Non-UTF-8 paths or unclassified tokens: treat as a local path.
-    Ok(BatchSource::File(PathBuf::from(input)))
+    Ok(ClassifiedInput::Path(PathBuf::from(input)))
+}
+
+fn network_urls_from_classified(items: &[ClassifiedInput]) -> Vec<&str> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ClassifiedInput::Token(PasteToken::PageUrl(url) | PasteToken::RemoteFileUrl(url)) => {
+                Some(url.as_str())
+            }
+            ClassifiedInput::Token(PasteToken::LocalPath(_)) | ClassifiedInput::Path(_) => None,
+        })
+        .collect()
+}
+
+/// Materialize a classified input (downloads remote files when needed).
+fn materialize_cli_input(input: ClassifiedInput) -> Result<BatchSource, String> {
+    match input {
+        ClassifiedInput::Token(token) => {
+            materialize_paste_token(&token).map_err(|error| error.to_string())
+        }
+        ClassifiedInput::Path(path) => Ok(BatchSource::File(path)),
+    }
 }
 
 fn print_invocations(artifact: &ConversionArtifact) {
@@ -654,13 +693,14 @@ fn run_batch_cli(
     enqueue.force = force;
     enqueue.output_dir = output_dir;
 
-    let mut sources = Vec::with_capacity(inputs.len());
+    // Classify first (no network), confirm all network tokens, then download.
+    let mut classified = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        let source = resolve_input_to_source(input)?;
-        sources.push(source);
+        classified.push(classify_cli_input(input)?);
     }
-    confirm_network_sources(&sources, yes)?;
-    for source in sources {
+    confirm_network_urls(network_urls_from_classified(&classified), yes)?;
+    for item in classified {
+        let source = materialize_cli_input(item)?;
         queue.enqueue(source, &enqueue);
     }
 
@@ -948,8 +988,9 @@ fn print_help() {
          converted). URL fetches are public-internet only by default (no\n\
          localhost/LAN). Use a file path for local content, or pass\n\
          --allow-private-urls / SHIFT_ALLOW_PRIVATE_URLS=1. On a TTY, network\n\
-         fetches ask for confirmation unless --yes is set (--yes never unlocks\n\
-         private hosts).\n\
+         fetches (page URLs and direct file downloads) ask for confirmation\n\
+         unless --yes is set. Non-interactive (non-TTY) runs require --yes for\n\
+         any network fetch. --yes never unlocks private hosts.\n\
          Directory inputs require --recursive (union of registered extensions).\n\
          Use `shift-cli formats` to list registered conversion capability.\n\
          Use `shift-cli doctor` to see which engines are installed and ready.\n\
@@ -964,21 +1005,16 @@ fn print_help() {
     );
 }
 
-/// Confirm outbound URL fetches on a TTY unless `--yes`. Private hosts still fail
-/// later via shared policy unless `--allow-private-urls` was set.
-fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), String> {
-    let urls: Vec<&str> = sources
-        .iter()
-        .filter_map(|source| match source {
-            BatchSource::Url(url) => Some(url.as_str()),
-            BatchSource::File(_) => None,
-        })
-        .collect();
+/// Confirm outbound URL fetches (page + remote file) before materialization.
+///
+/// Private hosts fail fast via shared policy unless `--allow-private-urls`.
+/// On a TTY, prompts unless `--yes`. Non-TTY requires `--yes` (no silent network).
+fn confirm_network_urls(urls: Vec<&str>, yes: bool) -> Result<(), String> {
     if urls.is_empty() {
         return Ok(());
     }
 
-    // Fail fast on private hosts with a clear message (before any confirm).
+    // Fail fast on private hosts with a clear message (before any confirm/download).
     for url in &urls {
         ensure_public_url_fetch_allowed(url).map_err(|error| error.to_string())?;
     }
@@ -996,12 +1032,10 @@ fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), Str
     }
 
     if !stdin_is_tty() {
-        // Non-interactive scripts: visible but not blocking (same spirit as the app).
-        eprintln!("shift-cli: fetching {} URL(s)", urls.len());
-        for url in &urls {
-            eprintln!("  · {}", url_display_host(url));
-        }
-        return Ok(());
+        return Err(
+            "network fetch requires --yes in non-interactive mode (no TTY for confirmation)"
+                .to_owned(),
+        );
     }
 
     eprint!("shift-cli: {summary} [y/N] ");
@@ -1015,6 +1049,19 @@ fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), Str
     } else {
         Err("cancelled (network fetch not confirmed; pass --yes to skip)".to_owned())
     }
+}
+
+/// Confirm network sources after materialization (legacy shape for tests).
+#[cfg(test)]
+fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), String> {
+    let urls: Vec<&str> = sources
+        .iter()
+        .filter_map(|source| match source {
+            BatchSource::Url(url) => Some(url.as_str()),
+            BatchSource::File(_) => None,
+        })
+        .collect();
+    confirm_network_urls(urls, yes)
 }
 
 fn stdin_is_tty() -> bool {
@@ -1221,6 +1268,43 @@ mod tests {
         }
         let sources = [BatchSource::Url("http://127.0.0.1/x".into())];
         let error = confirm_network_sources(&sources, true).unwrap_err();
+        assert!(
+            error.contains("non-public") || error.contains("public internet"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn classify_keeps_remote_file_url_until_materialize() {
+        let classified =
+            classify_cli_input(OsStr::new("https://cdn.example.com/docs/report.pdf")).unwrap();
+        match &classified {
+            ClassifiedInput::Token(PasteToken::RemoteFileUrl(url)) => {
+                assert_eq!(url, "https://cdn.example.com/docs/report.pdf");
+            }
+            other => panic!("expected remote file token, got {other:?}"),
+        }
+        let urls = network_urls_from_classified(std::slice::from_ref(&classified));
+        assert_eq!(urls, vec!["https://cdn.example.com/docs/report.pdf"]);
+    }
+
+    #[test]
+    fn classify_rejects_invalid_file_urls() {
+        let error = classify_cli_input(OsStr::new("file://hostname/only")).unwrap_err();
+        assert!(
+            error.contains("invalid file://") || error.contains("file://"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn confirm_network_urls_includes_remote_file_urls() {
+        let _env = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        let error = confirm_network_urls(vec!["http://127.0.0.1/secret.pdf"], true).unwrap_err();
         assert!(
             error.contains("non-public") || error.contains("public internet"),
             "{error}"

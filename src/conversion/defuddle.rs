@@ -251,10 +251,24 @@ fn env_flag_truthy(name: &str) -> bool {
 }
 
 /// Refuse non-public URL hosts when [`block_private_urls`] is active.
+///
+/// Checks literal host forms (IP / localhost-style names) and, for domain names,
+/// resolves A/AAAA records so names that point at LAN/loopback/metadata ranges
+/// are blocked. Residual DNS-rebinding TOCTOU between resolve and connect is
+/// inherent to separate name lookup; hop revalidation still applies to remote
+/// file downloads.
 pub fn ensure_public_url_fetch_allowed(url: &str) -> Result<(), ConversionError> {
-    if block_private_urls() && url_targets_non_public_host(url) {
+    if !block_private_urls() {
+        return Ok(());
+    }
+    if url_targets_non_public_host(url) {
         return Err(ConversionError::new(format!(
             "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {url}"
+        )));
+    }
+    if url_resolves_to_non_public_host(url) {
+        return Err(ConversionError::new(format!(
+            "refusing URL whose host resolves to a non-public address (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {url}"
         )));
     }
     Ok(())
@@ -271,32 +285,94 @@ pub fn url_display_host(url: &str) -> String {
 /// True when the URL host is loopback, private, link-local, or a localhost-style name.
 ///
 /// Used so URL fetches stay on the public internet unless explicitly opted in.
+/// Literal IP and special domain checks only — see [`url_resolves_to_non_public_host`]
+/// for DNS-backed policy.
 pub fn url_targets_non_public_host(value: &str) -> bool {
     let Ok(parsed) = Url::parse(value.trim()) else {
         return false;
     };
     match parsed.host() {
-        Some(url::Host::Domain(domain)) => {
-            let domain = domain.to_ascii_lowercase();
-            domain == "localhost"
-                || domain.ends_with(".localhost")
-                || domain.ends_with(".local")
-                || domain == "0.0.0.0"
-        }
-        Some(url::Host::Ipv4(ip)) => {
-            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback()
-                || ip.is_unique_local()
-                || {
-                    // Link-local unicast fe80::/10
-                    let segments = ip.segments();
-                    (segments[0] & 0xffc0) == 0xfe80
-                }
-                || ip.is_unspecified()
-        }
+        Some(url::Host::Domain(domain)) => domain_is_non_public(domain),
+        Some(url::Host::Ipv4(ip)) => ipv4_is_non_public(ip),
+        Some(url::Host::Ipv6(ip)) => ipv6_is_non_public(ip),
         None => false,
+    }
+}
+
+/// True when a domain name resolves to any non-public address (or mixed public/private).
+///
+/// IP literals are skipped (already covered by [`url_targets_non_public_host`]).
+/// DNS failures return false so offline / NXDOMAIN cases fail later at the fetcher.
+pub fn url_resolves_to_non_public_host(value: &str) -> bool {
+    use std::net::{SocketAddr, ToSocketAddrs};
+
+    let Ok(parsed) = Url::parse(value.trim()) else {
+        return false;
+    };
+    // Only domain names need resolution; literal IPs were checked already.
+    let Some(url::Host::Domain(domain)) = parsed.host() else {
+        return false;
+    };
+    if domain_is_non_public(domain) {
+        return true;
+    }
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let Ok(addrs) = (domain, port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs {
+        match addr {
+            SocketAddr::V4(v4) if ipv4_is_non_public(*v4.ip()) => return true,
+            SocketAddr::V6(v6) if ipv6_is_non_public(*v6.ip()) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn domain_is_non_public(domain: &str) -> bool {
+    let domain = domain.to_ascii_lowercase();
+    domain == "localhost"
+        || domain.ends_with(".localhost")
+        || domain.ends_with(".local")
+        || domain == "0.0.0.0"
+        // Well-known cloud metadata / internal names (not public internet).
+        || domain == "metadata.google.internal"
+        || domain.ends_with(".metadata.google.internal")
+        || domain == "metadata"
+        || domain.ends_with(".internal")
+}
+
+fn ipv4_is_non_public(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        // CGNAT / shared address space 100.64.0.0/10 (RFC 6598).
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        // Benchmarking 198.18.0.0/15 (RFC 2544).
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        // IETF protocol assignments 192.0.0.0/24 (excluding documentation already covered).
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        // Reserved for future use 240.0.0.0/4.
+        || (octets[0] & 0xf0) == 240
+}
+
+fn ipv6_is_non_public(ip: std::net::Ipv6Addr) -> bool {
+    // IPv4-mapped forms (:ffff:x.x.x.x) must use the embedded v4 policy.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_is_non_public(v4);
+    }
+    ip.is_loopback() || ip.is_unique_local() || ip.is_unspecified() || ip.is_multicast() || {
+        // Link-local unicast fe80::/10
+        let segments = ip.segments();
+        (segments[0] & 0xffc0) == 0xfe80
     }
 }
 
@@ -355,15 +431,30 @@ mod tests {
         assert!(url_targets_non_public_host("http://192.168.1.1/"));
         assert!(url_targets_non_public_host("http://10.0.0.5/a"));
         assert!(url_targets_non_public_host("http://[::1]/"));
+        // IPv4-mapped IPv6 loopback / private / link-local metadata.
+        assert!(url_targets_non_public_host("http://[::ffff:127.0.0.1]/"));
+        assert!(url_targets_non_public_host("http://[::ffff:10.0.0.1]/"));
+        assert!(url_targets_non_public_host(
+            "http://[::ffff:169.254.169.254]/"
+        ));
+        // CGNAT and metadata-style names.
+        assert!(url_targets_non_public_host("http://100.64.1.2/"));
+        assert!(url_targets_non_public_host(
+            "http://metadata.google.internal/"
+        ));
+        assert!(url_targets_non_public_host("http://foo.internal/x"));
         assert!(!url_targets_non_public_host("https://example.com/article"));
         assert!(!url_targets_non_public_host("https://8.8.8.8/"));
     }
 
+    /// Serializes tests that mutate `SHIFT_*_PRIVATE_URLS` process env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn public_url_policy_blocks_private_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Isolate from the developer's shell env for this process.
-        // SAFETY: tests in this binary are not run in parallel with other
-        // env-mutating tests that depend on these keys.
+        // SAFETY: serialized behind ENV_LOCK.
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -374,7 +465,10 @@ mod tests {
             err.to_string().contains("non-public") || err.to_string().contains("public internet"),
             "error: {err}"
         );
-        assert!(ensure_public_url_fetch_allowed("https://example.com/a").is_ok());
+        // Literal public IP — no DNS required.
+        assert!(ensure_public_url_fetch_allowed("https://8.8.8.8/").is_ok());
+        // Domain path may resolve; only assert it is not rejected as a private literal.
+        assert!(!url_targets_non_public_host("https://example.com/a"));
     }
 
     #[test]

@@ -187,7 +187,8 @@ cargo run --bin shift-cli -- report.docx --to html
 # Prefer Pandoc where both modules can produce Markdown
 cargo run --bin shift-cli -- report.docx --module pandoc
 
-# Extract a web page with Defuddle (public hosts only; --yes skips TTY confirm)
+# Extract a web page with Defuddle (public hosts only; --yes skips TTY confirm
+# and is required for non-interactive/non-TTY network fetches)
 cargo run --bin shift-cli -- https://example.com/article --yes
 
 # PDF → HTML via Docling (MarkItDown only emits Markdown)

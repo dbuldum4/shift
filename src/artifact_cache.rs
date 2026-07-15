@@ -184,15 +184,12 @@ fn export_file_matches_len(path: &Path, len: u64, hash_hex: &str) -> bool {
     if meta.len() != len {
         return false;
     }
-    let Some(parent) = path.parent() else {
+    // Always re-hash the staged file. A sidecar alone is not enough: a same-length
+    // edit (or a stale sidecar left after a partial write) would otherwise pass.
+    let Ok(actual) = hash_file(path) else {
         return false;
     };
-    let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
-        return false;
-    };
-    fs::read_to_string(hash_sidecar_path(parent, name))
-        .map(|stored| stored.trim() == hash_hex)
-        .unwrap_or(false)
+    format!("{actual:016x}") == hash_hex
 }
 
 fn disambiguated_export_name(safe: &str, hash: u64) -> String {
@@ -589,6 +586,32 @@ mod tests {
         let path = stage_export_bytes("note.md", b"body").unwrap();
         assert!(export_matches_bytes(&path, b"body"));
         assert!(!export_matches_bytes(&path, b"other"));
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_matches_rejects_same_length_content_edit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("stale-edit");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+        let path = stage_export_bytes("note.md", b"body").unwrap();
+        assert!(export_matches_bytes(&path, b"body"));
+        // Same length, different bytes — must not reuse staged file.
+        fs::write(&path, b"xxxx").unwrap();
+        assert!(!export_matches_bytes(&path, b"body"));
+        // Even if the sidecar still claims the old hash, content wins.
+        let sidecar = path.with_file_name(format!(
+            ".{}.hash",
+            path.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(sidecar.is_file() || path.parent().unwrap().join(".note.md.hash").is_file());
+        assert!(!export_matches_bytes(&path, b"body"));
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
         }

@@ -5024,10 +5024,12 @@ impl Shift {
         }
         let paste = parse_magic_paste(trimmed);
         if paste.is_empty() {
-            self.fail_magic_paste(
-                "Paste a page URL, file path, file:// link, direct file URL, or image.",
-                cx,
-            );
+            let message = if trimmed.to_ascii_lowercase().starts_with("file:") {
+                "Invalid file:// URL — use a local path or a valid file:// path."
+            } else {
+                "Paste a page URL, file path, file:// link, direct file URL, or image."
+            };
+            self.fail_magic_paste(message, cx);
             return;
         }
         self.begin_magic_paste_resolve(paste, Some(trimmed.to_owned()), cx);
@@ -5422,11 +5424,11 @@ impl Shift {
         }
     }
 
-    /// Mark conversion Ready and pre-stage the export path for Reveal / Open / drag.
+    /// Mark conversion Ready. Export staging is lazy (first Reveal / Open / drag)
+    /// so large artifacts do not hitch the UI thread at Ready time.
     fn set_ready_artifact(&mut self, artifact: Arc<ConversionArtifact>) {
         self.conversion = ConversionState::Ready(artifact);
         self.cached_ready_path = None;
-        let _ = self.ensure_cached_ready_path();
     }
 
     fn copy_output(&mut self, cx: &mut Context<Self>) {

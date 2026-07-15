@@ -340,6 +340,7 @@ fn download_remote_file(url: &str) -> Result<PathBuf, ConversionError> {
 /// Fast path: curl follows redirects (no private-URL policy).
 fn download_follow_redirects(url: &str, path: &Path) -> Result<(), ConversionError> {
     let mut command = Command::new("curl");
+    apply_curl_http_only(&mut command);
     command
         .arg("-fsSL")
         .arg("--max-filesize")
@@ -385,6 +386,7 @@ fn download_with_redirect_revalidation(url: &str, path: &Path) -> Result<(), Con
         let mut command = Command::new("curl");
         // No -L / max-redirs 0: surface 3xx so we can validate the next hop.
         // No -f: we need to inspect redirect status codes ourselves.
+        apply_curl_http_only(&mut command);
         command
             .arg("-sS")
             .arg("--max-redirs")
@@ -456,7 +458,10 @@ fn download_with_redirect_revalidation(url: &str, path: &Path) -> Result<(), Con
 fn location_header(headers: &str) -> Option<String> {
     for line in headers.lines() {
         let line = line.trim();
-        let (name, value) = line.split_once(':')?;
+        // Status lines (`HTTP/1.1 302 Found`) have no colon — skip them.
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if name.eq_ignore_ascii_case("location") {
             let value = value.trim();
             if !value.is_empty() {
@@ -469,19 +474,46 @@ fn location_header(headers: &str) -> Option<String> {
 
 fn resolve_redirect_url(base: &str, location: &str) -> Result<String, ConversionError> {
     let location = location.trim();
-    if looks_like_url(location) {
-        return Ok(location.to_owned());
-    }
-    let base = Url::parse(base).map_err(|error| {
-        ConversionError::new(format!("invalid redirect base URL {base}: {error}"))
-    })?;
-    base.join(location)
-        .map(|url| url.to_string())
-        .map_err(|error| {
+    let resolved = if let Ok(absolute) = Url::parse(location) {
+        // Absolute URL in Location — only http(s) may proceed.
+        if !matches!(absolute.scheme(), "http" | "https") {
+            return Err(ConversionError::new(format!(
+                "refusing non-http(s) redirect Location '{location}'"
+            )));
+        }
+        absolute
+    } else {
+        let base = Url::parse(base).map_err(|error| {
+            ConversionError::new(format!("invalid redirect base URL {base}: {error}"))
+        })?;
+        base.join(location).map_err(|error| {
             ConversionError::new(format!(
                 "could not resolve redirect Location '{location}': {error}"
             ))
-        })
+        })?
+    };
+
+    if !matches!(resolved.scheme(), "http" | "https") || resolved.host().is_none() {
+        return Err(ConversionError::new(format!(
+            "refusing non-http(s) redirect target '{resolved}'"
+        )));
+    }
+    // Drop userinfo so credentials in Location cannot be forwarded blindly.
+    if !resolved.username().is_empty() || resolved.password().is_some() {
+        return Err(ConversionError::new(format!(
+            "refusing redirect Location with credentials: {location}"
+        )));
+    }
+    Ok(resolved.to_string())
+}
+
+/// Limit curl to http(s) only (blocks file:// and other protocol smuggling).
+fn apply_curl_http_only(command: &mut Command) {
+    command
+        .arg("--proto")
+        .arg("=https,http")
+        .arg("--proto-redir")
+        .arg("=https,http");
 }
 
 fn remote_file_name(url: &str) -> String {
@@ -695,6 +727,45 @@ mod tests {
     fn resolve_redirect_joins_relative_location() {
         let next = resolve_redirect_url("https://cdn.example.com/a/b.pdf", "../c.pdf").unwrap();
         assert_eq!(next, "https://cdn.example.com/c.pdf");
+    }
+
+    #[test]
+    fn location_header_skips_status_line() {
+        let headers = "HTTP/1.1 302 Found\r\n\
+             Server: cloudflare\r\n\
+             Location: https://cdn.example.com/real.pdf\r\n\
+             Content-Length: 0\r\n\r\n";
+        assert_eq!(
+            location_header(headers).as_deref(),
+            Some("https://cdn.example.com/real.pdf")
+        );
+        // LF-only dumps and lower-case names.
+        let headers = "HTTP/2 301\nlocation: /next.pdf\n";
+        assert_eq!(location_header(headers).as_deref(), Some("/next.pdf"));
+        assert_eq!(location_header("HTTP/1.1 200 OK\n"), None);
+    }
+
+    #[test]
+    fn resolve_redirect_rejects_non_http_schemes() {
+        let err = resolve_redirect_url("https://cdn.example.com/a.pdf", "file:///etc/passwd")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-http"),
+            "unexpected error: {err}"
+        );
+        let err =
+            resolve_redirect_url("https://cdn.example.com/a.pdf", "gopher://evil/").unwrap_err();
+        assert!(err.to_string().contains("non-http"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn resolve_redirect_rejects_credentials_in_location() {
+        let err = resolve_redirect_url(
+            "https://cdn.example.com/a.pdf",
+            "https://user:pass@evil.example/x.pdf",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("credentials"), "unexpected: {err}");
     }
 
     #[test]

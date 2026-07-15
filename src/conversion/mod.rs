@@ -676,11 +676,33 @@ pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), Conversio
     }
 
     if let Err(error) = std::fs::rename(&partial, path) {
-        // Some platforms refuse rename-over-existing; remove then retry once.
+        // Some platforms refuse rename-over-existing. Move the previous file
+        // aside first so a failed second rename can restore it (never delete
+        // the only good copy before the new file is in place).
         if path.exists() {
-            let _ = std::fs::remove_file(path);
-            if std::fs::rename(&partial, path).is_ok() {
-                return Ok(());
+            let backup = dir.join(format!(".{stem}.{token}.shift-bak"));
+            match std::fs::rename(path, &backup) {
+                Ok(()) => match std::fs::rename(&partial, path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup);
+                        return Ok(());
+                    }
+                    Err(error2) => {
+                        let _ = std::fs::rename(&backup, path);
+                        let _ = std::fs::remove_file(&partial);
+                        return Err(ConversionError::new(format!(
+                            "could not finalize {}: {error2}",
+                            path.display()
+                        )));
+                    }
+                },
+                Err(_) => {
+                    let _ = std::fs::remove_file(&partial);
+                    return Err(ConversionError::new(format!(
+                        "could not finalize {}: {error}",
+                        path.display()
+                    )));
+                }
             }
         }
         let _ = std::fs::remove_file(&partial);
@@ -1717,11 +1739,15 @@ mod tests {
         let path = dir.join("out.md");
         write_bytes_atomically(&path, b"# hello\n").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"# hello\n");
-        // No partial siblings remain.
+        // Overwrite existing destination (backup path on platforms that need it).
+        write_bytes_atomically(&path, b"# world\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"# world\n");
+        // No partial or backup siblings remain.
         for entry in std::fs::read_dir(&dir).unwrap() {
             let name = entry.unwrap().file_name();
             let name = name.to_string_lossy();
             assert!(!name.contains("shift-partial"), "leftover partial: {name}");
+            assert!(!name.contains("shift-bak"), "leftover backup: {name}");
         }
         let _ = std::fs::remove_dir_all(dir);
     }
