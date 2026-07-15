@@ -12,8 +12,8 @@
 #![allow(unexpected_cfgs)] // objc `msg_send!` cfg noise
 
 use cocoa::appkit::{NSApp, NSApplication, NSModalResponse, NSOpenPanel, NSSavePanel};
-use cocoa::base::{NO, YES, id, nil};
-use cocoa::foundation::{NSString, NSURL};
+use cocoa::base::{BOOL, NO, YES, id, nil};
+use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
 use futures::channel::oneshot;
 use objc::{msg_send, sel, sel_impl};
 use std::cell::Cell;
@@ -172,6 +172,68 @@ pub fn reveal_in_finder(path: &Path) {
 /// Open `path` with the default application (`open`).
 pub fn open_path(path: &Path) {
     let _ = Command::new("/usr/bin/open").arg(path).spawn();
+}
+
+/// Begin a native macOS drag of an existing file (for drop into Finder, Downloads, etc.).
+///
+/// Must be called on the main thread while a mouse-drag `NSEvent` is current
+/// (for example from a GPUI `on_drag` start handler). Blocks until the drag
+/// session ends. Returns `true` if AppKit accepted the drag.
+pub fn begin_file_drag(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    // SAFETY: main-thread only; AppKit objects live for the duration of the call.
+    unsafe {
+        let app = NSApp();
+        if app == nil {
+            return false;
+        }
+        let event: id = msg_send![app, currentEvent];
+        if event == nil {
+            return false;
+        }
+
+        let mut window: id = msg_send![app, keyWindow];
+        if window == nil {
+            window = msg_send![app, mainWindow];
+        }
+        if window == nil {
+            let windows: id = msg_send![app, windows];
+            if windows != nil {
+                let count: usize = msg_send![windows, count];
+                if count > 0 {
+                    window = msg_send![windows, objectAtIndex: 0usize];
+                }
+            }
+        }
+        if window == nil {
+            return false;
+        }
+
+        let view: id = msg_send![window, contentView];
+        if view == nil {
+            return false;
+        }
+
+        let path_str = path.to_string_lossy();
+        let ns_path = NSString::alloc(nil).init_str(&path_str);
+        if ns_path == nil {
+            return false;
+        }
+
+        // Zero rect: AppKit uses the current mouse location for the drag image.
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+        let ok: BOOL = msg_send![
+            view,
+            dragFile: ns_path
+            fromRect: rect
+            slideBack: YES
+            event: event
+        ];
+        let _: () = msg_send![ns_path, release];
+        ok == YES
+    }
 }
 
 fn begin_dialog() -> bool {

@@ -32,12 +32,36 @@ pub enum BatchSource {
 }
 
 impl BatchSource {
-    pub fn from_path_or_url(value: impl AsRef<Path>) -> Self {
+    /// Classify a path-like string as a local file or http(s) URL.
+    ///
+    /// `file://` URLs are resolved to local paths when possible. Invalid
+    /// `file://` forms (e.g. host-only on Unix) return an error rather than a
+    /// synthetic filesystem path that would fail later with a confusing message.
+    pub fn try_from_path_or_url(value: impl AsRef<Path>) -> Result<Self, String> {
         let path = value.as_ref();
-        if let Some(text) = path.to_str().filter(|value| looks_like_url(value)) {
-            Self::Url(text.to_owned())
-        } else {
-            Self::File(path.to_path_buf())
+        if let Some(text) = path.to_str() {
+            let text = text.trim();
+            if let Ok(parsed) = url::Url::parse(text) {
+                if parsed.scheme() == "file" {
+                    return parsed.to_file_path().map(Self::File).map_err(|_| {
+                        format!("invalid file:// URL (could not resolve to a local path): {text}")
+                    });
+                }
+            }
+            if looks_like_url(text) {
+                return Ok(Self::Url(text.to_owned()));
+            }
+        }
+        Ok(Self::File(path.to_path_buf()))
+    }
+
+    /// Like [`Self::try_from_path_or_url`], but maps invalid `file://` URLs to a
+    /// best-effort local path for callers that cannot surface classification errors.
+    pub fn from_path_or_url(value: impl AsRef<Path>) -> Self {
+        match Self::try_from_path_or_url(value.as_ref()) {
+            Ok(source) => source,
+            // Preserve previous best-effort behavior only when try fails for non-URL paths.
+            Err(_) => Self::File(value.as_ref().to_path_buf()),
         }
     }
 
@@ -663,8 +687,14 @@ fn write_artifact(
     // Align with single-file CLI: refuse existing outputs unless force.
     // In-queue name clashes are resolved earlier via uniquify_planned_destinations.
     prepare_batch_destination(planned, source, force)?;
-    artifact.write_to(planned)?;
-    Ok(planned.to_path_buf())
+    // Atomic write: partial sibling then rename. On failure scrub any leftovers.
+    match artifact.write_to(planned) {
+        Ok(()) => Ok(planned.to_path_buf()),
+        Err(error) => {
+            let _ = super::remove_partial_outputs(planned);
+            Err(error)
+        }
+    }
 }
 
 /// Process every `Queued` item until the queue is idle or fully cancelled.
@@ -767,13 +797,14 @@ pub fn run_batch(
             continue;
         }
 
+        let write_destination = destination.clone();
         let result = std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
                 convert_source(registry, &source, format, &options).and_then(|artifact| {
                     if cancel.load(Ordering::SeqCst) {
                         return Err(ConversionError::cancelled());
                     }
-                    write_artifact(&artifact, &destination, source.as_file(), force)
+                    write_artifact(&artifact, &write_destination, source.as_file(), force)
                         .map(|path| (path, artifact.module_id.to_owned(), artifact.bytes.len()))
                 })
             });
@@ -816,6 +847,9 @@ pub fn run_batch(
                 }
             }
             Err(error) if error.is_cancelled() || cancel.load(Ordering::SeqCst) => {
+                // Drop incomplete partial siblings; final path only exists after
+                // a successful atomic rename.
+                let _ = super::remove_partial_outputs(&destination);
                 if let Some(item) = queue.get_mut(id) {
                     item.state = BatchItemState::Cancelled;
                 }
@@ -932,6 +966,18 @@ mod tests {
         let source = BatchSource::File(PathBuf::from("/docs/report.pdf"));
         let dest = resolve_destination(&source, OutputFormat::MARKDOWN, Some(Path::new("/out")));
         assert_eq!(dest, PathBuf::from("/out/report.md"));
+    }
+
+    #[test]
+    fn try_from_path_or_url_resolves_file_urls() {
+        let source = BatchSource::try_from_path_or_url("file:///tmp/sample.pdf").unwrap();
+        assert_eq!(source, BatchSource::File(PathBuf::from("/tmp/sample.pdf")));
+
+        let source = BatchSource::try_from_path_or_url("https://example.com/a").unwrap();
+        assert_eq!(source, BatchSource::Url("https://example.com/a".to_owned()));
+
+        let err = BatchSource::try_from_path_or_url("file://hostname/only").unwrap_err();
+        assert!(err.contains("invalid file://"), "unexpected: {err}");
     }
 
     #[test]

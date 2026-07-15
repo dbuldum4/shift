@@ -5,6 +5,7 @@ mod defuddle;
 mod diagnostics;
 mod docling;
 mod ffmpeg;
+mod magic_paste;
 mod markitdown;
 mod pandoc;
 mod pdf_slice;
@@ -25,8 +26,8 @@ pub use batch::{
     resolve_destination, run_batch, suggested_url_file_name, uniquify_destination,
 };
 pub use defuddle::{
-    DefuddleModule, DefuddleOptions, block_private_urls, looks_like_url,
-    url_targets_non_public_host,
+    DefuddleModule, DefuddleOptions, block_private_urls, ensure_public_url_fetch_allowed,
+    looks_like_url, url_display_host, url_targets_non_public_host,
 };
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
@@ -36,6 +37,11 @@ pub use docling::{DoclingImageExportMode, DoclingModule, DoclingOptions, Docling
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
     is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+};
+pub use magic_paste::{
+    MAX_REMOTE_FILE_BYTES, MagicPaste, PasteToken, REMOTE_DOWNLOAD_TIMEOUT,
+    materialize_magic_paste, materialize_paste_token, parse_magic_paste, stage_pasted_image,
+    url_looks_like_remote_file,
 };
 pub use markitdown::{MarkItDownModule, MarkItDownOptions};
 pub use pandoc::{PandocModule, PandocOptions, pdf_engine_candidates, resolve_pdf_engine};
@@ -612,12 +618,17 @@ impl ConversionArtifact {
     }
 
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), ConversionError> {
-        std::fs::write(path.as_ref(), &self.bytes).map_err(|error| {
-            ConversionError::new(format!(
-                "could not write {}: {error}",
-                path.as_ref().display()
-            ))
-        })
+        // Atomic: write a sibling partial, then rename into place so cancel /
+        // crash never leaves a half-written final path.
+        write_bytes_atomically(path.as_ref(), &self.bytes)
+    }
+
+    /// Human-readable result summary for UI previews (text excerpt or binary facts).
+    pub fn preview_summary(&self) -> String {
+        if self.format.is_text_previewable() {
+            return text_preview_excerpt(&self.bytes);
+        }
+        binary_preview_summary(self)
     }
 
     /// Fill pipeline/invocations for a single-module conversion when unset.
@@ -636,6 +647,139 @@ impl ConversionArtifact {
         }
         self.module_id = module_id;
         self
+    }
+}
+
+/// Write `bytes` to `path` via a unique `*.shift-partial` sibling, then rename.
+///
+/// On failure the partial file is removed. The final path appears only after a
+/// complete write so cancelled conversions do not leave truncated destinations.
+pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let partial = dir.join(format!(".{stem}.{token}.shift-partial"));
+
+    if let Err(error) = std::fs::write(&partial, bytes) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(ConversionError::new(format!(
+            "could not write {}: {error}",
+            path.display()
+        )));
+    }
+
+    if let Err(error) = std::fs::rename(&partial, path) {
+        // Some platforms refuse rename-over-existing; remove then retry once.
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+            if std::fs::rename(&partial, path).is_ok() {
+                return Ok(());
+            }
+        }
+        let _ = std::fs::remove_file(&partial);
+        return Err(ConversionError::new(format!(
+            "could not finalize {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove incomplete `*.shift-partial` siblings next to a planned destination.
+pub fn remove_partial_outputs(planned: &Path) -> usize {
+    let Some(parent) = planned.parent() else {
+        return 0;
+    };
+    let Some(stem) = planned.file_name().and_then(|value| value.to_str()) else {
+        return 0;
+    };
+    let prefix = format!(".{stem}.");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && name.ends_with(".shift-partial")
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+const TEXT_PREVIEW_CHAR_LIMIT: usize = 4_000;
+
+fn text_preview_excerpt(bytes: &[u8]) -> String {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return format!(
+            "Binary-looking payload ({} bytes) — not valid UTF-8 text.\nUse Download to save the file.",
+            bytes.len()
+        );
+    };
+    let total_chars = text.chars().count();
+    let mut excerpt: String = text.chars().take(TEXT_PREVIEW_CHAR_LIMIT).collect();
+    if total_chars > TEXT_PREVIEW_CHAR_LIMIT {
+        excerpt.push_str(&format!(
+            "\n\n… preview truncated ({total_chars} characters total · {} on disk when saved)",
+            format_byte_size(bytes.len() as u64)
+        ));
+    } else if excerpt.trim().is_empty() {
+        excerpt.push_str("The conversion completed with an empty document.");
+    }
+    excerpt
+}
+
+fn binary_preview_summary(artifact: &ConversionArtifact) -> String {
+    let size = format_byte_size(artifact.bytes.len() as u64);
+    let pipeline = if artifact.pipeline.is_empty() {
+        artifact.module_id.to_owned()
+    } else {
+        artifact.pipeline.join(" → ")
+    };
+    let kind = if ffmpeg::is_video_output(artifact.format) {
+        "Video"
+    } else if ffmpeg::is_audio_output(artifact.format) {
+        "Audio"
+    } else if ffmpeg::is_image_output(artifact.format) {
+        "Image"
+    } else if ffmpeg::is_subtitle_output(artifact.format) {
+        "Subtitles"
+    } else {
+        "Binary"
+    };
+    format!(
+        "{kind} · {} · {size}\nFile: {}\nEngine: {pipeline}\n\nNot shown inline — Download, drag, or Reveal after save.\nNo media player in Shift; open with your default app after saving.",
+        artifact.format.label(),
+        artifact.file_name,
+    )
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1} GB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1} MB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -1557,6 +1701,101 @@ mod tests {
             Path::new("report.html"),
             Path::new("report.converted.html")
         ));
+    }
+
+    #[test]
+    fn write_bytes_atomically_creates_final_without_partial_left_behind() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-atomic-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.md");
+        write_bytes_atomically(&path, b"# hello\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"# hello\n");
+        // No partial siblings remain.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.contains("shift-partial"), "leftover partial: {name}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_partial_outputs_cleans_siblings() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-partial-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let planned = dir.join("report.md");
+        let partial = dir.join(".report.md.123.shift-partial");
+        std::fs::write(&partial, b"half").unwrap();
+        assert_eq!(remove_partial_outputs(&planned), 1);
+        assert!(!partial.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview_summary_is_honest_for_binary_and_text() {
+        let text = ConversionArtifact {
+            file_name: "note.md".into(),
+            media_type: "text/markdown",
+            bytes: b"# Title\n\nHello".to_vec(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        };
+        let summary = text.preview_summary();
+        assert!(summary.contains("Title"), "{summary}");
+
+        let binary = ConversionArtifact {
+            file_name: "clip.mp3".into(),
+            media_type: "audio/mpeg",
+            bytes: vec![0u8; 2048],
+            format: OutputFormat::MP3,
+            module_id: "ffmpeg",
+            pipeline: vec!["ffmpeg"],
+            invocations: Vec::new(),
+        };
+        let summary = binary.preview_summary();
+        assert!(
+            summary.contains("Audio") || summary.contains("MP3") || summary.contains("mp3"),
+            "{summary}"
+        );
+        assert!(summary.contains("Not shown inline"), "{summary}");
+        assert!(!summary.contains("player widget"), "{summary}");
+    }
+
+    #[test]
+    fn prepare_destination_refuses_source_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-source-safe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("doc.md");
+        std::fs::write(&source, b"src").unwrap();
+        let error = prepare_batch_destination(&source, Some(&source), true).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to overwrite source"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

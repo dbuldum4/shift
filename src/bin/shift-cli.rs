@@ -2,8 +2,10 @@ use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionArtifact,
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
-    FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions,
-    default_output_path, expand_input_paths, looks_like_url, prepare_batch_destination, run_batch,
+    FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions,
+    default_output_path, ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url,
+    materialize_paste_token, parse_magic_paste, prepare_batch_destination, run_batch,
+    url_display_host,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -64,6 +66,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         return Err("use either --output or --output-dir, not both".to_owned());
     }
 
+    // Shared with app: public hosts only unless explicitly opted in.
+    // `--yes` never re-enables private/LAN fetches.
+    if parsed.allow_private_urls {
+        // SAFETY: single-threaded CLI entry; set before any fetch.
+        unsafe {
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
+    }
+
     let use_batch = parsed.batch_explicit || inputs.len() > 1 || parsed.output_dir.is_some();
     if use_batch && parsed.stdout {
         return Err("batch conversion cannot write to --stdout (use -O/--output-dir)".to_owned());
@@ -105,6 +116,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             parsed.output_dir,
             parsed.output,
             parsed.force,
+            parsed.yes,
             &registry,
             parsed.verbose,
         );
@@ -112,15 +124,18 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
 
     // Single-file / single-URL path (in-memory convert, then write or stdout).
     let input = &inputs[0];
-    let input_url = url_input(input);
-    let artifact = if let Some(url) = input_url {
-        registry
-            .convert_url_with_options(url, parsed.target, &options)
-            .map_err(|error| error.to_string())?
-    } else {
-        registry
-            .convert_to_with_options(PathBuf::from(input), parsed.target, &options)
-            .map_err(|error| error.to_string())?
+    let source = resolve_input_to_source(input)?;
+    confirm_network_sources(std::slice::from_ref(&source), parsed.yes)?;
+    let artifact = match &source {
+        BatchSource::Url(url) => {
+            eprintln!("shift-cli: fetching {}", url_display_host(url));
+            registry
+                .convert_url_with_options(url, parsed.target, &options)
+                .map_err(|error| error.to_string())?
+        }
+        BatchSource::File(path) => registry
+            .convert_to_with_options(path.clone(), parsed.target, &options)
+            .map_err(|error| error.to_string())?,
     };
 
     if parsed.progress {
@@ -137,20 +152,18 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             .write_all(&artifact.bytes)
             .map_err(|error| format!("could not write output: {error}"))?;
     } else {
-        let destination = parsed.output.unwrap_or_else(|| {
-            if input_url.is_some() {
-                PathBuf::from(&artifact.file_name)
-            } else {
-                default_output_path(PathBuf::from(input).as_path(), parsed.target)
-            }
+        let destination = parsed.output.unwrap_or_else(|| match &source {
+            BatchSource::Url(_) => PathBuf::from(&artifact.file_name),
+            BatchSource::File(path) => default_output_path(path.as_path(), parsed.target),
         });
-        let source_path = input_url.is_none().then(|| PathBuf::from(input));
+        let source_path = source.as_file().map(|path| path.to_path_buf());
         // Shared with batch: refuse source overwrite, honor --force, create parents.
         prepare_batch_destination(&destination, source_path.as_deref(), parsed.force)
             .map_err(|error| error.to_string())?;
         artifact
             .write_to(&destination)
             .map_err(|error| error.to_string())?;
+        // Full path on stdout so scripts and humans know where the file landed.
         println!("{}", destination.display());
     }
 
@@ -165,6 +178,10 @@ struct ParsedConvertArgs {
     output_dir: Option<PathBuf>,
     stdout: bool,
     force: bool,
+    /// Skip interactive sharp-edge confirms (network fetch). Does not allow private URLs.
+    yes: bool,
+    /// Opt into localhost/LAN URL fetches (default: public internet only).
+    allow_private_urls: bool,
     target: OutputFormat,
     preferred_module: Option<String>,
     ffmpeg: FfmpegOptions,
@@ -187,6 +204,8 @@ impl Default for ParsedConvertArgs {
             output_dir: None,
             stdout: false,
             force: false,
+            yes: false,
+            allow_private_urls: false,
             target: OutputFormat::MARKDOWN,
             preferred_module: None,
             ffmpeg: FfmpegOptions::default(),
@@ -237,6 +256,8 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
             }
             "--stdout" => parsed.stdout = true,
             "--force" => parsed.force = true,
+            "--yes" | "-y" => parsed.yes = true,
+            "--allow-private-urls" => parsed.allow_private_urls = true,
             "--recursive" => parsed.recursive = true,
             "--verbose" | "-v" => parsed.verbose = true,
             "--progress" => parsed.progress = true,
@@ -488,7 +509,7 @@ fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsSt
     if recursive {
         let mut out = Vec::new();
         for input in inputs {
-            if url_input(&input).is_some() {
+            if is_network_or_file_url_input(&input) {
                 out.push(input);
                 continue;
             }
@@ -515,7 +536,7 @@ fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsSt
         Ok(out)
     } else {
         for input in &inputs {
-            if url_input(input).is_some() {
+            if is_network_or_file_url_input(input) {
                 continue;
             }
             let path = Path::new(input);
@@ -528,6 +549,25 @@ fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsSt
         }
         Ok(inputs)
     }
+}
+
+/// Classify one CLI argument into a file path or page URL (downloads remote files).
+fn resolve_input_to_source(input: &OsStr) -> Result<BatchSource, String> {
+    if let Some(text) = input.to_str() {
+        match parse_magic_paste(text) {
+            MagicPaste::Single(token) => {
+                return materialize_paste_token(&token).map_err(|error| error.to_string());
+            }
+            MagicPaste::Multiple(_) => {
+                return Err(format!(
+                    "each argument must be a single path or URL (got multiple tokens): {text}"
+                ));
+            }
+            MagicPaste::Empty => {}
+        }
+    }
+    // Non-UTF-8 paths or unclassified tokens: treat as a local path.
+    Ok(BatchSource::File(PathBuf::from(input)))
 }
 
 fn print_invocations(artifact: &ConversionArtifact) {
@@ -604,6 +644,7 @@ fn run_batch_cli(
     output_dir: Option<PathBuf>,
     single_output: Option<PathBuf>,
     force: bool,
+    yes: bool,
     registry: &ConversionRegistry,
     verbose: bool,
 ) -> Result<ExitCode, String> {
@@ -613,8 +654,13 @@ fn run_batch_cli(
     enqueue.force = force;
     enqueue.output_dir = output_dir;
 
+    let mut sources = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        let source = BatchSource::from_path_or_url(PathBuf::from(input));
+        let source = resolve_input_to_source(input)?;
+        sources.push(source);
+    }
+    confirm_network_sources(&sources, yes)?;
+    for source in sources {
         queue.enqueue(source, &enqueue);
     }
 
@@ -789,8 +835,12 @@ fn print_doctor_help() {
     );
 }
 
-fn url_input(input: &OsStr) -> Option<&str> {
-    input.to_str().filter(|value| looks_like_url(value))
+/// http(s) page/file URLs and `file://` links — not expanded as directories.
+fn is_network_or_file_url_input(input: &OsStr) -> bool {
+    input.to_str().is_some_and(|value| {
+        let value = value.trim();
+        looks_like_url(value) || value.starts_with("file://") || value.starts_with("FILE://")
+    })
 }
 
 fn print_formats() {
@@ -849,6 +899,8 @@ fn print_help() {
          -O, --output-dir <DIR>  Write every batch output into DIR\n  \
          --stdout                Write bytes to stdout (single input only)\n  \
          --force                 Overwrite existing outputs\n  \
+         --yes, -y               Skip interactive confirms (network fetch); scripts\n  \
+         --allow-private-urls    Allow localhost/LAN URL fetches (default: public only)\n  \
          --module <ID>           Prefer a conversion module (see `formats`)\n  \
          --recursive             Expand directory inputs into convertible files\n  \
          --verbose, -v           Print redacted converter invocations on stderr\n  \
@@ -891,9 +943,13 @@ fn print_help() {
          --ocr-lang <CODE>       OCR language(s), e.g. eng or eng+deu\n  \
          --docling-tables / --no-docling-tables\n  \
          --docling-table-mode fast|accurate\n\n\
-         URLs (http/https) are extracted with Defuddle (outbound fetch to the\n\
-         given host; set SHIFT_BLOCK_PRIVATE_URLS=1 to refuse loopback/private\n\
-         addresses when feeding untrusted URLs).\n\
+         Inputs may be local paths, file:// URLs, page URLs (http/https,\n\
+         extracted with Defuddle), or direct file URLs (downloaded then\n\
+         converted). URL fetches are public-internet only by default (no\n\
+         localhost/LAN). Use a file path for local content, or pass\n\
+         --allow-private-urls / SHIFT_ALLOW_PRIVATE_URLS=1. On a TTY, network\n\
+         fetches ask for confirmation unless --yes is set (--yes never unlocks\n\
+         private hosts).\n\
          Directory inputs require --recursive (union of registered extensions).\n\
          Use `shift-cli formats` to list registered conversion capability.\n\
          Use `shift-cli doctor` to see which engines are installed and ready.\n\
@@ -906,6 +962,64 @@ fn print_help() {
          Single-file: if no -o is supplied, Shift writes beside the source.\n  \
          Batch: prefer -O/--output-dir for multi-file runs."
     );
+}
+
+/// Confirm outbound URL fetches on a TTY unless `--yes`. Private hosts still fail
+/// later via shared policy unless `--allow-private-urls` was set.
+fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), String> {
+    let urls: Vec<&str> = sources
+        .iter()
+        .filter_map(|source| match source {
+            BatchSource::Url(url) => Some(url.as_str()),
+            BatchSource::File(_) => None,
+        })
+        .collect();
+    if urls.is_empty() {
+        return Ok(());
+    }
+
+    // Fail fast on private hosts with a clear message (before any confirm).
+    for url in &urls {
+        ensure_public_url_fetch_allowed(url).map_err(|error| error.to_string())?;
+    }
+
+    let summary = if urls.len() == 1 {
+        format!("Fetch public URL {}?", urls[0])
+    } else {
+        let hosts: Vec<String> = urls.iter().map(|url| url_display_host(url)).collect();
+        format!("Fetch {} public URL(s) ({})?", urls.len(), hosts.join(", "))
+    };
+
+    if yes {
+        eprintln!("shift-cli: {summary} (--yes)");
+        return Ok(());
+    }
+
+    if !stdin_is_tty() {
+        // Non-interactive scripts: visible but not blocking (same spirit as the app).
+        eprintln!("shift-cli: fetching {} URL(s)", urls.len());
+        for url in &urls {
+            eprintln!("  · {}", url_display_host(url));
+        }
+        return Ok(());
+    }
+
+    eprint!("shift-cli: {summary} [y/N] ");
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| format!("could not read confirmation: {error}"))?;
+    let answer = line.trim().to_ascii_lowercase();
+    if matches!(answer.as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err("cancelled (network fetch not confirmed; pass --yes to skip)".to_owned())
+    }
+}
+
+fn stdin_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 #[cfg(test)]
@@ -949,7 +1063,7 @@ mod tests {
 
         let input = OsString::from_vec(b"report-\xff.pdf".to_vec());
 
-        assert_eq!(url_input(&input), None);
+        assert!(!is_network_or_file_url_input(&input));
         assert_eq!(
             PathBuf::from(input).as_os_str().as_bytes(),
             b"report-\xff.pdf"
@@ -1080,6 +1194,37 @@ mod tests {
     fn rejects_unknown_arguments() {
         let error = run(args(&["file.md", "--nope"])).unwrap_err();
         assert!(error.contains("unknown argument"), "{error}");
+    }
+
+    #[test]
+    fn parses_yes_and_allow_private_url_flags() {
+        let parsed = parse_convert_args(&args(&[
+            "https://example.com",
+            "--yes",
+            "--allow-private-urls",
+            "-t",
+            "markdown",
+        ]))
+        .unwrap();
+        assert!(parsed.yes);
+        assert!(parsed.allow_private_urls);
+        assert_eq!(parsed.target, OutputFormat::MARKDOWN);
+    }
+
+    #[test]
+    fn confirm_network_rejects_private_hosts_without_allow() {
+        // Ensure default public-only policy for this process.
+        let _env = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        let sources = [BatchSource::Url("http://127.0.0.1/x".into())];
+        let error = confirm_network_sources(&sources, true).unwrap_err();
+        assert!(
+            error.contains("non-public") || error.contains("public internet"),
+            "{error}"
+        );
     }
 
     #[test]

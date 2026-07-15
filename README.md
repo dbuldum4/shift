@@ -149,9 +149,10 @@ or choosing a supported file starts conversion automatically and may suggest an
 output format (video → MP4, audio → MP3, documents → Markdown) until you pick
 one yourself. Paste an `http(s)` URL into the bar above the drop zone and press
 Enter or Convert to extract the page with Defuddle (this performs an outbound
-fetch to the given host; set `SHIFT_BLOCK_PRIVATE_URLS=1` to refuse
-loopback/private addresses when feeding untrusted URLs). The source file is
-never modified; Download refuses to overwrite the selected source. Use the
+fetch to the given host). URL fetches are **public internet only** by default
+(no localhost/LAN); use the file picker for local files, or set
+`SHIFT_ALLOW_PRIVATE_URLS=1` / CLI `--allow-private-urls` to opt in. The source
+file is never modified; Download refuses to overwrite the selected source. Use the
 output dropdown (with search) on the right to choose a format (formats whose
 engines are missing are labeled). Multi-file queue supports **Overwrite** (CLI
 `--force` parity). The settings button opens a full-screen settings view with a
@@ -186,8 +187,8 @@ cargo run --bin shift-cli -- report.docx --to html
 # Prefer Pandoc where both modules can produce Markdown
 cargo run --bin shift-cli -- report.docx --module pandoc
 
-# Extract a web page with Defuddle
-cargo run --bin shift-cli -- https://example.com/article
+# Extract a web page with Defuddle (public hosts only; --yes skips TTY confirm)
+cargo run --bin shift-cli -- https://example.com/article --yes
 
 # PDF → HTML via Docling (MarkItDown only emits Markdown)
 cargo run --bin shift-cli -- scan.pdf --to html --module docling

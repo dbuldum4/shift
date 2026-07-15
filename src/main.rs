@@ -2,22 +2,23 @@ mod file_picker;
 mod text_input;
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Bounds, ClipboardItem, Context, ElementId, Entity,
-    ExternalPaths, FocusHandle, FontWeight, KeyBinding, Menu, MenuItem, PathBuilder, PathStyle,
-    Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, hsla, point, prelude::*, px,
-    rgb, size,
+    Animation, AnimationExt, App, Application, Bounds, ClipboardEntry, ClipboardItem, Context,
+    ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, ImageFormat, KeyBinding, Menu,
+    MenuItem, PathBuilder, PathStyle, Pixels, Point, Render, SharedString, StrokeOptions,
+    SystemMenuType, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions,
+    canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
 };
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
     BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
     ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingImageExportMode, DoclingOptions,
-    DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES,
-    MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions, Readiness,
+    DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
+    MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfInputOptions, Readiness,
     available_ready_outputs, available_ready_url_outputs, expand_input_paths, is_audio_output,
     is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output, looks_like_url,
-    paths_refer_to_same_file, pdf_engine_candidates, run_batch, suggested_output_for_path,
-    suggested_output_for_url,
+    materialize_magic_paste, parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates,
+    run_batch, stage_pasted_image, suggested_output_for_path, suggested_output_for_url,
+    url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_ENTRIES, StoredHistoryEntry,
@@ -25,7 +26,8 @@ use shift_core::history::{
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
-    cache_artifact_bytes, load_default_session_settings, save_default_session_settings,
+    cache_artifact_bytes, export_matches_bytes, load_default_session_settings,
+    save_default_session_settings, stage_export_file,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -191,6 +193,94 @@ impl Render for ModuleDrag {
             .text_color(rgb(TEXT))
             .child(self.label.clone())
     }
+}
+
+/// Ghost shown briefly while a native Finder file drag is initiated from the output panel.
+#[derive(Clone)]
+struct OutputFileDrag {
+    label: SharedString,
+    position: Point<Pixels>,
+}
+
+impl OutputFileDrag {
+    fn new(label: impl Into<SharedString>, position: Point<Pixels>) -> Self {
+        Self {
+            label: label.into(),
+            position,
+        }
+    }
+}
+
+impl Render for OutputFileDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(self.position.x - px(100.0))
+            .top(self.position.y - px(22.0))
+            .max_w(px(240.0))
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .bg(rgb(BG_ELEVATED))
+            .border_1()
+            .border_color(rgb(BORDER_STRONG))
+            .shadow_lg()
+            .text_sm()
+            .font_family(FONT_MONO)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(TEXT))
+            .child(self.label.clone())
+    }
+}
+
+/// Start a native Finder file drag using a pre-staged path (no large rewrite on the UI thread).
+///
+/// `begin_file_drag` still blocks for the AppKit drag session; staging must already be done.
+fn begin_output_file_drag(
+    payload: &OutputDragPayload,
+    app: WeakEntity<Shift>,
+    position: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<OutputFileDrag> {
+    match payload.staged_path.as_ref() {
+        Some(path) if path.is_file() => {
+            if !file_picker::begin_file_drag(path) {
+                report_drag_failure(
+                    app,
+                    "Could not start Finder drag (no active mouse event or window).",
+                    cx,
+                );
+            }
+        }
+        Some(_) => {
+            report_drag_failure(
+                app,
+                "Could not start drag: staged file is missing. Try Reveal or Download.",
+                cx,
+            );
+        }
+        None => {
+            report_drag_failure(
+                app,
+                "Could not start drag: artifact is not staged yet. Try Reveal first.",
+                cx,
+            );
+        }
+    }
+    // Native drag owns the gesture; drop GPUI's internal drag after the session ends.
+    window.defer(cx, |window, cx| {
+        cx.stop_active_drag(window);
+    });
+    cx.new(|_| OutputFileDrag::new(payload.file_name.clone(), position))
+}
+
+fn report_drag_failure(app: WeakEntity<Shift>, message: &str, cx: &mut App) {
+    let message = message.to_owned();
+    let _ = app.update(cx, |this, cx| {
+        this.save_status = Some(message.into());
+        cx.notify();
+    });
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -368,7 +458,8 @@ fn batch_item_status_label(item: &BatchItem) -> SharedString {
         BatchItemState::Queued => "queued".into(),
         BatchItemState::Running => "running…".into(),
         BatchItemState::Succeeded { written_path, .. } => {
-            format!("✓ {}", written_path.display()).into()
+            // Full path — trust requirement: never hide where the file landed.
+            format!("✓ saved · {}", written_path.display()).into()
         }
         BatchItemState::Failed { error } => format!("✗ {error}").into(),
         BatchItemState::Cancelled => "cancelled".into(),
@@ -1021,30 +1112,8 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
         )
 }
 
-fn markdown_excerpt(artifact: &ConversionArtifact) -> SharedString {
-    let text = artifact.text().unwrap_or("Text output is not valid UTF-8.");
-    let mut excerpt: String = text.chars().take(1_200).collect();
-    if text.chars().count() > 1_200 {
-        excerpt.push_str("\n\n…");
-    }
-    if excerpt.trim().is_empty() {
-        excerpt.push_str("The conversion completed with an empty document.");
-    }
-    excerpt.into()
-}
-
 fn artifact_preview(artifact: &ConversionArtifact) -> SharedString {
-    if artifact.format.is_text_previewable() {
-        return markdown_excerpt(artifact);
-    }
-    let size = format_file_size(artifact.bytes.len() as u64);
-    format!(
-        "{} ready to download.\n\n{} · {size} · via {}\n\nBinary media is not shown inline — use Download to save the file.",
-        artifact.format.label(),
-        artifact.file_name,
-        module_label(artifact.module_id)
-    )
-    .into()
+    artifact.preview_summary().into()
 }
 
 fn parse_optional_secs(value: &str) -> Result<Option<f64>, String> {
@@ -1993,6 +2062,8 @@ fn conversion_options_panel(
                     .child(
                         div()
                             .id("pandoc-reference-doc")
+                            .max_w(px(220.0))
+                            .min_w_0()
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -2002,6 +2073,7 @@ fn conversion_options_panel(
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_PRIMARY))
+                            .truncate()
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BG_ACTIVE)))
                             .child(ref_doc_label)
@@ -2079,6 +2151,16 @@ struct OutputPanelView {
     conversion_progress: Option<(Option<f32>, SharedString)>,
     show_command_inspect: bool,
     install_hints: Vec<(SharedString, SharedString)>,
+    /// Pre-staged export path for the ready artifact (avoids rewriting large media on drag).
+    cached_ready_path: Option<PathBuf>,
+}
+
+/// Payload for native Finder drag from the output panel.
+#[derive(Clone)]
+struct OutputDragPayload {
+    file_name: String,
+    /// Pre-staged path when available; drag will not rewrite bytes when this is set.
+    staged_path: Option<PathBuf>,
 }
 
 fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElement {
@@ -2096,7 +2178,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
         conversion_progress,
         show_command_inspect,
         install_hints,
+        cached_ready_path,
     } = view;
+    let app_entity = cx.weak_entity();
     let filter_lower = format_filter.to_ascii_lowercase();
     let content = match state {
         ConversionState::Empty => div()
@@ -2120,7 +2204,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .text_sm()
                     .text_color(rgb(TEXT_MUTED))
                     .child(
-                        "Choose a document, media file, or paste a URL — Shift converts it automatically.",
+                        "Choose a document, media file, or paste a URL, path, or image — Shift converts it automatically.",
                     ),
             ),
         ConversionState::Converting => {
@@ -2298,6 +2382,11 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .iter()
                 .map(|inv| format!("{}: {}", inv.module_id, inv.argv_display).into())
                 .collect();
+            let drag_payload = OutputDragPayload {
+                file_name: artifact.file_name.clone(),
+                staged_path: cached_ready_path.clone(),
+            };
+            let drag_app = app_entity.clone();
             div()
                 .flex()
                 .flex_col()
@@ -2306,32 +2395,69 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .child(
                     div()
                         .flex()
-                        .items_center()
+                        .flex_wrap()
+                        .items_start()
                         .justify_between()
                         .gap_2()
                         .child(
                             div()
+                                .id("output-drag-source")
                                 .flex()
                                 .flex_col()
                                 .gap_1()
                                 .min_w_0()
                                 .flex_1()
+                                // Keep a usable label column so long names truncate instead of
+                                // collapsing to a single-character vertical stack.
+                                .min_w(px(160.0))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_move()
+                                .hover(|style| style.bg(rgb(BG_HOVER)))
+                                .on_drag(drag_payload, move |payload, position, window, cx| {
+                                    begin_output_file_drag(
+                                        payload,
+                                        drag_app.clone(),
+                                        position,
+                                        window,
+                                        cx,
+                                    )
+                                })
                                 .child(
                                     div()
-                                        .text_lg()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(file_name),
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .min_w_0()
+                                        .w_full()
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .child("⠿"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_lg()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(file_name),
+                                        ),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(TEXT_SECONDARY))
+                                        .truncate()
                                         .child(conversion_detail),
                                 )
                                 .child(
                                     div()
                                         .flex()
                                         .flex_wrap()
+                                        .items_center()
                                         .gap_1()
                                         .child(
                                             div()
@@ -2342,12 +2468,19 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                 .text_xs()
                                                 .text_color(rgb(BADGE_TEXT))
                                                 .child(pipeline_badge),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .child("Drag to Downloads or Documents"),
                                         ),
                                 ),
                         )
                         .child(
                             div()
                                 .flex()
+                                .flex_shrink_0()
                                 .flex_wrap()
                                 .gap_2()
                                 .child(action_chip("save-conversion", "Download", cx, |this, cx| {
@@ -2380,8 +2513,14 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         ),
                 )
                 .when(!is_text, |panel| {
+                    let binary_payload = OutputDragPayload {
+                        file_name: artifact.file_name.clone(),
+                        staged_path: cached_ready_path.clone(),
+                    };
+                    let binary_app = app_entity.clone();
                     panel.child(
                         div()
+                            .id("output-binary-drag")
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -2390,18 +2529,40 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .bg(rgb(BG_ELEVATED))
                             .border_1()
                             .border_color(rgb(BORDER_STRONG))
+                            .cursor_move()
+                            .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
+                            .on_drag(binary_payload, move |payload, position, window, cx| {
+                                begin_output_file_drag(
+                                    payload,
+                                    binary_app.clone(),
+                                    position,
+                                    window,
+                                    cx,
+                                )
+                            })
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Binary artifact"),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child("⠿"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Binary artifact"),
+                                    ),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
                                     .child(format!(
-                                        "{} · {size} · not shown inline",
+                                        "{} · {size} · not shown inline — Download or drag to save",
                                         artifact.format.label()
                                     )),
                             )
@@ -2444,6 +2605,16 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .text_sm()
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(excerpt),
+                    )
+                })
+                .when_some(cached_ready_path.clone(), |panel, staged| {
+                    // Preview is not a permanent save; still show the staged path
+                    // so Reveal/Open have a concrete location.
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(format!("On disk (staged) · {}", staged.display())),
                     )
                 })
                 .when(show_command_inspect && !commands.is_empty(), |panel| {
@@ -2600,7 +2771,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                     div()
                                                         .text_xs()
                                                         .text_color(rgb(TEXT_DIM))
-                                                        .child("missing"),
+                                                        .child("engine not installed"),
+                                                )
+                                            })
+                                            .when(!enabled, |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(TEXT_DIM))
+                                                        .child("not for this source"),
                                                 )
                                             }),
                                     )
@@ -2815,7 +2994,7 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .active(|style| style.opacity(0.82))
                 .child("Convert")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.submit_url_from_input(cx);
+                    this.submit_magic_paste_from_input(cx);
                     cx.stop_propagation();
                 })),
         )
@@ -4431,7 +4610,39 @@ impl Shift {
     }
 
     fn enqueue_paths(&mut self, paths: Vec<PathBuf>, auto_start: bool, cx: &mut Context<Self>) {
-        if paths.is_empty() {
+        let mut sources = Vec::new();
+        let mut errors = Vec::new();
+        for path in paths {
+            match BatchSource::try_from_path_or_url(&path) {
+                Ok(source) => sources.push(source),
+                Err(error) => errors.push(error),
+            }
+        }
+        if !errors.is_empty() {
+            let detail = errors.join("; ");
+            self.batch_status = Some(
+                if sources.is_empty() {
+                    format!("Could not add paths: {detail}")
+                } else {
+                    format!("Some paths skipped: {detail}")
+                }
+                .into(),
+            );
+            if sources.is_empty() {
+                cx.notify();
+                return;
+            }
+        }
+        self.enqueue_sources(sources, auto_start, cx);
+    }
+
+    fn enqueue_sources(
+        &mut self,
+        sources: Vec<BatchSource>,
+        auto_start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
             return;
         }
         if self.batch_running {
@@ -4440,8 +4651,10 @@ impl Shift {
             cx.notify();
             return;
         }
-        for path in &paths {
-            file_picker::remember_directory(path);
+        for source in &sources {
+            if let Some(path) = source.as_file() {
+                file_picker::remember_directory(path);
+            }
         }
         let options = match self.build_conversion_options(cx) {
             Ok(options) => options,
@@ -4457,10 +4670,6 @@ impl Shift {
             output_dir: self.batch_output_dir.clone(),
             force: self.batch_force,
         };
-        let sources = paths
-            .into_iter()
-            .map(BatchSource::from_path_or_url)
-            .collect::<Vec<_>>();
         let count = sources.len();
         self.batch_queue.enqueue_many(sources, &enqueue);
         // Focus first file for the drop-zone card when entering batch mode.
@@ -4803,9 +5012,182 @@ impl Shift {
         self.start_conversion(cx);
     }
 
-    fn submit_url_from_input(&mut self, cx: &mut Context<Self>) {
-        let url = self.url_input.read(cx).content().trim().to_owned();
-        self.set_selected_url(url, cx);
+    fn submit_magic_paste_from_input(&mut self, cx: &mut Context<Self>) {
+        let text = self.url_input.read(cx).content().to_owned();
+        self.submit_magic_paste_text(text, cx);
+    }
+
+    fn submit_magic_paste_text(&mut self, text: String, cx: &mut Context<Self>) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let paste = parse_magic_paste(trimmed);
+        if paste.is_empty() {
+            self.fail_magic_paste(
+                "Paste a page URL, file path, file:// link, direct file URL, or image.",
+                cx,
+            );
+            return;
+        }
+        self.begin_magic_paste_resolve(paste, Some(trimmed.to_owned()), cx);
+    }
+
+    fn ingest_clipboard_image(&mut self, bytes: Vec<u8>, extension: &str, cx: &mut Context<Self>) {
+        match stage_pasted_image(&bytes, extension) {
+            Ok(path) => {
+                self.url_input
+                    .update(cx, |input, cx| input.set_content("", cx));
+                self.set_selected_file(path, cx);
+            }
+            Err(error) => {
+                self.fail_magic_paste(&error.to_string(), cx);
+            }
+        }
+    }
+
+    fn fail_magic_paste(&mut self, message: &str, cx: &mut Context<Self>) {
+        // Invalidate any in-flight conversion so a late success cannot
+        // replace this validation error with an unrelated Ready state.
+        self.cancel_active_conversion();
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.conversion_generation = self.conversion_generation.wrapping_add(1);
+        self.selected_file = None;
+        self.selected_url = None;
+        self.file_preview = None;
+        self.conversion = ConversionState::Failed(message.to_owned().into());
+        self.save_status = None;
+        self.output_menu_open = false;
+        cx.notify();
+    }
+
+    fn begin_magic_paste_resolve(
+        &mut self,
+        paste: MagicPaste,
+        display_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_active_conversion();
+        self.ensure_diagnostics(cx);
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        let generation = self.selection_generation;
+
+        // Optimistic preview while downloads / path checks run.
+        match paste.tokens() {
+            [PasteToken::PageUrl(url)] | [PasteToken::RemoteFileUrl(url)] => {
+                self.selected_file = None;
+                self.selected_url = Some(url.clone());
+                self.file_preview = Some(build_url_preview(url));
+                if let Some(text) = display_text.clone() {
+                    self.url_input
+                        .update(cx, |input, cx| input.set_content(text, cx));
+                }
+            }
+            [PasteToken::LocalPath(path)] => {
+                let path = path.clone();
+                self.selected_url = None;
+                self.selected_file = Some(path.clone());
+                self.file_preview = Some(build_file_preview_with_size(&path, "…".into()));
+                if let Some(text) = display_text.clone() {
+                    self.url_input
+                        .update(cx, |input, cx| input.set_content(text, cx));
+                }
+            }
+            _ => {
+                self.selected_file = None;
+                self.selected_url = None;
+                self.file_preview = None;
+                if let Some(text) = display_text.clone() {
+                    self.url_input
+                        .update(cx, |input, cx| input.set_content(text, cx));
+                }
+            }
+        }
+
+        self.conversion = ConversionState::Converting;
+        self.conversion_progress = None;
+        self.cached_ready_path = None;
+        self.show_command_inspect = false;
+        self.save_status = None;
+        self.output_menu_open = false;
+        self.active_history_id = None;
+        cx.notify();
+
+        let label = paste
+            .tokens()
+            .iter()
+            .find_map(|token| match token {
+                PasteToken::RemoteFileUrl(url) | PasteToken::PageUrl(url) => {
+                    Some(format!("Fetching {}…", url_display_host(url)))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "Resolving…".into());
+        self.conversion_progress = Some((None, label.into()));
+        cx.notify();
+
+        let resolve = cx
+            .background_executor()
+            .spawn(async move { materialize_magic_paste(&paste) });
+
+        cx.spawn(async move |this, cx| {
+            let result = resolve.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(sources) => this.apply_materialized_sources(sources, display_text, cx),
+                    Err(error) => {
+                        this.selected_file = None;
+                        this.selected_url = None;
+                        this.file_preview = None;
+                        this.conversion_progress = None;
+                        this.conversion = ConversionState::Failed(error.to_string().into());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_materialized_sources(
+        &mut self,
+        sources: Vec<BatchSource>,
+        display_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversion_progress = None;
+        match sources.as_slice() {
+            [] => {
+                self.fail_magic_paste("Nothing to convert from paste.", cx);
+            }
+            [BatchSource::File(path)] if self.batch_queue.is_empty() => {
+                let path = path.clone();
+                self.set_selected_file(path, cx);
+                if let Some(text) = display_text {
+                    self.url_input
+                        .update(cx, |input, cx| input.set_content(text, cx));
+                }
+            }
+            [BatchSource::Url(url)] if self.batch_queue.is_empty() => {
+                self.set_selected_url(url.clone(), cx);
+            }
+            _ => {
+                // Multiple sources, or a single source while a queue already exists.
+                self.enqueue_sources(sources, false, cx);
+                if let Some(text) = display_text {
+                    self.url_input
+                        .update(cx, |input, cx| input.set_content(text, cx));
+                }
+                // Clear single-file converting state; queue owns the work.
+                if !matches!(self.conversion, ConversionState::Ready { .. }) {
+                    self.conversion = ConversionState::Empty;
+                }
+                cx.notify();
+            }
+        }
     }
 
     fn set_selected_url(&mut self, url: String, cx: &mut Context<Self>) {
@@ -4814,20 +5196,10 @@ impl Shift {
             return;
         }
         if !looks_like_url(&url) {
-            // Invalidate any in-flight conversion so a late success cannot
-            // replace this validation error with an unrelated Ready state.
-            self.cancel_active_conversion();
-            self.selection_generation = self.selection_generation.wrapping_add(1);
-            self.conversion_generation = self.conversion_generation.wrapping_add(1);
-            self.selected_file = None;
-            self.selected_url = None;
-            self.file_preview = None;
-            self.conversion = ConversionState::Failed(
-                "Enter a full http:// or https:// URL to extract with Defuddle.".into(),
+            self.fail_magic_paste(
+                "Enter a full http:// or https:// URL to extract with Defuddle.",
+                cx,
             );
-            self.save_status = None;
-            self.output_menu_open = false;
-            cx.notify();
             return;
         }
 
@@ -5022,15 +5394,23 @@ impl Shift {
     }
 
     fn ensure_cached_ready_path(&mut self) -> Option<PathBuf> {
-        if let Some(path) = self.cached_ready_path.clone() {
-            if path.is_file() {
-                return Some(path);
-            }
-        }
         let ConversionState::Ready(artifact) = &self.conversion else {
             return None;
         };
-        match cache_artifact_bytes(&artifact.file_name, &artifact.bytes) {
+        // Reuse only when the staged file still matches this artifact's bytes.
+        if let Some(path) = self.cached_ready_path.clone() {
+            if path.is_file() && export_matches_bytes(&path, &artifact.bytes) {
+                return Some(path);
+            }
+            self.cached_ready_path = None;
+        }
+        // Write once to the content-hash cache, then hard-link/copy into the
+        // user-facing export name so large media is not rewritten on drag.
+        let staged = (|| {
+            let cache_path = cache_artifact_bytes(&artifact.file_name, &artifact.bytes)?;
+            stage_export_file(&artifact.file_name, &cache_path)
+        })();
+        match staged {
             Ok(path) => {
                 self.cached_ready_path = Some(path.clone());
                 Some(path)
@@ -5040,6 +5420,13 @@ impl Shift {
                 None
             }
         }
+    }
+
+    /// Mark conversion Ready and pre-stage the export path for Reveal / Open / drag.
+    fn set_ready_artifact(&mut self, artifact: Arc<ConversionArtifact>) {
+        self.conversion = ConversionState::Ready(artifact);
+        self.cached_ready_path = None;
+        let _ = self.ensure_cached_ready_path();
     }
 
     fn copy_output(&mut self, cx: &mut Context<Self>) {
@@ -5066,7 +5453,7 @@ impl Shift {
     fn reveal_output(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.ensure_cached_ready_path() {
             file_picker::reveal_in_finder(&path);
-            self.save_status = Some("Revealed in Finder.".into());
+            self.save_status = Some(format!("Revealed · {}", path.display()).into());
         }
         cx.notify();
     }
@@ -5074,7 +5461,7 @@ impl Shift {
     fn open_output(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.ensure_cached_ready_path() {
             file_picker::open_path(&path);
-            self.save_status = Some("Opened with default app.".into());
+            self.save_status = Some(format!("Opened · {}", path.display()).into());
         }
         cx.notify();
     }
@@ -5212,23 +5599,24 @@ impl Shift {
                             && this.selected_file.as_ref() == Some(&path)
                         {
                             this.conversion_progress = None;
-                            this.conversion = match result {
+                            match result {
                                 Ok(artifact) => {
                                     let artifact = Arc::new(artifact);
                                     this.record_history(HistoryOutcome::Ready(Arc::clone(
                                         &artifact,
                                     )));
-                                    ConversionState::Ready(artifact)
+                                    this.set_ready_artifact(artifact);
                                 }
                                 Err(error) if error.is_cancelled() => {
-                                    ConversionState::Failed("Conversion cancelled.".into())
+                                    this.conversion =
+                                        ConversionState::Failed("Conversion cancelled.".into());
                                 }
                                 Err(error) => {
                                     let message: SharedString = error.to_string().into();
                                     this.record_history(HistoryOutcome::Failed(message.clone()));
-                                    ConversionState::Failed(message)
+                                    this.conversion = ConversionState::Failed(message);
                                 }
-                            };
+                            }
                             cx.notify();
                         }
                     });
@@ -5264,9 +5652,10 @@ impl Shift {
             let _ = progress_tx.send(progress);
         }));
         self.conversion = ConversionState::Converting;
+        let host = url_display_host(&url);
         self.conversion_progress = Some((
             None,
-            format!("Converting to {}…", output_format.label()).into(),
+            format!("Fetching {host} → {}…", output_format.label()).into(),
         ));
         self.cached_ready_path = None;
         self.save_status = None;
@@ -5309,23 +5698,24 @@ impl Shift {
                             && this.selected_url.as_ref() == Some(&url)
                         {
                             this.conversion_progress = None;
-                            this.conversion = match result {
+                            match result {
                                 Ok(artifact) => {
                                     let artifact = Arc::new(artifact);
                                     this.record_history(HistoryOutcome::Ready(Arc::clone(
                                         &artifact,
                                     )));
-                                    ConversionState::Ready(artifact)
+                                    this.set_ready_artifact(artifact);
                                 }
                                 Err(error) if error.is_cancelled() => {
-                                    ConversionState::Failed("Conversion cancelled.".into())
+                                    this.conversion =
+                                        ConversionState::Failed("Conversion cancelled.".into());
                                 }
                                 Err(error) => {
                                     let message: SharedString = error.to_string().into();
                                     this.record_history(HistoryOutcome::Failed(message.clone()));
-                                    ConversionState::Failed(message)
+                                    this.conversion = ConversionState::Failed(message);
                                 }
-                            };
+                            }
                             cx.notify();
                         }
                     });
@@ -5606,7 +5996,7 @@ impl Shift {
 
         match entry.outcome {
             HistoryOutcome::Ready(artifact) => {
-                self.conversion = ConversionState::Ready(artifact);
+                self.set_ready_artifact(artifact);
                 cx.notify();
             }
             HistoryOutcome::ReadyLarge { .. } => {
@@ -5649,11 +6039,6 @@ impl Shift {
             let Some(path) = receiver.await.ok().flatten() else {
                 return;
             };
-            let file_name = path
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-
             // Mirror CLI / batch: never overwrite the selected source file.
             if let Some(source) = source_path.as_ref() {
                 if paths_refer_to_same_file(source, &path) {
@@ -5676,9 +6061,10 @@ impl Shift {
                 }
             }
 
+            let save_path = path.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { artifact.write_to(&path) })
+                .spawn(async move { artifact.write_to(&save_path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // Only attribute save status to the selection that started it.
@@ -5688,7 +6074,12 @@ impl Shift {
                     return;
                 }
                 this.save_status = Some(match result {
-                    Ok(()) => format!("Saved {file_name}").into(),
+                    Ok(()) => {
+                        // Stage the saved path so Reveal opens the user's file,
+                        // not only the cache copy.
+                        this.cached_ready_path = Some(path.clone());
+                        format!("Saved to {}", path.display()).into()
+                    }
                     Err(error) => format!("Could not save: {error}").into(),
                 });
                 cx.notify();
@@ -5785,6 +6176,7 @@ impl Render for Shift {
         let batch_force = self.batch_force;
         let batch_status = self.batch_status.clone();
         let batch_item_progress = self.batch_item_progress.clone();
+        let cached_ready_path = self.cached_ready_path.clone();
         let focus_handle = self.focus_handle.clone();
 
         div()
@@ -5894,6 +6286,7 @@ impl Render for Shift {
                                 available_outputs,
                                 ready_outputs,
                                 show_conversion_options,
+                                cached_ready_path,
                                 conversion_options: ConversionPanelView {
                                     active_modules: active_option_modules,
                                     output_format,
@@ -6161,7 +6554,8 @@ fn main() {
                 let shift_entity = cx.new(|cx| {
                     let session = load_default_session_settings();
                     let options = session.to_conversion_options();
-                    let url_input = cx.new(|cx| TextInput::new(cx, "Paste a URL to extract…", ""));
+                    let url_input =
+                        cx.new(|cx| TextInput::new(cx, "Paste a URL, path, or image…", ""));
                     let format_filter_input =
                         cx.new(|cx| TextInput::new(cx, "Filter formats…", ""));
                     let ffmpeg_start_input = cx.new(|cx| {
@@ -6357,16 +6751,46 @@ fn main() {
 
                 window.focus(&shift_entity.read(cx).focus_handle);
 
-                // Route Enter in the URL field back to the app entity.
+                // Route Enter / magic paste from the input bar back to the app entity.
                 let parent = shift_entity.downgrade();
                 let url_input = shift_entity.read(cx).url_input.clone();
                 url_input.update(cx, |input, _cx| {
-                    input.set_on_submit(move |url, cx| {
-                        let parent = parent.clone();
-                        let url = url.to_owned();
+                    let parent_submit = parent.clone();
+                    input.set_on_submit(move |text, cx| {
+                        let parent = parent_submit.clone();
+                        let text = text.to_owned();
                         cx.defer(move |cx| {
-                            let _ = parent.update(cx, |this, cx| this.set_selected_url(url, cx));
+                            let _ = parent.update(cx, |this, cx| {
+                                this.submit_magic_paste_text(text, cx);
+                            });
                         });
+                    });
+
+                    let parent_paste = parent.clone();
+                    input.set_on_paste(move |item, _window, cx| {
+                        let Some(image) = item.entries().iter().find_map(|entry| match entry {
+                            ClipboardEntry::Image(image) => Some(image),
+                            ClipboardEntry::String(_) => None,
+                        }) else {
+                            return false;
+                        };
+                        let extension = match image.format() {
+                            ImageFormat::Png => "png",
+                            ImageFormat::Jpeg => "jpg",
+                            ImageFormat::Webp => "webp",
+                            ImageFormat::Gif => "gif",
+                            ImageFormat::Svg => "svg",
+                            ImageFormat::Bmp => "bmp",
+                            ImageFormat::Tiff => "tiff",
+                        };
+                        let bytes = image.bytes.clone();
+                        let parent = parent_paste.clone();
+                        cx.defer(move |cx| {
+                            let _ = parent.update(cx, |this, cx| {
+                                this.ingest_clipboard_image(bytes, extension, cx);
+                            });
+                        });
+                        true
                     });
                 });
 

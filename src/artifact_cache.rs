@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const CACHE_DIR_NAME: &str = "artifact-cache";
+const EXPORT_SUBDIR: &str = "export";
+const PASTE_STAGING_SUBDIR: &str = "paste-staging";
 /// Default TTL for cached artifacts (7 days).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Soft cap on total cache size before oldest entries are purged (512 MiB).
@@ -18,6 +20,11 @@ pub fn artifact_cache_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(override_dir));
     }
     application_support_dir().map(|dir| dir.join(CACHE_DIR_NAME))
+}
+
+/// Default paste-staging directory under the artifact cache (when no env override).
+pub fn default_paste_staging_dir() -> Option<PathBuf> {
+    artifact_cache_dir().map(|dir| dir.join(PASTE_STAGING_SUBDIR))
 }
 
 /// Ensure the cache directory exists and return it.
@@ -68,8 +75,199 @@ pub fn cache_artifact_file(source: &Path) -> io::Result<PathBuf> {
     cache_artifact_bytes(name, &bytes)
 }
 
+/// Stage bytes under a user-facing file name for Finder drag-export / Reveal / Open.
+///
+/// Unlike [`cache_artifact_bytes`], the path prefers the original `file_name` (sanitized)
+/// so dragging into Downloads or Documents keeps a readable name. When that name is
+/// already occupied by different content, a short content-hash disambiguator is
+/// inserted so existing staged files are not overwritten underfoot.
+pub fn stage_export_bytes(file_name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let dir = ensure_artifact_cache_dir()?.join(EXPORT_SUBDIR);
+    fs::create_dir_all(&dir)?;
+    let safe = export_file_name(file_name);
+    let hash = simple_hash(bytes);
+    let hash_hex = format!("{hash:016x}");
+
+    let preferred = dir.join(&safe);
+    if export_file_matches(&preferred, bytes, &hash_hex) {
+        return Ok(preferred);
+    }
+
+    // Prefer the clean name when free; otherwise disambiguate so we never clobber
+    // a different artifact that Finder may still reference.
+    let target_name = if preferred.exists() {
+        disambiguated_export_name(&safe, hash)
+    } else {
+        safe.clone()
+    };
+    let path = dir.join(&target_name);
+    if export_file_matches(&path, bytes, &hash_hex) {
+        return Ok(path);
+    }
+
+    write_export_file(&dir, &target_name, bytes, &hash_hex)?;
+    Ok(path)
+}
+
+/// Hard-link or copy an existing cache file into the export staging dir under `file_name`.
+///
+/// Prefer this when the artifact is already on disk so large media is not rewritten.
+/// Content is hashed by streaming (not loaded fully into RAM).
+pub fn stage_export_file(file_name: &str, source: &Path) -> io::Result<PathBuf> {
+    let dir = ensure_artifact_cache_dir()?.join(EXPORT_SUBDIR);
+    fs::create_dir_all(&dir)?;
+    let safe = export_file_name(file_name);
+    let source_meta = fs::metadata(source)?;
+    let source_len = source_meta.len();
+    let hash = hash_file(source)?;
+    let hash_hex = format!("{hash:016x}");
+
+    let preferred = dir.join(&safe);
+    if export_file_matches_len(&preferred, source_len, &hash_hex)
+        || paths_same_file(source, &preferred)
+    {
+        let _ = fs::write(hash_sidecar_path(&dir, &safe), &hash_hex);
+        return Ok(preferred);
+    }
+
+    let target_name = if preferred.exists() && !paths_same_file(source, &preferred) {
+        disambiguated_export_name(&safe, hash)
+    } else {
+        safe.clone()
+    };
+    let path = dir.join(&target_name);
+    if paths_same_file(source, &path) || export_file_matches_len(&path, source_len, &hash_hex) {
+        let _ = fs::write(hash_sidecar_path(&dir, &target_name), &hash_hex);
+        return Ok(path);
+    }
+
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    if fs::hard_link(source, &path).is_err() {
+        fs::copy(source, &path)?;
+    }
+    let _ = fs::write(hash_sidecar_path(&dir, &target_name), &hash_hex);
+    Ok(path)
+}
+
+/// True when `path` is an export-staged file whose hash sidecar matches `bytes`.
+pub fn export_matches_bytes(path: &Path, bytes: &[u8]) -> bool {
+    let hash_hex = format!("{:016x}", simple_hash(bytes));
+    export_file_matches(path, bytes, &hash_hex)
+}
+
+fn write_export_file(dir: &Path, name: &str, bytes: &[u8], hash_hex: &str) -> io::Result<()> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    let _ = fs::write(hash_sidecar_path(dir, name), hash_hex);
+    Ok(())
+}
+
+fn hash_sidecar_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".{name}.hash"))
+}
+
+fn export_file_matches(path: &Path, bytes: &[u8], hash_hex: &str) -> bool {
+    export_file_matches_len(path, bytes.len() as u64, hash_hex)
+}
+
+fn export_file_matches_len(path: &Path, len: u64, hash_hex: &str) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() != len {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+        return false;
+    };
+    fs::read_to_string(hash_sidecar_path(parent, name))
+        .map(|stored| stored.trim() == hash_hex)
+        .unwrap_or(false)
+}
+
+fn disambiguated_export_name(safe: &str, hash: u64) -> String {
+    let short = format!("{hash:08x}");
+    let path = Path::new(safe);
+    match (
+        path.file_stem().and_then(|v| v.to_str()),
+        path.extension().and_then(|v| v.to_str()),
+    ) {
+        (Some(stem), Some(ext)) if !stem.is_empty() && !ext.is_empty() => {
+            format!("{stem}-{short}.{ext}")
+        }
+        _ => format!("{safe}-{short}"),
+    }
+}
+
+fn export_file_name(name: &str) -> String {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+        .unwrap_or("artifact");
+    // Keep readable names; only neutralize path separators already stripped by file_name().
+    let mut chars: Vec<char> = base
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | '\0' => '_',
+            other => other,
+        })
+        .collect();
+    if chars.is_empty() {
+        chars = "artifact".chars().collect();
+    }
+    const MAX_CHARS: usize = 180;
+    if chars.len() > MAX_CHARS {
+        // Preserve extension when truncating long names (character-based).
+        let as_string: String = chars.iter().collect();
+        if let Some((stem, ext)) = as_string.rsplit_once('.') {
+            let ext_len = ext.chars().count();
+            if !ext.is_empty() && !ext.contains('/') && ext_len < 32 {
+                let keep = MAX_CHARS.saturating_sub(ext_len + 1);
+                let stem: String = stem.chars().take(keep).collect();
+                return format!("{stem}.{ext}");
+            }
+        }
+        chars.truncate(MAX_CHARS);
+    }
+    chars.into_iter().collect()
+}
+
+fn paths_same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    // Prefer inode identity (covers hard links) before canonicalize.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 /// Remove cache entries older than `ttl` and, if still over `max_bytes`,
 /// delete oldest files until under the budget.
+///
+/// Walks the cache root recursively so `export/` and `paste-staging/` are
+/// included (hash sidecars and staged media would otherwise accumulate forever).
 pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeStats> {
     let Some(dir) = artifact_cache_dir() else {
         return Ok(PurgeStats::default());
@@ -80,28 +278,13 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
 
     let now = SystemTime::now();
     let mut entries: Vec<CacheEntry> = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let age = now.duration_since(modified).unwrap_or_default();
-        entries.push(CacheEntry {
-            path,
-            modified,
-            len: meta.len(),
-            age,
-        });
-    }
+    collect_cache_files(&dir, &now, &mut entries)?;
 
     let mut stats = PurgeStats::default();
     // Age-based purge.
     entries.retain(|entry| {
         if entry.age > ttl {
-            if fs::remove_file(&entry.path).is_ok() {
+            if remove_cache_path(&entry.path).is_ok() {
                 stats.removed += 1;
                 stats.freed_bytes += entry.len;
             }
@@ -111,7 +294,7 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
         }
     });
 
-    // Size budget: oldest first.
+    // Size budget: oldest first. Skip pure hash sidecars when summing? Include all files.
     let mut total: u64 = entries.iter().map(|e| e.len).sum();
     if total > max_bytes {
         entries.sort_by_key(|e| e.modified);
@@ -119,7 +302,7 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
             if total <= max_bytes {
                 break;
             }
-            if fs::remove_file(&entry.path).is_ok() {
+            if remove_cache_path(&entry.path).is_ok() {
                 total = total.saturating_sub(entry.len);
                 stats.removed += 1;
                 stats.freed_bytes += entry.len;
@@ -127,12 +310,93 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
         }
     }
 
+    // Drop empty export / paste-staging directories left behind.
+    let _ = remove_empty_subdir(&dir, EXPORT_SUBDIR);
+    let _ = remove_empty_subdir(&dir, PASTE_STAGING_SUBDIR);
+
     Ok(stats)
 }
 
-/// Purge with default TTL and size budget.
+/// Purge paste-staging files older than `ttl` (env override or default under cache).
+pub fn purge_paste_staging(ttl: Duration) -> io::Result<PurgeStats> {
+    let dir = if let Some(override_dir) = std::env::var_os("SHIFT_PASTE_STAGING_DIR") {
+        PathBuf::from(override_dir)
+    } else if let Some(cache) = default_paste_staging_dir() {
+        cache
+    } else {
+        std::env::temp_dir().join("shift-paste-staging")
+    };
+    if !dir.is_dir() {
+        return Ok(PurgeStats::default());
+    }
+
+    // When staging lives under the artifact cache, recursive purge already covers it.
+    if let Some(cache) = artifact_cache_dir() {
+        if dir.starts_with(&cache) {
+            return Ok(PurgeStats::default());
+        }
+    }
+
+    let now = SystemTime::now();
+    let mut entries = Vec::new();
+    collect_cache_files(&dir, &now, &mut entries)?;
+    let mut stats = PurgeStats::default();
+    for entry in entries {
+        if entry.age > ttl && remove_cache_path(&entry.path).is_ok() {
+            stats.removed += 1;
+            stats.freed_bytes += entry.len;
+        }
+    }
+    Ok(stats)
+}
+
+/// Purge with default TTL and size budget (cache + external paste-staging).
 pub fn purge_artifact_cache_defaults() -> io::Result<PurgeStats> {
-    purge_artifact_cache(DEFAULT_CACHE_TTL, DEFAULT_CACHE_MAX_BYTES)
+    let mut stats = purge_artifact_cache(DEFAULT_CACHE_TTL, DEFAULT_CACHE_MAX_BYTES)?;
+    let paste = purge_paste_staging(DEFAULT_CACHE_TTL)?;
+    stats.removed += paste.removed;
+    stats.freed_bytes += paste.freed_bytes;
+    Ok(stats)
+}
+
+fn collect_cache_files(dir: &Path, now: &SystemTime, out: &mut Vec<CacheEntry>) -> io::Result<()> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let age = now.duration_since(modified).unwrap_or_default();
+            out.push(CacheEntry {
+                path,
+                modified,
+                len: meta.len(),
+                age,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn remove_cache_path(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+fn remove_empty_subdir(root: &Path, name: &str) -> io::Result<()> {
+    let dir = root.join(name);
+    if dir.is_dir() {
+        // Only remove if empty; ignore errors if not.
+        let _ = fs::remove_dir(&dir);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -162,9 +426,9 @@ fn sanitize_cache_name(name: &str) -> String {
     if out.is_empty() {
         out = "artifact".into();
     }
-    // Keep names short.
-    if out.len() > 64 {
-        out.truncate(64);
+    // Keep names short (character count).
+    if out.chars().count() > 64 {
+        out = out.chars().take(64).collect();
     }
     out
 }
@@ -179,6 +443,24 @@ fn simple_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn hash_file(path: &Path) -> io::Result<u64> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut hash: u64 = 0xcbf29ce484222325;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for byte in &buf[..n] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,17 +468,21 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn caches_and_purges_artifacts() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "shift-cache-{}-{}",
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shift-cache-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
-        ));
+        ))
+    }
+
+    #[test]
+    fn caches_and_purges_artifacts_including_export() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("purge");
         fs::create_dir_all(&dir).unwrap();
         // SAFETY: serialized behind ENV_LOCK.
         unsafe {
@@ -211,11 +497,98 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"%PDF-fake");
 
-        // Immediate purge with zero TTL removes everything.
-        let stats = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
-        assert!(stats.removed >= 1);
-        assert!(!path.exists());
+        let export = stage_export_bytes("My Report.md", b"# hello").unwrap();
+        assert_eq!(
+            export.file_name().and_then(|value| value.to_str()),
+            Some("My Report.md")
+        );
+        assert_eq!(fs::read(&export).unwrap(), b"# hello");
+        // Identical content reuses the staged path.
+        let export_again = stage_export_bytes("My Report.md", b"# hello").unwrap();
+        assert_eq!(export, export_again);
+        // Different content does not overwrite the first staged file.
+        let export_updated = stage_export_bytes("My Report.md", b"# hello!").unwrap();
+        assert_ne!(export_updated, export);
+        assert!(
+            export_updated
+                .file_name()
+                .and_then(|v| v.to_str())
+                .is_some_and(|n| n.contains("My Report") && n.ends_with(".md"))
+        );
+        assert_eq!(fs::read(&export).unwrap(), b"# hello");
+        assert_eq!(fs::read(&export_updated).unwrap(), b"# hello!");
 
+        // Paste-staging under the cache root is also purged.
+        let paste_dir = dir.join(PASTE_STAGING_SUBDIR);
+        fs::create_dir_all(&paste_dir).unwrap();
+        let paste_file = paste_dir.join("clipboard-image.png");
+        fs::write(&paste_file, b"png-bytes").unwrap();
+
+        // Immediate purge with zero TTL removes everything, including export + paste-staging.
+        let stats = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
+        assert!(stats.removed >= 3);
+        assert!(!path.exists());
+        assert!(!export.exists());
+        assert!(!export_updated.exists());
+        assert!(!paste_file.exists());
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stage_export_file_hardlinks_or_copies() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("export-file");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let source = cache_artifact_bytes("clip.bin", b"binary-payload").unwrap();
+        let export = stage_export_file("clip.bin", &source).unwrap();
+        assert_eq!(fs::read(&export).unwrap(), b"binary-payload");
+        assert!(paths_same_file(&source, &export) || export.is_file());
+
+        // Second stage with same content reuses the path.
+        let export2 = stage_export_file("clip.bin", &source).unwrap();
+        assert_eq!(export, export2);
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_file_name_strips_path_components() {
+        assert_eq!(export_file_name("../../evil.txt"), "evil.txt");
+        assert_eq!(export_file_name("plain.md"), "plain.md");
+        assert_eq!(export_file_name(""), "artifact");
+    }
+
+    #[test]
+    fn export_file_name_truncates_by_chars() {
+        let long_stem: String = "あ".repeat(200);
+        let name = format!("{long_stem}.md");
+        let out = export_file_name(&name);
+        assert!(out.ends_with(".md"));
+        assert!(out.chars().count() <= 180);
+    }
+
+    #[test]
+    fn export_matches_bytes_reads_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("match");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+        let path = stage_export_bytes("note.md", b"body").unwrap();
+        assert!(export_matches_bytes(&path, b"body"));
+        assert!(!export_matches_bytes(&path, b"other"));
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
         }

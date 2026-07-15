@@ -590,4 +590,36 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_kills_process_group_children() {
+        // Parent shell sleeps; child sleep is in the same process group thanks to
+        // process_group(0). Cancel must tear down the whole group.
+        let path =
+            std::env::temp_dir().join(format!("shift-process-pg-cancel-{}", std::process::id()));
+        write_script(&path, "#!/bin/sh\nsleep 30 &\nwait\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancel);
+        let started = Instant::now();
+        let watcher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            cancel_flag.store(true, Ordering::SeqCst);
+        });
+        let error = run_command_cancellable(
+            Command::new(&path),
+            Duration::from_secs(20),
+            1024,
+            Some(Arc::clone(&cancel)),
+        )
+        .unwrap_err();
+        let _ = watcher.join();
+        let elapsed = started.elapsed();
+        assert!(error.is_cancelled(), "error: {error}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "process-group cancel took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -118,9 +118,10 @@ impl DefuddleModule {
     /// Convert a web page URL to a cleaned document via the Defuddle CLI.
     ///
     /// **Network:** Defuddle performs an outbound HTTP(S) fetch to the given
-    /// address. Shift is a user-driven desktop tool, so private and loopback
-    /// hosts are allowed by default. Set `SHIFT_BLOCK_PRIVATE_URLS=1` to refuse
-    /// non-public targets (SSRF hardening for automation / untrusted inputs).
+    /// address. Only public internet hosts are allowed by default (no
+    /// localhost / LAN). Local files should go through the file picker or a
+    /// path. Opt into private targets with `SHIFT_ALLOW_PRIVATE_URLS=1` or
+    /// `--allow-private-urls`.
     pub fn convert_url(
         &self,
         url: &str,
@@ -139,11 +140,7 @@ impl DefuddleModule {
                 "not a valid http(s) URL: {url}"
             )));
         }
-        if block_private_urls() && url_targets_non_public_host(url) {
-            return Err(ConversionError::new(format!(
-                "refusing non-public URL host (SHIFT_BLOCK_PRIVATE_URLS is set): {url}"
-            )));
-        }
+        ensure_public_url_fetch_allowed(url)?;
 
         let markdown = output_format == OutputFormat::MARKDOWN;
         let output = self.run(url, markdown, options)?;
@@ -214,29 +211,66 @@ impl ConversionModule for DefuddleModule {
 
 /// True for absolute http(s) URLs used as conversion sources.
 ///
-/// Accepts any host, including localhost and private ranges. Callers that
-/// fetch the URL (Defuddle) should treat this as an intentional outbound
-/// network request; see [`url_targets_non_public_host`] and
-/// `SHIFT_BLOCK_PRIVATE_URLS` for optional hardening.
+/// Accepts any host syntactically, including localhost and private ranges.
+/// Callers that *fetch* the URL must call [`ensure_public_url_fetch_allowed`]
+/// (or honor [`block_private_urls`]) so LAN/loopback stay opt-in only.
 pub fn looks_like_url(value: &str) -> bool {
     Url::parse(value.trim())
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
 }
 
-/// True when `SHIFT_BLOCK_PRIVATE_URLS` is set to a truthy value (`1`, `true`, `yes`).
+/// True when Shift should refuse private / loopback / link-local URL fetches.
+///
+/// **Default: true** (public internet hosts only). Local content should use the
+/// file picker or a filesystem path, not `http://localhost`.
+///
+/// Allow private hosts when:
+/// - `SHIFT_ALLOW_PRIVATE_URLS` is truthy (`1` / `true` / `yes`), or
+/// - legacy `SHIFT_BLOCK_PRIVATE_URLS` is explicitly falsey (`0` / `false` / `no`).
 pub fn block_private_urls() -> bool {
+    if env_flag_truthy("SHIFT_ALLOW_PRIVATE_URLS") {
+        return false;
+    }
+    match std::env::var("SHIFT_BLOCK_PRIVATE_URLS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        // Legacy explicit opt-out of blocking.
+        Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") => false,
+        // Unset or any other value: block private hosts (safe default).
+        _ => true,
+    }
+}
+
+fn env_flag_truthy(name: &str) -> bool {
     matches!(
-        std::env::var("SHIFT_BLOCK_PRIVATE_URLS")
-            .ok()
-            .as_deref()
-            .map(str::trim),
+        std::env::var(name).ok().as_deref().map(str::trim),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
 }
 
+/// Refuse non-public URL hosts when [`block_private_urls`] is active.
+pub fn ensure_public_url_fetch_allowed(url: &str) -> Result<(), ConversionError> {
+    if block_private_urls() && url_targets_non_public_host(url) {
+        return Err(ConversionError::new(format!(
+            "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {url}"
+        )));
+    }
+    Ok(())
+}
+
+/// Display host for progress UI (“Fetching example.com…”).
+pub fn url_display_host(url: &str) -> String {
+    Url::parse(url.trim())
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "url".into())
+}
+
 /// True when the URL host is loopback, private, link-local, or a localhost-style name.
 ///
-/// Used for optional SSRF hardening when Shift is driven by untrusted inputs.
+/// Used so URL fetches stay on the public internet unless explicitly opted in.
 pub fn url_targets_non_public_host(value: &str) -> bool {
     let Ok(parsed) = Url::parse(value.trim()) else {
         return false;
@@ -323,6 +357,30 @@ mod tests {
         assert!(url_targets_non_public_host("http://[::1]/"));
         assert!(!url_targets_non_public_host("https://example.com/article"));
         assert!(!url_targets_non_public_host("https://8.8.8.8/"));
+    }
+
+    #[test]
+    fn public_url_policy_blocks_private_by_default() {
+        // Isolate from the developer's shell env for this process.
+        // SAFETY: tests in this binary are not run in parallel with other
+        // env-mutating tests that depend on these keys.
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        assert!(block_private_urls());
+        let err = ensure_public_url_fetch_allowed("http://127.0.0.1/secret").unwrap_err();
+        assert!(
+            err.to_string().contains("non-public") || err.to_string().contains("public internet"),
+            "error: {err}"
+        );
+        assert!(ensure_public_url_fetch_allowed("https://example.com/a").is_ok());
+    }
+
+    #[test]
+    fn url_display_host_extracts_host() {
+        assert_eq!(url_display_host("https://example.com/path"), "example.com");
+        assert_eq!(url_display_host("http://localhost:3000/x"), "localhost");
     }
 
     #[test]

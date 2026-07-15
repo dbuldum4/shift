@@ -10,6 +10,10 @@ use gpui::{
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Return `true` when the callback fully handled the paste (skip default text insert).
+type PasteCallback =
+    Box<dyn Fn(&ClipboardItem, &mut Window, &mut Context<TextInput>) -> bool + 'static>;
+
 actions!(
     text_input,
     [
@@ -55,6 +59,7 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     on_submit: Option<SubmitCallback>,
+    on_paste: Option<PasteCallback>,
 }
 
 impl TextInput {
@@ -76,11 +81,20 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             on_submit: None,
+            on_paste: None,
         }
     }
 
     pub fn set_on_submit(&mut self, callback: impl Fn(&str, &mut Context<Self>) + 'static) {
         self.on_submit = Some(Box::new(callback));
+    }
+
+    /// Intercept clipboard paste. Return `true` to skip the default text insert.
+    pub fn set_on_paste(
+        &mut self,
+        callback: impl Fn(&ClipboardItem, &mut Window, &mut Context<Self>) -> bool + 'static,
+    ) {
+        self.on_paste = Some(Box::new(callback));
     }
 
     pub fn content(&self) -> &str {
@@ -149,7 +163,16 @@ impl TextInput {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(callback) = self.on_paste.as_ref() {
+            if callback(&item, window, cx) {
+                return;
+            }
+        }
+        if let Some(text) = item.text() {
+            // Keep newlines as spaces for single-line fields; magic-paste tokenizes on whitespace.
             self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
         }
     }
