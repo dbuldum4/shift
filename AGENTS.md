@@ -82,3 +82,9 @@ depending on network access or a developer's global installation.
 
 This repository may contain in-progress visual work. Inspect `git diff` before
 editing, preserve unrelated changes, and do not overwrite or revert user edits.
+
+## Workflow notes
+
+- This checkout has no git remote configured. Commit locally; do not attempt to
+  push unless the user provides a remote URL.
+- Do not open pull requests for this project; the user prefers direct commits.
