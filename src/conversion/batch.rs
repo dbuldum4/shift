@@ -1541,4 +1541,132 @@ mod tests {
             resolved.display()
         );
     }
+
+    /// UI queue panel: progress tallies recompute on every batch event.
+    mod ui_perf {
+        use super::*;
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn assert_within(budget: Duration, label: &str, work: impl FnOnce()) {
+            let start = Instant::now();
+            work();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed <= budget,
+                "{label} took {elapsed:?}, budget {budget:?}"
+            );
+        }
+
+        #[test]
+        fn progress_over_large_queue_stays_responsive() {
+            let mut queue = BatchQueue::new();
+            let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+            for i in 0..500 {
+                let id = queue.enqueue(
+                    BatchSource::File(PathBuf::from(format!("/tmp/in{i}.pdf"))),
+                    &opts,
+                );
+                if let Some(item) = queue.get_mut(id) {
+                    item.state = match i % 5 {
+                        0 => BatchItemState::Queued,
+                        1 => BatchItemState::Running,
+                        2 => BatchItemState::Succeeded {
+                            written_path: PathBuf::from(format!("/tmp/out{i}.md")),
+                            module_id: "pandoc".into(),
+                            byte_len: 1024,
+                        },
+                        3 => BatchItemState::Failed {
+                            error: "missing".into(),
+                        },
+                        _ => BatchItemState::Cancelled,
+                    };
+                }
+            }
+
+            assert_within(Duration::from_secs(1), "BatchQueue::progress×2k", || {
+                for _ in 0..2_000 {
+                    let progress = queue.progress();
+                    black_box(progress.completed());
+                    black_box(progress.remaining());
+                    black_box(progress.is_idle());
+                }
+            });
+
+            let progress = queue.progress();
+            assert_eq!(progress.total, 500);
+            assert_eq!(progress.completed() + progress.remaining(), 500);
+        }
+
+        #[test]
+        fn enqueue_many_for_folder_drop_stays_within_budget() {
+            let sources: Vec<_> = (0..300)
+                .map(|i| BatchSource::File(PathBuf::from(format!("/Users/me/Inbox/f{i}.docx"))))
+                .collect();
+            let opts = BatchEnqueueOptions {
+                output_format: OutputFormat::MARKDOWN,
+                conversion: ConversionOptions::default(),
+                output_dir: Some(PathBuf::from("/Users/me/Exports")),
+                force: false,
+            };
+
+            assert_within(Duration::from_secs(2), "enqueue_many×300", || {
+                let mut queue = BatchQueue::new();
+                queue.enqueue_many(sources.clone(), &opts);
+                assert_eq!(queue.len(), 300);
+                black_box(queue.progress().total);
+            });
+        }
+
+        #[test]
+        fn display_names_for_queue_rows_are_cheap() {
+            let sources: Vec<_> = (0..1_000)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        BatchSource::Url(format!("https://example.com/a/{i}"))
+                    } else {
+                        BatchSource::File(PathBuf::from(format!(
+                            "/Users/me/Documents/folder/file_{i}.pdf"
+                        )))
+                    }
+                })
+                .collect();
+
+            assert_within(Duration::from_secs(1), "display_name×10k", || {
+                for _ in 0..10 {
+                    for source in &sources {
+                        black_box(source.display_name());
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn state_labels_for_status_chips_are_cheap() {
+            let states = [
+                BatchItemState::Queued,
+                BatchItemState::Running,
+                BatchItemState::Succeeded {
+                    written_path: PathBuf::from("/tmp/a.md"),
+                    module_id: "pandoc".into(),
+                    byte_len: 1,
+                },
+                BatchItemState::Failed { error: "x".into() },
+                BatchItemState::Cancelled,
+            ];
+            assert_within(
+                Duration::from_secs(1),
+                "BatchItemState::label×100k",
+                || {
+                    for _ in 0..20_000 {
+                        for state in &states {
+                            black_box(state.label());
+                            black_box(state.is_terminal());
+                            black_box(state.is_retryable());
+                        }
+                    }
+                },
+            );
+        }
+    }
 }

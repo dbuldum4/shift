@@ -688,11 +688,59 @@ pub fn bind_keys(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::utf8_offset_from_utf16;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn converts_composition_offsets_within_the_inserted_text() {
         assert_eq!(utf8_offset_from_utf16("é", 0), 0);
         assert_eq!(utf8_offset_from_utf16("é", 1), "é".len());
         assert_eq!(utf8_offset_from_utf16("😀x", 2), "😀".len());
+    }
+
+    /// Caret / IME composition maps UTF-16 indices on every keystroke-adjacent path.
+    #[test]
+    fn utf16_offset_mapping_stays_fast_on_long_url_bar_content() {
+        // Magic-paste / URL bar can hold a long path list or URL.
+        let content = "https://example.com/articles/αβγ-🚀/".repeat(64)
+            + &"file:///Users/me/Documents/very long name with spaces.docx;".repeat(32);
+        let utf16_len: usize = content.chars().map(|c| c.len_utf16()).sum();
+
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            // Sample many caret positions across the string.
+            for step in 0..32 {
+                let offset = (utf16_len * step) / 32;
+                black_box(utf8_offset_from_utf16(&content, offset));
+            }
+            black_box(utf8_offset_from_utf16(&content, 0));
+            black_box(utf8_offset_from_utf16(&content, utf16_len));
+            black_box(utf8_offset_from_utf16(
+                &content,
+                utf16_len.saturating_add(50),
+            ));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_secs(2),
+            "utf8_offset_from_utf16×34k took {elapsed:?}"
+        );
+
+        assert_eq!(utf8_offset_from_utf16(&content, 0), 0);
+        assert_eq!(utf8_offset_from_utf16(&content, utf16_len), content.len());
+    }
+
+    #[test]
+    fn utf16_offset_mapping_is_monotonic() {
+        let text = "a😀b✨c日本語d";
+        let mut last = 0;
+        let mut utf16 = 0;
+        for ch in text.chars() {
+            let at = utf8_offset_from_utf16(text, utf16);
+            assert!(at >= last);
+            last = at;
+            utf16 += ch.len_utf16();
+        }
+        assert_eq!(utf8_offset_from_utf16(text, utf16), text.len());
     }
 }

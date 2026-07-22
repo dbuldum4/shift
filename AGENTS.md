@@ -54,7 +54,7 @@ Optional knobs live on `ConversionOptions`:
 | `ffmpeg` | trim, streams, encode mode, quality, mono, sample rate, scale, fps, mute, normalize audio, burn embedded subtitles, frame interval (sequence ZIP) |
 | `docling` | image export mode, OCR, tables, table mode, OCR language; password via `pdf.password` |
 | `defuddle` | frontmatter, language |
-| `pandoc` | standalone, TOC, PDF engine override, reference-doc |
+| `pandoc` | standalone, TOC, PDF engine override, reference-doc, citations (off by default) |
 | `markitdown` | keep data URIs |
 | `pdf` | password (never persisted), page_from / page_to (qpdf slice) |
 

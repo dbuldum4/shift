@@ -464,4 +464,74 @@ mod tests {
         assert_eq!(intern_module_id("pandoc"), "pandoc");
         assert_eq!(intern_module_id("nope"), "unknown");
     }
+
+    /// UI sidebar load path: decode a full history file must stay snappy.
+    #[test]
+    fn encode_decode_full_sidebar_stays_within_budget() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let mut entries = Vec::with_capacity(MAX_HISTORY_ENTRIES);
+        for id in 1..=MAX_HISTORY_ENTRIES as u64 {
+            let mut entry = sample_entry(id);
+            entry.name = format!("report-{id}.docx");
+            entry.detail = format!("Markdown  ·  via pandoc  ·  #{id}");
+            entry.outcome = if id % 4 == 0 {
+                StoredOutcome::Failed(format!("missing tool {id}"))
+            } else if id % 4 == 1 {
+                StoredOutcome::ReadyLarge {
+                    module_id: "ffmpeg".into(),
+                    byte_len: 12_000_000 + id as usize,
+                }
+            } else {
+                StoredOutcome::Ready {
+                    module_id: "pandoc".into(),
+                    file_name: format!("report-{id}.md"),
+                    format: "markdown".into(),
+                    bytes: format!("# Note {id}\n\n").repeat(128).into_bytes(),
+                }
+            };
+            entries.push(entry);
+        }
+
+        let start = Instant::now();
+        for _ in 0..100 {
+            let encoded = encode_history(&entries, MAX_HISTORY_ENTRIES as u64 + 1);
+            let loaded = decode_history(&encoded).expect("decode");
+            assert_eq!(loaded.entries.len(), MAX_HISTORY_ENTRIES);
+            black_box(loaded.next_id);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_secs(2),
+            "history encode/decode×100 took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn intern_module_id_is_hot_path_cheap() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let ids = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "ffmpeg",
+            "custom",
+            "",
+        ];
+        let start = Instant::now();
+        for _ in 0..50_000 {
+            for id in ids {
+                black_box(intern_module_id(id));
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_secs(1),
+            "intern_module_id×350k took {elapsed:?}"
+        );
+    }
 }

@@ -89,6 +89,13 @@ pub struct PandocOptions {
     pub toc: bool,
     /// Reference DOCX/ODT for styles when writing those formats (`--reference-doc`).
     pub reference_doc: Option<PathBuf>,
+    /// Parse Pandoc citation syntax (`@key`) in Markdown inputs.
+    ///
+    /// Off by default: bare `@` is far more often a package name, handle, or
+    /// mention than an academic cite, and Typst PDF fails hard without a
+    /// bibliography. When true, uses the default `markdown` reader (with
+    /// citations enabled).
+    pub citations: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -145,13 +152,13 @@ impl ConversionModule for PandocModule {
         let input_format = input
             .extension()
             .and_then(|extension| extension.to_str())
-            .map(pandoc_input_format)
-            .unwrap_or("markdown");
+            .map(|extension| pandoc_input_format(extension, options.pandoc.citations))
+            .unwrap_or_else(|| pandoc_markdown_from(options.pandoc.citations));
         let mut command = Command::new(&self.executable);
         command
             .arg(input)
             .arg("--from")
-            .arg(input_format)
+            .arg(&input_format)
             .arg("--to")
             .arg(target)
             .arg("--output")
@@ -225,17 +232,28 @@ impl ConversionModule for PandocModule {
     }
 }
 
-fn pandoc_input_format(extension: &str) -> &str {
-    match extension.to_ascii_lowercase().as_str() {
-        "adoc" => "asciidoc",
-        "bib" => "bibtex",
-        "enw" => "endnotexml",
-        "htm" => "html",
-        "md" | "markdown" | "txt" => "markdown",
-        "tex" => "latex",
-        "typ" => "typst",
-        "wiki" => "mediawiki",
-        _ => extension,
+/// Pandoc `--from` for Markdown-family inputs, with optional citations.
+fn pandoc_markdown_from(citations: bool) -> String {
+    if citations {
+        "markdown".into()
+    } else {
+        // Disable the citations extension so `@pkg` stays literal text.
+        "markdown-citations".into()
+    }
+}
+
+fn pandoc_input_format(extension: &str, citations: bool) -> String {
+    let lower = extension.to_ascii_lowercase();
+    match lower.as_str() {
+        "adoc" => "asciidoc".into(),
+        "bib" => "bibtex".into(),
+        "enw" => "endnotexml".into(),
+        "htm" => "html".into(),
+        "md" | "markdown" | "txt" => pandoc_markdown_from(citations),
+        "tex" => "latex".into(),
+        "typ" => "typst".into(),
+        "wiki" => "mediawiki".into(),
+        _ => extension.to_owned(),
     }
 }
 
@@ -366,6 +384,7 @@ mod tests {
                 toc: true,
                 pdf_engine: None,
                 reference_doc: Some(reference.clone()),
+                citations: false,
             },
             ..ConversionOptions::default()
         };
@@ -378,6 +397,10 @@ mod tests {
         assert!(args.contains("--toc"), "args: {args}");
         assert!(args.contains("--reference-doc"), "args: {args}");
         assert!(
+            args.contains("markdown-citations"),
+            "default Markdown should disable citations, args: {args}"
+        );
+        assert!(
             args.contains(reference.to_string_lossy().as_ref()),
             "args: {args}"
         );
@@ -386,6 +409,62 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.args", executable.display()));
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&reference);
+    }
+
+    #[test]
+    fn markdown_input_format_disables_citations_by_default() {
+        assert_eq!(pandoc_input_format("md", false), "markdown-citations");
+        assert_eq!(pandoc_input_format("MD", false), "markdown-citations");
+        assert_eq!(pandoc_input_format("markdown", false), "markdown-citations");
+        assert_eq!(pandoc_input_format("txt", false), "markdown-citations");
+        assert_eq!(pandoc_input_format("md", true), "markdown");
+        assert_eq!(pandoc_input_format("docx", false), "docx");
+        assert_eq!(pandoc_markdown_from(false), "markdown-citations");
+        assert_eq!(pandoc_markdown_from(true), "markdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn citations_option_enables_markdown_cite_reader() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-cite", std::process::id());
+        let executable = directory.join(format!("shift-pandoc-cite-{suffix}"));
+        let input = directory.join(format!("shift-pandoc-input-{suffix}.md"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '<p>ok</p>'",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "See @smith2020.").unwrap();
+
+        let options = ConversionOptions {
+            pandoc: PandocOptions {
+                citations: true,
+                ..PandocOptions::default()
+            },
+            ..ConversionOptions::default()
+        };
+        PandocModule::with_executable(&executable)
+            .convert(&input, OutputFormat::HTML, &options)
+            .unwrap();
+
+        let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        // Reader is exactly `markdown` (citations on), not `markdown-citations`.
+        assert!(
+            args.contains("--from markdown"),
+            "expected --from markdown with citations on, args: {args}"
+        );
+        assert!(
+            !args.contains("markdown-citations"),
+            "citations on must not use markdown-citations, args: {args}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        let _ = std::fs::remove_file(&input);
     }
 
     #[test]

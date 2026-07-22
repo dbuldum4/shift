@@ -3,10 +3,11 @@ mod text_input;
 
 use gpui::{
     Animation, AnimationExt, App, Application, Bounds, ClipboardEntry, ClipboardItem, Context,
-    ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, ImageFormat, KeyBinding, Menu,
-    MenuItem, PathBuilder, PathStyle, Pixels, Point, Render, SharedString, StrokeOptions,
-    SystemMenuType, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions,
-    canvas, div, ease_out_quint, hsla, point, prelude::*, px, rgb, size,
+    CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, ImageFormat,
+    KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder,
+    PathStyle, Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, hsla,
+    point, prelude::*, px, rgb, size,
 };
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
@@ -37,8 +38,19 @@ use std::time::Duration;
 use text_input::TextInput;
 
 const APP_NAME: &str = "Shift";
-/// Black-and-white monospaced developer theme (gpui.rs-inspired).
-const FONT_MONO: &str = "Menlo";
+/// Default UI font when session settings omit a family (legacy Menlo look).
+const FONT_MONO: &str = shift_core::session_settings::DEFAULT_UI_FONT_FAMILY;
+/// Curated font families for Theme settings (label, family name).
+/// Family names must match what Core Text / GPUI resolve on macOS.
+const UI_FONT_CHOICES: &[(&str, &str)] = &[
+    ("Menlo", "Menlo"),
+    ("SF Mono", "SF Mono"),
+    ("Monaco", "Monaco"),
+    ("Courier New", "Courier New"),
+    ("Andale Mono", "Andale Mono"),
+    ("Helvetica Neue", "Helvetica Neue"),
+    ("System", ".SystemUIFont"),
+];
 const BG: u32 = 0x000000;
 const BG_RAISED: u32 = 0x0a0a0a;
 const BG_SURFACE: u32 = 0x111111;
@@ -64,13 +76,54 @@ const STATUS_READY_BORDER: u32 = 0x555555;
 const STATUS_MISSING_FILL: u32 = 0x111111;
 const STATUS_MISSING_TEXT: u32 = 0x888888;
 const STATUS_MISSING_BORDER: u32 = 0x333333;
-const HISTORY_SIDEBAR_WIDTH: f32 = 220.0;
+// Keep mins near the defaults so a drag can't crush history chips or the output pane.
+// Sum of mins + handles must fit the window minimum (900px).
+const HISTORY_SIDEBAR_MIN: f32 = 220.0;
+const HISTORY_SIDEBAR_MAX: f32 = 360.0;
+const OUTPUT_PANEL_MIN: f32 = 340.0;
+const OUTPUT_PANEL_MAX: f32 = 600.0;
+const CENTER_PANEL_MIN: f32 = 300.0;
+/// Hit target width for each vertical resize handle (visual line is 1px inside).
+const PANEL_RESIZE_HANDLE_WIDTH: f32 = 5.0;
 const SETTINGS_SIDEBAR_WIDTH: f32 = 220.0;
+
+// Text overflow: prefer `.overflow_hidden().text_ellipsis().line_clamp(1)` over
+// `.truncate()`. The latter sets `whitespace_nowrap`, and GPUI then caches the
+// first text measure forever (`wrap_width` stays `None`) — labels freeze as bare
+// "…" (first pass too narrow) or hard-clip without an ellipsis (first pass wide).
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PanelResizeTarget {
+    History,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PanelResizeDrag {
+    target: PanelResizeTarget,
+    start_x: f32,
+    start_width: f32,
+}
+
+/// Clamp history sidebar width so the center panel keeps a usable minimum.
+fn clamp_history_sidebar_width(width: f32, window_width: f32, output_panel_width: f32) -> f32 {
+    let reserved = output_panel_width + CENTER_PANEL_MIN + PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+    let max_by_window = (window_width - reserved).max(HISTORY_SIDEBAR_MIN);
+    width.clamp(HISTORY_SIDEBAR_MIN, HISTORY_SIDEBAR_MAX.min(max_by_window))
+}
+
+/// Clamp output panel width so the center panel keeps a usable minimum.
+fn clamp_output_panel_width(width: f32, window_width: f32, history_sidebar_width: f32) -> f32 {
+    let reserved = history_sidebar_width + CENTER_PANEL_MIN + PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+    let max_by_window = (window_width - reserved).max(OUTPUT_PANEL_MIN);
+    width.clamp(OUTPUT_PANEL_MIN, OUTPUT_PANEL_MAX.min(max_by_window))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsSection {
     Converters,
     General,
+    Theme,
     Options,
     Paths,
     Diagnostics,
@@ -82,6 +135,7 @@ impl SettingsSection {
         match self {
             Self::Converters => "Converters",
             Self::General => "General",
+            Self::Theme => "Theme",
             Self::Options => "Options",
             Self::Paths => "Paths",
             Self::Diagnostics => "Diagnostics",
@@ -93,6 +147,7 @@ impl SettingsSection {
         match self {
             Self::Converters => "Choose which engine runs first when several support a conversion.",
             Self::General => "Session output format and retained conversion history.",
+            Self::Theme => "UI appearance — font family for the native app chrome.",
             Self::Options => {
                 "Session conversion knobs for FFmpeg, Docling, Defuddle, Pandoc, and MarkItDown."
             }
@@ -101,6 +156,14 @@ impl SettingsSection {
             Self::About => "Version, modules, and project info.",
         }
     }
+}
+
+fn ui_font_choice_label(family: &str) -> SharedString {
+    UI_FONT_CHOICES
+        .iter()
+        .find(|(_, name)| *name == family)
+        .map(|(label, _)| SharedString::from(*label))
+        .unwrap_or_else(|| family.to_owned().into())
 }
 
 #[derive(Clone)]
@@ -297,6 +360,30 @@ fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{:.2} GB", size / GB)
     }
+}
+
+/// Unicode-aware single-line ellipsis. Prefer this over GPUI `text_ellipsis` /
+/// `truncate` for labels: those measure an unusably narrow width in several
+/// flex/scroll layouts and collapse strings to ~3 characters (e.g. "PLAN.md" → "PLA").
+fn ellipsize_chars(s: &str, max_chars: usize) -> SharedString {
+    if max_chars == 0 {
+        return SharedString::from("…");
+    }
+    let mut iter = s.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(c) => out.push(c),
+            None => return out.into(),
+        }
+    }
+    if iter.next().is_none() {
+        return out.into();
+    }
+    // Replace the last kept char with an ellipsis so we stay within max_chars.
+    out.pop();
+    out.push('…');
+    out.into()
 }
 
 fn extension_badge(path: &Path) -> (String, u32, u32) {
@@ -669,9 +756,10 @@ fn batch_queue_panel(
         })
         .child(
             div()
+                .id("batch-queue-list")
                 .flex_1()
                 .min_h_0()
-                .overflow_hidden()
+                .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -729,15 +817,13 @@ fn batch_queue_panel(
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(TEXT_PRIMARY))
-                                        .truncate()
-                                        .child(name),
+                                        .child(ellipsize_chars(name.as_ref(), 48)),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(TEXT_MUTED))
-                                        .truncate()
-                                        .child(detail),
+                                        .child(ellipsize_chars(detail.as_ref(), 56)),
                                 )
                                 .child(
                                     div()
@@ -809,6 +895,7 @@ fn batch_queue_panel(
 fn history_sidebar(
     history: &[ConversionHistoryEntry],
     active_history_id: Option<u64>,
+    width: f32,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let is_empty = history.is_empty();
@@ -818,7 +905,7 @@ fn history_sidebar(
         .flex()
         .flex_col()
         .flex_shrink_0()
-        .w(px(HISTORY_SIDEBAR_WIDTH))
+        .w(px(width))
         .h_full()
         .bg(rgb(BG))
         .child(
@@ -864,9 +951,12 @@ fn history_sidebar(
                 .flex_col()
                 .flex_1()
                 .min_h_0()
+                .w_full()
+                .min_w_0()
                 .px_2()
                 .pb_3()
                 .gap_1()
+                .overflow_x_hidden()
                 .overflow_y_scroll()
                 .when(is_empty, |list| {
                     list.child(
@@ -894,14 +984,20 @@ fn history_sidebar(
                     let id = entry.id;
                     let active = active_history_id == Some(id);
                     let failed = matches!(entry.outcome, HistoryOutcome::Failed(_));
-                    let badge_color = entry.badge_color;
-                    let badge_text_color = entry.badge_text_color;
+                    let output_format = history_output_format(&entry);
+                    let output_badge_label: SharedString =
+                        output_format_badge_label(output_format).into();
+                    let detail = history_entry_detail(&entry);
 
+                    // Do not use text_ellipsis/line_clamp here: GPUI’s Truncate
+                    // path has been measuring ~1 line-height of width (~3ch), so
+                    // "PLAN.md" / "via Pandoc" render as "PLA" / "via". Show the
+                    // full strings; the list scrolls if content grows.
                     div()
                         .id(("history-entry", id))
                         .flex()
-                        .items_center()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1()
                         .w_full()
                         .px_2()
                         .py_2()
@@ -919,46 +1015,32 @@ fn history_sidebar(
                         })
                         .child(
                             div()
-                                .flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .justify_center()
-                                .size(px(32.0))
-                                .rounded_md()
-                                .bg(rgb(badge_color))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(badge_text_color))
-                                        .child(entry.extension_label),
-                                ),
+                                .w_full()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if failed {
+                                    rgb(TEXT_SECONDARY)
+                                } else {
+                                    rgb(TEXT_PRIMARY)
+                                })
+                                .child(ellipsize_chars(entry.name.as_ref(), 48)),
                         )
                         .child(
                             div()
                                 .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
+                                .items_center()
+                                .gap_2()
+                                .w_full()
+                                .child(history_conversion_chip(
+                                    entry.extension_label,
+                                    output_badge_label,
+                                ))
                                 .child(
                                     div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(if failed {
-                                            rgb(TEXT_SECONDARY)
-                                        } else {
-                                            rgb(TEXT_PRIMARY)
-                                        })
-                                        .truncate()
-                                        .child(entry.name),
-                                )
-                                .child(
-                                    div()
+                                        .flex_1()
                                         .text_xs()
                                         .text_color(rgb(TEXT_MUTED))
-                                        .truncate()
-                                        .child(entry.detail),
+                                        .child(ellipsize_chars(detail.as_ref(), 56)),
                                 ),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -966,6 +1048,55 @@ fn history_sidebar(
                             cx.stop_propagation();
                         }))
                 })),
+        )
+}
+
+/// Vertical drag handle between main columns (history | source | output).
+fn vertical_resize_handle(
+    id: impl Into<ElementId>,
+    target: PanelResizeTarget,
+    active: bool,
+    padded: bool,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let line = div()
+        .w(px(1.0))
+        .h_full()
+        .mx_auto()
+        .bg(if active {
+            rgb(BORDER_FOCUS)
+        } else {
+            rgb(BORDER)
+        })
+        .group_hover("panel-resize", |style| style.bg(rgb(BORDER_STRONG)));
+
+    div()
+        .id(id)
+        .group("panel-resize")
+        .h_full()
+        .w(px(PANEL_RESIZE_HANDLE_WIDTH))
+        .flex_shrink_0()
+        .cursor(CursorStyle::ResizeColumn)
+        .when(padded, |handle| handle.py_8())
+        .child(line)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.begin_panel_resize(target, f32::from(event.position.x), cx);
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+            if this.panel_resize.is_some() {
+                this.handle_panel_resize_move(event, window, cx);
+                cx.stop_propagation();
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.end_panel_resize(cx);
+            }),
         )
 }
 
@@ -1000,13 +1131,15 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
         .flex_col()
         .items_center()
         .gap_4()
-        .w_full()
-        .max_w(px(320.0))
+        // Fixed width so the inner flex row cannot shrink-wrap the text column
+        // down to a few characters (same bug history rows hit).
+        .w(px(320.0))
         .child(
             div()
                 .relative()
                 .flex()
                 .w_full()
+                .min_w_0()
                 .items_center()
                 .gap_3()
                 .px_4()
@@ -1041,7 +1174,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                                 .child(preview.extension_label),
                         ),
                 )
-                // Name + meta
+                // Name + meta. Avoid text_ellipsis — same GPUI Truncate bug as history.
                 .child(
                     div()
                         .flex()
@@ -1054,15 +1187,13 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT))
-                                .truncate()
-                                .child(preview.name),
+                                .child(ellipsize_chars(preview.name.as_ref(), 40)),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(rgb(TEXT_SECONDARY))
-                                .truncate()
-                                .child(preview.subtitle),
+                                .child(ellipsize_chars(preview.subtitle.as_ref(), 56)),
                         ),
                 )
                 // Clear (unpick) — does not delete the file on disk.
@@ -1208,6 +1339,7 @@ struct ConversionPanelView {
     defuddle_lang_input: Entity<TextInput>,
     pandoc_standalone: bool,
     pandoc_toc: bool,
+    pandoc_citations: bool,
     pandoc_pdf_engine: Option<String>,
     pandoc_reference_doc: Option<PathBuf>,
     pdf_page_from_input: Entity<TextInput>,
@@ -1247,6 +1379,7 @@ fn conversion_options_panel(
         defuddle_lang_input,
         pandoc_standalone,
         pandoc_toc,
+        pandoc_citations,
         pandoc_pdf_engine,
         pandoc_reference_doc,
         pdf_page_from_input,
@@ -2006,6 +2139,21 @@ fn conversion_options_panel(
                                 this.pandoc_toc = !this.pandoc_toc;
                                 this.start_conversion(cx);
                             },
+                        ))
+                        .child(chip(
+                            "pandoc-citations",
+                            if pandoc_citations {
+                                "Citations ✓"
+                            } else {
+                                "Citations"
+                            },
+                            pandoc_citations,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_citations = !this.pandoc_citations;
+                                this.persist_session_settings(cx);
+                                this.start_conversion(cx);
+                            },
                         )),
                 );
             if show_pdf_engine {
@@ -2073,7 +2221,9 @@ fn conversion_options_panel(
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_PRIMARY))
-                            .truncate()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .line_clamp(1)
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BG_ACTIVE)))
                             .child(ref_doc_label)
@@ -2358,7 +2508,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     )
             })),
         ConversionState::Ready(artifact) => {
-            let file_name: SharedString = artifact.file_name.clone().into();
+            // Full name kept for drag/save; display may be ellipsized in software.
+            let file_name_full = artifact.file_name.clone();
+            let file_name_display = ellipsize_chars(&artifact.file_name, 42);
             let size = format_file_size(artifact.bytes.len() as u64);
             let excerpt = artifact_preview(artifact.as_ref());
             let is_text = artifact.format.is_text_previewable();
@@ -2373,9 +2525,12 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .join(" → ")
                     .into()
             };
-            let conversion_detail = format!(
-                "{}  ·  {size}  ·  via {pipeline_badge}",
-                artifact.format.label()
+            let conversion_detail = ellipsize_chars(
+                &format!(
+                    "{}  ·  {size}  ·  via {pipeline_badge}",
+                    artifact.format.label()
+                ),
+                56,
             );
             let commands: Vec<SharedString> = artifact
                 .invocations
@@ -2383,230 +2538,190 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .map(|inv| format!("{}: {}", inv.module_id, inv.argv_display).into())
                 .collect();
             let drag_payload = OutputDragPayload {
-                file_name: artifact.file_name.clone(),
+                file_name: file_name_full,
                 staged_path: cached_ready_path.clone(),
             };
             let drag_app = app_entity.clone();
+            // One result card: name + metadata + actions (and text preview when available).
+            // Binary outputs keep the same surface — no second card with duplicate controls.
             div()
                 .flex()
                 .flex_col()
-                .gap_4()
+                .gap_3()
                 .h_full()
                 .child(
                     div()
+                        .id("output-result-card")
                         .flex()
-                        .flex_wrap()
-                        .items_start()
-                        .justify_between()
-                        .gap_2()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_xl()
+                        .bg(rgb(BG_ELEVATED))
+                        .border_1()
+                        .border_color(rgb(BORDER_STRONG))
                         .child(
                             div()
-                                .id("output-drag-source")
                                 .flex()
-                                .flex_col()
-                                .gap_1()
-                                .min_w_0()
-                                .flex_1()
-                                // Keep a usable label column so long names truncate instead of
-                                // collapsing to a single-character vertical stack.
-                                .min_w(px(160.0))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_move()
-                                .hover(|style| style.bg(rgb(BG_HOVER)))
-                                .on_drag(drag_payload, move |payload, position, window, cx| {
-                                    begin_output_file_drag(
-                                        payload,
-                                        drag_app.clone(),
-                                        position,
-                                        window,
-                                        cx,
-                                    )
-                                })
+                                .flex_wrap()
+                                .items_start()
+                                .justify_between()
+                                .gap_2()
                                 .child(
                                     div()
+                                        .id("output-drag-source")
                                         .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .min_w_0()
-                                        .w_full()
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_color(rgb(TEXT_MUTED))
-                                                .child("⠿"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_lg()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(file_name),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .truncate()
-                                        .child(conversion_detail),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
+                                        .flex_col()
                                         .gap_1()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .min_w(px(160.0))
+                                        .px_1()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .cursor_move()
+                                        .hover(|style| style.bg(rgb(BG_HOVER)))
+                                        .on_drag(
+                                            drag_payload,
+                                            move |payload, position, window, cx| {
+                                                begin_output_file_drag(
+                                                    payload,
+                                                    drag_app.clone(),
+                                                    position,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )
                                         .child(
                                             div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
-                                                .bg(rgb(BADGE_FILL))
-                                                .text_xs()
-                                                .text_color(rgb(BADGE_TEXT))
-                                                .child(pipeline_badge),
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .w_full()
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .child("⠿"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_lg()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(file_name_display),
+                                                ),
                                         )
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(TEXT_MUTED))
-                                                .child("Drag to Downloads or Documents"),
+                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .child(conversion_detail),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(rgb(BADGE_FILL))
+                                                        .text_xs()
+                                                        .text_color(rgb(BADGE_TEXT))
+                                                        .child(pipeline_badge),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .child("Drag to Downloads or Documents"),
+                                                ),
                                         ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_shrink_0()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(action_chip(
+                                            "save-conversion",
+                                            "Download",
+                                            cx,
+                                            |this, cx| {
+                                                this.save_output(cx);
+                                            },
+                                        ))
+                                        .child(action_chip(
+                                            "copy-conversion",
+                                            if is_text { "Copy" } else { "Copy path" },
+                                            cx,
+                                            |this, cx| {
+                                                this.copy_output(cx);
+                                            },
+                                        ))
+                                        .child(action_chip(
+                                            "reveal-conversion",
+                                            "Reveal",
+                                            cx,
+                                            |this, cx| {
+                                                this.reveal_output(cx);
+                                            },
+                                        ))
+                                        .child(action_chip(
+                                            "open-conversion",
+                                            "Open",
+                                            cx,
+                                            |this, cx| {
+                                                this.open_output(cx);
+                                            },
+                                        ))
+                                        .when(!commands.is_empty(), |row| {
+                                            row.child(action_chip(
+                                                "show-command",
+                                                if show_command_inspect {
+                                                    "Hide cmd"
+                                                } else {
+                                                    "Show cmd"
+                                                },
+                                                cx,
+                                                |this, cx| {
+                                                    this.show_command_inspect =
+                                                        !this.show_command_inspect;
+                                                    cx.notify();
+                                                },
+                                            ))
+                                        }),
                                 ),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_shrink_0()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(action_chip("save-conversion", "Download", cx, |this, cx| {
-                                    this.save_output(cx);
-                                }))
-                                .child(action_chip("copy-conversion", "Copy", cx, |this, cx| {
-                                    this.copy_output(cx);
-                                }))
-                                .child(action_chip("reveal-conversion", "Reveal", cx, |this, cx| {
-                                    this.reveal_output(cx);
-                                }))
-                                .child(action_chip("open-conversion", "Open", cx, |this, cx| {
-                                    this.open_output(cx);
-                                }))
-                                .when(!commands.is_empty(), |row| {
-                                    row.child(action_chip(
-                                        "show-command",
-                                        if show_command_inspect {
-                                            "Hide cmd"
-                                        } else {
-                                            "Show cmd"
-                                        },
-                                        cx,
-                                        |this, cx| {
-                                            this.show_command_inspect = !this.show_command_inspect;
-                                            cx.notify();
-                                        },
-                                    ))
-                                }),
-                        ),
-                )
-                .when(!is_text, |panel| {
-                    let binary_payload = OutputDragPayload {
-                        file_name: artifact.file_name.clone(),
-                        staged_path: cached_ready_path.clone(),
-                    };
-                    let binary_app = app_entity.clone();
-                    panel.child(
-                        div()
-                            .id("output-binary-drag")
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .p_4()
-                            .rounded_xl()
-                            .bg(rgb(BG_ELEVATED))
-                            .border_1()
-                            .border_color(rgb(BORDER_STRONG))
-                            .cursor_move()
-                            .hover(|style| style.border_color(rgb(BORDER_FOCUS)))
-                            .on_drag(binary_payload, move |payload, position, window, cx| {
-                                begin_output_file_drag(
-                                    payload,
-                                    binary_app.clone(),
-                                    position,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .child("⠿"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Binary artifact"),
-                                    ),
-                            )
-                            .child(
+                        .when(!is_text, |card| {
+                            card.child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
-                                    .child(format!(
-                                        "{} · {size} · not shown inline — Download or drag to save",
-                                        artifact.format.label()
-                                    )),
+                                    .child(
+                                        "Not shown inline — Download, drag the file above, or Open with your default app.",
+                                    ),
                             )
-                            .child(
+                        })
+                        .when(is_text, |card| {
+                            card.child(
                                 div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(action_chip(
-                                        "binary-copy-path",
-                                        "Copy path",
-                                        cx,
-                                        |this, cx| this.copy_output(cx),
-                                    ))
-                                    .child(action_chip(
-                                        "binary-reveal",
-                                        "Reveal",
-                                        cx,
-                                        |this, cx| this.reveal_output(cx),
-                                    ))
-                                    .child(action_chip(
-                                        "binary-open",
-                                        "Open",
-                                        cx,
-                                        |this, cx| this.open_output(cx),
-                                    )),
-                            ),
-                    )
-                })
-                .when(is_text, |panel| {
-                    panel.child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .p_5()
-                            .rounded_xl()
-                            .bg(rgb(BG_RAISED))
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .overflow_hidden()
-                            .text_sm()
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .child(excerpt),
-                    )
-                })
+                                    .p_4()
+                                    .rounded_lg()
+                                    .bg(rgb(BG_RAISED))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(excerpt),
+                            )
+                        }),
+                )
                 .when_some(cached_ready_path.clone(), |panel, staged| {
                     // Preview is not a permanent save; still show the staged path
                     // so Reveal/Open have a concrete location.
@@ -2791,18 +2906,33 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
             )
         });
 
+    // Outer clips to the panel; scroll child carries options + result so tall
+    // Pandoc/FFmpeg knobs + artifact cards remain reachable.
     div()
         .relative()
         .size_full()
-        .p_8()
-        .pt(px(78.0))
+        .overflow_hidden()
         .flex()
         .flex_col()
-        .gap_3()
-        .when(show_conversion_options, |panel| {
-            panel.child(conversion_options_panel(conversion_options, cx))
-        })
-        .child(div().flex_1().min_h_0().child(content))
+        .child(
+            div()
+                .id("output-panel-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .p_8()
+                .pt(px(78.0))
+                .gap_3()
+                .when(show_conversion_options, |panel| {
+                    panel.child(conversion_options_panel(conversion_options, cx))
+                })
+                // flex_1 grows when short (empty/converting centering); omit
+                // min_h_0 so tall Ready content expands the scroll range.
+                .child(div().flex_1().child(content)),
+        )
         .child(
             div()
                 .absolute()
@@ -2847,6 +2977,107 @@ fn module_label(id: &str) -> &str {
         "ffmpeg" => "FFmpeg",
         other => other,
     }
+}
+
+/// Short uppercase badge for an output format (mirrors input extension badges).
+fn output_format_badge_label(format: OutputFormat) -> String {
+    let ext = format.extension().to_ascii_uppercase();
+    if ext.is_empty() {
+        "OUT".into()
+    } else if ext.len() <= 4 {
+        ext
+    } else {
+        ext.chars().take(4).collect()
+    }
+}
+
+/// Resolved output format for a history row (prefers the artifact when present).
+fn history_output_format(entry: &ConversionHistoryEntry) -> OutputFormat {
+    match &entry.outcome {
+        HistoryOutcome::Ready(artifact) => artifact.format,
+        HistoryOutcome::ReadyLarge { .. } | HistoryOutcome::Failed(_) => entry.output_format,
+    }
+}
+
+/// Secondary line under the history title: engine / size / failure — input and
+/// output formats are shown as badges, so they are not repeated here.
+fn history_entry_detail(entry: &ConversionHistoryEntry) -> SharedString {
+    match &entry.outcome {
+        HistoryOutcome::Ready(artifact) => {
+            format!("via {}", module_label(artifact.module_id)).into()
+        }
+        HistoryOutcome::ReadyLarge {
+            module_id,
+            byte_len,
+        } => format!(
+            "{}  ·  via {} (re-convert to restore)",
+            format_file_size(*byte_len as u64),
+            module_label(module_id)
+        )
+        .into(),
+        HistoryOutcome::Failed(_) => "failed".into(),
+    }
+}
+
+/// Persisted detail string: keeps input → output explicit for stored history.
+fn history_entry_stored_detail(entry: &ConversionHistoryEntry) -> String {
+    let input = entry.extension_label.as_ref();
+    let output = history_output_format(entry).label();
+    match &entry.outcome {
+        HistoryOutcome::Ready(artifact) => {
+            format!(
+                "{input} → {output}  ·  via {}",
+                module_label(artifact.module_id)
+            )
+        }
+        HistoryOutcome::ReadyLarge {
+            module_id,
+            byte_len,
+        } => format!(
+            "{input} → {output}  ·  {}  ·  via {} (re-convert to restore)",
+            format_file_size(*byte_len as u64),
+            module_label(module_id)
+        ),
+        HistoryOutcome::Failed(_) => format!("{input} → {output}  ·  failed"),
+    }
+}
+
+/// Compact chip showing input → output so history rows read as a conversion.
+fn history_conversion_chip(
+    input_label: SharedString,
+    output_label: SharedString,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .h(px(32.0))
+        .px_2()
+        .rounded_md()
+        .bg(rgb(BADGE_FILL))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(BADGE_TEXT))
+                .child(input_label),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(TEXT_MUTED))
+                .child("→"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(BADGE_TEXT))
+                .child(output_label),
+        )
 }
 
 fn module_description(id: &str) -> &str {
@@ -3187,14 +3418,12 @@ fn settings_converters_panel(
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
                                     .child(label),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
-                                    .truncate()
                                     .child(description),
                             ),
                     )
@@ -3347,6 +3576,114 @@ fn settings_general_panel(
         ))
 }
 
+fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
+    let selected = ui_font_family.to_owned();
+    let preview_family: SharedString = selected.clone().into();
+    let preview_label = ui_font_choice_label(&selected);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "Theme",
+            "Choose the typeface used for Shift’s interface. Changes apply immediately and are kept across launches.",
+        ))
+        .child(settings_card(
+            "Font family",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .w_full()
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .w_full()
+                        .children(UI_FONT_CHOICES.iter().enumerate().map(|(index, (label, family))| {
+                            let family_owned = (*family).to_owned();
+                            let is_selected = selected == *family;
+                            div()
+                                .id(("ui-font", index as u64))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .font_family(*family)
+                                .font_weight(FontWeight::MEDIUM)
+                                .cursor_pointer()
+                                .bg(if is_selected {
+                                    rgb(TEXT)
+                                } else {
+                                    rgb(BG_SURFACE)
+                                })
+                                .text_color(if is_selected {
+                                    rgb(TEXT_INVERSE)
+                                } else {
+                                    rgb(TEXT_SECONDARY)
+                                })
+                                .border_1()
+                                .border_color(if is_selected {
+                                    rgb(TEXT)
+                                } else {
+                                    rgb(BORDER)
+                                })
+                                .hover(|style| {
+                                    if is_selected {
+                                        style
+                                    } else {
+                                        style.bg(rgb(BG_HOVER))
+                                    }
+                                })
+                                .child(*label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_ui_font_family(family_owned.clone(), cx);
+                                    cx.stop_propagation();
+                                }))
+                        })),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(rgb(BG_RAISED))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("Preview · {preview_label}")),
+                        )
+                        .child(
+                            div()
+                                .font_family(preview_family)
+                                .text_sm()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child("The quick brown fox — MD → PDF 0123456789"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(
+                            "Uses fonts installed on this Mac. If a face is missing, the system falls back to a similar default.",
+                        ),
+                ),
+        ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn settings_options_panel(
     quality: FfmpegQuality,
@@ -3359,6 +3696,7 @@ fn settings_options_panel(
     defuddle_frontmatter: bool,
     pandoc_standalone: bool,
     pandoc_toc: bool,
+    pandoc_citations: bool,
     markitdown_keep_data_uris: bool,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement + use<> {
@@ -3624,6 +3962,20 @@ fn settings_options_panel(
                             cx,
                             |this, cx| {
                                 this.pandoc_toc = !this.pandoc_toc;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-pandoc-citations",
+                            if pandoc_citations {
+                                "Citations ✓"
+                            } else {
+                                "Citations"
+                            },
+                            pandoc_citations,
+                            cx,
+                            |this, cx| {
+                                this.pandoc_citations = !this.pandoc_citations;
                                 this.apply_session_option_change(cx);
                             },
                         ))
@@ -3901,14 +4253,18 @@ fn settings_diagnostics_panel(
                                                                 .text_sm()
                                                                 .font_weight(FontWeight::SEMIBOLD)
                                                                 .text_color(rgb(TEXT_PRIMARY))
-                                                                .truncate()
+                                                                .overflow_hidden()
+                                        .text_ellipsis()
+                                        .line_clamp(1)
                                                                 .child(engine.label),
                                                         )
                                                         .child(
                                                             div()
                                                                 .text_xs()
                                                                 .text_color(rgb(TEXT_MUTED))
-                                                                .truncate()
+                                                                .overflow_hidden()
+                                        .text_ellipsis()
+                                        .line_clamp(1)
                                                                 .child(format!(
                                                                     "{version} · {path}"
                                                                 )),
@@ -4010,7 +4366,9 @@ fn settings_diagnostics_panel(
                                                     div()
                                                         .text_xs()
                                                         .text_color(rgb(TEXT_MUTED))
-                                                        .truncate()
+                                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .line_clamp(1)
                                                         .child(version),
                                                 ),
                                         )
@@ -4121,6 +4479,7 @@ struct SettingsView {
     preference_error: Option<SharedString>,
     output_format: OutputFormat,
     history_count: usize,
+    ui_font_family: String,
     quality: FfmpegQuality,
     encode_mode: FfmpegEncodeMode,
     mono: bool,
@@ -4131,6 +4490,7 @@ struct SettingsView {
     defuddle_frontmatter: bool,
     pandoc_standalone: bool,
     pandoc_toc: bool,
+    pandoc_citations: bool,
     markitdown_keep_data_uris: bool,
     diagnostics: Option<Arc<DiagnosticsReport>>,
     diagnostics_loading: bool,
@@ -4143,6 +4503,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         preference_error,
         output_format,
         history_count,
+        ui_font_family,
         quality,
         encode_mode,
         mono,
@@ -4153,6 +4514,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         defuddle_frontmatter,
         pandoc_standalone,
         pandoc_toc,
+        pandoc_citations,
         markitdown_keep_data_uris,
         diagnostics,
         diagnostics_loading,
@@ -4189,6 +4551,9 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                         settings_general_panel(*output_format, *history_count, cx)
                             .into_any_element()
                     }
+                    SettingsSection::Theme => {
+                        settings_theme_panel(ui_font_family, cx).into_any_element()
+                    }
                     SettingsSection::Options => settings_options_panel(
                         *quality,
                         *encode_mode,
@@ -4200,6 +4565,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                         *defuddle_frontmatter,
                         *pandoc_standalone,
                         *pandoc_toc,
+                        *pandoc_citations,
                         *markitdown_keep_data_uris,
                         cx,
                     )
@@ -4317,15 +4683,16 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                             cx,
                         ))
                         .child(settings_nav_item(SettingsSection::General, section, 1, cx))
-                        .child(settings_nav_item(SettingsSection::Options, section, 2, cx))
-                        .child(settings_nav_item(SettingsSection::Paths, section, 3, cx))
+                        .child(settings_nav_item(SettingsSection::Theme, section, 2, cx))
+                        .child(settings_nav_item(SettingsSection::Options, section, 3, cx))
+                        .child(settings_nav_item(SettingsSection::Paths, section, 4, cx))
                         .child(settings_nav_item(
                             SettingsSection::Diagnostics,
                             section,
-                            4,
+                            5,
                             cx,
                         ))
-                        .child(settings_nav_item(SettingsSection::About, section, 5, cx)),
+                        .child(settings_nav_item(SettingsSection::About, section, 6, cx)),
                 )
                 .child(settings_content(&view, cx)),
         )
@@ -4368,6 +4735,8 @@ struct Shift {
     format_filter_input: Entity<TextInput>,
     settings_open: bool,
     settings_section: SettingsSection,
+    /// UI font family for the app chrome (session-persisted Theme setting).
+    ui_font_family: String,
     shortcuts_help_open: bool,
     show_command_inspect: bool,
     module_priority: Vec<String>,
@@ -4377,6 +4746,12 @@ struct Shift {
     history: Vec<ConversionHistoryEntry>,
     next_history_id: u64,
     active_history_id: Option<u64>,
+    /// History sidebar width (logical pixels); resizable via left divider.
+    history_sidebar_width: f32,
+    /// Output panel width (logical pixels); resizable via right divider.
+    output_panel_width: f32,
+    /// Active column-resize drag, if any.
+    panel_resize: Option<PanelResizeDrag>,
     // Shared batch queue (same runner as shift-cli).
     batch_queue: BatchQueue,
     batch_output_dir: Option<PathBuf>,
@@ -4421,6 +4796,7 @@ struct Shift {
     defuddle_lang_input: Entity<TextInput>,
     pandoc_standalone: bool,
     pandoc_toc: bool,
+    pandoc_citations: bool,
     pandoc_pdf_engine: Option<String>,
     pandoc_reference_doc: Option<PathBuf>,
     pdf_page_from_input: Entity<TextInput>,
@@ -5343,6 +5719,7 @@ impl Shift {
                 standalone: self.pandoc_standalone,
                 toc: self.pandoc_toc,
                 reference_doc: self.pandoc_reference_doc.clone(),
+                citations: self.pandoc_citations,
             },
             defuddle: DefuddleOptions {
                 frontmatter: self.defuddle_frontmatter,
@@ -5370,10 +5747,85 @@ impl Shift {
         settings.set_output_format(self.output_format);
         settings.batch_output_dir = self.batch_output_dir.clone();
         settings.batch_force = self.batch_force;
+        settings.history_sidebar_width = self.history_sidebar_width;
+        settings.output_panel_width = self.output_panel_width;
+        settings.ui_font_family = self.ui_font_family.clone();
         if let Ok(options) = self.build_conversion_options(cx) {
             settings.apply_conversion_options(&options);
         }
         let _ = save_default_session_settings(&settings);
+    }
+
+    fn set_ui_font_family(&mut self, family: String, cx: &mut Context<Self>) {
+        let family = family.trim().to_owned();
+        let family = if family.is_empty() {
+            FONT_MONO.to_owned()
+        } else {
+            family
+        };
+        if self.ui_font_family == family {
+            return;
+        }
+        self.ui_font_family = family;
+        self.persist_session_settings(cx);
+        cx.notify();
+    }
+
+    fn begin_panel_resize(
+        &mut self,
+        target: PanelResizeTarget,
+        start_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let start_width = match target {
+            PanelResizeTarget::History => self.history_sidebar_width,
+            PanelResizeTarget::Output => self.output_panel_width,
+        };
+        self.panel_resize = Some(PanelResizeDrag {
+            target,
+            start_x,
+            start_width,
+        });
+        cx.notify();
+    }
+
+    fn handle_panel_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.panel_resize else {
+            return;
+        };
+        let window_width = f32::from(window.viewport_size().width);
+        let x = f32::from(event.position.x);
+        let delta = x - drag.start_x;
+        match drag.target {
+            PanelResizeTarget::History => {
+                self.history_sidebar_width = clamp_history_sidebar_width(
+                    drag.start_width + delta,
+                    window_width,
+                    self.output_panel_width,
+                );
+            }
+            PanelResizeTarget::Output => {
+                // Divider sits to the left of the output panel: drag left → wider output.
+                self.output_panel_width = clamp_output_panel_width(
+                    drag.start_width - delta,
+                    window_width,
+                    self.history_sidebar_width,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    fn end_panel_resize(&mut self, cx: &mut Context<Self>) {
+        if self.panel_resize.take().is_some() {
+            self.persist_session_settings(cx);
+            cx.notify();
+        }
     }
 
     fn install_hints_for_failure(&self) -> Vec<(SharedString, SharedString)> {
@@ -5901,41 +6353,21 @@ impl Shift {
             other => other,
         };
 
-        let detail = match &outcome {
-            HistoryOutcome::Ready(artifact) => format!(
-                "{}  ·  via {}",
-                artifact.format.label(),
-                module_label(artifact.module_id)
-            ),
-            HistoryOutcome::ReadyLarge {
-                module_id,
-                byte_len,
-                ..
-            } => format!(
-                "{}  ·  {}  ·  via {} (re-convert to restore)",
-                self.output_format.label(),
-                format_file_size(*byte_len as u64),
-                module_label(module_id)
-            ),
-            HistoryOutcome::Failed(_) => format!("{}  ·  failed", self.output_format.label()),
-        };
-
         let id = self.next_history_id;
         self.next_history_id = self.next_history_id.wrapping_add(1);
-        self.history.insert(
-            0,
-            ConversionHistoryEntry {
-                id,
-                source,
-                name: preview.name,
-                detail: detail.into(),
-                extension_label: preview.extension_label,
-                badge_color: preview.badge_color,
-                badge_text_color: preview.badge_text_color,
-                output_format: self.output_format,
-                outcome,
-            },
-        );
+        let mut entry = ConversionHistoryEntry {
+            id,
+            source,
+            name: preview.name,
+            detail: "".into(),
+            extension_label: preview.extension_label,
+            badge_color: preview.badge_color,
+            badge_text_color: preview.badge_text_color,
+            output_format: self.output_format,
+            outcome,
+        };
+        entry.detail = history_entry_stored_detail(&entry).into();
+        self.history.insert(0, entry);
         self.history.truncate(MAX_HISTORY_ENTRIES);
         self.active_history_id = Some(id);
         self.persist_history();
@@ -6121,6 +6553,7 @@ impl Render for Shift {
         let format_filter_input = self.format_filter_input.clone();
         let format_filter = self.format_filter_input.read(cx).content().to_owned();
         let settings_open = self.settings_open;
+        let ui_font_family = self.ui_font_family.clone();
         let shortcuts_help_open = self.shortcuts_help_open;
         let show_command_inspect = self.show_command_inspect;
         let conversion_progress = self.conversion_progress.clone();
@@ -6137,6 +6570,22 @@ impl Render for Shift {
         let history = self.history.clone();
         let history_count = history.len();
         let active_history_id = self.active_history_id;
+        let history_sidebar_width = self.history_sidebar_width;
+        let output_panel_width = self.output_panel_width;
+        let resizing_history = matches!(
+            self.panel_resize,
+            Some(PanelResizeDrag {
+                target: PanelResizeTarget::History,
+                ..
+            })
+        );
+        let resizing_output = matches!(
+            self.panel_resize,
+            Some(PanelResizeDrag {
+                target: PanelResizeTarget::Output,
+                ..
+            })
+        );
         let active_option_modules = self.active_option_modules();
         let show_conversion_options = !active_option_modules.is_empty();
         let ffmpeg_quality = self.ffmpeg_quality;
@@ -6163,6 +6612,7 @@ impl Render for Shift {
         let defuddle_lang_input = self.defuddle_lang_input.clone();
         let pandoc_standalone = self.pandoc_standalone;
         let pandoc_toc = self.pandoc_toc;
+        let pandoc_citations = self.pandoc_citations;
         let pandoc_pdf_engine = self.pandoc_pdf_engine.clone();
         let pandoc_reference_doc = self.pandoc_reference_doc.clone();
         let pdf_page_from_input = self.pdf_page_from_input.clone();
@@ -6197,19 +6647,26 @@ impl Render for Shift {
             .size_full()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .font_family(FONT_MONO)
+            .font_family(ui_font_family.clone())
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.output_menu_open {
                     this.output_menu_open = false;
                     cx.notify();
                 }
             }))
-            .child(history_sidebar(&history, active_history_id, cx))
-            .child(
-                div()
-                    .h_full()
-                    .child(div().w(px(1.0)).h_full().bg(rgb(BORDER))),
-            )
+            .child(history_sidebar(
+                &history,
+                active_history_id,
+                history_sidebar_width,
+                cx,
+            ))
+            .child(vertical_resize_handle(
+                "resize-history",
+                PanelResizeTarget::History,
+                resizing_history,
+                false,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -6253,17 +6710,20 @@ impl Render for Shift {
                             }))
                     }),
             )
+            .child(vertical_resize_handle(
+                "resize-output",
+                PanelResizeTarget::Output,
+                resizing_output,
+                true,
+                cx,
+            ))
             .child(
                 div()
+                    .w(px(output_panel_width))
+                    .flex_shrink_0()
                     .h_full()
-                    .py_8()
-                    .child(div().w(px(1.0)).h_full().bg(rgb(BORDER))),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
+                    .min_h_0()
+                    .overflow_hidden()
                     .bg(rgb(BG))
                     .when(show_batch, |panel| {
                         panel.child(batch_queue_panel(
@@ -6316,6 +6776,7 @@ impl Render for Shift {
                                     defuddle_lang_input,
                                     pandoc_standalone,
                                     pandoc_toc,
+                                    pandoc_citations,
                                     pandoc_pdf_engine,
                                     pandoc_reference_doc,
                                     pdf_page_from_input,
@@ -6356,6 +6817,33 @@ impl Render for Shift {
                         cx.notify();
                     })),
             )
+            // Full-window hit target while dragging so moves outside the thin handle still track.
+            .when(resizing_history || resizing_output, |root| {
+                root.child(
+                    div()
+                        .id("panel-resize-capture")
+                        .absolute()
+                        .inset_0()
+                        .cursor(CursorStyle::ResizeColumn)
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                            this.handle_panel_resize_move(event, window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.end_panel_resize(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.end_panel_resize(cx);
+                            }),
+                        ),
+                )
+            })
             .when_some(folder_confirm, |root, confirm| {
                 let count = confirm.expanded.len();
                 root.child(
@@ -6495,6 +6983,7 @@ impl Render for Shift {
                         preference_error,
                         output_format,
                         history_count,
+                        ui_font_family,
                         quality: ffmpeg_quality,
                         encode_mode: ffmpeg_encode_mode,
                         mono: ffmpeg_mono,
@@ -6505,6 +6994,7 @@ impl Render for Shift {
                         defuddle_frontmatter,
                         pandoc_standalone,
                         pandoc_toc,
+                        pandoc_citations,
                         markitdown_keep_data_uris,
                         diagnostics,
                         diagnostics_loading,
@@ -6539,6 +7029,7 @@ fn main() {
         }]);
 
         let bounds = Bounds::centered(None, size(px(1180.0), px(720.0)), cx);
+        let initial_window_width = f32::from(bounds.size.width);
 
         cx.open_window(
             WindowOptions {
@@ -6681,6 +7172,16 @@ fn main() {
                         batch_queue.set_output_dir(Some(dir.as_path()));
                     }
                     let focus_handle = cx.focus_handle();
+                    let history_sidebar_width = clamp_history_sidebar_width(
+                        session.history_sidebar_width,
+                        initial_window_width,
+                        session.output_panel_width,
+                    );
+                    let output_panel_width = clamp_output_panel_width(
+                        session.output_panel_width,
+                        initial_window_width,
+                        history_sidebar_width,
+                    );
                     Shift {
                         focus_handle,
                         selected_file: None,
@@ -6697,6 +7198,7 @@ fn main() {
                         format_filter_input,
                         settings_open: false,
                         settings_section: SettingsSection::Converters,
+                        ui_font_family: session.resolved_ui_font_family().to_owned(),
                         shortcuts_help_open: false,
                         show_command_inspect: false,
                         module_priority: load_module_priority(),
@@ -6706,6 +7208,9 @@ fn main() {
                         history,
                         next_history_id,
                         active_history_id: None,
+                        history_sidebar_width,
+                        output_panel_width,
+                        panel_resize: None,
                         batch_queue,
                         batch_output_dir: session.batch_output_dir.clone(),
                         batch_running: false,
@@ -6742,6 +7247,7 @@ fn main() {
                         defuddle_lang_input,
                         pandoc_standalone: options.pandoc.standalone,
                         pandoc_toc: options.pandoc.toc,
+                        pandoc_citations: options.pandoc.citations,
                         pandoc_pdf_engine: options.pandoc.pdf_engine.clone(),
                         pandoc_reference_doc: options.pandoc.reference_doc.clone(),
                         pdf_page_from_input,
@@ -6807,4 +7313,608 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod ui_perf {
+    //! Performance budgets for pure UI helpers used on the main render path.
+    //!
+    //! These are not full GPUI frame tests (no window/GPU). They guard the cheap
+    //! pure work that still runs every selection change, history restore, batch
+    //! update, and options parse — and would freeze the UI if they regress.
+
+    use super::*;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    /// Soft wall-clock budget. Loose for unoptimized debug builds; still fails
+    /// if a pure helper shells out or turns quadratic.
+    fn assert_within(budget: Duration, label: &str, work: impl FnOnce()) {
+        let start = Instant::now();
+        work();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= budget,
+            "{label} took {elapsed:?}, budget {budget:?}"
+        );
+    }
+
+    fn sample_artifact(id: u64, bytes: Vec<u8>) -> ConversionArtifact {
+        ConversionArtifact {
+            file_name: format!("file{id}.md"),
+            media_type: "text/markdown",
+            bytes,
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        }
+    }
+
+    fn sample_history_entry(id: u64, outcome: HistoryOutcome) -> ConversionHistoryEntry {
+        ConversionHistoryEntry {
+            id,
+            source: HistorySource::File(PathBuf::from(format!(
+                "/Users/me/Documents/report{id}.docx"
+            ))),
+            name: format!("report{id}.docx").into(),
+            detail: "DOCX → Markdown  ·  via Pandoc".into(),
+            extension_label: "DOCX".into(),
+            badge_color: BADGE_FILL,
+            badge_text_color: BADGE_TEXT,
+            output_format: OutputFormat::MARKDOWN,
+            outcome,
+        }
+    }
+
+    fn sample_batch_item(id: u64, state: BatchItemState) -> BatchItem {
+        BatchItem {
+            id: BatchItemId(id),
+            source: BatchSource::File(PathBuf::from(format!("/tmp/input{id}.pdf"))),
+            output_format: OutputFormat::MARKDOWN,
+            format_selection: BatchFormatSelection::Inherit,
+            options: ConversionOptions::default(),
+            destination: PathBuf::from(format!("/tmp/out{id}.md")),
+            force: false,
+            state,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn history_detail_makes_input_and_output_explicit() {
+        let ready = sample_history_entry(
+            1,
+            HistoryOutcome::Ready(Arc::new(sample_artifact(1, b"# hi".to_vec()))),
+        );
+        assert_eq!(
+            history_entry_stored_detail(&ready),
+            "DOCX → Markdown  ·  via Pandoc"
+        );
+        assert_eq!(history_entry_detail(&ready).as_ref(), "via Pandoc");
+        assert_eq!(
+            output_format_badge_label(history_output_format(&ready)),
+            "MD"
+        );
+
+        let failed = sample_history_entry(2, HistoryOutcome::Failed("boom".into()));
+        assert_eq!(
+            history_entry_stored_detail(&failed),
+            "DOCX → Markdown  ·  failed"
+        );
+        assert_eq!(history_entry_detail(&failed).as_ref(), "failed");
+
+        let large = sample_history_entry(
+            3,
+            HistoryOutcome::ReadyLarge {
+                module_id: "pandoc".into(),
+                byte_len: 2 * 1024 * 1024,
+            },
+        );
+        let stored = history_entry_stored_detail(&large);
+        assert!(stored.starts_with("DOCX → Markdown  ·  "));
+        assert!(stored.contains("via Pandoc"));
+        assert!(stored.contains("re-convert to restore"));
+        assert_eq!(output_format_badge_label(OutputFormat::PDF), "PDF");
+        assert_eq!(output_format_badge_label(OutputFormat::DOCX), "DOCX");
+    }
+
+    #[test]
+    fn ellipsize_chars_keeps_short_strings_and_caps_long_ones() {
+        assert_eq!(ellipsize_chars("PLAN.md", 42).as_ref(), "PLAN.md");
+        assert_eq!(ellipsize_chars("failed", 42).as_ref(), "failed");
+        assert_eq!(ellipsize_chars("via Pandoc", 42).as_ref(), "via Pandoc");
+        let long = "personal strength week 5 workout.docx";
+        let clipped = ellipsize_chars(long, 12);
+        assert_eq!(clipped.chars().count(), 12);
+        assert!(clipped.as_ref().ends_with('…'));
+        assert!(clipped.as_ref().starts_with("personal st"));
+        // Must not collapse to a few bare characters the way GPUI Truncate did.
+        assert_ne!(ellipsize_chars(long, 40).as_ref(), "per");
+        assert_ne!(ellipsize_chars("PLAN.md", 40).as_ref(), "PLA");
+    }
+
+    #[test]
+    fn format_file_size_stays_fast_across_scales() {
+        let sizes = [
+            0u64,
+            1,
+            512,
+            1023,
+            1024,
+            12_345,
+            1024 * 1024 - 1,
+            1024 * 1024,
+            50 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            5 * 1024 * 1024 * 1024,
+            u64::MAX / 2,
+        ];
+        assert_within(Duration::from_secs(1), "format_file_size×60k", || {
+            for _ in 0..5_000 {
+                for &size in &sizes {
+                    black_box(format_file_size(size));
+                }
+            }
+        });
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert!(format_file_size(1024 * 1024).contains("MB"));
+    }
+
+    #[test]
+    fn extension_badge_classifies_common_types_quickly() {
+        let paths = [
+            "photo.PNG",
+            "clip.mp4",
+            "track.flac",
+            "scan.PDF",
+            "archive.zip",
+            "main.rs",
+            "notes.md",
+            "data.json",
+            "README",
+            "long.extensionname",
+            "a.heic",
+            "b.webp",
+            "c.srt",
+            "d.docx",
+            "e.pptx",
+            "f.toml",
+            "g.yaml",
+            "h.csv",
+            "i.mov",
+            "j.mkv",
+        ];
+        assert_within(Duration::from_secs(1), "extension_badge×20k", || {
+            for _ in 0..1_000 {
+                for name in paths {
+                    black_box(extension_badge(Path::new(name)));
+                }
+            }
+        });
+        let (img, _, _) = extension_badge(Path::new("x.jpg"));
+        assert_eq!(img, "IMG");
+        let (vid, _, _) = extension_badge(Path::new("x.mp4"));
+        assert_eq!(vid, "VID");
+        let (file, _, _) = extension_badge(Path::new("noext"));
+        assert_eq!(file, "FILE");
+    }
+
+    #[test]
+    fn build_file_preview_with_size_is_cheap_for_large_batches() {
+        assert_within(
+            Duration::from_secs(1),
+            "build_file_preview_with_size×2k",
+            || {
+                for i in 0..2_000 {
+                    let path = PathBuf::from(format!(
+                        "/Users/me/Projects/shift/assets/sample_{i:05}.docx"
+                    ));
+                    black_box(build_file_preview_with_size(
+                        &path,
+                        format_file_size(12_345 + i as u64),
+                    ));
+                }
+            },
+        );
+        let preview =
+            build_file_preview_with_size(Path::new("/tmp/folder/notes.md"), "1.2 KB".into());
+        assert_eq!(preview.name.as_ref(), "notes.md");
+        assert!(preview.subtitle.as_ref().contains("folder"));
+        assert_eq!(preview.extension_label.as_ref(), "MD");
+    }
+
+    #[test]
+    fn build_url_preview_handles_many_hosts() {
+        assert_within(Duration::from_secs(1), "build_url_preview×5k", || {
+            for i in 0..5_000 {
+                let host = i % 97;
+                let url = format!("https://news.example{host}.com/articles/{i}?q=1#top");
+                black_box(build_url_preview(&url));
+            }
+        });
+        let preview = build_url_preview("  HTTPS://Example.COM/path  ");
+        assert!(preview.subtitle.as_ref().contains("Example.COM"));
+        assert_eq!(preview.extension_label.as_ref(), "WEB");
+    }
+
+    #[test]
+    fn batch_item_status_labels_scale_with_queue_size() {
+        let states = [
+            BatchItemState::Queued,
+            BatchItemState::Running,
+            BatchItemState::Succeeded {
+                written_path: PathBuf::from("/Volumes/Exports/out.md"),
+                module_id: "pandoc".into(),
+                byte_len: 4096,
+            },
+            BatchItemState::Failed {
+                error: "engine missing".into(),
+            },
+            BatchItemState::Cancelled,
+        ];
+        let items: Vec<_> = (0..2_000)
+            .map(|i| sample_batch_item(i, states[i as usize % states.len()].clone()))
+            .collect();
+
+        assert_within(
+            Duration::from_secs(1),
+            "batch_item_status_label×10 passes",
+            || {
+                for _ in 0..10 {
+                    for item in &items {
+                        black_box(batch_item_status_label(item));
+                    }
+                }
+            },
+        );
+
+        let ok = batch_item_status_label(&sample_batch_item(
+            1,
+            BatchItemState::Succeeded {
+                written_path: PathBuf::from("/tmp/a.md"),
+                module_id: "pandoc".into(),
+                byte_len: 1,
+            },
+        ));
+        assert!(ok.as_ref().contains("/tmp/a.md"));
+    }
+
+    #[test]
+    fn artifact_preview_summary_path_stays_responsive() {
+        let text = sample_artifact(1, "# Heading\n\n".repeat(800).into_bytes());
+        let binary = ConversionArtifact {
+            file_name: "clip.mp4".into(),
+            media_type: "video/mp4",
+            bytes: vec![0u8; 64 * 1024],
+            format: OutputFormat::MP4,
+            module_id: "ffmpeg",
+            pipeline: vec!["ffmpeg"],
+            invocations: Vec::new(),
+        };
+
+        assert_within(Duration::from_secs(1), "artifact_preview×400", || {
+            for _ in 0..200 {
+                black_box(artifact_preview(&text));
+                black_box(artifact_preview(&binary));
+            }
+        });
+        assert!(!artifact_preview(&text).is_empty());
+        assert!(
+            artifact_preview(&binary)
+                .as_ref()
+                .contains("Not shown inline")
+                || artifact_preview(&binary).as_ref().contains("Video")
+                || artifact_preview(&binary).as_ref().contains("mp4")
+                || !artifact_preview(&binary).is_empty()
+        );
+    }
+
+    #[test]
+    fn option_field_parsers_handle_busy_settings_edits() {
+        let secs = ["", "0", "1.5", "  12  ", "abc", "-1", "1e9", "nan"];
+        let ints = ["", "0", "30", "  4 ", "x", "-3", "999999"];
+        assert_within(Duration::from_secs(1), "parse_optional×15k", || {
+            for _ in 0..1_000 {
+                for s in secs {
+                    let _ = black_box(parse_optional_secs(s));
+                }
+                for s in ints {
+                    let _ = black_box(parse_optional_u32(s));
+                }
+            }
+        });
+        assert_eq!(parse_optional_secs("").unwrap(), None);
+        assert_eq!(parse_optional_secs("2.5").unwrap(), Some(2.5));
+        assert!(parse_optional_secs("-1").is_err());
+        assert_eq!(parse_optional_u32("12").unwrap(), Some(12));
+        assert!(parse_optional_u32("nope").is_err());
+    }
+
+    #[test]
+    fn module_chrome_lookups_are_constant_time_style() {
+        let ids = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "ffmpeg",
+            "unknown-module",
+            "",
+        ];
+        assert_within(Duration::from_secs(1), "module_label×70k", || {
+            for _ in 0..10_000 {
+                for id in ids {
+                    black_box(module_label(id));
+                    black_box(module_description(id));
+                }
+            }
+        });
+        assert_eq!(module_label("pandoc"), "Pandoc");
+        assert!(module_description("ffmpeg").contains("Audio"));
+    }
+
+    #[test]
+    fn settings_section_metadata_is_instant() {
+        let sections = [
+            SettingsSection::Converters,
+            SettingsSection::General,
+            SettingsSection::Theme,
+            SettingsSection::Options,
+            SettingsSection::Paths,
+            SettingsSection::Diagnostics,
+            SettingsSection::About,
+        ];
+        assert_within(Duration::from_secs(1), "settings_section×30k", || {
+            for _ in 0..5_000 {
+                for section in sections {
+                    black_box(section.label());
+                    black_box(section.description());
+                }
+            }
+        });
+        assert_eq!(SettingsSection::Theme.label(), "Theme");
+        assert_eq!(SettingsSection::About.label(), "About");
+        assert_eq!(ui_font_choice_label("Menlo").as_ref(), "Menlo");
+        assert_eq!(ui_font_choice_label(".SystemUIFont").as_ref(), "System");
+        assert_eq!(ui_font_choice_label("CustomFace").as_ref(), "CustomFace");
+        assert!(!UI_FONT_CHOICES.is_empty());
+    }
+
+    #[test]
+    fn history_store_round_trip_stays_within_budget_for_full_sidebar() {
+        let entries: Vec<_> = (1..=MAX_HISTORY_ENTRIES as u64)
+            .map(|id| {
+                let outcome = if id % 3 == 0 {
+                    HistoryOutcome::Failed("engine missing".into())
+                } else if id % 3 == 1 {
+                    HistoryOutcome::ReadyLarge {
+                        module_id: "ffmpeg".into(),
+                        byte_len: 8_000_000,
+                    }
+                } else {
+                    HistoryOutcome::Ready(Arc::new(sample_artifact(
+                        id,
+                        format!("# body {id}\n").repeat(64).into_bytes(),
+                    )))
+                };
+                sample_history_entry(id, outcome)
+            })
+            .collect();
+
+        assert_within(
+            Duration::from_secs(2),
+            "history to/from store ×100",
+            || {
+                for _ in 0..100 {
+                    let stored: Vec<_> = entries.iter().map(to_stored_entry).collect();
+                    let loaded = LoadedHistory {
+                        entries: stored,
+                        next_id: MAX_HISTORY_ENTRIES as u64 + 1,
+                    };
+                    let (restored, next_id) = history_from_store(loaded);
+                    black_box((restored.len(), next_id));
+                }
+            },
+        );
+
+        let stored = to_stored_entry(&entries[0]);
+        let back = from_stored_entry(stored).expect("round trip");
+        assert_eq!(back.id, entries[0].id);
+        assert_eq!(back.name.as_ref(), entries[0].name.as_ref());
+    }
+
+    #[test]
+    fn history_from_store_skips_bad_formats_without_quadratic_cost() {
+        let mut entries = Vec::new();
+        for id in 1..=200 {
+            entries.push(StoredHistoryEntry {
+                id,
+                source: StoredSource::File(PathBuf::from(format!("/tmp/{id}.bin"))),
+                name: format!("{id}.bin"),
+                detail: "x".into(),
+                extension_label: "BIN".into(),
+                badge_color: 1,
+                badge_text_color: 2,
+                // Mix valid and invalid so filtering runs.
+                output_format: if id % 5 == 0 {
+                    "not-a-real-format".into()
+                } else {
+                    "markdown".into()
+                },
+                outcome: StoredOutcome::Failed("nope".into()),
+            });
+        }
+        assert_within(Duration::from_secs(1), "history_from_store filter", || {
+            for _ in 0..100 {
+                let loaded = LoadedHistory {
+                    entries: entries.clone(),
+                    next_id: 201,
+                };
+                let (restored, next_id) = history_from_store(loaded);
+                assert_eq!(next_id, 201);
+                black_box(restored.len());
+            }
+        });
+    }
+
+    #[test]
+    fn ready_state_arc_clone_stays_cheap_for_large_artifacts() {
+        // Render clones ConversionState::Ready; Arc keeps that O(1).
+        let large = Arc::new(ConversionArtifact {
+            file_name: "huge.md".into(),
+            media_type: "text/markdown",
+            bytes: vec![b'x'; 2 * 1024 * 1024],
+            format: OutputFormat::MARKDOWN,
+            module_id: "markitdown",
+            pipeline: vec!["markitdown"],
+            invocations: Vec::new(),
+        });
+        let state = ConversionState::Ready(large);
+
+        assert_within(Duration::from_secs(1), "Ready Arc clone×50k", || {
+            for _ in 0..50_000 {
+                black_box(state.clone());
+            }
+        });
+
+        // Cloning must not deep-copy the payload (still one strong count owner + clones).
+        if let ConversionState::Ready(a) = &state {
+            assert_eq!(Arc::strong_count(a), 1);
+            let cloned = state.clone();
+            if let ConversionState::Ready(b) = cloned {
+                assert!(Arc::ptr_eq(a, &b));
+                assert_eq!(Arc::strong_count(a), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn history_outcome_ready_clone_shares_artifact_bytes() {
+        let artifact = Arc::new(sample_artifact(9, vec![b'#'; 256 * 1024]));
+        let entry = sample_history_entry(9, HistoryOutcome::Ready(artifact.clone()));
+        assert_within(Duration::from_secs(1), "history entry clone×20k", || {
+            for _ in 0..20_000 {
+                black_box(entry.clone());
+            }
+        });
+        if let HistoryOutcome::Ready(a) = &entry.outcome {
+            assert_eq!(Arc::strong_count(a), 2); // entry + local
+        }
+    }
+
+    #[test]
+    fn shared_string_preview_fields_construct_quickly() {
+        assert_within(Duration::from_secs(1), "SharedString previews×5k", || {
+            for i in 0..5_000 {
+                let preview = FilePreview {
+                    name: format!("document-{i}.pdf").into(),
+                    subtitle: format!("{:.1} MB  ·  Downloads", (i % 90) as f64 + 0.1).into(),
+                    extension_label: "PDF".into(),
+                    badge_color: BADGE_FILL,
+                    badge_text_color: BADGE_TEXT,
+                };
+                black_box(preview.name.as_ref().len() + preview.subtitle.as_ref().len());
+            }
+        });
+    }
+
+    #[test]
+    fn output_format_chip_labels_cover_full_catalog_fast() {
+        // Format chips iterate OutputFormat::ALL on every selection change.
+        assert_within(
+            Duration::from_secs(1),
+            "format labels×500 catalogs",
+            || {
+                for _ in 0..500 {
+                    for format in OutputFormat::ALL {
+                        black_box(format.id());
+                        black_box(format.label());
+                        black_box(format.extension());
+                        black_box(format.is_text_previewable());
+                    }
+                }
+            },
+        );
+        assert!(!OutputFormat::ALL.is_empty());
+    }
+
+    #[test]
+    fn conversion_state_variants_construct_without_surprise_alloc_spikes() {
+        assert_within(Duration::from_secs(1), "ConversionState×10k", || {
+            for i in 0..10_000 {
+                let state = match i % 4 {
+                    0 => ConversionState::Empty,
+                    1 => ConversionState::Converting,
+                    2 => {
+                        ConversionState::Ready(Arc::new(sample_artifact(i as u64, b"ok".to_vec())))
+                    }
+                    _ => ConversionState::Failed("boom".into()),
+                };
+                black_box(matches!(state, ConversionState::Empty));
+            }
+        });
+    }
+
+    #[test]
+    fn module_drag_and_output_drag_labels_are_cheap() {
+        assert_within(Duration::from_secs(1), "drag structs×10k", || {
+            for i in 0..10_000 {
+                let drag = ModuleDrag::new(i % 5, format!("Module {i}"))
+                    .position(point(px((i % 800) as f32), px((i % 600) as f32)));
+                let out = OutputFileDrag::new(format!("out-{i}.md"), point(px(10.0), px(20.0)));
+                black_box((drag.index, out.label.as_ref().len()));
+            }
+        });
+    }
+
+    #[test]
+    fn panel_width_clamps_respect_min_max_and_center_room() {
+        let window = 1180.0;
+        // Within range: unchanged.
+        assert_eq!(clamp_history_sidebar_width(240.0, window, 470.0), 240.0);
+        assert_eq!(clamp_output_panel_width(470.0, window, 240.0), 470.0);
+
+        // Floor / ceiling (absolute max only when the window still has center room).
+        assert_eq!(
+            clamp_history_sidebar_width(10.0, window, 470.0),
+            HISTORY_SIDEBAR_MIN
+        );
+        assert_eq!(
+            clamp_history_sidebar_width(9999.0, 2000.0, OUTPUT_PANEL_MIN),
+            HISTORY_SIDEBAR_MAX
+        );
+        // Absolute max when the window is wide enough; otherwise window room wins.
+        let room_limited = window - 470.0 - CENTER_PANEL_MIN - PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+        assert_eq!(
+            clamp_history_sidebar_width(9999.0, window, 470.0),
+            HISTORY_SIDEBAR_MAX.min(room_limited)
+        );
+        assert_eq!(
+            clamp_output_panel_width(10.0, window, 240.0),
+            OUTPUT_PANEL_MIN
+        );
+        assert_eq!(
+            clamp_output_panel_width(9999.0, 2000.0, HISTORY_SIDEBAR_MIN),
+            OUTPUT_PANEL_MAX
+        );
+
+        // Narrow window: leave room for the center column.
+        let narrow = 900.0;
+        let peer_output = OUTPUT_PANEL_MIN;
+        let history = clamp_history_sidebar_width(HISTORY_SIDEBAR_MAX, narrow, peer_output);
+        let center_left = narrow - history - peer_output - PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+        assert!(
+            center_left + 0.5 >= CENTER_PANEL_MIN,
+            "history clamp left only {center_left} for center"
+        );
+        let peer_history = HISTORY_SIDEBAR_MIN;
+        let output = clamp_output_panel_width(OUTPUT_PANEL_MAX, narrow, peer_history);
+        let center_right = narrow - peer_history - output - PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+        assert!(
+            center_right + 0.5 >= CENTER_PANEL_MIN,
+            "output clamp left only {center_right} for center"
+        );
+    }
 }

@@ -1979,4 +1979,165 @@ mod tests {
         assert_eq!(parts[2], "••••");
         assert!(!parts.iter().any(|p| p == "s3cret"));
     }
+
+    /// UI hot paths: format chips, previews, and destination naming on selection change.
+    ///
+    /// Budgets are deliberately loose for unoptimized debug test builds; they
+    /// still fail if a helper accidentally shells out or turns quadratic.
+    mod ui_perf {
+        use super::*;
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn assert_within(budget: Duration, label: &str, work: impl FnOnce()) {
+            let start = Instant::now();
+            work();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed <= budget,
+                "{label} took {elapsed:?}, budget {budget:?}"
+            );
+        }
+
+        #[test]
+        fn format_catalog_metadata_for_chips_is_cheap() {
+            // ~500 UI refreshes of the full chip strip.
+            assert_within(Duration::from_secs(1), "OutputFormat::ALL×500", || {
+                for _ in 0..500 {
+                    for format in OutputFormat::ALL {
+                        black_box(format.id());
+                        black_box(format.label());
+                        black_box(format.extension());
+                        black_box(format.media_type());
+                        black_box(format.is_text_previewable());
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn preview_summary_for_text_and_binary_stays_responsive() {
+            let text = ConversionArtifact {
+                file_name: "essay.md".into(),
+                media_type: "text/markdown",
+                bytes: "# Title\n\n".repeat(2_000).into_bytes(),
+                format: OutputFormat::MARKDOWN,
+                module_id: "pandoc",
+                pipeline: vec!["pandoc"],
+                invocations: Vec::new(),
+            };
+            let binary = ConversionArtifact {
+                file_name: "clip.mp4".into(),
+                media_type: "video/mp4",
+                bytes: vec![0u8; 128 * 1024],
+                format: OutputFormat::MP4,
+                module_id: "ffmpeg",
+                pipeline: vec!["ffmpeg"],
+                invocations: Vec::new(),
+            };
+
+            // One preview per conversion result; stress a few hundred restores.
+            assert_within(Duration::from_secs(1), "preview_summary×400", || {
+                for _ in 0..200 {
+                    black_box(text.preview_summary());
+                    black_box(binary.preview_summary());
+                }
+            });
+
+            let text_preview = text.preview_summary();
+            assert!(text_preview.contains("Title") || text_preview.contains("truncated"));
+            let binary_preview = binary.preview_summary();
+            assert!(binary_preview.contains("Not shown inline"));
+        }
+
+        #[test]
+        fn default_output_path_naming_scales_with_batch_size() {
+            let inputs: Vec<_> = (0..200)
+                .map(|i| {
+                    std::path::PathBuf::from(format!("/Users/me/Movies/project/clip_{i:04}.mov"))
+                })
+                .collect();
+
+            // One naming pass per batch item × a few formats.
+            assert_within(Duration::from_secs(1), "default_output_path×800", || {
+                for input in &inputs {
+                    for format in [
+                        OutputFormat::MP3,
+                        OutputFormat::MARKDOWN,
+                        OutputFormat::PNG,
+                        OutputFormat::SRT,
+                    ] {
+                        black_box(default_output_path(input, format));
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn registry_available_outputs_listing_is_stable_cost() {
+            let registry = ConversionRegistry::default();
+            let samples = [
+                "report.docx",
+                "scan.pdf",
+                "page.html",
+                "clip.mp4",
+                "track.wav",
+                "notes.md",
+                "deck.pptx",
+                "photo.png",
+            ];
+            // File-pick path: list chips for a handful of extensions repeatedly.
+            assert_within(Duration::from_secs(2), "available_outputs×80", || {
+                for _ in 0..10 {
+                    for name in samples {
+                        black_box(registry.available_outputs(Path::new(name)));
+                    }
+                }
+            });
+            assert_within(Duration::from_secs(1), "available_url_outputs×200", || {
+                for _ in 0..200 {
+                    black_box(registry.available_url_outputs());
+                }
+            });
+        }
+
+        #[test]
+        fn suggested_output_helpers_keep_up_with_ingest() {
+            let paths = [
+                "a.docx", "b.pdf", "c.mp4", "d.html", "e.wav", "f.pptx", "g.md", "h.png", "i.mkv",
+                "j.epub",
+            ];
+            assert_within(Duration::from_secs(1), "suggested_output×2k", || {
+                for _ in 0..200 {
+                    for name in paths {
+                        black_box(suggested_output_for_path(Path::new(name)));
+                    }
+                    black_box(suggested_output_for_url());
+                }
+            });
+        }
+
+        #[test]
+        fn format_byte_size_and_argv_display_for_status_lines() {
+            assert_within(Duration::from_secs(1), "format_byte_size×20k", || {
+                for i in 0..20_000u64 {
+                    black_box(format_byte_size(i.wrapping_mul(997)));
+                }
+            });
+            let argv = [
+                "ffmpeg",
+                "-i",
+                "/tmp/in.mp4",
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "/tmp/out.mp3",
+            ];
+            assert_within(Duration::from_secs(1), "format_argv_display×5k", || {
+                for _ in 0..5_000 {
+                    black_box(format_argv_display(&argv));
+                }
+            });
+        }
+    }
 }

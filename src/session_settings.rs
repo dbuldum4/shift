@@ -13,6 +13,25 @@ use std::path::{Path, PathBuf};
 const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE_NAME: &str = "session-settings.json";
 
+/// Default history sidebar width in logical pixels (matches app constant).
+pub const DEFAULT_HISTORY_SIDEBAR_WIDTH: f32 = 240.0;
+/// Default output panel width in logical pixels (≈ half of remaining space at launch).
+pub const DEFAULT_OUTPUT_PANEL_WIDTH: f32 = 470.0;
+/// Default UI font family (historical fixed Menlo monospaced look).
+pub const DEFAULT_UI_FONT_FAMILY: &str = "Menlo";
+
+fn default_history_sidebar_width() -> f32 {
+    DEFAULT_HISTORY_SIDEBAR_WIDTH
+}
+
+fn default_output_panel_width() -> f32 {
+    DEFAULT_OUTPUT_PANEL_WIDTH
+}
+
+fn default_ui_font_family() -> String {
+    DEFAULT_UI_FONT_FAMILY.to_owned()
+}
+
 /// Durable UI/CLI session knobs. Passwords are never stored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSettings {
@@ -20,6 +39,15 @@ pub struct SessionSettings {
     pub output_format: String,
     pub batch_output_dir: Option<PathBuf>,
     pub batch_force: bool,
+    /// History sidebar width in logical pixels (main window layout).
+    #[serde(default = "default_history_sidebar_width")]
+    pub history_sidebar_width: f32,
+    /// Output panel width in logical pixels (main window layout).
+    #[serde(default = "default_output_panel_width")]
+    pub output_panel_width: f32,
+    /// UI font family name applied to the native app chrome.
+    #[serde(default = "default_ui_font_family")]
+    pub ui_font_family: String,
     pub options: SessionConversionOptions,
 }
 
@@ -30,6 +58,9 @@ impl Default for SessionSettings {
             output_format: OutputFormat::MARKDOWN.id().to_owned(),
             batch_output_dir: None,
             batch_force: false,
+            history_sidebar_width: DEFAULT_HISTORY_SIDEBAR_WIDTH,
+            output_panel_width: DEFAULT_OUTPUT_PANEL_WIDTH,
+            ui_font_family: DEFAULT_UI_FONT_FAMILY.to_owned(),
             options: SessionConversionOptions::default(),
         }
     }
@@ -42,6 +73,16 @@ impl SessionSettings {
 
     pub fn set_output_format(&mut self, format: OutputFormat) {
         self.output_format = format.id().to_owned();
+    }
+
+    /// Normalize empty/whitespace font values back to the default.
+    pub fn resolved_ui_font_family(&self) -> &str {
+        let trimmed = self.ui_font_family.trim();
+        if trimmed.is_empty() {
+            DEFAULT_UI_FONT_FAMILY
+        } else {
+            trimmed
+        }
     }
 
     pub fn to_conversion_options(&self) -> ConversionOptions {
@@ -179,6 +220,9 @@ pub struct SessionPandocOptions {
     pub standalone: bool,
     pub toc: bool,
     pub reference_doc: Option<PathBuf>,
+    /// Opt-in Pandoc `@cite` parsing (off by default; see [`PandocOptions::citations`]).
+    #[serde(default)]
+    pub citations: bool,
 }
 
 impl From<&PandocOptions> for SessionPandocOptions {
@@ -188,6 +232,7 @@ impl From<&PandocOptions> for SessionPandocOptions {
             standalone: value.standalone,
             toc: value.toc,
             reference_doc: value.reference_doc.clone(),
+            citations: value.citations,
         }
     }
 }
@@ -199,6 +244,7 @@ impl SessionPandocOptions {
             standalone: self.standalone,
             toc: self.toc,
             reference_doc: self.reference_doc.clone(),
+            citations: self.citations,
         }
     }
 }
@@ -391,6 +437,9 @@ mod tests {
         assert_eq!(loaded.output_format(), OutputFormat::HTML);
         assert!(loaded.batch_force);
         assert_eq!(loaded.batch_output_dir, Some(PathBuf::from("/tmp/out")));
+        assert_eq!(loaded.history_sidebar_width, DEFAULT_HISTORY_SIDEBAR_WIDTH);
+        assert_eq!(loaded.output_panel_width, DEFAULT_OUTPUT_PANEL_WIDTH);
+        assert_eq!(loaded.ui_font_family, DEFAULT_UI_FONT_FAMILY);
         assert_eq!(loaded.options.docling.ocr_lang.as_deref(), Some("eng"));
         assert_eq!(loaded.options.pdf.page_from, Some(2));
         assert!(loaded.options.ffmpeg.mute);
@@ -423,5 +472,82 @@ mod tests {
         let settings = load_session_settings(dir.join("nope.json"));
         assert_eq!(settings, SessionSettings::default());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn panel_widths_round_trip_and_legacy_json_gets_defaults() {
+        let dir = unique_dir("panel-widths");
+        let path = dir.join("session-settings.json");
+
+        let settings = SessionSettings {
+            history_sidebar_width: 300.0,
+            output_panel_width: 520.0,
+            ui_font_family: "SF Mono".into(),
+            ..Default::default()
+        };
+        save_session_settings(&path, &settings).unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded.history_sidebar_width, 300.0);
+        assert_eq!(loaded.output_panel_width, 520.0);
+        assert_eq!(loaded.ui_font_family, "SF Mono");
+        assert_eq!(loaded.resolved_ui_font_family(), "SF Mono");
+
+        // Older files without the new fields still load with defaults.
+        let mut legacy = serde_json::to_value(SessionSettings::default()).expect("serialize");
+        let obj = legacy.as_object_mut().expect("object");
+        obj.remove("history_sidebar_width");
+        obj.remove("output_panel_width");
+        obj.remove("ui_font_family");
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).expect("json")).unwrap();
+        let migrated = load_session_settings(&path);
+        assert_eq!(
+            migrated.history_sidebar_width,
+            DEFAULT_HISTORY_SIDEBAR_WIDTH
+        );
+        assert_eq!(migrated.output_panel_width, DEFAULT_OUTPUT_PANEL_WIDTH);
+        assert_eq!(migrated.ui_font_family, DEFAULT_UI_FONT_FAMILY);
+
+        let blank = SessionSettings {
+            ui_font_family: "   ".into(),
+            ..Default::default()
+        };
+        assert_eq!(blank.resolved_ui_font_family(), DEFAULT_UI_FONT_FAMILY);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Session knobs are re-serialized when UI options change; keep that path cheap.
+    #[test]
+    fn serialize_deserialize_session_settings_stays_within_budget() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let mut settings = SessionSettings::default();
+        settings.set_output_format(OutputFormat::MP3);
+        settings.batch_force = true;
+        settings.batch_output_dir = Some(PathBuf::from("/Users/me/Exports/shift-out"));
+        settings.options.ffmpeg.mute = true;
+        settings.options.ffmpeg.mono = true;
+        settings.options.docling.ocr = true;
+        settings.options.docling.ocr_lang = Some("eng+deu".into());
+        settings.options.defuddle.frontmatter = true;
+        settings.options.pandoc.toc = true;
+        settings.options.pandoc.reference_doc = Some(PathBuf::from("/Users/me/Templates/ref.docx"));
+        settings.options.markitdown.keep_data_uris = true;
+        settings.options.pdf.page_from = Some(1);
+        settings.options.pdf.page_to = Some(40);
+
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            let json = serde_json::to_vec(&settings).expect("serialize");
+            let back: SessionSettings = serde_json::from_slice(&json).expect("deserialize");
+            black_box(back.output_format());
+            black_box(settings.to_conversion_options());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_secs(2),
+            "session settings serde×1k took {elapsed:?}"
+        );
     }
 }

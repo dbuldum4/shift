@@ -390,6 +390,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
             "--keep-data-uris" => parsed.markitdown.keep_data_uris = true,
             "--standalone" => parsed.pandoc.standalone = true,
             "--toc" => parsed.pandoc.toc = true,
+            "--citations" => parsed.pandoc.citations = true,
             "--pdf-engine" => {
                 cursor += 1;
                 parsed.pandoc.pdf_engine = Some(
@@ -972,6 +973,7 @@ fn print_help() {
          Pandoc options:\n  \
          --standalone            Produce a standalone document (-s)\n  \
          --toc                   Include a table of contents\n  \
+         --citations             Parse @cite keys in Markdown (off by default)\n  \
          --pdf-engine <NAME>     PDF engine override (else SHIFT_PDF_ENGINE / auto)\n  \
          --reference-doc <PATH>  Style reference for docx/odt writers\n\n\
          Defuddle options:\n  \
@@ -1542,6 +1544,7 @@ mod tests {
             "2-5",
             "--reference-doc",
             "/refs/style.docx",
+            "--citations",
             "--verbose",
             "--progress",
             "--recursive",
@@ -1555,6 +1558,7 @@ mod tests {
             parsed.pandoc.reference_doc.as_deref(),
             Some(Path::new("/refs/style.docx"))
         );
+        assert!(parsed.pandoc.citations);
         assert!(parsed.verbose);
         assert!(parsed.progress);
         assert!(parsed.recursive);
