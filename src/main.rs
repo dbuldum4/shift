@@ -25,8 +25,9 @@ use shift_core::conversion::{
     url_display_host,
 };
 use shift_core::history::{
-    LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_ENTRIES, StoredHistoryEntry,
-    StoredOutcome, StoredSource, clear_history_store, intern_module_id, load_history, save_history,
+    LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
+    StoredHistoryEntry, StoredOutcome, StoredSource, clear_history_store, intern_module_id,
+    load_history, save_history,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
@@ -215,6 +216,7 @@ struct ConversionHistoryEntry {
     badge_text_color: u32,
     output_format: OutputFormat,
     outcome: HistoryOutcome,
+    archived: bool,
 }
 
 #[derive(Clone)]
@@ -897,11 +899,22 @@ fn batch_queue_panel(
 
 fn history_sidebar(
     history: &[ConversionHistoryEntry],
+    history_search: Entity<TextInput>,
+    show_archived: bool,
     active_history_id: Option<u64>,
     width: f32,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
-    let is_empty = history.is_empty();
+    let search = history_search.read(cx).content().to_lowercase();
+    let visible: Vec<_> = history
+        .iter()
+        .filter(|entry| {
+            (show_archived || !entry.archived)
+                && (search.is_empty() || history_matches_search(entry, &search))
+        })
+        .cloned()
+        .collect();
+    let is_empty = visible.is_empty();
 
     div()
         .id("history-sidebar")
@@ -914,38 +927,59 @@ fn history_sidebar(
         .child(
             div()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .gap_2()
                 .px_4()
                 .pt(px(28.0))
                 .pb_3()
                 .child(
                     div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child("History"),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child("History"),
+                        )
+                        .when(!is_empty, |header| {
+                            header.child(
+                                div()
+                                    .id("clear-history")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_SECONDARY))
+                                    })
+                                    .child("Clear")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear_history(cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        }),
                 )
-                .when(!is_empty, |header| {
-                    header.child(
+                .child(
+                    div().flex().items_center().gap_2().child(
                         div()
-                            .id("clear-history")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
-                            .cursor_pointer()
-                            .hover(|style| {
-                                style.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_SECONDARY))
-                            })
-                            .child("Clear")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear_history(cx);
-                                cx.stop_propagation();
-                            })),
-                    )
-                }),
+                            .flex_1()
+                            .min_w_0()
+                            .rounded_lg()
+                            .bg(rgb(BG_SURFACE))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_sm()
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .overflow_hidden()
+                            .child(history_search),
+                    ),
+                ),
         )
         .child(
             div()
@@ -983,7 +1017,7 @@ fn history_sidebar(
                             ),
                     )
                 })
-                .children(history.iter().cloned().map(|entry| {
+                .children(visible.iter().cloned().map(|entry| {
                     let id = entry.id;
                     let active = active_history_id == Some(id);
                     let failed = matches!(entry.outcome, HistoryOutcome::Failed(_));
@@ -991,11 +1025,12 @@ fn history_sidebar(
                     let output_badge_label: SharedString =
                         output_format_badge_label(output_format).into();
                     let detail = history_entry_detail(&entry);
+                    let archive_label = if entry.archived {
+                        "Unarchive"
+                    } else {
+                        "Archive"
+                    };
 
-                    // Do not use text_ellipsis/line_clamp here: GPUI’s Truncate
-                    // path has been measuring ~1 line-height of width (~3ch), so
-                    // "PLAN.md" / "via Pandoc" render as "PLA" / "via". Show the
-                    // full strings; the list scrolls if content grows.
                     div()
                         .id(("history-entry", id))
                         .flex()
@@ -1046,12 +1081,61 @@ fn history_sidebar(
                                         .child(ellipsize_chars(detail.as_ref(), 56)),
                                 ),
                         )
+                        .when(active, |row| {
+                            row.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .px_1()
+                                    .child(
+                                        div()
+                                            .id(("history-archive", id))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
+                                            .child(archive_label)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.archive_history_entry(id, cx);
+                                                cx.stop_propagation();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("history-delete", id))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
+                                            .child("Delete")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_history_entry(id, cx);
+                                                cx.stop_propagation();
+                                            })),
+                                    ),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.restore_history_entry(id, cx);
                             cx.stop_propagation();
                         }))
                 })),
         )
+}
+
+fn history_matches_search(entry: &ConversionHistoryEntry, query: &str) -> bool {
+    entry.name.to_lowercase().contains(query)
+        || entry.detail.to_lowercase().contains(query)
+        || entry.extension_label.to_lowercase().contains(query)
+        || history_output_format(entry)
+            .label()
+            .to_lowercase()
+            .contains(query)
+        || match &entry.source {
+            HistorySource::File(path) => path.to_string_lossy().to_lowercase().contains(query),
+            HistorySource::Url(url) => url.to_lowercase().contains(query),
+        }
 }
 
 /// Vertical drag handle between main columns (history | source | output).
@@ -3125,6 +3209,7 @@ fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEntry {
         badge_text_color: entry.badge_text_color,
         output_format: entry.output_format.id().to_owned(),
         outcome,
+        archived: entry.archived,
     }
 }
 
@@ -3171,6 +3256,7 @@ fn from_stored_entry(entry: StoredHistoryEntry) -> Option<ConversionHistoryEntry
         badge_text_color: entry.badge_text_color,
         output_format,
         outcome,
+        archived: entry.archived,
     })
 }
 
@@ -3470,6 +3556,9 @@ fn settings_converters_panel(
 fn settings_general_panel(
     output_format: OutputFormat,
     history_count: usize,
+    history_limit: usize,
+    history_limit_input: Entity<TextInput>,
+    show_archived: bool,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement + use<> {
     div()
@@ -3548,9 +3637,57 @@ fn settings_general_panel(
                 .gap_3()
                 .w_full()
                 .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(format!(
-                    "{history_count} entr{} retained (max {MAX_HISTORY_ENTRIES}).",
+                    "{history_count} entr{} retained (limit {history_limit}).",
                     if history_count == 1 { "y" } else { "ies" }
                 )))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child("Keep up to:"),
+                        )
+                        .child(
+                            div()
+                                .w(px(80.0))
+                                .min_w_0()
+                                .rounded_lg()
+                                .bg(rgb(BG_SURFACE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_sm()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .overflow_hidden()
+                                .child(history_limit_input),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child("entries"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(chip(
+                            "show-archived",
+                            "Show archived",
+                            show_archived,
+                            cx,
+                            |this, cx| {
+                                this.show_archived = !this.show_archived;
+                                this.persist_session_settings(cx);
+                                cx.notify();
+                            },
+                        )),
+                )
                 .child(
                     div()
                         .id("settings-clear-history")
@@ -4482,6 +4619,9 @@ struct SettingsView {
     preference_error: Option<SharedString>,
     output_format: OutputFormat,
     history_count: usize,
+    history_limit: usize,
+    history_limit_input: Entity<TextInput>,
+    show_archived: bool,
     ui_font_family: String,
     quality: FfmpegQuality,
     encode_mode: FfmpegEncodeMode,
@@ -4506,6 +4646,9 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         preference_error,
         output_format,
         history_count,
+        history_limit,
+        history_limit_input,
+        show_archived,
         ui_font_family,
         quality,
         encode_mode,
@@ -4550,10 +4693,15 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                         cx,
                     )
                     .into_any_element(),
-                    SettingsSection::General => {
-                        settings_general_panel(*output_format, *history_count, cx)
-                            .into_any_element()
-                    }
+                    SettingsSection::General => settings_general_panel(
+                        *output_format,
+                        *history_count,
+                        *history_limit,
+                        history_limit_input.clone(),
+                        *show_archived,
+                        cx,
+                    )
+                    .into_any_element(),
                     SettingsSection::Theme => {
                         settings_theme_panel(ui_font_family, cx).into_any_element()
                     }
@@ -4749,6 +4897,10 @@ struct Shift {
     history: Vec<ConversionHistoryEntry>,
     next_history_id: u64,
     active_history_id: Option<u64>,
+    history_search: Entity<TextInput>,
+    history_limit_input: Entity<TextInput>,
+    history_limit: usize,
+    show_archived: bool,
     /// History sidebar width (logical pixels); resizable via left divider.
     history_sidebar_width: f32,
     /// Output panel width (logical pixels); resizable via right divider.
@@ -4928,6 +5080,9 @@ impl Shift {
             )
         });
         let pdf_password_input = cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+        let history_search = cx.new(|cx| TextInput::new(cx, "Search history…", ""));
+        let history_limit_input =
+            cx.new(|cx| TextInput::new(cx, "30", session.history_limit.to_string()));
         let (history, next_history_id) = history_from_store(load_history());
         let mut batch_queue = BatchQueue::new();
         if let Some(dir) = session.batch_output_dir.as_ref() {
@@ -4970,6 +5125,10 @@ impl Shift {
             history,
             next_history_id,
             active_history_id: None,
+            history_search,
+            history_limit_input,
+            history_limit: session.history_limit,
+            show_archived: session.show_archived,
             history_sidebar_width,
             output_panel_width,
             panel_resize: None,
@@ -5962,6 +6121,8 @@ impl Shift {
         settings.history_sidebar_width = self.history_sidebar_width;
         settings.output_panel_width = self.output_panel_width;
         settings.ui_font_family = self.ui_font_family.clone();
+        settings.history_limit = self.history_limit;
+        settings.show_archived = self.show_archived;
         if let Ok(options) = self.build_conversion_options(cx) {
             settings.apply_conversion_options(&options);
         }
@@ -6577,10 +6738,11 @@ impl Shift {
             badge_text_color: preview.badge_text_color,
             output_format: self.output_format,
             outcome,
+            archived: false,
         };
         entry.detail = history_entry_stored_detail(&entry).into();
         self.history.insert(0, entry);
-        self.history.truncate(MAX_HISTORY_ENTRIES);
+        self.history.truncate(self.history_limit);
         self.active_history_id = Some(id);
         self.persist_history();
     }
@@ -6662,6 +6824,40 @@ impl Shift {
         self.history.clear();
         self.active_history_id = None;
         let _ = clear_history_store();
+        cx.notify();
+    }
+
+    fn set_history_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
+        let limit = limit.clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
+        if self.history_limit == limit {
+            return;
+        }
+        self.history_limit = limit;
+        self.history.truncate(self.history_limit);
+        self.history_limit_input.update(cx, |input, cx| {
+            input.set_content(limit.to_string(), cx);
+        });
+        self.persist_session_settings(cx);
+        cx.notify();
+    }
+
+    fn archive_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(entry) = self.history.iter_mut().find(|entry| entry.id == id) {
+            entry.archived = !entry.archived;
+            if entry.archived && !self.show_archived && self.active_history_id == Some(id) {
+                self.active_history_id = None;
+            }
+            self.persist_history();
+            cx.notify();
+        }
+    }
+
+    fn delete_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.history.retain(|entry| entry.id != id);
+        if self.active_history_id == Some(id) {
+            self.active_history_id = None;
+        }
+        self.persist_history();
         cx.notify();
     }
 
@@ -6783,6 +6979,10 @@ impl Render for Shift {
         let history_count = history.len();
         let active_history_id = self.active_history_id;
         let history_sidebar_width = self.history_sidebar_width;
+        let history_search = self.history_search.clone();
+        let history_limit_input = self.history_limit_input.clone();
+        let history_limit = self.history_limit;
+        let show_archived = self.show_archived;
         let output_panel_width = self.output_panel_width;
         let resizing_history = matches!(
             self.panel_resize,
@@ -6868,6 +7068,8 @@ impl Render for Shift {
             }))
             .child(history_sidebar(
                 &history,
+                history_search,
+                show_archived,
                 active_history_id,
                 history_sidebar_width,
                 cx,
@@ -7195,6 +7397,9 @@ impl Render for Shift {
                         preference_error,
                         output_format,
                         history_count,
+                        history_limit,
+                        history_limit_input,
+                        show_archived,
                         ui_font_family,
                         quality: ffmpeg_quality,
                         encode_mode: ffmpeg_encode_mode,
@@ -7263,6 +7468,23 @@ fn main() {
                 // Route Enter / magic paste from the input bar back to the app entity.
                 let parent = shift_entity.downgrade();
                 let url_input = shift_entity.read(cx).url_input.clone();
+                let history_limit_input = shift_entity.read(cx).history_limit_input.clone();
+
+                history_limit_input.update(cx, |input, _cx| {
+                    let parent_limit = parent.clone();
+                    input.set_on_submit(move |text, cx| {
+                        let parent = parent_limit.clone();
+                        let text = text.to_owned();
+                        cx.defer(move |cx| {
+                            let _ = parent.update(cx, |this, cx| {
+                                if let Ok(limit) = text.trim().parse::<usize>() {
+                                    this.set_history_limit(limit, cx);
+                                }
+                            });
+                        });
+                    });
+                });
+
                 url_input.update(cx, |input, _cx| {
                     let parent_submit = parent.clone();
                     input.set_on_submit(move |text, cx| {
@@ -7325,6 +7547,7 @@ mod ui_perf {
     //! update, and options parse — and would freeze the UI if they regress.
 
     use super::*;
+    use shift_core::history::MAX_HISTORY_ENTRIES;
     use std::hint::black_box;
     use std::time::{Duration, Instant};
 
@@ -7365,6 +7588,7 @@ mod ui_perf {
             badge_text_color: BADGE_TEXT,
             output_format: OutputFormat::MARKDOWN,
             outcome,
+            archived: false,
         }
     }
 
@@ -7745,6 +7969,7 @@ mod ui_perf {
                     "markdown".into()
                 },
                 outcome: StoredOutcome::Failed("nope".into()),
+                archived: false,
             });
         }
         assert_within(Duration::from_secs(1), "history_from_store filter", || {

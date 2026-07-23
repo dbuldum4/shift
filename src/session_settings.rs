@@ -5,6 +5,7 @@ use crate::conversion::{
     FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions,
     PdfInputOptions,
 };
+use crate::history::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -32,6 +33,14 @@ fn default_ui_font_family() -> String {
     DEFAULT_UI_FONT_FAMILY.to_owned()
 }
 
+fn default_history_limit() -> usize {
+    DEFAULT_HISTORY_LIMIT
+}
+
+fn default_show_archived() -> bool {
+    false
+}
+
 /// Durable UI/CLI session knobs. Passwords are never stored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSettings {
@@ -48,6 +57,12 @@ pub struct SessionSettings {
     /// UI font family name applied to the native app chrome.
     #[serde(default = "default_ui_font_family")]
     pub ui_font_family: String,
+    /// Maximum number of conversion history entries to keep.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+    /// Show archived entries in the history sidebar.
+    #[serde(default = "default_show_archived")]
+    pub show_archived: bool,
     pub options: SessionConversionOptions,
 }
 
@@ -61,6 +76,8 @@ impl Default for SessionSettings {
             history_sidebar_width: DEFAULT_HISTORY_SIDEBAR_WIDTH,
             output_panel_width: DEFAULT_OUTPUT_PANEL_WIDTH,
             ui_font_family: DEFAULT_UI_FONT_FAMILY.to_owned(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
+            show_archived: false,
             options: SessionConversionOptions::default(),
         }
     }
@@ -356,6 +373,9 @@ pub fn load_session_settings(path: impl AsRef<Path>) -> SessionSettings {
             if settings.version == 0 {
                 settings.version = SETTINGS_VERSION;
             }
+            settings.history_limit = settings
+                .history_limit
+                .clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
             // Future migrations can branch on version here.
             settings
         }

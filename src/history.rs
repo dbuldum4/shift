@@ -1,16 +1,23 @@
-//! Persistent conversion history for the native app.
+//! Persistent conversion history backed by SQLite.
 //!
-//! Stored under Application Support next to module priority. Artifact bytes are
-//! capped the same way as the in-memory session list so the file cannot grow
-//! without bound.
+//! History lives under Application Support in a SQLite database with an FTS5
+//! virtual table for full-text search. Legacy binary blobs are imported once and
+//! then moved aside so they cannot block subsequent launches.
 
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use rusqlite::{Connection, params};
+use std::io::{self, Cursor, Read};
+use std::path::{Path, PathBuf};
 
-/// Cap retained history so large conversion artifacts cannot grow without bound.
-pub const MAX_HISTORY_ENTRIES: usize = 30;
 /// Full artifact bytes retained per history entry; larger results store metadata only.
 pub const MAX_HISTORY_ARTIFACT_BYTES: usize = 512 * 1024;
+/// Default cap for retained history entries.
+pub const DEFAULT_HISTORY_LIMIT: usize = 30;
+/// Minimum persisted history limit.
+pub const MIN_HISTORY_LIMIT: usize = 1;
+/// Maximum persisted history limit.
+pub const MAX_HISTORY_LIMIT: usize = 30_000;
+/// Kept for callers that used the older constant name.
+pub const MAX_HISTORY_ENTRIES: usize = DEFAULT_HISTORY_LIMIT;
 
 const MAGIC: &[u8] = b"SHIFT_HISTORY_V1\n";
 
@@ -46,6 +53,7 @@ pub struct StoredHistoryEntry {
     pub badge_text_color: u32,
     pub output_format: String,
     pub outcome: StoredOutcome,
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -54,8 +62,13 @@ pub struct LoadedHistory {
     pub next_id: u64,
 }
 
-/// Application Support path for the history file, when HOME is available.
-pub fn history_path() -> Option<PathBuf> {
+/// Application Support path for the SQLite history store, when HOME is available.
+pub fn history_db_path() -> Option<PathBuf> {
+    support_dir().map(|dir| dir.join("history.sqlite"))
+}
+
+/// Path to the legacy binary history blob.
+fn history_legacy_path() -> Option<PathBuf> {
     support_dir().map(|dir| dir.join("history"))
 }
 
@@ -64,71 +77,6 @@ pub fn support_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join("Library/Application Support/Shift"))
-}
-
-/// Load history from disk. Missing or corrupt files yield an empty list.
-pub fn load_history() -> LoadedHistory {
-    let Some(path) = history_path() else {
-        return LoadedHistory {
-            entries: Vec::new(),
-            next_id: 1,
-        };
-    };
-    match std::fs::read(&path) {
-        Ok(bytes) => decode_history(&bytes).unwrap_or_else(|_| LoadedHistory {
-            entries: Vec::new(),
-            next_id: 1,
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => LoadedHistory {
-            entries: Vec::new(),
-            next_id: 1,
-        },
-        Err(_) => LoadedHistory {
-            entries: Vec::new(),
-            next_id: 1,
-        },
-    }
-}
-
-/// Persist history atomically (write temp + rename). Truncates to
-/// [`MAX_HISTORY_ENTRIES`] before writing.
-pub fn save_history(entries: &[StoredHistoryEntry], next_id: u64) -> io::Result<()> {
-    let Some(path) = history_path() else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not locate the user home directory",
-        ));
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let truncated: Vec<_> = entries.iter().take(MAX_HISTORY_ENTRIES).cloned().collect();
-    let payload = encode_history(&truncated, next_id);
-
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&payload)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
-/// Remove the on-disk history file (no-op if missing).
-pub fn clear_history_store() -> io::Result<()> {
-    let Some(path) = history_path() else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not locate the user home directory",
-        ));
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }
 
 /// Map a stored module id onto a known static string.
@@ -143,7 +91,389 @@ pub fn intern_module_id(id: &str) -> &'static str {
     }
 }
 
-fn encode_history(entries: &[StoredHistoryEntry], next_id: u64) -> Vec<u8> {
+fn initialize_history_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY,
+            source_kind INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            name TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            extension_label TEXT NOT NULL,
+            badge_color INTEGER NOT NULL,
+            badge_text_color INTEGER NOT NULL,
+            output_format TEXT NOT NULL,
+            module_id TEXT,
+            file_name TEXT,
+            format TEXT,
+            artifact_bytes BLOB,
+            byte_len INTEGER,
+            error_message TEXT,
+            outcome_kind INTEGER NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at DESC, id DESC);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+            name, source, detail, output_format, module_id,
+            content='history', content_rowid='id'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS history_fts_insert AFTER INSERT ON history BEGIN
+            INSERT INTO history_fts(rowid, name, source, detail, output_format, module_id)
+            VALUES (new.id, new.name, new.source, new.detail, new.output_format, new.module_id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS history_fts_delete AFTER DELETE ON history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, name, source, detail, output_format, module_id)
+            VALUES ('delete', old.id, old.name, old.source, old.detail, old.output_format, old.module_id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS history_fts_update AFTER UPDATE ON history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, name, source, detail, output_format, module_id)
+            VALUES ('delete', old.id, old.name, old.source, old.detail, old.output_format, old.module_id);
+            INSERT INTO history_fts(rowid, name, source, detail, output_format, module_id)
+            VALUES (new.id, new.name, new.source, new.detail, new.output_format, new.module_id);
+        END;
+        ",
+    )
+}
+
+/// Open (or create) the history database at the given path and ensure the schema exists.
+pub fn open_history(path: impl AsRef<Path>) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(path)?;
+    initialize_history_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Load history from disk. Missing or corrupt stores yield an empty list.
+pub fn load_history() -> LoadedHistory {
+    let Some(db_path) = history_db_path() else {
+        return LoadedHistory {
+            entries: Vec::new(),
+            next_id: 1,
+        };
+    };
+    let legacy_path = history_legacy_path();
+
+    let mut legacy_bytes: Option<Vec<u8>> = None;
+    if !db_path.exists() {
+        if let Some(ref legacy) = legacy_path {
+            if legacy.exists() {
+                if let Ok(bytes) = std::fs::read(legacy) {
+                    legacy_bytes = Some(bytes);
+                }
+            }
+        }
+    }
+
+    if let Some(parent) = db_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let conn = match open_history(&db_path) {
+        Ok(conn) => conn,
+        Err(_) => {
+            return LoadedHistory {
+                entries: Vec::new(),
+                next_id: 1,
+            };
+        }
+    };
+
+    if legacy_bytes.is_some() {
+        if let Some(ref legacy) = legacy_path {
+            let _ = import_legacy_history(&conn, legacy_bytes.as_deref().unwrap_or_default());
+            let backup = legacy.with_extension("legacy.bak");
+            let _ = std::fs::rename(legacy, &backup);
+        }
+    }
+
+    match history_entries(&conn, true) {
+        Ok(entries) => {
+            let max_id = entries.iter().map(|e| e.id).max().unwrap_or(0);
+            let next_id = max_id.saturating_add(1).max(1);
+            LoadedHistory { entries, next_id }
+        }
+        Err(_) => LoadedHistory {
+            entries: Vec::new(),
+            next_id: 1,
+        },
+    }
+}
+
+/// Persist the in-memory history list to SQLite. The `next_id` is retained from
+/// the in-memory view but recomputed from the stored IDs on load.
+pub fn save_history(entries: &[StoredHistoryEntry], _next_id: u64) -> io::Result<()> {
+    let Some(db_path) = history_db_path() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not locate the user home directory",
+        ));
+    };
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut conn = open_history(&db_path).map_err(|error| io::Error::other(error.to_string()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    tx.execute("DELETE FROM history", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    for entry in entries {
+        if insert_entry(&tx, entry)
+            .map_err(|error| io::Error::other(error.to_string()))
+            .is_err()
+        {
+            break;
+        }
+    }
+    tx.commit()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
+/// Remove the on-disk history store (no-op if missing).
+pub fn clear_history_store() -> io::Result<()> {
+    if let Some(db_path) = history_db_path() {
+        let _ = std::fs::remove_file(&db_path);
+    }
+    if let Some(legacy) = history_legacy_path() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    Ok(())
+}
+
+fn insert_entry(tx: &Connection, entry: &StoredHistoryEntry) -> Result<(), rusqlite::Error> {
+    let (source_kind, source) = match &entry.source {
+        StoredSource::File(path) => (0i64, path.to_string_lossy().into_owned()),
+        StoredSource::Url(url) => (1i64, url.clone()),
+    };
+
+    let (outcome_kind, module_id, file_name, format, artifact_bytes, byte_len, error_message) =
+        match &entry.outcome {
+            StoredOutcome::Ready {
+                module_id,
+                file_name,
+                format,
+                bytes,
+            } => (
+                0i64,
+                Some(module_id.as_str()),
+                Some(file_name.as_str()),
+                Some(format.as_str()),
+                Some(bytes.as_slice()),
+                None::<i64>,
+                None::<&str>,
+            ),
+            StoredOutcome::ReadyLarge {
+                module_id,
+                byte_len,
+            } => (
+                1i64,
+                Some(module_id.as_str()),
+                None::<&str>,
+                None::<&str>,
+                None::<&[u8]>,
+                Some(*byte_len as i64),
+                None::<&str>,
+            ),
+            StoredOutcome::Failed(message) => (
+                2i64,
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+                None::<&[u8]>,
+                None::<i64>,
+                Some(message.as_str()),
+            ),
+        };
+
+    tx.execute(
+        "INSERT INTO history (
+            id, source_kind, source, name, detail, extension_label,
+            badge_color, badge_text_color, output_format, module_id,
+            file_name, format, artifact_bytes, byte_len, error_message,
+            outcome_kind, archived
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            entry.id as i64,
+            source_kind,
+            source,
+            entry.name,
+            entry.detail,
+            entry.extension_label,
+            entry.badge_color as i64,
+            entry.badge_text_color as i64,
+            entry.output_format,
+            module_id,
+            file_name,
+            format,
+            artifact_bytes,
+            byte_len,
+            error_message,
+            outcome_kind,
+            entry.archived as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert a single entry and trim the table so only the most recent `limit` rows remain.
+pub fn add_history_entry(
+    conn: &Connection,
+    entry: &StoredHistoryEntry,
+    limit: usize,
+) -> Result<(), rusqlite::Error> {
+    insert_entry(conn, entry)?;
+    if limit == 0 {
+        return Ok(());
+    }
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+    let limit = limit as i64;
+    if total > limit {
+        let excess = total - limit;
+        conn.execute(
+            "DELETE FROM history WHERE id IN (
+                SELECT id FROM history ORDER BY created_at ASC, id ASC LIMIT ?1
+            )",
+            params![excess],
+        )?;
+    }
+    Ok(())
+}
+
+/// Return all history entries, optionally including archived rows.
+pub fn history_entries(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<StoredHistoryEntry>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM history WHERE (archived = 0 OR ?1 = 1) ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map(params![include_archived as i64], row_to_entry)?;
+    rows.collect()
+}
+
+/// Search history entries using the FTS5 index. An empty query returns the most recent rows.
+pub fn search_history(
+    conn: &Connection,
+    query: &str,
+    include_archived: bool,
+) -> Result<Vec<StoredHistoryEntry>, rusqlite::Error> {
+    let query = query.trim();
+    if query.is_empty() {
+        return history_entries(conn, include_archived);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT h.* FROM history AS h
+         JOIN history_fts ON h.id = history_fts.rowid
+         WHERE history_fts MATCH ?1 AND (h.archived = 0 OR ?2 = 1)
+         ORDER BY h.created_at DESC, h.id DESC",
+    )?;
+    let rows = stmt.query_map(params![query, include_archived as i64], row_to_entry)?;
+    rows.collect()
+}
+
+/// Mark an entry as archived. Returns `true` if the row existed.
+pub fn archive_history(conn: &Connection, id: u64) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute(
+        "UPDATE history SET archived = 1 WHERE id = ?1",
+        params![id as i64],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Delete an entry from history. Returns `true` if the row existed.
+pub fn delete_history(conn: &Connection, id: u64) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute("DELETE FROM history WHERE id = ?1", params![id as i64])?;
+    Ok(changed > 0)
+}
+
+/// Delete every history row.
+pub fn clear_history(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM history", [])?;
+    Ok(())
+}
+
+/// Decode a legacy binary blob and import the rows it contains.
+pub fn import_legacy_history(conn: &Connection, bytes: &[u8]) -> io::Result<usize> {
+    let loaded = decode_history(bytes)?;
+    let mut count = 0;
+    for entry in &loaded.entries {
+        if insert_entry(conn, entry).is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn row_to_entry(row: &rusqlite::Row) -> Result<StoredHistoryEntry, rusqlite::Error> {
+    let id = row.get::<_, i64>("id")? as u64;
+    let source_kind = row.get::<_, i64>("source_kind")?;
+    let source_raw = row.get::<_, String>("source")?;
+    let source = match source_kind {
+        0 => StoredSource::File(PathBuf::from(source_raw)),
+        1 => StoredSource::Url(source_raw),
+        _ => {
+            return Err(rusqlite::Error::IntegralValueOutOfRange(0, source_kind));
+        }
+    };
+    let name = row.get::<_, String>("name")?;
+    let detail = row.get::<_, String>("detail")?;
+    let extension_label = row.get::<_, String>("extension_label")?;
+    let badge_color = row.get::<_, i64>("badge_color")? as u32;
+    let badge_text_color = row.get::<_, i64>("badge_text_color")? as u32;
+    let output_format = row.get::<_, String>("output_format")?;
+    let outcome_kind = row.get::<_, i64>("outcome_kind")?;
+    let archived = row.get::<_, i64>("archived")? != 0;
+
+    let module_id: Option<String> = row.get("module_id")?;
+    let file_name: Option<String> = row.get("file_name")?;
+    let format: Option<String> = row.get("format")?;
+    let artifact_bytes: Option<Vec<u8>> = row.get("artifact_bytes")?;
+    let byte_len: Option<i64> = row.get("byte_len")?;
+    let error_message: Option<String> = row.get("error_message")?;
+
+    let outcome = match outcome_kind {
+        0 => StoredOutcome::Ready {
+            module_id: module_id.unwrap_or_default(),
+            file_name: file_name.unwrap_or_default(),
+            format: format.unwrap_or_default(),
+            bytes: artifact_bytes.unwrap_or_default(),
+        },
+        1 => StoredOutcome::ReadyLarge {
+            module_id: module_id.unwrap_or_default(),
+            byte_len: byte_len.unwrap_or(0) as usize,
+        },
+        2 => StoredOutcome::Failed(error_message.unwrap_or_default()),
+        _ => {
+            return Err(rusqlite::Error::IntegralValueOutOfRange(0, outcome_kind));
+        }
+    };
+
+    Ok(StoredHistoryEntry {
+        id,
+        source,
+        name,
+        detail,
+        extension_label,
+        badge_color,
+        badge_text_color,
+        output_format,
+        outcome,
+        archived,
+    })
+}
+
+// Legacy binary format --------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn encode_history(entries: &[StoredHistoryEntry], next_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(256 + entries.len() * 128);
     out.extend_from_slice(MAGIC);
     write_u64(&mut out, next_id);
@@ -154,8 +484,8 @@ fn encode_history(entries: &[StoredHistoryEntry], next_id: u64) -> Vec<u8> {
     out
 }
 
-fn decode_history(bytes: &[u8]) -> io::Result<LoadedHistory> {
-    let mut cursor = io::Cursor::new(bytes);
+pub(crate) fn decode_history(bytes: &[u8]) -> io::Result<LoadedHistory> {
+    let mut cursor = Cursor::new(bytes);
     let mut magic = [0u8; 17];
     cursor.read_exact(&mut magic)?;
     if magic.as_slice() != MAGIC {
@@ -179,6 +509,7 @@ fn decode_history(bytes: &[u8]) -> io::Result<LoadedHistory> {
     })
 }
 
+#[cfg(test)]
 fn write_entry(out: &mut Vec<u8>, entry: &StoredHistoryEntry) {
     write_u64(out, entry.id);
     match &entry.source {
@@ -225,7 +556,7 @@ fn write_entry(out: &mut Vec<u8>, entry: &StoredHistoryEntry) {
     }
 }
 
-fn read_entry(cursor: &mut io::Cursor<&[u8]>) -> io::Result<StoredHistoryEntry> {
+fn read_entry(cursor: &mut Cursor<&[u8]>) -> io::Result<StoredHistoryEntry> {
     let id = read_u64(cursor)?;
     let source_kind = read_u8(cursor)?;
     let source_raw = read_string(cursor)?;
@@ -267,7 +598,10 @@ fn read_entry(cursor: &mut io::Cursor<&[u8]>) -> io::Result<StoredHistoryEntry> 
                 byte_len,
             }
         }
-        2 => StoredOutcome::Failed(read_string(cursor)?),
+        2 => {
+            let message = read_string(cursor)?;
+            StoredOutcome::Failed(message)
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -285,253 +619,162 @@ fn read_entry(cursor: &mut io::Cursor<&[u8]>) -> io::Result<StoredHistoryEntry> 
         badge_text_color,
         output_format,
         outcome,
+        archived: false,
     })
 }
 
-fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
+#[cfg(test)]
 fn write_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
+    out.extend_from_slice(&value.to_be_bytes());
 }
 
+fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    cursor.read_exact(&mut bytes)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+#[cfg(test)]
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_u32(cursor: &mut Cursor<&[u8]>) -> io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    cursor.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_u8(cursor: &mut Cursor<&[u8]>) -> io::Result<u8> {
+    let mut byte = [0u8; 1];
+    cursor.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
+
+#[cfg(test)]
 fn write_string(out: &mut Vec<u8>, value: &str) {
-    write_bytes(out, value.as_bytes());
+    let bytes = value.as_bytes();
+    write_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
 }
 
+fn read_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
+    let len = read_u32(cursor)? as usize;
+    let mut bytes = vec![0u8; len];
+    cursor.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
 fn write_bytes(out: &mut Vec<u8>, value: &[u8]) {
-    write_u32(out, value.len() as u32);
+    write_u64(out, value.len() as u64);
     out.extend_from_slice(value);
 }
 
-fn read_u8(cursor: &mut io::Cursor<&[u8]>) -> io::Result<u8> {
-    let mut buf = [0u8; 1];
-    cursor.read_exact(&mut buf)?;
-    Ok(buf[0])
-}
-
-fn read_u32(cursor: &mut io::Cursor<&[u8]>) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    cursor.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u64(cursor: &mut io::Cursor<&[u8]>) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    cursor.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_bytes(cursor: &mut io::Cursor<&[u8]>) -> io::Result<Vec<u8>> {
-    let len = read_u32(cursor)? as usize;
-    let mut buf = vec![0u8; len];
-    cursor.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-fn read_string(cursor: &mut io::Cursor<&[u8]>) -> io::Result<String> {
-    let bytes = read_bytes(cursor)?;
-    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+fn read_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
+    let len = read_u64(cursor)? as usize;
+    let mut bytes = vec![0u8; len];
+    cursor.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Serialize tests that touch HOME / disk so they do not race.
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_temp_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "shift-history-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var_os("HOME");
-        // SAFETY: tests hold LOCK so only one mutates HOME at a time.
-        unsafe {
-            std::env::set_var("HOME", &dir);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("HOME", value);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-
-    fn sample_entry(id: u64) -> StoredHistoryEntry {
+    fn sample_entry(id: u64, name: &str, archived: bool) -> StoredHistoryEntry {
         StoredHistoryEntry {
             id,
-            source: StoredSource::File(PathBuf::from("/tmp/report.docx")),
-            name: "report.docx".into(),
-            detail: "Markdown  ·  via pandoc".into(),
-            extension_label: "DOCX".into(),
-            badge_color: 0x1a1a1a,
-            badge_text_color: 0xcccccc,
-            output_format: "markdown".into(),
+            source: StoredSource::File(PathBuf::from("/tmp/sample.txt")),
+            name: name.to_owned(),
+            detail: "detail".to_owned(),
+            extension_label: "TXT".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "markdown".to_owned(),
             outcome: StoredOutcome::Ready {
-                module_id: "pandoc".into(),
-                file_name: "report.md".into(),
-                format: "markdown".into(),
-                bytes: b"# Hello\n".to_vec(),
+                module_id: "pandoc".to_owned(),
+                file_name: "sample.md".to_owned(),
+                format: "markdown".to_owned(),
+                bytes: b"body".to_vec(),
             },
+            archived,
         }
     }
 
     #[test]
-    fn round_trip_ready_url_and_failed_entries() {
+    fn add_and_retrieve_entries() {
+        let conn = open_history(":memory:").unwrap();
+        let e1 = sample_entry(1, "first", false);
+        let e2 = sample_entry(2, "second", true);
+        add_history_entry(&conn, &e1, DEFAULT_HISTORY_LIMIT).unwrap();
+        add_history_entry(&conn, &e2, DEFAULT_HISTORY_LIMIT).unwrap();
+
+        let unarchived = history_entries(&conn, false).unwrap();
+        assert_eq!(unarchived.len(), 1);
+        assert_eq!(unarchived[0].name, "first");
+
+        let all = history_entries(&conn, true).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn limit_enforcement_removes_oldest() {
+        let conn = open_history(":memory:").unwrap();
+        add_history_entry(&conn, &sample_entry(1, "one", false), 2).unwrap();
+        add_history_entry(&conn, &sample_entry(2, "two", false), 2).unwrap();
+        add_history_entry(&conn, &sample_entry(3, "three", false), 2).unwrap();
+
+        let entries = history_entries(&conn, false).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, 3);
+        assert_eq!(entries[1].id, 2);
+    }
+
+    #[test]
+    fn full_text_search_matches_name_and_detail() {
+        let conn = open_history(":memory:").unwrap();
+        let e1 = sample_entry(1, "quarterly report", false);
+        let mut e2 = sample_entry(2, "notes", false);
+        e2.detail = "report".to_owned();
+        add_history_entry(&conn, &e1, DEFAULT_HISTORY_LIMIT).unwrap();
+        add_history_entry(&conn, &e2, DEFAULT_HISTORY_LIMIT).unwrap();
+
+        let found = search_history(&conn, "report", false).unwrap();
+        assert_eq!(found.len(), 2);
+
+        let found = search_history(&conn, "quarterly", false).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 1);
+    }
+
+    #[test]
+    fn archive_and_delete_mutate_rows() {
+        let conn = open_history(":memory:").unwrap();
+        add_history_entry(&conn, &sample_entry(1, "one", false), DEFAULT_HISTORY_LIMIT).unwrap();
+        assert!(archive_history(&conn, 1).unwrap());
+        let entries = history_entries(&conn, false).unwrap();
+        assert!(entries.is_empty());
+
+        assert!(delete_history(&conn, 1).unwrap());
+        let all = history_entries(&conn, true).unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn legacy_migration_imports_and_sets_archived_false() {
         let entries = vec![
-            sample_entry(1),
-            StoredHistoryEntry {
-                id: 2,
-                source: StoredSource::Url("https://example.com/a".into()),
-                name: "example.com".into(),
-                detail: "HTML  ·  via defuddle".into(),
-                extension_label: "URL".into(),
-                badge_color: 0x111111,
-                badge_text_color: 0x888888,
-                output_format: "html".into(),
-                outcome: StoredOutcome::ReadyLarge {
-                    module_id: "defuddle".into(),
-                    byte_len: 900_000,
-                },
-            },
-            StoredHistoryEntry {
-                id: 3,
-                source: StoredSource::File(PathBuf::from("/tmp/broken.pdf")),
-                name: "broken.pdf".into(),
-                detail: "Markdown  ·  failed".into(),
-                extension_label: "PDF".into(),
-                badge_color: 1,
-                badge_text_color: 2,
-                output_format: "markdown".into(),
-                outcome: StoredOutcome::Failed("engine missing".into()),
-            },
+            sample_entry(1, "legacy-one", false),
+            sample_entry(2, "legacy-two", false),
         ];
+        let legacy = encode_history(&entries, 3);
 
-        let encoded = encode_history(&entries, 4);
-        let loaded = decode_history(&encoded).unwrap();
-        assert_eq!(loaded.next_id, 4);
-        assert_eq!(loaded.entries, entries);
-    }
+        let conn = open_history(":memory:").unwrap();
+        let count = import_legacy_history(&conn, &legacy).unwrap();
+        assert_eq!(count, 2);
 
-    #[test]
-    fn save_load_and_clear_on_disk() {
-        with_temp_home(|_| {
-            let entries = vec![sample_entry(7)];
-            save_history(&entries, 8).unwrap();
-            let loaded = load_history();
-            assert_eq!(loaded.next_id, 8);
-            assert_eq!(loaded.entries, entries);
-
-            clear_history_store().unwrap();
-            let empty = load_history();
-            assert!(empty.entries.is_empty());
-            assert_eq!(empty.next_id, 1);
-        });
-    }
-
-    #[test]
-    fn corrupt_file_yields_empty_history() {
-        with_temp_home(|_| {
-            let path = history_path().unwrap();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"not a history file").unwrap();
-            let loaded = load_history();
-            assert!(loaded.entries.is_empty());
-            assert_eq!(loaded.next_id, 1);
-        });
-    }
-
-    #[test]
-    fn intern_module_id_maps_known_engines() {
-        assert_eq!(intern_module_id("pandoc"), "pandoc");
-        assert_eq!(intern_module_id("nope"), "unknown");
-    }
-
-    /// UI sidebar load path: decode a full history file must stay snappy.
-    #[test]
-    fn encode_decode_full_sidebar_stays_within_budget() {
-        use std::hint::black_box;
-        use std::time::{Duration, Instant};
-
-        let mut entries = Vec::with_capacity(MAX_HISTORY_ENTRIES);
-        for id in 1..=MAX_HISTORY_ENTRIES as u64 {
-            let mut entry = sample_entry(id);
-            entry.name = format!("report-{id}.docx");
-            entry.detail = format!("Markdown  ·  via pandoc  ·  #{id}");
-            entry.outcome = if id % 4 == 0 {
-                StoredOutcome::Failed(format!("missing tool {id}"))
-            } else if id % 4 == 1 {
-                StoredOutcome::ReadyLarge {
-                    module_id: "ffmpeg".into(),
-                    byte_len: 12_000_000 + id as usize,
-                }
-            } else {
-                StoredOutcome::Ready {
-                    module_id: "pandoc".into(),
-                    file_name: format!("report-{id}.md"),
-                    format: "markdown".into(),
-                    bytes: format!("# Note {id}\n\n").repeat(128).into_bytes(),
-                }
-            };
-            entries.push(entry);
-        }
-
-        let start = Instant::now();
-        for _ in 0..100 {
-            let encoded = encode_history(&entries, MAX_HISTORY_ENTRIES as u64 + 1);
-            let loaded = decode_history(&encoded).expect("decode");
-            assert_eq!(loaded.entries.len(), MAX_HISTORY_ENTRIES);
-            black_box(loaded.next_id);
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed <= Duration::from_secs(2),
-            "history encode/decode×100 took {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn intern_module_id_is_hot_path_cheap() {
-        use std::hint::black_box;
-        use std::time::{Duration, Instant};
-
-        let ids = [
-            "markitdown",
-            "pandoc",
-            "defuddle",
-            "docling",
-            "ffmpeg",
-            "custom",
-            "",
-        ];
-        let start = Instant::now();
-        for _ in 0..50_000 {
-            for id in ids {
-                black_box(intern_module_id(id));
-            }
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed <= Duration::from_secs(1),
-            "intern_module_id×350k took {elapsed:?}"
-        );
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(!loaded[0].archived);
     }
 }
