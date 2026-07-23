@@ -34,6 +34,7 @@ use shift_core::{
     cache_artifact_bytes, export_matches_bytes, load_default_session_settings,
     save_default_session_settings, stage_export_file,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,14 +47,17 @@ const APP_NAME: &str = "Shift";
 const FONT_MONO: &str = shift_core::session_settings::DEFAULT_UI_FONT_FAMILY;
 /// Curated font families for Theme settings (label, family name).
 /// Family names must match what Core Text / GPUI resolve on macOS.
+/// Bundled and system UI font choices. Bundled Geist fonts are registered in `main`.
 const UI_FONT_CHOICES: &[(&str, &str)] = &[
+    ("Geist", "Geist"),
+    ("Geist Mono", "Geist Mono"),
+    ("System", ".SystemUIFont"),
     ("Menlo", "Menlo"),
     ("SF Mono", "SF Mono"),
     ("Monaco", "Monaco"),
     ("Courier New", "Courier New"),
     ("Andale Mono", "Andale Mono"),
     ("Helvetica Neue", "Helvetica Neue"),
-    ("System", ".SystemUIFont"),
 ];
 const BG: u32 = 0x000000;
 const BG_RAISED: u32 = 0x0a0a0a;
@@ -7407,6 +7411,19 @@ fn main() {
                 MenuItem::action(format!("Quit {APP_NAME}"), Quit),
             ],
         }]);
+
+        // Load bundled Geist variable fonts (SIL Open Font License 1.1).
+        // These are available as selectable UI font families in Theme settings.
+        if let Err(e) = cx.text_system().add_fonts(vec![
+            Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Variable.ttf").as_slice()),
+            Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Italic-Variable.ttf").as_slice()),
+            Cow::Borrowed(include_bytes!("../assets/fonts/GeistMono-Variable.ttf").as_slice()),
+            Cow::Borrowed(
+                include_bytes!("../assets/fonts/GeistMono-Italic-Variable.ttf").as_slice(),
+            ),
+        ]) {
+            eprintln!("shift: failed to load bundled Geist fonts: {e}");
+        }
 
         let bounds = Bounds::centered(None, size(px(1180.0), px(720.0)), cx);
         let initial_window_width = f32::from(bounds.size.width);
