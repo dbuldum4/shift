@@ -13,7 +13,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use gpui::{AppContext, Entity, TestAppContext};
 
-use super::{BatchFormatSelection, BatchItemState, ConversionState, OutputFormat, Shift};
+use super::{
+    BatchFormatSelection, BatchItemState, ConversionState, HistoryOutcome, OutputFormat, Shift,
+};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -862,4 +864,235 @@ async fn clear_batch_queue_while_running_is_durable(cx: &mut TestAppContext) {
     });
     assert!(!running);
     assert!(empty);
+}
+
+#[gpui::test]
+async fn private_url_is_blocked_when_private_urls_disallowed(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    // The env guard normally opts into private URLs so tests can hit example.com.
+    // Remove it temporarily to verify the default public-internet-only policy.
+    unsafe { std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS") };
+
+    let shift = create_shift(cx);
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("http://192.168.1.1/page.html".into(), cx)
+    });
+    cx.run_until_parked();
+
+    let blocked = shift.read_with(cx, |this, _| {
+        matches!(
+            &this.conversion,
+            ConversionState::Failed(msg) if msg.as_ref().contains("non-public")
+        )
+    });
+    assert!(blocked, "expected a non-public URL failure");
+}
+
+#[gpui::test]
+async fn history_can_be_cleared_archived_and_deleted(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "hist.txt", b"hello");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.set_selected_file(path, cx));
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+    assert_eq!(shift.read_with(cx, |this, _| this.history.len()), 1);
+
+    shift.update(cx, |this, cx| this.archive_history_entry(id, cx));
+    let (archived, active_id) = shift.read_with(cx, |this, _| {
+        (this.history[0].archived, this.active_history_id)
+    });
+    assert!(archived);
+    assert!(active_id.is_none());
+
+    shift.update(cx, |this, cx| this.delete_history_entry(id, cx));
+    assert!(shift.read_with(cx, |this, _| this.history.is_empty()));
+
+    // clear_history on an already empty history is safe.
+    shift.update(cx, |this, cx| this.clear_history(cx));
+    assert!(shift.read_with(cx, |this, _| this.history.is_empty()));
+    assert!(shift.read_with(cx, |this, _| this.active_history_id.is_none()));
+}
+
+#[gpui::test]
+async fn history_limit_truncates_entries_and_updates_input(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let paths = [
+        write_input(&env, "hist_a.txt", b"a"),
+        write_input(&env, "hist_b.txt", b"b"),
+        write_input(&env, "hist_c.txt", b"c"),
+    ];
+    let shift = create_shift(cx);
+
+    for path in &paths {
+        shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+        cx.run_until_parked();
+    }
+    assert_eq!(shift.read_with(cx, |this, _| this.history.len()), 3);
+
+    shift.update(cx, |this, cx| {
+        this.set_history_limit(1, cx);
+        assert_eq!(this.history_limit, 1);
+        assert_eq!(this.history_limit_input.read(cx).content(), "1");
+    });
+    assert_eq!(shift.read_with(cx, |this, _| this.history.len()), 1);
+
+    shift.update(cx, |this, cx| {
+        this.set_history_limit(100_000, cx);
+        assert_eq!(this.history_limit, 30_000);
+        assert_eq!(this.history_limit_input.read(cx).content(), "30000");
+    });
+}
+
+#[gpui::test]
+async fn conversion_failure_records_history_and_can_be_restored(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    env.override_tool("markitdown", FAILING_MARKITDOWN_FAKE);
+    let path = write_input(&env, "fails.txt", b"FAIL intentional");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    cx.run_until_parked();
+
+    let (failed, history_failed) = shift.read_with(cx, |this, _| {
+        let failed = matches!(this.conversion, ConversionState::Failed(_));
+        let history_failed = matches!(
+            this.history.first().map(|entry| &entry.outcome),
+            Some(HistoryOutcome::Failed(_))
+        );
+        (failed, history_failed)
+    });
+    assert!(failed);
+    assert!(history_failed);
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+    shift.update(cx, |this, cx| this.clear_selected_file(cx));
+    cx.run_until_parked();
+
+    shift.update(cx, |this, cx| this.restore_history_entry(id, cx));
+    let (active_id, selected, restored_failed) = shift.read_with(cx, |this, _| {
+        (
+            this.active_history_id,
+            this.selected_file.clone(),
+            matches!(this.conversion, ConversionState::Failed(_)),
+        )
+    });
+    assert_eq!(active_id, Some(id));
+    assert_eq!(selected, Some(path));
+    assert!(restored_failed);
+}
+
+#[gpui::test]
+async fn folder_expand_dismiss_clears_confirm_without_queuing(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let dir = env.inputs().join("folder");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("nested.txt"), b"nested").unwrap();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.ingest_paths(vec![dir.clone()], cx));
+    cx.run_until_parked();
+    assert!(shift.read_with(cx, |this, _| this.folder_confirm.is_some()));
+
+    shift.update(cx, |this, cx| this.dismiss_folder_confirm(cx));
+    cx.run_until_parked();
+    let (cleared, empty) = shift.read_with(cx, |this, _| {
+        (this.folder_confirm.is_none(), this.batch_queue.is_empty())
+    });
+    assert!(cleared);
+    assert!(empty);
+}
+
+#[gpui::test]
+async fn batch_force_overwrites_existing_output(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "force.txt", b"unique content");
+    let output = path.with_extension("md");
+    fs::write(&output, b"existing").unwrap();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.enqueue_paths(vec![path], false, cx));
+    shift.update(cx, |this, cx| this.toggle_batch_force(cx));
+    shift.update(cx, |this, cx| this.start_batch(cx));
+    cx.run_until_parked();
+
+    assert_eq!(fs::read_to_string(&output).unwrap(), "unique content");
+}
+
+#[gpui::test]
+async fn batch_with_unsupported_file_type_fails(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let bogus = env.inputs().join("bogus.xyz");
+    fs::write(&bogus, b"data").unwrap();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.enqueue_paths(vec![bogus], false, cx));
+    shift.update(cx, |this, cx| this.start_batch(cx));
+    cx.run_until_parked();
+
+    let (failed, status) = shift.read_with(cx, |this, _| {
+        let failed = this
+            .batch_queue
+            .items()
+            .iter()
+            .any(|item| matches!(item.state, BatchItemState::Failed { .. }));
+        (failed, this.batch_status.clone())
+    });
+    assert!(failed, "expected the unsupported file to fail");
+    assert!(
+        status.as_ref().is_some_and(|s| s.contains("1 failed")),
+        "expected batch to report a failure, got {status:?}"
+    );
+}
+
+#[gpui::test]
+async fn magic_paste_with_multiple_paths_queues_batch(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let a = write_input(&env, "multi_a.txt", b"a");
+    let b = write_input(&env, "multi_b.txt", b"b");
+    let shift = create_shift(cx);
+
+    let text = format!("{} {}", a.display(), b.display());
+    shift.update(cx, |this, cx| this.submit_magic_paste_text(text, cx));
+    cx.run_until_parked();
+
+    let (count, conversion_empty) = shift.read_with(cx, |this, _| {
+        (
+            this.batch_queue.items().len(),
+            matches!(this.conversion, ConversionState::Empty),
+        )
+    });
+    assert_eq!(count, 2);
+    assert!(conversion_empty);
+}
+
+#[gpui::test]
+async fn text_input_set_content_round_trips(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    let content = shift.update(cx, |this, cx| {
+        this.url_input
+            .update(cx, |input, cx| input.set_content("hello world", cx));
+        this.url_input.read(cx).content().to_string()
+    });
+    assert_eq!(content, "hello world");
+}
+
+#[gpui::test]
+async fn reveal_open_and_copy_output_do_not_panic(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.reveal_output(cx);
+        this.open_output(cx);
+        this.copy_output(cx);
+    });
 }

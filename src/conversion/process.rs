@@ -178,7 +178,7 @@ fn kill_pid(pid: u32) {
     {
         // Negative PID kills the whole process group (set up via process_group(0)).
         let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
+            .args(["-KILL", "--", &format!("-{pid}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -437,7 +437,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_script(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
@@ -446,11 +449,17 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    fn shell_command(path: &Path) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(path);
+        cmd
+    }
+
     #[test]
     fn captures_successful_output() {
         let path = std::env::temp_dir().join(format!("shift-process-ok-{}", std::process::id()));
         write_script(&path, "#!/bin/sh\nprintf 'hello'\nprintf 'err' >&2\n");
-        let output = run_command(Command::new(&path), Duration::from_secs(5), 1024).unwrap();
+        let output = run_command(shell_command(&path), Duration::from_secs(5), 1024).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"err");
@@ -462,7 +471,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("shift-process-hang-{}", std::process::id()));
         write_script(&path, "#!/bin/sh\nsleep 30\n");
         let started = Instant::now();
-        let error = run_command(Command::new(&path), Duration::from_millis(300), 1024).unwrap_err();
+        let error =
+            run_command(shell_command(&path), Duration::from_millis(300), 1024).unwrap_err();
         let elapsed = started.elapsed();
         assert!(error.to_string().contains("timed out"), "error: {error}");
         assert!(
@@ -479,7 +489,7 @@ mod tests {
             &path,
             "#!/bin/sh\n# Emit more than the 64-byte cap.\ndd if=/dev/zero bs=200 count=1 2>/dev/null\n",
         );
-        let error = run_command(Command::new(&path), Duration::from_secs(5), 64).unwrap_err();
+        let error = run_command(shell_command(&path), Duration::from_secs(5), 64).unwrap_err();
         assert!(
             error.to_string().contains("exceeded") || error.to_string().contains("limit"),
             "error: {error}"
@@ -496,7 +506,7 @@ mod tests {
             "#!/bin/sh\ndd if=/dev/zero bs=200 count=1 2>/dev/null\nsleep 30\n",
         );
         let started = Instant::now();
-        let error = run_command(Command::new(&path), Duration::from_secs(20), 64).unwrap_err();
+        let error = run_command(shell_command(&path), Duration::from_secs(20), 64).unwrap_err();
         let elapsed = started.elapsed();
         assert!(
             error.to_string().contains("exceeded") || error.to_string().contains("limit"),
@@ -525,7 +535,7 @@ mod tests {
         write_script(&path, "#!/bin/sh\necho should-not-run\n");
         let cancel = Arc::new(AtomicBool::new(true));
         let error = run_command_cancellable(
-            Command::new(&path),
+            shell_command(&path),
             Duration::from_secs(5),
             1024,
             Some(Arc::clone(&cancel)),
@@ -548,7 +558,7 @@ mod tests {
             cancel_flag.store(true, Ordering::SeqCst);
         });
         let error = run_command_cancellable(
-            Command::new(&path),
+            shell_command(&path),
             Duration::from_secs(20),
             1024,
             Some(Arc::clone(&cancel)),
@@ -576,7 +586,7 @@ mod tests {
             cancel_flag.store(true, Ordering::SeqCst);
         });
         let error = run_command_cancellable(
-            Command::new(&path),
+            shell_command(&path),
             Duration::from_secs(20),
             1024,
             Some(cancel),
@@ -607,7 +617,7 @@ mod tests {
             cancel_flag.store(true, Ordering::SeqCst);
         });
         let error = run_command_cancellable(
-            Command::new(&path),
+            shell_command(&path),
             Duration::from_secs(20),
             1024,
             Some(Arc::clone(&cancel)),
@@ -621,5 +631,227 @@ mod tests {
             "process-group cancel took too long: {elapsed:?}"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn process_timeout_respects_env_and_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("SHIFT_CONVERSION_TIMEOUT_SECS").ok();
+        unsafe { std::env::remove_var("SHIFT_CONVERSION_TIMEOUT_SECS") };
+        assert_eq!(process_timeout(), DEFAULT_PROCESS_TIMEOUT);
+        unsafe { std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", "123") };
+        assert_eq!(process_timeout(), Duration::from_secs(123));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", value),
+                None => std::env::remove_var("SHIFT_CONVERSION_TIMEOUT_SECS"),
+            }
+        }
+    }
+
+    #[test]
+    fn max_output_bytes_respects_env_and_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES").ok();
+        unsafe { std::env::remove_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES") };
+        assert_eq!(max_output_bytes(), DEFAULT_MAX_OUTPUT_BYTES);
+        unsafe { std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", "1024") };
+        assert_eq!(max_output_bytes(), 1024);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", value),
+                None => std::env::remove_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES"),
+            }
+        }
+    }
+
+    #[test]
+    fn is_runnable_requires_regular_executable_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exec_path =
+            std::env::temp_dir().join(format!("shift-process-runnable-{}", std::process::id()));
+        write_script(&exec_path, "#!/bin/sh\necho ok\n");
+        assert!(is_runnable(&exec_path));
+
+        let non_exec =
+            std::env::temp_dir().join(format!("shift-process-nonexec-{}", std::process::id()));
+        std::fs::write(&non_exec, b"not executable").unwrap();
+        assert!(!is_runnable(&non_exec));
+
+        let dir = std::env::temp_dir().join(format!("shift-process-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_runnable(&dir));
+
+        let missing =
+            std::env::temp_dir().join(format!("shift-process-missing-{}", std::process::id()));
+        assert!(!is_runnable(&missing));
+
+        let _ = std::fs::remove_file(&exec_path);
+        let _ = std::fs::remove_file(&non_exec);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn find_executable_searches_path_and_common_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let bin_dir =
+            std::env::temp_dir().join(format!("shift-process-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let tool = bin_dir.join("shift_test_tool");
+        write_script(&tool, "#!/bin/sh\necho found\n");
+
+        let previous = std::env::var("PATH").ok();
+        let new_path = match &previous {
+            Some(old) => format!("{}:{}", bin_dir.display(), old),
+            None => bin_dir.display().to_string(),
+        };
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        assert_eq!(
+            find_executable("shift_test_tool").as_deref(),
+            Some(tool.as_path())
+        );
+        assert!(find_executable("shift_test_tool_definitely_missing").is_none());
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_dir(&bin_dir);
+    }
+
+    #[test]
+    fn resolve_tool_path_prefers_env_override_local_candidate_and_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = std::env::temp_dir().join(format!("shift-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let env_tool = temp.join("env_tool");
+        let local_tool = temp.join("local_tool");
+        let default_tool = temp.join("default_tool");
+        write_script(&env_tool, "#!/bin/sh\necho env\n");
+        write_script(&local_tool, "#!/bin/sh\necho local\n");
+        write_script(&default_tool, "#!/bin/sh\necho default\n");
+
+        let previous_path = std::env::var("PATH").ok();
+        let new_path = match &previous_path {
+            Some(old) => format!("{}:{}", temp.display(), old),
+            None => temp.display().to_string(),
+        };
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let env_key = "SHIFT_PROCESS_RESOLVE_TEST_BIN";
+        let previous_env = std::env::var_os(env_key);
+
+        // Env override wins.
+        unsafe { std::env::set_var(env_key, &env_tool) };
+        assert_eq!(
+            resolve_tool_path(env_key, "default_tool", std::slice::from_ref(&local_tool)),
+            Some(env_tool.clone())
+        );
+
+        // Configured-but-broken override is still surfaced.
+        let broken = temp.join("broken_tool");
+        std::fs::write(&broken, b"not executable").unwrap();
+        unsafe { std::env::set_var(env_key, &broken) };
+        assert_eq!(
+            resolve_tool_path(env_key, "default_tool", std::slice::from_ref(&local_tool)),
+            Some(broken.clone())
+        );
+
+        // Bare name in env override is resolved on PATH.
+        unsafe { std::env::set_var(env_key, "default_tool") };
+        assert_eq!(
+            resolve_tool_path(env_key, "other_default", std::slice::from_ref(&local_tool)),
+            Some(default_tool.clone())
+        );
+
+        // When env is unset, local candidates take precedence over default search.
+        unsafe { std::env::remove_var(env_key) };
+        assert_eq!(
+            resolve_tool_path(env_key, "default_tool", std::slice::from_ref(&local_tool)),
+            Some(local_tool.clone())
+        );
+
+        // Fallback to the default name on PATH.
+        assert_eq!(
+            resolve_tool_path(env_key, "default_tool", &[]),
+            Some(default_tool.clone())
+        );
+
+        // Nothing matches -> None.
+        assert!(resolve_tool_path(env_key, "no_such_tool", &[]).is_none());
+
+        unsafe {
+            match previous_env {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let _ = std::fs::remove_file(&env_tool);
+        let _ = std::fs::remove_file(&local_tool);
+        let _ = std::fs::remove_file(&default_tool);
+        let _ = std::fs::remove_file(&broken);
+        let _ = std::fs::remove_dir(&temp);
+    }
+
+    #[test]
+    fn resolve_tool_executable_falls_back_to_bare_name() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_key = "SHIFT_PROCESS_RESOLVE_EXEC_BIN";
+        unsafe { std::env::remove_var(env_key) };
+        assert_eq!(
+            resolve_tool_executable(env_key, "missing_default", &[]),
+            std::ffi::OsString::from("missing_default")
+        );
+    }
+
+    #[test]
+    fn read_file_limited_reads_and_rejects_by_size() {
+        let path =
+            std::env::temp_dir().join(format!("shift-process-read-file-{}", std::process::id()));
+        std::fs::write(&path, b"hello world").unwrap();
+
+        assert_eq!(read_file_limited(&path, 100).unwrap(), b"hello world");
+        assert_eq!(read_file_limited(&path, 11).unwrap(), b"hello world");
+        let error = read_file_limited(&path, 5).unwrap_err();
+        assert!(error.to_string().contains("too large"), "error: {error}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_limited_respects_maximum_and_reports_truncation() {
+        assert!(read_limited(std::io::empty(), 10).unwrap().bytes.is_empty());
+        assert!(!read_limited(std::io::empty(), 10).unwrap().truncated);
+
+        let data = b"exactly ten".as_slice();
+        let result = read_limited(data, 11).unwrap();
+        assert_eq!(result.bytes, b"exactly ten");
+        assert!(!result.truncated);
+
+        let result = read_limited(data, 5).unwrap();
+        assert_eq!(result.bytes, b"exact");
+        assert!(result.truncated);
+
+        let result = read_limited(data, 20).unwrap();
+        assert_eq!(result.bytes, b"exactly ten");
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn run_command_reports_missing_executable() {
+        let missing =
+            std::env::temp_dir().join(format!("shift-process-missing-exe-{}", std::process::id()));
+        let error = run_command(Command::new(&missing), Duration::from_secs(1), 1024).unwrap_err();
+        assert!(error.is_executable_not_found(), "error: {error}");
     }
 }

@@ -1,61 +1,46 @@
 //! Fast, reliable native file picking on macOS.
 //!
 //! Improvements over GPUI's built-in `prompt_for_paths`:
-//! - Prewarms the open/save panel XPC service at launch (first open is near-instant)
-//! - Presents as a sheet on the key window when possible
-//! - Elevates panel level and activates the app so the dialog can't get buried
-//! - Resolves aliases/symlinks
-//! - Guards against re-entrant opens (double-click / multi-dialog crashes)
-//! - Restores focus to the previous key window after dismissal
-//! - Remembers the last directory for faster subsequent navigation
+//! - Prewarms the open/save panel XPC service during app launch instead of on first click.
+//! - Presents as a sheet on the key window when possible.
+//! - Elevates panel level and activates the app so the dialog can't get buried.
+//! - Resolves aliases/symlinks.
+//! - Guards against re-entrant opens (double-click / multi-dialog crashes).
+//! - Restores focus to the previous key window after dismissal.
+//! - Remembers the last directory for faster subsequent navigation.
+//!
+//! On non-Apple platforms the public functions compile to no-op stubs so the
+//! crate (and its GUI tests) can be built and run elsewhere.
 
 #![allow(unexpected_cfgs)] // objc `msg_send!` cfg noise
 
-use cocoa::appkit::{NSApp, NSApplication, NSModalResponse, NSOpenPanel, NSSavePanel};
-use cocoa::base::{BOOL, NO, YES, id, nil};
-use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
 use futures::channel::oneshot;
-use objc::{msg_send, sel, sel_impl};
-use std::cell::Cell;
-use std::ffi::{CStr, OsStr};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
 static LAST_DIRECTORY: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGShieldingWindowLevel() -> i32;
-}
-
-#[derive(Clone, Copy)]
-enum OpenPanelMode {
-    SingleFile,
-    MultipleFiles,
-    Directory,
-}
-
 /// Pre-create an `NSOpenPanel` so macOS spins up `openAndSavePanelService`
 /// during app launch instead of on the first user click.
 ///
 /// Must be called on the main thread after `NSApplication` exists.
+#[cfg(target_os = "macos")]
 pub fn prewarm() {
     unsafe {
         let panel = NSOpenPanel::openPanel(nil);
-        // Touch a couple of properties so AppKit fully initializes the panel.
         panel.setCanChooseFiles_(YES);
         panel.setCanChooseDirectories_(NO);
         panel.setResolvesAliases_(YES);
         let _: () = msg_send![panel, setAllowsOtherFileTypes: YES];
-        // Force a retain/release cycle so the service stays warm briefly.
         let _: id = msg_send![panel, retain];
         let _: () = msg_send![panel, release];
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+pub fn prewarm() {}
 
 /// Returns `true` if a file dialog is already open.
 pub fn is_busy() -> bool {
@@ -76,172 +61,14 @@ pub fn remember_directory(path: &Path) {
     }
 }
 
-/// Present a single-file open dialog.
-///
-/// Returns a oneshot that resolves to the selected path, or `None` if the user
-/// cancelled / the dialog could not be shown.
-#[allow(dead_code)] // Kept for single-file call sites and tests.
-pub fn pick_file(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Option<PathBuf>> {
-    let (tx, rx) = oneshot::channel();
-
-    if !begin_dialog() {
-        let _ = tx.send(None);
-        return rx;
-    }
-
-    let start_dir = resolve_start_dir(starting_directory);
-    // SAFETY: called from the GPUI main thread (click handler / foreground spawn).
-    unsafe {
-        present_open_panel(start_dir, OpenPanelMode::SingleFile, move |paths| {
-            let _ = tx.send(paths.into_iter().next());
-        });
-    }
-
-    rx
-}
-
-/// Present a multi-file open dialog for batch conversion.
-///
-/// Returns selected paths (empty on cancel).
-pub fn pick_files(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Vec<PathBuf>> {
-    let (tx, rx) = oneshot::channel();
-
-    if !begin_dialog() {
-        let _ = tx.send(Vec::new());
-        return rx;
-    }
-
-    let start_dir = resolve_start_dir(starting_directory);
-    // SAFETY: called from the GPUI main thread.
-    unsafe {
-        present_open_panel(start_dir, OpenPanelMode::MultipleFiles, move |paths| {
-            let _ = tx.send(paths);
-        });
-    }
-
-    rx
-}
-
-/// Present a directory chooser for batch output folders.
-pub fn pick_directory(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Option<PathBuf>> {
-    let (tx, rx) = oneshot::channel();
-
-    if !begin_dialog() {
-        let _ = tx.send(None);
-        return rx;
-    }
-
-    let start_dir = resolve_start_dir(starting_directory);
-    // SAFETY: called from the GPUI main thread.
-    unsafe {
-        present_open_panel(start_dir, OpenPanelMode::Directory, move |paths| {
-            let _ = tx.send(paths.into_iter().next());
-        });
-    }
-
-    rx
-}
-
-/// Present a save dialog with a suggested output name.
-pub fn pick_save_file(
-    suggested_name: &str,
-    starting_directory: Option<PathBuf>,
-) -> oneshot::Receiver<Option<PathBuf>> {
-    let (tx, rx) = oneshot::channel();
-
-    if !begin_dialog() {
-        let _ = tx.send(None);
-        return rx;
-    }
-
-    let start_dir = resolve_start_dir(starting_directory);
-
-    // SAFETY: called from the GPUI main thread (click handler).
-    unsafe {
-        present_save_panel(suggested_name, start_dir, tx);
-    }
-
-    rx
-}
-
-/// Reveal `path` in Finder (selects the file when it exists).
-pub fn reveal_in_finder(path: &Path) {
-    let _ = Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
-}
-
-/// Open `path` with the default application (`open`).
-pub fn open_path(path: &Path) {
-    let _ = Command::new("/usr/bin/open").arg(path).spawn();
-}
-
-/// Begin a native macOS drag of an existing file (for drop into Finder, Downloads, etc.).
-///
-/// Must be called on the main thread while a mouse-drag `NSEvent` is current
-/// (for example from a GPUI `on_drag` start handler). Blocks until the drag
-/// session ends. Returns `true` if AppKit accepted the drag.
-pub fn begin_file_drag(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    // SAFETY: main-thread only; AppKit objects live for the duration of the call.
-    unsafe {
-        let app = NSApp();
-        if app == nil {
-            return false;
-        }
-        let event: id = msg_send![app, currentEvent];
-        if event == nil {
-            return false;
-        }
-
-        let mut window: id = msg_send![app, keyWindow];
-        if window == nil {
-            window = msg_send![app, mainWindow];
-        }
-        if window == nil {
-            let windows: id = msg_send![app, windows];
-            if windows != nil {
-                let count: usize = msg_send![windows, count];
-                if count > 0 {
-                    window = msg_send![windows, objectAtIndex: 0usize];
-                }
-            }
-        }
-        if window == nil {
-            return false;
-        }
-
-        let view: id = msg_send![window, contentView];
-        if view == nil {
-            return false;
-        }
-
-        let path_str = path.to_string_lossy();
-        let ns_path = NSString::alloc(nil).init_str(&path_str);
-        if ns_path == nil {
-            return false;
-        }
-
-        // Zero rect: AppKit uses the current mouse location for the drag image.
-        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-        let ok: BOOL = msg_send![
-            view,
-            dragFile: ns_path
-            fromRect: rect
-            slideBack: YES
-            event: event
-        ];
-        let _: () = msg_send![ns_path, release];
-        ok == YES
-    }
-}
-
+#[cfg(any(target_os = "macos", test))]
 fn begin_dialog() -> bool {
     DIALOG_OPEN
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn resolve_start_dir(starting_directory: Option<PathBuf>) -> Option<PathBuf> {
     starting_directory
         .filter(|p| p.is_dir())
@@ -255,6 +82,7 @@ fn resolve_start_dir(starting_directory: Option<PathBuf>) -> Option<PathBuf> {
         .or_else(default_start_directory)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn default_start_directory() -> Option<PathBuf> {
     home_dir()
         .map(|h| h.join("Documents"))
@@ -262,18 +90,180 @@ fn default_start_directory() -> Option<PathBuf> {
         .or_else(home_dir)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-unsafe fn present_open_panel(
-    start_dir: Option<PathBuf>,
-    mode: OpenPanelMode,
-    on_complete: impl FnOnce(Vec<PathBuf>) + Send + 'static,
-) {
-    unsafe {
+#[cfg(target_os = "macos")]
+mod macos {
+    pub use super::*;
+    use cocoa::appkit::{NSApp, NSApplication, NSModalResponse, NSOpenPanel, NSSavePanel};
+    use cocoa::base::{BOOL, NO, YES, id, nil};
+    use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
+    use objc::{msg_send, sel, sel_impl};
+    use std::cell::Cell;
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Command;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGShieldingWindowLevel() -> i32;
+    }
+
+    #[derive(Clone, Copy)]
+    enum OpenPanelMode {
+        SingleFile,
+        MultipleFiles,
+        Directory,
+    }
+
+    pub fn pick_file(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+
+        if !begin_dialog() {
+            let _ = tx.send(None);
+            return rx;
+        }
+
+        let start_dir = resolve_start_dir(starting_directory);
+        unsafe {
+            present_open_panel(start_dir, OpenPanelMode::SingleFile, move |paths| {
+                let _ = tx.send(paths.into_iter().next());
+            });
+        }
+
+        rx
+    }
+
+    pub fn pick_files(starting_directory: Option<PathBuf>) -> oneshot::Receiver<Vec<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+
+        if !begin_dialog() {
+            let _ = tx.send(Vec::new());
+            return rx;
+        }
+
+        let start_dir = resolve_start_dir(starting_directory);
+        unsafe {
+            present_open_panel(start_dir, OpenPanelMode::MultipleFiles, move |paths| {
+                let _ = tx.send(paths);
+            });
+        }
+
+        rx
+    }
+
+    pub fn pick_directory(
+        starting_directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+
+        if !begin_dialog() {
+            let _ = tx.send(None);
+            return rx;
+        }
+
+        let start_dir = resolve_start_dir(starting_directory);
+        unsafe {
+            present_open_panel(start_dir, OpenPanelMode::Directory, move |paths| {
+                let _ = tx.send(paths.into_iter().next());
+            });
+        }
+
+        rx
+    }
+
+    pub fn pick_save_file(
+        suggested_name: &str,
+        starting_directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+
+        if !begin_dialog() {
+            let _ = tx.send(None);
+            return rx;
+        }
+
+        let start_dir = resolve_start_dir(starting_directory);
+
+        unsafe {
+            present_save_panel(suggested_name, start_dir, tx);
+        }
+
+        rx
+    }
+
+    pub fn reveal_in_finder(path: &Path) {
+        let _ = Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
+    }
+
+    pub fn open_path(path: &Path) {
+        let _ = Command::new("/usr/bin/open").arg(path).spawn();
+    }
+
+    pub fn begin_file_drag(path: &Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        unsafe {
+            let app = NSApp();
+            if app == nil {
+                return false;
+            }
+            let event: id = msg_send![app, currentEvent];
+            if event == nil {
+                return false;
+            }
+
+            let mut window: id = msg_send![app, keyWindow];
+            if window == nil {
+                window = msg_send![app, mainWindow];
+            }
+            if window == nil {
+                let windows: id = msg_send![app, windows];
+                if windows != nil {
+                    let count: usize = msg_send![windows, count];
+                    if count > 0 {
+                        window = msg_send![windows, objectAtIndex: 0usize];
+                    }
+                }
+            }
+            if window == nil {
+                return false;
+            }
+
+            let view: id = msg_send![window, contentView];
+            if view == nil {
+                return false;
+            }
+
+            let path_str = path.to_string_lossy();
+            let ns_path = NSString::alloc(nil).init_str(&path_str);
+            if ns_path == nil {
+                return false;
+            }
+
+            let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+            let ok: BOOL = msg_send![
+                view,
+                dragFile: ns_path
+                fromRect: rect
+                slideBack: YES
+                event: event
+            ];
+            let _: () = msg_send![ns_path, release];
+            ok == YES
+        }
+    }
+
+    unsafe fn present_open_panel(
+        start_dir: Option<PathBuf>,
+        mode: OpenPanelMode,
+        on_complete: impl FnOnce(Vec<PathBuf>) + Send + 'static,
+    ) {
         let panel = NSOpenPanel::openPanel(nil);
-        // Retain for the lifetime of the modal; released in the completion handler.
         let panel: id = msg_send![panel, retain];
 
         match mode {
@@ -296,7 +286,6 @@ unsafe fn present_open_panel(
                 panel.setCanCreateDirectories(YES);
             }
         }
-        // Resolve Finder aliases / symlinks so callers always get a real path.
         panel.setResolvesAliases_(YES);
 
         if let Some(dir) = start_dir.as_ref() {
@@ -312,14 +301,12 @@ unsafe fn present_open_panel(
         let _: () = msg_send![panel, setPrompt: prompt];
         let _: () = msg_send![prompt, release];
 
-        // Keep the panel above everything while it's active.
         let level = CGShieldingWindowLevel() as i64;
         let _: () = msg_send![panel, setLevel: level];
 
         let app = NSApp();
         app.activateIgnoringOtherApps_(YES);
 
-        // Remember the previous key window so we can restore focus after dismiss.
         let previous_key: id = msg_send![app, keyWindow];
         if previous_key != nil {
             let _: id = msg_send![previous_key, retain];
@@ -356,7 +343,6 @@ unsafe fn present_open_panel(
                 }
             }
 
-            // Dismiss fully before notifying waiters.
             let _: () = msg_send![state.panel, orderOut: nil];
             let _: () = msg_send![state.panel, release];
 
@@ -382,14 +368,12 @@ unsafe fn present_open_panel(
             let _: () = msg_send![panel, beginWithCompletionHandler: block];
         }
     }
-}
 
-unsafe fn present_save_panel(
-    suggested_name: &str,
-    start_dir: Option<PathBuf>,
-    tx: oneshot::Sender<Option<PathBuf>>,
-) {
-    unsafe {
+    unsafe fn present_save_panel(
+        suggested_name: &str,
+        start_dir: Option<PathBuf>,
+        tx: oneshot::Sender<Option<PathBuf>>,
+    ) {
         let panel = NSSavePanel::savePanel(nil);
         let panel: id = msg_send![panel, retain];
         panel.setCanCreateDirectories(YES);
@@ -461,26 +445,24 @@ unsafe fn present_save_panel(
             let _: () = msg_send![panel, beginWithCompletionHandler: block];
         }
     }
-}
 
-struct OpenCompletionState {
-    on_complete: Option<Box<dyn FnOnce(Vec<PathBuf>) + Send>>,
-    panel: id,
-    previous_key: id,
-}
+    struct OpenCompletionState {
+        on_complete: Option<Box<dyn FnOnce(Vec<PathBuf>) + Send>>,
+        panel: id,
+        previous_key: id,
+    }
 
-struct SaveCompletionState {
-    tx: oneshot::Sender<Option<PathBuf>>,
-    panel: id,
-    previous_key: id,
-}
+    struct SaveCompletionState {
+        tx: oneshot::Sender<Option<PathBuf>>,
+        panel: id,
+        previous_key: id,
+    }
 
-// `id` is a raw pointer; the completion block always runs on the main thread.
-unsafe impl Send for OpenCompletionState {}
-unsafe impl Send for SaveCompletionState {}
+    // `id` is a raw pointer; the completion block always runs on the main thread.
+    unsafe impl Send for OpenCompletionState {}
+    unsafe impl Send for SaveCompletionState {}
 
-unsafe fn sheet_parent(app: id) -> id {
-    unsafe {
+    unsafe fn sheet_parent(app: id) -> id {
         let key: id = msg_send![app, keyWindow];
         if key != nil {
             return key;
@@ -498,73 +480,121 @@ unsafe fn sheet_parent(app: id) -> id {
         }
         nil
     }
-}
 
-unsafe fn set_directory_url(panel: id, dir: &Path) {
-    unsafe {
+    unsafe fn set_directory_url(panel: id, dir: &Path) {
         let path_str = dir.to_string_lossy();
         let ns_path = NSString::alloc(nil).init_str(&path_str);
         let url = NSURL::fileURLWithPath_isDirectory_(nil, ns_path, YES);
         panel.setDirectoryURL(url);
         let _: () = msg_send![ns_path, release];
     }
-}
 
-fn selected_paths(panel: id) -> Vec<PathBuf> {
-    unsafe {
-        let urls = panel.URLs();
-        if urls == nil {
-            return Vec::new();
+    fn selected_paths(panel: id) -> Vec<PathBuf> {
+        unsafe {
+            let urls = panel.URLs();
+            if urls == nil {
+                return Vec::new();
+            }
+            let count: usize = msg_send![urls, count];
+            let mut paths = Vec::with_capacity(count);
+            for i in 0..count {
+                let url: id = msg_send![urls, objectAtIndex: i];
+                if url == nil {
+                    continue;
+                }
+                let is_file: bool = msg_send![url, isFileURL];
+                if !is_file {
+                    continue;
+                }
+                if let Some(path) = ns_url_to_path(url) {
+                    paths.push(path);
+                }
+            }
+            paths
         }
-        let count: usize = msg_send![urls, count];
-        let mut paths = Vec::with_capacity(count);
-        for i in 0..count {
-            let url: id = msg_send![urls, objectAtIndex: i];
+    }
+
+    fn selected_save_path(panel: id) -> Option<PathBuf> {
+        unsafe {
+            let url: id = msg_send![panel, URL];
             if url == nil {
-                continue;
+                return None;
             }
-            let is_file: bool = msg_send![url, isFileURL];
-            if !is_file {
-                continue;
-            }
-            if let Some(path) = ns_url_to_path(url) {
-                paths.push(path);
-            }
+            ns_url_to_path(url)
         }
-        paths
+    }
+
+    fn ns_url_to_path(url: id) -> Option<PathBuf> {
+        unsafe {
+            let path: *const i8 = msg_send![url, fileSystemRepresentation];
+            if path.is_null() {
+                let ns_path: id = msg_send![url, path];
+                if ns_path == nil {
+                    return None;
+                }
+                let utf8: *const i8 = msg_send![ns_path, UTF8String];
+                if utf8.is_null() {
+                    return None;
+                }
+                let cstr = CStr::from_ptr(utf8);
+                return Some(PathBuf::from(OsStr::from_bytes(cstr.to_bytes())));
+            }
+            let cstr = CStr::from_ptr(path);
+            Some(PathBuf::from(OsStr::from_bytes(cstr.to_bytes())))
+        }
     }
 }
 
-fn selected_save_path(panel: id) -> Option<PathBuf> {
-    unsafe {
-        let url: id = msg_send![panel, URL];
-        if url == nil {
-            return None;
-        }
-        ns_url_to_path(url)
+#[cfg(target_os = "macos")]
+pub use macos::*;
+
+#[cfg(not(target_os = "macos"))]
+mod stub {
+    pub use super::*;
+
+    pub fn pick_file(_starting_directory: Option<PathBuf>) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+        DIALOG_OPEN.store(false, Ordering::Release);
+        let _ = tx.send(None);
+        rx
+    }
+
+    pub fn pick_files(_starting_directory: Option<PathBuf>) -> oneshot::Receiver<Vec<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+        DIALOG_OPEN.store(false, Ordering::Release);
+        let _ = tx.send(Vec::new());
+        rx
+    }
+
+    pub fn pick_directory(
+        _starting_directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+        DIALOG_OPEN.store(false, Ordering::Release);
+        let _ = tx.send(None);
+        rx
+    }
+
+    pub fn pick_save_file(
+        _suggested_name: &str,
+        _starting_directory: Option<PathBuf>,
+    ) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = oneshot::channel();
+        DIALOG_OPEN.store(false, Ordering::Release);
+        let _ = tx.send(None);
+        rx
+    }
+
+    pub fn reveal_in_finder(_path: &Path) {}
+    pub fn open_path(_path: &Path) {}
+
+    pub fn begin_file_drag(_path: &Path) -> bool {
+        false
     }
 }
 
-fn ns_url_to_path(url: id) -> Option<PathBuf> {
-    unsafe {
-        let path: *const i8 = msg_send![url, fileSystemRepresentation];
-        if path.is_null() {
-            // Fallback to path string if fileSystemRepresentation fails.
-            let ns_path: id = msg_send![url, path];
-            if ns_path == nil {
-                return None;
-            }
-            let utf8: *const i8 = msg_send![ns_path, UTF8String];
-            if utf8.is_null() {
-                return None;
-            }
-            let cstr = CStr::from_ptr(utf8);
-            return Some(PathBuf::from(OsStr::from_bytes(cstr.to_bytes())));
-        }
-        let cstr = CStr::from_ptr(path);
-        Some(PathBuf::from(OsStr::from_bytes(cstr.to_bytes())))
-    }
-}
+#[cfg(not(target_os = "macos"))]
+pub use stub::*;
 
 #[cfg(test)]
 mod tests {
@@ -717,5 +747,25 @@ mod tests {
 
         DIALOG_OPEN.store(false, Ordering::SeqCst);
         assert!(!is_busy());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stub_pickers_return_empty_selections() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
+        // `try_recv` on a oneshot receiver returns `Result<Option<T>, Canceled>`.
+        assert_eq!(pick_file(None).try_recv(), Ok(Some(None)));
+        assert_eq!(pick_files(None).try_recv(), Ok(Some(Vec::new())));
+        assert_eq!(pick_directory(None).try_recv(), Ok(Some(None)));
+        assert_eq!(pick_save_file("out.md", None).try_recv(), Ok(Some(None)));
+        assert!(!begin_file_drag(Path::new("/tmp")));
+        assert!(!is_busy());
+
+        // These are no-ops on non-Apple platforms; just ensure they don't panic.
+        reveal_in_finder(Path::new("/tmp"));
+        open_path(Path::new("/tmp"));
+        prewarm();
     }
 }

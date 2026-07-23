@@ -788,6 +788,7 @@ mod tests {
 
     #[test]
     fn stages_clipboard_image_bytes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("shift-magic-paste-img-{}", std::process::id()));
         // SAFETY: test-only env override for staging location.
@@ -1012,7 +1013,7 @@ exit 0
 
     #[test]
     fn expand_user_path_tilde() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("shift-magic-home-{}", std::process::id()));
         fs::create_dir_all(&home).unwrap();
         let old = std::env::var_os("HOME");
@@ -1086,7 +1087,7 @@ exit 0
 
     #[test]
     fn paste_staging_dir_env_override_and_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("shift-paste-staging-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         unsafe {
@@ -1117,7 +1118,7 @@ exit 0
 
     #[test]
     fn stage_pasted_image_edge_cases() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("shift-magic-img-edge-{}", std::process::id()));
         unsafe {
             std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
@@ -1140,7 +1141,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn stage_pasted_image_write_failure() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("shift-magic-img-ro-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mut permissions = fs::metadata(&dir).unwrap().permissions();
@@ -1216,7 +1217,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn materialize_remote_file_url() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let staging =
             std::env::temp_dir().join(format!("shift-magic-remote-{}", std::process::id()));
         fs::create_dir_all(&staging).unwrap();
@@ -1258,7 +1259,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn download_remote_file_scenarios() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let staging =
             std::env::temp_dir().join(format!("shift-magic-download-{}", std::process::id()));
         fs::create_dir_all(&staging).unwrap();
@@ -1308,7 +1309,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn download_with_redirect_revalidation_scenarios() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let staging =
             std::env::temp_dir().join(format!("shift-magic-redirect-{}", std::process::id()));
         fs::create_dir_all(&staging).unwrap();
