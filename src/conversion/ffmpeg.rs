@@ -677,14 +677,13 @@ fn zip_png_frames(frames_dir: &Path, zip_path: &Path) -> Result<(), ConversionEr
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("frame.png");
-        let bytes = fs::read(path).map_err(|error| {
+        let mut reader = BufReader::new(fs::File::open(path).map_err(|error| {
             ConversionError::new(format!("could not read frame {}: {error}", path.display()))
-        })?;
+        })?);
         zip.start_file(name, options).map_err(|error| {
             ConversionError::new(format!("could not add {name} to ZIP: {error}"))
         })?;
-        use std::io::Write;
-        zip.write_all(&bytes).map_err(|error| {
+        std::io::copy(&mut reader, &mut zip).map_err(|error| {
             ConversionError::new(format!("could not write {name} into ZIP: {error}"))
         })?;
     }
