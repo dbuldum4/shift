@@ -5,12 +5,13 @@
 //! error messaging for their engine.
 
 use super::ConversionError;
-use std::ffi::OsStr;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -351,8 +352,34 @@ pub fn common_bin_dirs() -> Vec<PathBuf> {
 ///
 /// Absolute paths that are runnable are returned as-is. Relative names are
 /// searched on `PATH`, then in [`common_bin_dirs`].
+///
+/// Results are memoized process-wide (keyed by `name`): converter discovery is
+/// stable for the life of the process, so the PATH / common-dir scan runs once
+/// per tool instead of on every `ConversionRegistry::default()`.
 pub fn find_executable(name: impl AsRef<OsStr>) -> Option<PathBuf> {
     let name = name.as_ref();
+    let cache = find_executable_cache();
+    if let Some(cached) = cache
+        .lock()
+        .expect("executable discovery cache poisoned")
+        .get(name)
+    {
+        return cached.clone();
+    }
+    let resolved = find_executable_uncached(name);
+    cache
+        .lock()
+        .expect("executable discovery cache poisoned")
+        .insert(name.to_owned(), resolved.clone());
+    resolved
+}
+
+fn find_executable_cache() -> &'static Mutex<HashMap<OsString, Option<PathBuf>>> {
+    static CACHE: OnceLock<Mutex<HashMap<OsString, Option<PathBuf>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn find_executable_uncached(name: &OsStr) -> Option<PathBuf> {
     let as_path = Path::new(name);
     if as_path.is_absolute() || as_path.components().count() > 1 {
         return is_runnable(as_path).then(|| as_path.to_path_buf());
@@ -392,6 +419,59 @@ pub fn resolve_tool_path(
     default_name: &str,
     local_candidates: &[PathBuf],
 ) -> Option<PathBuf> {
+    let key = ResolveKey::capture(env_override, default_name, local_candidates);
+    let cache = resolve_path_cache();
+    if let Some(cached) = cache.lock().expect("tool path cache poisoned").get(&key) {
+        return cached.clone();
+    }
+    let resolved = resolve_tool_path_uncached(env_override, default_name, local_candidates);
+    cache
+        .lock()
+        .expect("tool path cache poisoned")
+        .insert(key, resolved.clone());
+    resolved
+}
+
+/// Cache key for [`resolve_tool_path`] / [`resolve_tool_executable`].
+///
+/// Includes the env override name, default name, and local candidates as
+/// required, plus the env override's current value so a changed override does
+/// not read a stale result. In production these are all stable, so each tool is
+/// resolved once per process.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ResolveKey {
+    env_override: String,
+    env_value: Option<OsString>,
+    default_name: String,
+    local_candidates: Vec<PathBuf>,
+}
+
+impl ResolveKey {
+    fn capture(env_override: &str, default_name: &str, local_candidates: &[PathBuf]) -> Self {
+        Self {
+            env_override: env_override.to_owned(),
+            env_value: std::env::var_os(env_override),
+            default_name: default_name.to_owned(),
+            local_candidates: local_candidates.to_vec(),
+        }
+    }
+}
+
+fn resolve_path_cache() -> &'static Mutex<HashMap<ResolveKey, Option<PathBuf>>> {
+    static CACHE: OnceLock<Mutex<HashMap<ResolveKey, Option<PathBuf>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_executable_cache() -> &'static Mutex<HashMap<ResolveKey, OsString>> {
+    static CACHE: OnceLock<Mutex<HashMap<ResolveKey, OsString>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_tool_path_uncached(
+    env_override: &str,
+    default_name: &str,
+    local_candidates: &[PathBuf],
+) -> Option<PathBuf> {
     if let Some(override_path) = std::env::var_os(env_override) {
         if !override_path.is_empty() {
             let path = PathBuf::from(&override_path);
@@ -426,10 +506,24 @@ pub fn resolve_tool_executable(
     env_override: &str,
     default_name: &str,
     local_candidates: &[PathBuf],
-) -> std::ffi::OsString {
-    resolve_tool_path(env_override, default_name, local_candidates)
+) -> OsString {
+    let key = ResolveKey::capture(env_override, default_name, local_candidates);
+    let cache = resolve_executable_cache();
+    if let Some(cached) = cache
+        .lock()
+        .expect("tool executable cache poisoned")
+        .get(&key)
+    {
+        return cached.clone();
+    }
+    let resolved = resolve_tool_path(env_override, default_name, local_candidates)
         .map(|path| path.into_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from(default_name))
+        .unwrap_or_else(|| OsString::from(default_name));
+    cache
+        .lock()
+        .expect("tool executable cache poisoned")
+        .insert(key, resolved.clone());
+    resolved
 }
 
 #[cfg(all(test, unix))]

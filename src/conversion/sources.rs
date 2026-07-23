@@ -3,6 +3,7 @@
 use super::{ConversionError, ConversionRegistry};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Maximum directory nesting when expanding folders recursively.
 pub const MAX_EXPAND_DEPTH: usize = 8;
@@ -21,6 +22,15 @@ pub fn supported_input_extensions(registry: &ConversionRegistry) -> HashSet<Stri
     set
 }
 
+/// Input extensions supported by the default registry, computed once per process.
+///
+/// [`expand_input_paths`] would otherwise rebuild `ConversionRegistry::default()`
+/// (which resolves external executables) on every call just to read this set.
+fn default_supported_input_extensions() -> &'static HashSet<String> {
+    static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
+    CACHE.get_or_init(|| supported_input_extensions(&ConversionRegistry::default()))
+}
+
 /// Expand files and directories into a flat list of convertible file paths.
 ///
 /// - Files are included when their extension is in `extensions` (case-insensitive).
@@ -32,8 +42,8 @@ pub fn expand_input_paths(
     paths: &[impl AsRef<Path>],
     recursive: bool,
 ) -> Result<Vec<PathBuf>, ConversionError> {
-    let extensions = supported_input_extensions(&ConversionRegistry::default());
-    expand_input_paths_with_extensions(paths, recursive, &extensions)
+    let extensions = default_supported_input_extensions();
+    expand_input_paths_with_extensions(paths, recursive, extensions)
 }
 
 /// Like [`expand_input_paths`], but uses an explicit extension allow-list.

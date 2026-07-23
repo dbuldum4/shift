@@ -13,13 +13,13 @@ mod process;
 mod sources;
 mod suggest;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use batch::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
@@ -380,6 +380,19 @@ impl OutputFormat {
         }
     }
 
+    /// Lowercased [`Self::label`], interned once per process.
+    ///
+    /// Avoids re-allocating a lowercase copy on every call (e.g. filter/search
+    /// paths in `main.rs`).
+    pub fn label_lowercase(self) -> &'static str {
+        intern_lowercase(self.label())
+    }
+
+    /// Lowercased [`Self::id`], interned once per process.
+    pub fn id_lowercase(self) -> &'static str {
+        intern_lowercase(self.id())
+    }
+
     pub fn extension(self) -> &'static str {
         match self.0 {
             "markdown" | "gfm" | "commonmark" | "commonmark_x" | "markdown_github"
@@ -477,6 +490,27 @@ impl OutputFormat {
             "srt" | "vtt" | "plain" | "markdown" | "html" | "gfm"
         )
     }
+}
+
+/// Return a `'static` lowercase copy of `value`, computed and leaked once.
+///
+/// Backed by a process-wide table so repeated calls (menus, search filters)
+/// reuse the same interned string instead of allocating a fresh `String`.
+fn intern_lowercase(value: &'static str) -> &'static str {
+    static TABLE: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = table.lock().expect("lowercase intern table poisoned");
+    if let Some(&interned) = table.get(value) {
+        return interned;
+    }
+    let lowered = value.to_ascii_lowercase();
+    let interned: &'static str = if lowered == value {
+        value
+    } else {
+        Box::leak(lowered.into_boxed_str())
+    };
+    table.insert(value, interned);
+    interned
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -761,9 +795,20 @@ fn text_preview_excerpt(bytes: &[u8]) -> String {
             bytes.len()
         );
     };
-    let total_chars = text.chars().count();
-    let mut excerpt: String = text.chars().take(TEXT_PREVIEW_CHAR_LIMIT).collect();
-    if total_chars > TEXT_PREVIEW_CHAR_LIMIT {
+    // Single pass over the char iterator: take the excerpt, then keep counting
+    // the same iterator's remainder to detect (and quantify) truncation without
+    // re-scanning the whole string.
+    let mut chars = text.chars();
+    let mut excerpt = String::new();
+    for _ in 0..TEXT_PREVIEW_CHAR_LIMIT {
+        match chars.next() {
+            Some(ch) => excerpt.push(ch),
+            None => break,
+        }
+    }
+    let remaining = chars.count();
+    if remaining > 0 {
+        let total_chars = TEXT_PREVIEW_CHAR_LIMIT + remaining;
         excerpt.push_str(&format!(
             "\n\n… preview truncated ({total_chars} characters total · {} on disk when saved)",
             format_byte_size(bytes.len() as u64)
@@ -902,8 +947,9 @@ pub trait ConversionModule: Send + Sync {
 }
 
 /// Dispatches requests according to module order. Earlier modules win.
+#[derive(Clone)]
 pub struct ConversionRegistry {
-    modules: Vec<Box<dyn ConversionModule>>,
+    modules: Vec<Arc<dyn ConversionModule>>,
 }
 
 #[derive(Clone, Copy)]
@@ -918,16 +964,11 @@ enum ConversionRoute<'a> {
 
 impl Default for ConversionRegistry {
     fn default() -> Self {
-        // MarkItDown stays first for fast broad Markdown. Docling fills PDF →
-        // HTML/plain (and higher-quality Markdown when prioritized above
-        // MarkItDown). Pandoc owns publishing writers; Defuddle owns URLs.
-        // FFmpeg owns audio/video container conversion (no document overlap).
-        Self::new()
-            .with_module(MarkItDownModule::default())
-            .with_module(PandocModule::default())
-            .with_module(DefuddleModule::default())
-            .with_module(DoclingModule::default())
-            .with_module(FfmpegModule::default())
+        // Building modules resolves external executables, but that work is now
+        // memoized process-wide in `process.rs` (see `resolve_tool_executable`).
+        // So repeated `default()` calls no longer re-scan `PATH`/common dirs;
+        // they only re-wrap the shared `Arc` modules, which is cheap.
+        Self::build_default()
     }
 }
 
@@ -938,8 +979,23 @@ impl ConversionRegistry {
         }
     }
 
+    /// Build the standard registry used by [`Default`].
+    ///
+    /// MarkItDown stays first for fast broad Markdown. Docling fills PDF →
+    /// HTML/plain (and higher-quality Markdown when prioritized above
+    /// MarkItDown). Pandoc owns publishing writers; Defuddle owns URLs. FFmpeg
+    /// owns audio/video container conversion (no document overlap).
+    fn build_default() -> Self {
+        Self::new()
+            .with_module(MarkItDownModule::default())
+            .with_module(PandocModule::default())
+            .with_module(DefuddleModule::default())
+            .with_module(DoclingModule::default())
+            .with_module(FfmpegModule::default())
+    }
+
     pub fn with_module(mut self, module: impl ConversionModule + 'static) -> Self {
-        self.modules.push(Box::new(module));
+        self.modules.push(Arc::new(module));
         self
     }
 
@@ -954,7 +1010,7 @@ impl ConversionRegistry {
     }
 
     pub fn modules(&self) -> impl Iterator<Item = &dyn ConversionModule> {
-        self.modules.iter().map(Box::as_ref)
+        self.modules.iter().map(Arc::as_ref)
     }
 
     /// Whether a registered module uses this stable id.
@@ -966,14 +1022,14 @@ impl ConversionRegistry {
         self.modules
             .iter()
             .find(|module| module.supports(input, output))
-            .map(Box::as_ref)
+            .map(Arc::as_ref)
     }
 
     pub fn module_for_url(&self, output: OutputFormat) -> Option<&dyn ConversionModule> {
         self.modules
             .iter()
             .find(|module| module.supports_url(output))
-            .map(Box::as_ref)
+            .map(Arc::as_ref)
     }
 
     fn route_for(&self, input: &Path, output: OutputFormat) -> Option<ConversionRoute<'_>> {
