@@ -5655,7 +5655,7 @@ impl Shift {
         // Blocking convert/write work on GPUI's background executor (not a raw thread).
         cx.background_executor()
             .spawn(async move {
-                let summary = run_batch(&mut queue, &*registry, &cancel, |event| {
+                let summary = run_batch(&mut queue, &registry, &cancel, |event| {
                     let _ = event_tx.send(event);
                 });
                 let _ = done_tx.send((queue, summary));
