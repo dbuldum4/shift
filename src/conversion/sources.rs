@@ -258,4 +258,40 @@ mod tests {
         assert!(exts.contains("mp4"));
         assert!(exts.contains("docx"));
     }
+
+    #[test]
+    fn expansion_honors_maximum_depth() {
+        let mut dir = unique_dir("deep");
+        let root = dir.clone();
+        // Build a chain of nested directories deeper than MAX_EXPAND_DEPTH.
+        for _ in 0..MAX_EXPAND_DEPTH + 1 {
+            dir = dir.join("sub");
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+
+        let mut exts = HashSet::new();
+        exts.insert("txt".into());
+        let result = expand_input_paths_with_extensions(&[root.as_path()], true, &exts);
+        assert!(result.is_err(), "expected depth limit error");
+        assert!(result.unwrap_err().to_string().contains("maximum depth"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expansion_skips_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_dir("cycle");
+        let target = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let link = dir.join("link");
+        symlink(&target, &link).unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
+        // Should not recurse infinitely and should not return the symlink itself as a file.
+        assert!(found.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

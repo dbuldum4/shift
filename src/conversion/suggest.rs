@@ -103,4 +103,25 @@ mod tests {
         );
         assert_eq!(suggested_output_for_url(), OutputFormat::MARKDOWN);
     }
+
+    #[test]
+    fn suggests_edge_case_extensions() {
+        // Video demux and media container special cases.
+        assert_eq!(suggested_output_for_path("tape.mxf"), OutputFormat::MP4);
+        // Subtitle inputs re-export as SRT.
+        assert_eq!(suggested_output_for_path("subs.srt"), OutputFormat::SRT);
+        assert_eq!(suggested_output_for_path("subs.vtt"), OutputFormat::SRT);
+        // Uppercase and compound extensions still classify correctly.
+        assert_eq!(suggested_output_for_path("Photo.JPEG"), OutputFormat::PNG);
+        assert_eq!(
+            suggested_output_for_path("archive.tar.gz"),
+            OutputFormat::MARKDOWN
+        );
+        // No extension or unknown extension falls back to Markdown.
+        assert_eq!(suggested_output_for_path("README"), OutputFormat::MARKDOWN);
+        assert_eq!(
+            suggested_output_for_path("data.unknown"),
+            OutputFormat::MARKDOWN
+        );
+    }
 }

@@ -210,4 +210,39 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.args", executable.display()));
         let _ = std::fs::remove_file(&input);
     }
+
+    #[test]
+    fn fails_when_markitdown_exits_with_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let executable = directory.join(format!("shift-markitdown-fail-{suffix}"));
+        let input = directory.join(format!("shift-markitdown-fail-input-{suffix}.txt"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'intentional failure' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "source").unwrap();
+
+        let result = MarkItDownModule::with_executable(&executable).convert(
+            &input,
+            OutputFormat::MARKDOWN,
+            &ConversionOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("MarkItDown could not convert"),
+            "{message}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(&input);
+    }
 }

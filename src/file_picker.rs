@@ -565,3 +565,157 @@ fn ns_url_to_path(url: id) -> Option<PathBuf> {
         Some(PathBuf::from(OsStr::from_bytes(cstr.to_bytes())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct HomeGuard {
+        previous: Option<OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", home.as_os_str());
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("HOME");
+                },
+            }
+        }
+    }
+
+    fn reset() {
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        DIALOG_OPEN.store(false, Ordering::SeqCst);
+    }
+
+    fn unique_temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shift-picker-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn default_start_directory_prefers_documents() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("documents");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(default_start_directory(), Some(home.join("Documents")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_start_directory_falls_back_to_home() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(default_start_directory(), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_prefers_provided_directory() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("provided");
+        let provided = home.join("provided");
+        std::fs::create_dir_all(&provided).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(resolve_start_dir(Some(provided.clone())), Some(provided));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_falls_back_to_last_directory() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("last");
+        let last = home.join("last");
+        std::fs::create_dir_all(&last).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(last.clone());
+        assert_eq!(resolve_start_dir(None), Some(last));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_falls_back_to_default() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("default");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(resolve_start_dir(None), Some(home.join("Documents")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_stores_parent_for_files_and_directory_itself() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember");
+        let parent = home.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let file = parent.join("file.txt");
+        std::fs::write(&file, b"").unwrap();
+        reset();
+
+        remember_directory(&file);
+        assert_eq!(
+            *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(parent.clone())
+        );
+
+        remember_directory(&parent);
+        assert_eq!(
+            *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(parent)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn begin_dialog_and_is_busy_guard_reentry() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
+        assert!(!is_busy());
+        assert!(begin_dialog());
+        assert!(is_busy());
+        assert!(!begin_dialog());
+
+        DIALOG_OPEN.store(false, Ordering::SeqCst);
+        assert!(!is_busy());
+    }
+}

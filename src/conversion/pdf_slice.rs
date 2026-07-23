@@ -202,4 +202,50 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.args", fake.display()));
         let _ = std::fs::remove_file(&input);
     }
+
+    #[test]
+    fn rejects_missing_input_file() {
+        let missing =
+            std::env::temp_dir().join(format!("shift-qpdf-missing-{}.pdf", std::process::id()));
+        assert!(extract_pdf_pages(&missing, 1, Some(2), None, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_when_qpdf_returns_nonzero() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let fake = directory.join(format!("shift-qpdf-fail-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-fail-input-{suffix}.pdf"));
+        std::fs::write(&fake, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let result = extract_pdf_pages(&input, 2, Some(4), None, None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("qpdf could not extract")
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&input);
+    }
 }

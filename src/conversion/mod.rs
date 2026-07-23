@@ -1662,6 +1662,18 @@ mod tests {
     }
 
     #[test]
+    fn pdf_plain_routes_to_docling() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for(Path::new("scan.pdf"), OutputFormat("plain"))
+                .unwrap()
+                .id(),
+            "docling"
+        );
+    }
+
+    #[test]
     fn default_priority_still_prefers_markitdown_over_docling_for_pdf_markdown() {
         let registry = ConversionRegistry::default();
         assert_eq!(
