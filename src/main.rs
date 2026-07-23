@@ -72,6 +72,8 @@ const TEXT_SECONDARY: u32 = 0x888888;
 const TEXT_MUTED: u32 = 0x666666;
 const TEXT_DIM: u32 = 0x444444;
 const TEXT_INVERSE: u32 = 0x000000;
+/// Subtle press feedback for interactive surfaces (Emil Kowalski / Apple-style active states).
+const ACTIVE_OPACITY: f32 = 0.88;
 const BADGE_FILL: u32 = 0x1a1a1a;
 const BADGE_TEXT: u32 = 0xcccccc;
 const STATUS_READY_FILL: u32 = 0x1a1a1a;
@@ -625,6 +627,7 @@ fn batch_queue_panel(
                                 .hover(|style| {
                                     style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child("Folder")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.choose_output_folder(cx);
@@ -654,6 +657,7 @@ fn batch_queue_panel(
                                 .hover(|style| {
                                     style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child(force_label)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.toggle_batch_force(cx);
@@ -676,6 +680,7 @@ fn batch_queue_panel(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Start")
                                     .on_click(cx.listener(|this, _, _, cx| this.start_batch(cx))),
                             )
@@ -697,6 +702,7 @@ fn batch_queue_panel(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_batch(cx))),
                             )
@@ -718,6 +724,7 @@ fn batch_queue_panel(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Retry failed")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.retry_failed_batch(cx)),
@@ -740,6 +747,7 @@ fn batch_queue_panel(
                                 .hover(|style| {
                                     style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child("Clear")
                                 .on_click(cx.listener(|this, _, _, cx| this.clear_batch_queue(cx))),
                         ),
@@ -850,6 +858,7 @@ fn batch_queue_panel(
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child(if is_override { "Inherit" } else { "Override" })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_batch_item_format(id, cx);
@@ -868,6 +877,7 @@ fn batch_queue_panel(
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Reveal")
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         file_picker::reveal_in_finder(&path);
@@ -886,6 +896,7 @@ fn batch_queue_panel(
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Retry")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.retry_batch_item(id, cx);
@@ -894,6 +905,11 @@ fn batch_queue_panel(
                             )
                         })
                 })),
+        )
+        .with_animation(
+            "batch-queue-in",
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.5 + 0.5 * progress),
         )
 }
 
@@ -957,6 +973,7 @@ fn history_sidebar(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_SECONDARY))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Clear")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.clear_history(cx);
@@ -1041,6 +1058,7 @@ fn history_sidebar(
                         .py_2()
                         .rounded_lg()
                         .cursor_pointer()
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .when(active, |row| {
                             row.bg(rgb(BG_ELEVATED))
                                 .border_1()
@@ -1095,6 +1113,7 @@ fn history_sidebar(
                                             .text_color(rgb(TEXT_MUTED))
                                             .cursor_pointer()
                                             .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
+                                            .active(|style| style.opacity(ACTIVE_OPACITY))
                                             .child(archive_label)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.archive_history_entry(id, cx);
@@ -1108,6 +1127,7 @@ fn history_sidebar(
                                             .text_color(rgb(TEXT_MUTED))
                                             .cursor_pointer()
                                             .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
+                                            .active(|style| style.opacity(ACTIVE_OPACITY))
                                             .child("Delete")
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.delete_history_entry(id, cx);
@@ -1304,7 +1324,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                                 .border_color(rgb(BORDER_FOCUS))
                                 .text_color(rgb(TEXT))
                         })
-                        .active(|style| style.opacity(0.85))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child(
                             div()
                                 .text_sm()
@@ -1392,6 +1412,7 @@ fn chip(
                 style.bg(rgb(BG_HOVER))
             }
         })
+        .active(|style| style.opacity(ACTIVE_OPACITY))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -1530,6 +1551,7 @@ fn conversion_options_panel(
                         .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child("Apply")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.apply_conversion_options(cx);
@@ -2313,6 +2335,7 @@ fn conversion_options_panel(
                             .line_clamp(1)
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                            .active(|style| style.opacity(ACTIVE_OPACITY))
                             .child(ref_doc_label)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.pick_reference_doc(cx);
@@ -2517,6 +2540,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_conversion(cx))),
                 )
@@ -2583,6 +2607,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .text_color(rgb(TEXT_PRIMARY))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                            .active(|style| style.opacity(ACTIVE_OPACITY))
                             .child("Copy install command")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
@@ -2868,6 +2893,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .border_color(rgb(BORDER))
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(BG_HOVER)))
+                .active(|style| style.opacity(ACTIVE_OPACITY))
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Output"))
                 .child(
                     div()
@@ -2957,6 +2983,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .when(enabled, |row| {
                                         row.cursor_pointer()
                                             .hover(|style| style.bg(rgb(BG_HOVER)))
+                                            .active(|style| style.opacity(ACTIVE_OPACITY))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.set_output_format(format, cx);
                                                 cx.stop_propagation();
@@ -3048,6 +3075,7 @@ fn action_chip(
         .text_color(rgb(TEXT_PRIMARY))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+        .active(|style| style.opacity(ACTIVE_OPACITY))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -3311,7 +3339,7 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .text_color(rgb(TEXT_PRIMARY))
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-                .active(|style| style.opacity(0.82))
+                .active(|style| style.opacity(ACTIVE_OPACITY))
                 .child("Convert")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.submit_magic_paste_from_input(cx);
@@ -3346,6 +3374,7 @@ fn settings_nav_item(
                 style.bg(rgb(BG_SURFACE))
             }
         })
+        .active(|style| style.opacity(ACTIVE_OPACITY))
         .child(
             div()
                 .text_sm()
@@ -3704,6 +3733,7 @@ fn settings_general_panel(
                         .text_color(rgb(TEXT_SECONDARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child("Clear history")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.clear_history(cx);
@@ -3779,6 +3809,7 @@ fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl I
                                         style.bg(rgb(BG_HOVER))
                                     }
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child(*label)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.set_ui_font_family(family_owned.clone(), cx);
@@ -4324,6 +4355,7 @@ fn settings_diagnostics_panel(
                         .text_color(rgb(TEXT_SECONDARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child(if loading { "Checking…" } else { "Refresh" })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_diagnostics(cx);
@@ -4778,6 +4810,7 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_HOVER)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child(div().text_color(rgb(TEXT_SECONDARY)).child("←"))
                         .child("Back")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -4846,6 +4879,11 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .child(settings_nav_item(SettingsSection::About, section, 6, cx)),
                 )
                 .child(settings_content(&view, cx)),
+        )
+        .with_animation(
+            "settings-screen-in",
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.5 + 0.5 * progress),
         )
 }
 
@@ -7032,6 +7070,7 @@ impl Render for Shift {
                             .bg(rgb(DROP_ZONE_COLOR))
                             .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
                             .cursor_pointer()
+                            .active(|style| style.opacity(ACTIVE_OPACITY))
                             .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(BG_ELEVATED)))
                             .child(rounded_dashed_border(has_selection || show_batch))
                             .when_some(preview, |zone, preview| {
@@ -7146,6 +7185,7 @@ impl Render for Shift {
                     .text_color(rgb(TEXT_SECONDARY))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                    .active(|style| style.opacity(ACTIVE_OPACITY))
                     .child("⚙")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.output_menu_open = false;
