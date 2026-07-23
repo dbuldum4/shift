@@ -13,6 +13,7 @@ mod process;
 mod sources;
 mod suggest;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -1143,10 +1144,45 @@ impl ConversionRegistry {
     }
 
     pub fn available_outputs(&self, input: &Path) -> Vec<OutputFormat> {
+        let Some(extension) = input.extension().and_then(|value| value.to_str()) else {
+            return Vec::new();
+        };
+
+        let mut reachable = HashSet::new();
+        for (first_index, first) in self.modules.iter().enumerate() {
+            if !first
+                .input_extensions()
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            {
+                continue;
+            }
+
+            reachable.extend(first.output_formats().iter().copied());
+
+            for &intermediate in first.chainable_output_formats() {
+                if !first.output_formats().contains(&intermediate) {
+                    continue;
+                }
+                for (second_index, second) in self.modules.iter().enumerate() {
+                    if second_index == first_index {
+                        continue;
+                    }
+                    if second
+                        .input_extensions()
+                        .iter()
+                        .any(|candidate| intermediate.extension().eq_ignore_ascii_case(candidate))
+                    {
+                        reachable.extend(second.output_formats().iter().copied());
+                    }
+                }
+            }
+        }
+
         OutputFormat::ALL
             .iter()
             .copied()
-            .filter(|output| self.route_for(input, *output).is_some())
+            .filter(|output| reachable.contains(output))
             .collect()
     }
 
