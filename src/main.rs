@@ -1,6 +1,9 @@
 mod file_picker;
 mod text_input;
 
+#[cfg(test)]
+mod ui_tests;
+
 use gpui::{
     Animation, AnimationExt, App, Application, Bounds, ClipboardEntry, ClipboardItem, Context,
     CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, ImageFormat,
@@ -175,7 +178,7 @@ struct FilePreview {
     badge_text_color: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ConversionState {
     Empty,
     Converting,
@@ -4806,6 +4809,215 @@ struct Shift {
 }
 
 impl Shift {
+    fn new(cx: &mut Context<Self>, initial_window_width: f32) -> Self {
+        let session = load_default_session_settings();
+        let options = session.to_conversion_options();
+        let url_input = cx.new(|cx| TextInput::new(cx, "Paste a URL, path, or image…", ""));
+        let format_filter_input = cx.new(|cx| TextInput::new(cx, "Filter formats…", ""));
+        let ffmpeg_start_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "0",
+                options
+                    .ffmpeg
+                    .start_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let ffmpeg_duration_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "optional",
+                options
+                    .ffmpeg
+                    .duration_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let ffmpeg_frame_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "0",
+                options
+                    .ffmpeg
+                    .frame_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let ffmpeg_fps_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "optional",
+                options
+                    .ffmpeg
+                    .fps
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let ffmpeg_frame_interval_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "1.0",
+                options
+                    .ffmpeg
+                    .frame_interval_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let ffmpeg_audio_stream_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "0",
+                options
+                    .ffmpeg
+                    .audio_stream
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let ffmpeg_subtitle_stream_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "0",
+                options
+                    .ffmpeg
+                    .subtitle_stream
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let docling_ocr_lang_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "e.g. eng",
+                options.docling.ocr_lang.clone().unwrap_or_default(),
+            )
+        });
+        let defuddle_lang_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "optional, e.g. en",
+                options.defuddle.lang.clone().unwrap_or_default(),
+            )
+        });
+        let pdf_page_from_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "from",
+                options
+                    .pdf
+                    .page_from
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let pdf_page_to_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "to",
+                options
+                    .pdf
+                    .page_to
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let pdf_password_input = cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+        let (history, next_history_id) = history_from_store(load_history());
+        let mut batch_queue = BatchQueue::new();
+        if let Some(dir) = session.batch_output_dir.as_ref() {
+            batch_queue.set_output_dir(Some(dir.as_path()));
+        }
+        let focus_handle = cx.focus_handle();
+        let history_sidebar_width = clamp_history_sidebar_width(
+            session.history_sidebar_width,
+            initial_window_width,
+            session.output_panel_width,
+        );
+        let output_panel_width = clamp_output_panel_width(
+            session.output_panel_width,
+            initial_window_width,
+            history_sidebar_width,
+        );
+        Shift {
+            focus_handle,
+            selected_file: None,
+            selected_url: None,
+            file_preview: None,
+            selection_generation: 0,
+            conversion_generation: 0,
+            conversion: ConversionState::Empty,
+            save_status: None,
+            preference_error: None,
+            output_format: session.output_format(),
+            user_chose_format: false,
+            output_menu_open: false,
+            format_filter_input,
+            settings_open: false,
+            settings_section: SettingsSection::Converters,
+            ui_font_family: session.resolved_ui_font_family().to_owned(),
+            shortcuts_help_open: false,
+            show_command_inspect: false,
+            module_priority: load_module_priority(),
+            diagnostics: None,
+            diagnostics_loading: false,
+            url_input,
+            history,
+            next_history_id,
+            active_history_id: None,
+            history_sidebar_width,
+            output_panel_width,
+            panel_resize: None,
+            batch_queue,
+            batch_output_dir: session.batch_output_dir.clone(),
+            batch_running: false,
+            batch_generation: 0,
+            batch_cancel: Arc::new(AtomicBool::new(false)),
+            batch_status: None,
+            batch_force: session.batch_force,
+            batch_item_progress: HashMap::new(),
+            folder_confirm: None,
+            conversion_cancel: Arc::new(AtomicBool::new(false)),
+            conversion_progress: None,
+            cached_ready_path: None,
+            ffmpeg_quality: options.ffmpeg.quality,
+            ffmpeg_encode_mode: options.ffmpeg.encode_mode,
+            ffmpeg_mono: options.ffmpeg.mono,
+            ffmpeg_mute: options.ffmpeg.mute,
+            ffmpeg_normalize: options.ffmpeg.normalize_audio,
+            ffmpeg_burn_subs: options.ffmpeg.burn_subtitles,
+            ffmpeg_sample_rate_hz: options.ffmpeg.sample_rate_hz,
+            ffmpeg_scale_width: options.ffmpeg.scale_width,
+            ffmpeg_start_input,
+            ffmpeg_duration_input,
+            ffmpeg_frame_input,
+            ffmpeg_fps_input,
+            ffmpeg_frame_interval_input,
+            ffmpeg_audio_stream_input,
+            ffmpeg_subtitle_stream_input,
+            docling_images: options.docling.image_export_mode,
+            docling_ocr: options.docling.ocr,
+            docling_tables: options.docling.tables,
+            docling_table_mode: options.docling.table_mode,
+            docling_ocr_lang_input,
+            defuddle_frontmatter: options.defuddle.frontmatter,
+            defuddle_lang_input,
+            pandoc_standalone: options.pandoc.standalone,
+            pandoc_toc: options.pandoc.toc,
+            pandoc_citations: options.pandoc.citations,
+            pandoc_pdf_engine: options.pandoc.pdf_engine.clone(),
+            pandoc_reference_doc: options.pandoc.reference_doc.clone(),
+            pdf_page_from_input,
+            pdf_page_to_input,
+            pdf_password_input,
+            markitdown_keep_data_uris: options.markitdown.keep_data_uris,
+        }
+    }
     fn refresh_diagnostics(&mut self, cx: &mut Context<Self>) {
         if self.diagnostics_loading {
             return;
@@ -7044,218 +7256,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let shift_entity = cx.new(|cx| {
-                    let session = load_default_session_settings();
-                    let options = session.to_conversion_options();
-                    let url_input =
-                        cx.new(|cx| TextInput::new(cx, "Paste a URL, path, or image…", ""));
-                    let format_filter_input =
-                        cx.new(|cx| TextInput::new(cx, "Filter formats…", ""));
-                    let ffmpeg_start_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "0",
-                            options
-                                .ffmpeg
-                                .start_secs
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let ffmpeg_duration_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "optional",
-                            options
-                                .ffmpeg
-                                .duration_secs
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let ffmpeg_frame_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "0",
-                            options
-                                .ffmpeg
-                                .frame_secs
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let ffmpeg_fps_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "optional",
-                            options
-                                .ffmpeg
-                                .fps
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let ffmpeg_frame_interval_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "1.0",
-                            options
-                                .ffmpeg
-                                .frame_interval_secs
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let ffmpeg_audio_stream_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "0",
-                            options
-                                .ffmpeg
-                                .audio_stream
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let ffmpeg_subtitle_stream_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "0",
-                            options
-                                .ffmpeg
-                                .subtitle_stream
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let docling_ocr_lang_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "e.g. eng",
-                            options.docling.ocr_lang.clone().unwrap_or_default(),
-                        )
-                    });
-                    let defuddle_lang_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "optional, e.g. en",
-                            options.defuddle.lang.clone().unwrap_or_default(),
-                        )
-                    });
-                    let pdf_page_from_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "from",
-                            options
-                                .pdf
-                                .page_from
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let pdf_page_to_input = cx.new(|cx| {
-                        TextInput::new(
-                            cx,
-                            "to",
-                            options
-                                .pdf
-                                .page_to
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let pdf_password_input =
-                        cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
-                    let (history, next_history_id) = history_from_store(load_history());
-                    let mut batch_queue = BatchQueue::new();
-                    if let Some(dir) = session.batch_output_dir.as_ref() {
-                        batch_queue.set_output_dir(Some(dir.as_path()));
-                    }
-                    let focus_handle = cx.focus_handle();
-                    let history_sidebar_width = clamp_history_sidebar_width(
-                        session.history_sidebar_width,
-                        initial_window_width,
-                        session.output_panel_width,
-                    );
-                    let output_panel_width = clamp_output_panel_width(
-                        session.output_panel_width,
-                        initial_window_width,
-                        history_sidebar_width,
-                    );
-                    Shift {
-                        focus_handle,
-                        selected_file: None,
-                        selected_url: None,
-                        file_preview: None,
-                        selection_generation: 0,
-                        conversion_generation: 0,
-                        conversion: ConversionState::Empty,
-                        save_status: None,
-                        preference_error: None,
-                        output_format: session.output_format(),
-                        user_chose_format: false,
-                        output_menu_open: false,
-                        format_filter_input,
-                        settings_open: false,
-                        settings_section: SettingsSection::Converters,
-                        ui_font_family: session.resolved_ui_font_family().to_owned(),
-                        shortcuts_help_open: false,
-                        show_command_inspect: false,
-                        module_priority: load_module_priority(),
-                        diagnostics: None,
-                        diagnostics_loading: false,
-                        url_input,
-                        history,
-                        next_history_id,
-                        active_history_id: None,
-                        history_sidebar_width,
-                        output_panel_width,
-                        panel_resize: None,
-                        batch_queue,
-                        batch_output_dir: session.batch_output_dir.clone(),
-                        batch_running: false,
-                        batch_generation: 0,
-                        batch_cancel: Arc::new(AtomicBool::new(false)),
-                        batch_status: None,
-                        batch_force: session.batch_force,
-                        batch_item_progress: HashMap::new(),
-                        folder_confirm: None,
-                        conversion_cancel: Arc::new(AtomicBool::new(false)),
-                        conversion_progress: None,
-                        cached_ready_path: None,
-                        ffmpeg_quality: options.ffmpeg.quality,
-                        ffmpeg_encode_mode: options.ffmpeg.encode_mode,
-                        ffmpeg_mono: options.ffmpeg.mono,
-                        ffmpeg_mute: options.ffmpeg.mute,
-                        ffmpeg_normalize: options.ffmpeg.normalize_audio,
-                        ffmpeg_burn_subs: options.ffmpeg.burn_subtitles,
-                        ffmpeg_sample_rate_hz: options.ffmpeg.sample_rate_hz,
-                        ffmpeg_scale_width: options.ffmpeg.scale_width,
-                        ffmpeg_start_input,
-                        ffmpeg_duration_input,
-                        ffmpeg_frame_input,
-                        ffmpeg_fps_input,
-                        ffmpeg_frame_interval_input,
-                        ffmpeg_audio_stream_input,
-                        ffmpeg_subtitle_stream_input,
-                        docling_images: options.docling.image_export_mode,
-                        docling_ocr: options.docling.ocr,
-                        docling_tables: options.docling.tables,
-                        docling_table_mode: options.docling.table_mode,
-                        docling_ocr_lang_input,
-                        defuddle_frontmatter: options.defuddle.frontmatter,
-                        defuddle_lang_input,
-                        pandoc_standalone: options.pandoc.standalone,
-                        pandoc_toc: options.pandoc.toc,
-                        pandoc_citations: options.pandoc.citations,
-                        pandoc_pdf_engine: options.pandoc.pdf_engine.clone(),
-                        pandoc_reference_doc: options.pandoc.reference_doc.clone(),
-                        pdf_page_from_input,
-                        pdf_page_to_input,
-                        pdf_password_input,
-                        markitdown_keep_data_uris: options.markitdown.keep_data_uris,
-                    }
-                });
+                let shift_entity = cx.new(|cx| Shift::new(cx, initial_window_width));
 
                 window.focus(&shift_entity.read(cx).focus_handle);
 

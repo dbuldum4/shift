@@ -32,6 +32,9 @@ block = "0.1"
 cocoa = "0.26"
 objc = "0.2"
 
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }
+
 [profile.release]
 lto = "thin"
 strip = true
