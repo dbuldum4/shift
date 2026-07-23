@@ -1,16 +1,19 @@
 mod file_picker;
 mod text_input;
+mod ui;
 
 #[cfg(test)]
 mod ui_tests;
 
+use crate::ui::animation;
+use crate::ui::theme::{THEME, card_shadow};
 use gpui::{
     Animation, AnimationExt, App, Application, Bounds, ClipboardEntry, ClipboardItem, Context,
-    CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, ImageFormat,
+    CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, ImageFormat,
     KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder,
     PathStyle, Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, hsla,
-    point, prelude::*, px, rgb, size,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, point,
+    prelude::*, pulsating_between, px, rgb, size,
 };
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
@@ -61,43 +64,11 @@ const UI_FONT_CHOICES: &[(&str, &str)] = &[
     ("Andale Mono", "Andale Mono"),
     ("Helvetica Neue", "Helvetica Neue"),
 ];
-const BG: u32 = 0x000000;
-const BG_RAISED: u32 = 0x0a0a0a;
-const BG_SURFACE: u32 = 0x111111;
-const BG_ELEVATED: u32 = 0x1a1a1a;
-const BG_HOVER: u32 = 0x222222;
-const BG_ACTIVE: u32 = 0x2a2a2a;
-
-/// Consistent elevation shadow for raised cards and dialogs.
-fn card_shadow() -> Vec<gpui::BoxShadow> {
-    vec![gpui::BoxShadow {
-        color: hsla(0.0, 0.0, 0.0, 0.65),
-        blur_radius: px(24.0),
-        spread_radius: px(0.0),
-        offset: point(px(0.0), px(8.0)),
-    }]
-}
-const DROP_ZONE_COLOR: u32 = 0x0a0a0a;
-const DROP_ZONE_HOVER_COLOR: u32 = 0x111111;
-const BORDER: u32 = 0x222222;
-const BORDER_STRONG: u32 = 0x333333;
-const BORDER_FOCUS: u32 = 0x555555;
-const TEXT: u32 = 0xffffff;
-const TEXT_PRIMARY: u32 = 0xe8e8e8;
-const TEXT_SECONDARY: u32 = 0x888888;
-const TEXT_MUTED: u32 = 0x666666;
-const TEXT_DIM: u32 = 0x444444;
-const TEXT_INVERSE: u32 = 0x000000;
-/// Subtle press feedback for interactive surfaces (Emil Kowalski / Apple-style active states).
-const ACTIVE_OPACITY: f32 = 0.88;
+/// Monochrome file-type badge colors, retained as `u32` because they are stored
+/// in the SQLite history schema. UI render sites should use `THEME.badge_fill` /
+/// `THEME.badge_text` so the chrome can vary independently of the persisted value.
 const BADGE_FILL: u32 = 0x1a1a1a;
 const BADGE_TEXT: u32 = 0xcccccc;
-const STATUS_READY_FILL: u32 = 0x1a1a1a;
-const STATUS_READY_TEXT: u32 = 0xe8e8e8;
-const STATUS_READY_BORDER: u32 = 0x555555;
-const STATUS_MISSING_FILL: u32 = 0x111111;
-const STATUS_MISSING_TEXT: u32 = 0x888888;
-const STATUS_MISSING_BORDER: u32 = 0x333333;
 // Keep mins near the defaults so a drag can't crush history chips or the output pane.
 // Sum of mins + handles must fit the window minimum (900px).
 const HISTORY_SIDEBAR_MIN: f32 = 220.0;
@@ -269,14 +240,14 @@ impl Render for ModuleDrag {
             .px_4()
             .py_3()
             .rounded_lg()
-            .bg(rgb(BG_ELEVATED))
+            .bg(THEME.elevated)
             .border_1()
-            .border_color(rgb(BORDER_STRONG))
+            .border_color(THEME.border_strong)
             .shadow_lg()
             .text_sm()
             .font_family(FONT_MONO)
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(TEXT))
+            .text_color(THEME.text)
             .child(self.label.clone())
     }
 }
@@ -307,14 +278,14 @@ impl Render for OutputFileDrag {
             .px_4()
             .py_3()
             .rounded_lg()
-            .bg(rgb(BG_ELEVATED))
+            .bg(THEME.elevated)
             .border_1()
-            .border_color(rgb(BORDER_STRONG))
+            .border_color(THEME.border_strong)
             .shadow_lg()
             .text_sm()
             .font_family(FONT_MONO)
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(TEXT))
+            .text_color(THEME.text)
             .child(self.label.clone())
     }
 }
@@ -524,9 +495,9 @@ fn rounded_dashed_border(accent: bool) -> impl IntoElement {
 
             if let Ok(path) = path.build() {
                 let color = if accent {
-                    rgb(BORDER_FOCUS)
+                    THEME.border_focused
                 } else {
-                    rgb(BORDER)
+                    THEME.border
                 };
                 window.paint_path(path, color);
             }
@@ -546,7 +517,7 @@ fn empty_drop_prompt() -> impl IntoElement {
         .child(
             div()
                 .text_3xl()
-                .text_color(rgb(TEXT_SECONDARY))
+                .text_color(THEME.text_secondary)
                 .child("\u{2191}"),
         )
         .child(
@@ -558,7 +529,7 @@ fn empty_drop_prompt() -> impl IntoElement {
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(TEXT_SECONDARY))
+                .text_color(THEME.text_secondary)
                 .child("or click to browse (multi-select)"),
         )
 }
@@ -633,17 +604,17 @@ fn batch_queue_panel(
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(BG_ELEVATED))
+                                .bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER_STRONG))
+                                .border_color(THEME.border_strong)
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(THEME.text_primary)
                                 .cursor_pointer()
                                 .hover(|style| {
-                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                    style.bg(THEME.active).border_color(THEME.border_focused)
                                 })
-                                .active(|style| style.opacity(ACTIVE_OPACITY))
+                                .active(|style| style.opacity(THEME.active_opacity))
                                 .child("Folder")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.choose_output_folder(cx);
@@ -655,25 +626,21 @@ fn batch_queue_panel(
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(if force {
-                                    rgb(BG_ACTIVE)
-                                } else {
-                                    rgb(BG_ELEVATED)
-                                })
+                                .bg(if force { THEME.active } else { THEME.elevated })
                                 .border_1()
                                 .border_color(if force {
-                                    rgb(BORDER_FOCUS)
+                                    THEME.border_focused
                                 } else {
-                                    rgb(BORDER_STRONG)
+                                    THEME.border_strong
                                 })
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(THEME.text_primary)
                                 .cursor_pointer()
                                 .hover(|style| {
-                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                    style.bg(THEME.active).border_color(THEME.border_focused)
                                 })
-                                .active(|style| style.opacity(ACTIVE_OPACITY))
+                                .active(|style| style.opacity(THEME.active_opacity))
                                 .child(force_label)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.toggle_batch_force(cx);
@@ -686,17 +653,17 @@ fn batch_queue_panel(
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(rgb(BG_ELEVATED))
+                                    .bg(THEME.elevated)
                                     .border_1()
-                                    .border_color(rgb(BORDER_STRONG))
+                                    .border_color(THEME.border_strong)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(THEME.text_primary)
                                     .cursor_pointer()
                                     .hover(|style| {
-                                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                        style.bg(THEME.active).border_color(THEME.border_focused)
                                     })
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child("Start")
                                     .on_click(cx.listener(|this, _, _, cx| this.start_batch(cx))),
                             )
@@ -708,17 +675,17 @@ fn batch_queue_panel(
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(rgb(BG_ELEVATED))
+                                    .bg(THEME.elevated)
                                     .border_1()
-                                    .border_color(rgb(BORDER_STRONG))
+                                    .border_color(THEME.border_strong)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(THEME.text_primary)
                                     .cursor_pointer()
                                     .hover(|style| {
-                                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                        style.bg(THEME.active).border_color(THEME.border_focused)
                                     })
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_batch(cx))),
                             )
@@ -730,17 +697,17 @@ fn batch_queue_panel(
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(rgb(BG_ELEVATED))
+                                    .bg(THEME.elevated)
                                     .border_1()
-                                    .border_color(rgb(BORDER_STRONG))
+                                    .border_color(THEME.border_strong)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(THEME.text_primary)
                                     .cursor_pointer()
                                     .hover(|style| {
-                                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                        style.bg(THEME.active).border_color(THEME.border_focused)
                                     })
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child("Retry failed")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.retry_failed_batch(cx)),
@@ -753,17 +720,17 @@ fn batch_queue_panel(
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(BG_ELEVATED))
+                                .bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER_STRONG))
+                                .border_color(THEME.border_strong)
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(THEME.text_primary)
                                 .cursor_pointer()
                                 .hover(|style| {
-                                    style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                                    style.bg(THEME.active).border_color(THEME.border_focused)
                                 })
-                                .active(|style| style.opacity(ACTIVE_OPACITY))
+                                .active(|style| style.opacity(THEME.active_opacity))
                                 .child("Clear")
                                 .on_click(cx.listener(|this, _, _, cx| this.clear_batch_queue(cx))),
                         ),
@@ -772,14 +739,14 @@ fn batch_queue_panel(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(THEME.text_muted)
                 .child(format!("Output: {folder_label}")),
         )
         .when_some(status, |panel, status| {
             panel.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_color(THEME.text_secondary)
                     .child(status),
             )
         })
@@ -831,9 +798,9 @@ fn batch_queue_panel(
                         .px_3()
                         .py_2()
                         .rounded_md()
-                        .bg(rgb(BG_RAISED))
+                        .bg(THEME.raised)
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .child(
                             div()
                                 .flex()
@@ -845,19 +812,19 @@ fn batch_queue_panel(
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(THEME.text_primary)
                                         .child(ellipsize_chars(name.as_ref(), 48)),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(THEME.text_muted)
                                         .child(ellipsize_chars(detail.as_ref(), 56)),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_DIM))
+                                        .text_color(THEME.text_dim)
                                         .child(format_label),
                                 ),
                         )
@@ -871,10 +838,10 @@ fn batch_queue_panel(
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(THEME.text_secondary)
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child(if is_override { "Inherit" } else { "Override" })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_batch_item_format(id, cx);
@@ -890,10 +857,10 @@ fn batch_queue_panel(
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(THEME.text_secondary)
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child("Reveal")
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         file_picker::reveal_in_finder(&path);
@@ -909,10 +876,10 @@ fn batch_queue_panel(
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(THEME.text_secondary)
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child("Retry")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.retry_batch_item(id, cx);
@@ -924,8 +891,8 @@ fn batch_queue_panel(
         )
         .with_animation(
             "batch-queue-in",
-            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
-            |element, progress| element.opacity(0.5 + 0.5 * progress),
+            Animation::new(animation::ENTER_DURATION).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.12 + 0.88 * progress),
         )
 }
 
@@ -955,7 +922,7 @@ fn history_sidebar(
         .flex_shrink_0()
         .w(px(width))
         .h_full()
-        .bg(rgb(BG))
+        .bg(THEME.background)
         .child(
             div()
                 .flex()
@@ -973,7 +940,7 @@ fn history_sidebar(
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(THEME.text_secondary)
                                 .child("History"),
                         )
                         .when(!is_empty, |header| {
@@ -984,12 +951,12 @@ fn history_sidebar(
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(THEME.text_muted)
                                     .cursor_pointer()
                                     .hover(|style| {
-                                        style.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_SECONDARY))
+                                        style.bg(THEME.elevated).text_color(THEME.text_secondary)
                                     })
-                                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                                    .active(|style| style.opacity(THEME.active_opacity))
                                     .child("Clear")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.clear_history(cx);
@@ -1004,11 +971,11 @@ fn history_sidebar(
                             .flex_1()
                             .min_w_0()
                             .rounded_lg()
-                            .bg(rgb(BG_SURFACE))
+                            .bg(THEME.surface)
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(THEME.border)
                             .text_sm()
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(THEME.text_primary)
                             .overflow_hidden()
                             .child(history_search),
                     ),
@@ -1039,13 +1006,13 @@ fn history_sidebar(
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(THEME.text_muted)
                                     .child("No conversions yet"),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_DIM))
+                                    .text_color(THEME.text_dim)
                                     .child("Completed work is kept across launches."),
                             ),
                     )
@@ -1074,16 +1041,16 @@ fn history_sidebar(
                         .py_2()
                         .rounded_lg()
                         .cursor_pointer()
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
+                        .active(|style| style.opacity(THEME.active_opacity))
                         .when(active, |row| {
-                            row.bg(rgb(BG_ELEVATED))
+                            row.bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER_STRONG))
+                                .border_color(THEME.border_strong)
                         })
                         .when(!active, |row| {
                             row.border_1()
-                                .border_color(rgb(BG))
-                                .hover(|style| style.bg(rgb(BG_SURFACE)))
+                                .border_color(THEME.background)
+                                .hover(|style| style.bg(THEME.surface))
                         })
                         .child(
                             div()
@@ -1091,9 +1058,9 @@ fn history_sidebar(
                                 .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(if failed {
-                                    rgb(TEXT_SECONDARY)
+                                    THEME.text_secondary
                                 } else {
-                                    rgb(TEXT_PRIMARY)
+                                    THEME.text_primary
                                 })
                                 .child(ellipsize_chars(entry.name.as_ref(), 48)),
                         )
@@ -1111,7 +1078,7 @@ fn history_sidebar(
                                     div()
                                         .flex_1()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(THEME.text_muted)
                                         .child(ellipsize_chars(detail.as_ref(), 56)),
                                 ),
                         )
@@ -1126,10 +1093,10 @@ fn history_sidebar(
                                         div()
                                             .id(("history-archive", id))
                                             .text_xs()
-                                            .text_color(rgb(TEXT_MUTED))
+                                            .text_color(THEME.text_muted)
                                             .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
-                                            .active(|style| style.opacity(ACTIVE_OPACITY))
+                                            .hover(|style| style.text_color(THEME.text_primary))
+                                            .active(|style| style.opacity(THEME.active_opacity))
                                             .child(archive_label)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.archive_history_entry(id, cx);
@@ -1140,10 +1107,10 @@ fn history_sidebar(
                                         div()
                                             .id(("history-delete", id))
                                             .text_xs()
-                                            .text_color(rgb(TEXT_MUTED))
+                                            .text_color(THEME.text_muted)
                                             .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
-                                            .active(|style| style.opacity(ACTIVE_OPACITY))
+                                            .hover(|style| style.text_color(THEME.text_primary))
+                                            .active(|style| style.opacity(THEME.active_opacity))
                                             .child("Delete")
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.delete_history_entry(id, cx);
@@ -1187,11 +1154,11 @@ fn vertical_resize_handle(
         .h_full()
         .mx_auto()
         .bg(if active {
-            rgb(BORDER_FOCUS)
+            THEME.border_focused
         } else {
-            rgb(BORDER)
+            THEME.border
         })
-        .group_hover("panel-resize", |style| style.bg(rgb(BORDER_STRONG)));
+        .group_hover("panel-resize", |style| style.bg(THEME.border_strong));
 
     div()
         .id(id)
@@ -1268,9 +1235,9 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                 .px_4()
                 .py_3()
                 .rounded_xl()
-                .bg(rgb(BG_SURFACE))
+                .bg(THEME.surface)
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(THEME.border)
                 .shadow(card_shadow())
                 // File-type badge
                 .child(
@@ -1283,7 +1250,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                         .rounded_lg()
                         .bg(rgb(badge_color))
                         .border_1()
-                        .border_color(hsla(0.0, 0.0, 1.0, 0.06))
+                        .border_color(THEME.border_light)
                         .child(
                             div()
                                 .text_xs()
@@ -1304,13 +1271,13 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                             div()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT))
+                                .text_color(THEME.text)
                                 .child(ellipsize_chars(preview.name.as_ref(), 40)),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(THEME.text_secondary)
                                 .child(ellipsize_chars(preview.subtitle.as_ref(), 56)),
                         ),
                 )
@@ -1324,18 +1291,18 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                         .justify_center()
                         .size(px(28.0))
                         .rounded_full()
-                        .bg(rgb(BG_HOVER))
+                        .bg(THEME.hover)
                         .border_1()
-                        .border_color(rgb(BORDER_STRONG))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .border_color(THEME.border_strong)
+                        .text_color(THEME.text_secondary)
                         .cursor_pointer()
                         .hover(|style| {
                             style
-                                .bg(rgb(BG_HOVER))
-                                .border_color(rgb(BORDER_FOCUS))
-                                .text_color(rgb(TEXT))
+                                .bg(THEME.hover)
+                                .border_color(THEME.border_focused)
+                                .text_color(THEME.text)
                         })
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
+                        .active(|style| style.opacity(THEME.active_opacity))
                         .child(
                             div()
                                 .text_sm()
@@ -1351,13 +1318,13 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(THEME.text_muted)
                 .child("Click to add files  ·  Drop more for batch"),
         )
         .with_animation(
             "file-preview-in",
-            Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
-            |element, progress| element.opacity(0.35 + 0.65 * progress),
+            Animation::new(animation::DIALOG_DURATION).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.12 + 0.88 * progress),
         )
 }
 
@@ -1408,22 +1375,22 @@ fn chip(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .bg(if selected { rgb(TEXT) } else { rgb(BG_SURFACE) })
+        .bg(if selected { THEME.text } else { THEME.surface })
         .text_color(if selected {
-            rgb(TEXT_INVERSE)
+            THEME.text_inverse
         } else {
-            rgb(TEXT_SECONDARY)
+            THEME.text_secondary
         })
         .border_1()
-        .border_color(if selected { rgb(TEXT) } else { rgb(BORDER) })
+        .border_color(if selected { THEME.text } else { THEME.border })
         .hover(|style| {
             if selected {
                 style
             } else {
-                style.bg(rgb(BG_HOVER))
+                style.bg(THEME.hover)
             }
         })
-        .active(|style| style.opacity(ACTIVE_OPACITY))
+        .active(|style| style.opacity(THEME.active_opacity))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -1533,9 +1500,9 @@ fn conversion_options_panel(
         .w_full()
         .p_3()
         .rounded_xl()
-        .bg(rgb(BG_RAISED))
+        .bg(THEME.raised)
         .border_1()
-        .border_color(rgb(BORDER))
+        .border_color(THEME.border)
         .shadow(card_shadow())
         .child(
             div()
@@ -1546,7 +1513,7 @@ fn conversion_options_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .child("Conversion options"),
                 )
                 .child(
@@ -1555,15 +1522,15 @@ fn conversion_options_panel(
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(BG_ELEVATED))
+                        .bg(THEME.elevated)
                         .border_1()
-                        .border_color(rgb(BORDER_STRONG))
+                        .border_color(THEME.border_strong)
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(THEME.text_primary)
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(BG_ACTIVE)))
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
+                        .hover(|style| style.bg(THEME.active))
+                        .active(|style| style.opacity(THEME.active_opacity))
                         .child("Apply")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.apply_conversion_options(cx);
@@ -1576,7 +1543,7 @@ fn conversion_options_panel(
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_color(THEME.text_muted)
                     .child("FFmpeg"),
             )
         })
@@ -1588,7 +1555,12 @@ fn conversion_options_panel(
                         .flex_wrap()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Quality"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child("Quality"),
+                        )
                         .child(chip(
                             "media-quality-balanced",
                             FfmpegQuality::Balanced.label(),
@@ -1626,7 +1598,7 @@ fn conversion_options_panel(
                         .flex_wrap()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Encode"))
+                        .child(div().text_xs().text_color(THEME.text_muted).child("Encode"))
                         .child(chip(
                             "media-encode-auto",
                             FfmpegEncodeMode::Auto.label(),
@@ -1672,7 +1644,7 @@ fn conversion_options_panel(
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(THEME.text_muted)
                                         .child("Start (sec)"),
                                 )
                                 .child(
@@ -1680,9 +1652,9 @@ fn conversion_options_panel(
                                         .h(px(32.0))
                                         .px_2()
                                         .rounded_md()
-                                        .bg(rgb(BG_SURFACE))
+                                        .bg(THEME.surface)
                                         .border_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(THEME.border)
                                         .child(start_input.clone()),
                                 ),
                         )
@@ -1695,7 +1667,7 @@ fn conversion_options_panel(
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(THEME.text_muted)
                                         .child("Duration (sec)"),
                                 )
                                 .child(
@@ -1703,9 +1675,9 @@ fn conversion_options_panel(
                                         .h(px(32.0))
                                         .px_2()
                                         .rounded_md()
-                                        .bg(rgb(BG_SURFACE))
+                                        .bg(THEME.surface)
                                         .border_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(THEME.border)
                                         .child(duration_input.clone()),
                                 ),
                         ),
@@ -1720,7 +1692,7 @@ fn conversion_options_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child("Frame at (sec)"),
                         )
                         .child(
@@ -1728,9 +1700,9 @@ fn conversion_options_panel(
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(frame_input.clone()),
                         ),
                 );
@@ -1743,7 +1715,7 @@ fn conversion_options_panel(
                             .flex_wrap()
                             .gap_2()
                             .items_center()
-                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Audio"))
+                            .child(div().text_xs().text_color(THEME.text_muted).child("Audio"))
                             .child(chip(
                                 "media-mono",
                                 if mono { "Mono ✓" } else { "Mono" },
@@ -1821,7 +1793,7 @@ fn conversion_options_panel(
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(THEME.text_muted)
                                     .child("Audio stream index"),
                             )
                             .child(
@@ -1829,9 +1801,9 @@ fn conversion_options_panel(
                                     .h(px(32.0))
                                     .px_2()
                                     .rounded_md()
-                                    .bg(rgb(BG_SURFACE))
+                                    .bg(THEME.surface)
                                     .border_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(THEME.border)
                                     .child(audio_stream_input.clone()),
                             ),
                     );
@@ -1843,7 +1815,7 @@ fn conversion_options_panel(
                         .flex_wrap()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width"))
+                        .child(div().text_xs().text_color(THEME.text_muted).child("Width"))
                         .child(chip(
                             "media-scale-auto",
                             "Auto",
@@ -1892,15 +1864,15 @@ fn conversion_options_panel(
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("FPS"))
+                            .child(div().text_xs().text_color(THEME.text_muted).child("FPS"))
                             .child(
                                 div()
                                     .h(px(32.0))
                                     .px_2()
                                     .rounded_md()
-                                    .bg(rgb(BG_SURFACE))
+                                    .bg(THEME.surface)
                                     .border_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(THEME.border)
                                     .child(fps_input.clone()),
                             ),
                     )
@@ -1929,7 +1901,7 @@ fn conversion_options_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child("Frame interval (sec)"),
                         )
                         .child(
@@ -1937,9 +1909,9 @@ fn conversion_options_panel(
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(frame_interval_input.clone()),
                         ),
                 );
@@ -1953,7 +1925,7 @@ fn conversion_options_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child("Subtitle stream index"),
                         )
                         .child(
@@ -1961,9 +1933,9 @@ fn conversion_options_panel(
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(subtitle_stream_input.clone()),
                         ),
                 );
@@ -1976,7 +1948,7 @@ fn conversion_options_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child("Docling"),
                 )
                 .child(
@@ -1985,7 +1957,7 @@ fn conversion_options_panel(
                         .flex_wrap()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Images"))
+                        .child(div().text_xs().text_color(THEME.text_muted).child("Images"))
                         .child(chip(
                             "docling-images-placeholder",
                             DoclingImageExportMode::Placeholder.label(),
@@ -2077,7 +2049,7 @@ fn conversion_options_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child("OCR language (e.g. eng)"),
                         )
                         .child(
@@ -2085,16 +2057,16 @@ fn conversion_options_panel(
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(docling_ocr_lang_input),
                         ),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(THEME.text_dim)
                         .child("Embedded images can produce large artifacts."),
                 )
         })
@@ -2104,7 +2076,7 @@ fn conversion_options_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child("PDF pages"),
                 )
                 .child(
@@ -2120,7 +2092,7 @@ fn conversion_options_panel(
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(THEME.text_muted)
                                         .child("From page"),
                                 )
                                 .child(
@@ -2128,9 +2100,9 @@ fn conversion_options_panel(
                                         .h(px(32.0))
                                         .px_2()
                                         .rounded_md()
-                                        .bg(rgb(BG_SURFACE))
+                                        .bg(THEME.surface)
                                         .border_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(THEME.border)
                                         .child(pdf_page_from_input),
                                 ),
                         )
@@ -2140,15 +2112,20 @@ fn conversion_options_panel(
                                 .flex_col()
                                 .gap_1()
                                 .flex_1()
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("To page"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child("To page"),
+                                )
                                 .child(
                                     div()
                                         .h(px(32.0))
                                         .px_2()
                                         .rounded_md()
-                                        .bg(rgb(BG_SURFACE))
+                                        .bg(THEME.surface)
                                         .border_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(THEME.border)
                                         .child(pdf_page_to_input),
                                 ),
                         ),
@@ -2161,7 +2138,7 @@ fn conversion_options_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child("PDF password (session only)"),
                         )
                         .child(
@@ -2169,9 +2146,9 @@ fn conversion_options_panel(
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(pdf_password_input),
                         ),
                 )
@@ -2182,7 +2159,7 @@ fn conversion_options_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child("Defuddle"),
                 )
                 .child(div().flex().flex_wrap().gap_2().items_center().child(chip(
@@ -2207,7 +2184,7 @@ fn conversion_options_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child("Language (BCP 47)"),
                         )
                         .child(
@@ -2215,9 +2192,9 @@ fn conversion_options_panel(
                                 .h(px(32.0))
                                 .px_2()
                                 .rounded_md()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(defuddle_lang_input),
                         ),
                 )
@@ -2228,7 +2205,7 @@ fn conversion_options_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child("Pandoc"),
                 )
                 .child(
@@ -2286,7 +2263,7 @@ fn conversion_options_panel(
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(THEME.text_muted)
                             .child("PDF engine"),
                     )
                     .child(chip(
@@ -2325,7 +2302,7 @@ fn conversion_options_panel(
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(THEME.text_muted)
                             .child("Reference doc"),
                     )
                     .child(
@@ -2336,18 +2313,18 @@ fn conversion_options_panel(
                             .px_3()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(BG_ELEVATED))
+                            .bg(THEME.elevated)
                             .border_1()
-                            .border_color(rgb(BORDER_STRONG))
+                            .border_color(THEME.border_strong)
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(THEME.text_primary)
                             .overflow_hidden()
                             .text_ellipsis()
                             .line_clamp(1)
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(BG_ACTIVE)))
-                            .active(|style| style.opacity(ACTIVE_OPACITY))
+                            .hover(|style| style.bg(THEME.active))
+                            .active(|style| style.opacity(THEME.active_opacity))
                             .child(ref_doc_label)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.pick_reference_doc(cx);
@@ -2376,7 +2353,7 @@ fn conversion_options_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child("MarkItDown"),
                 )
                 .child(div().flex().flex_wrap().gap_2().items_center().child(chip(
@@ -2396,20 +2373,20 @@ fn conversion_options_panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(THEME.text_dim)
                         .child("Keeping data URIs can produce large Markdown files."),
                 )
         })
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(TEXT_DIM))
+                .text_color(THEME.text_dim)
                 .child("Edit fields, then Apply. Chips reconvert immediately."),
         )
         .with_animation(
             "conversion-options-in",
-            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
-            |element, progress| element.opacity(0.5 + 0.5 * progress),
+            Animation::new(animation::PANEL_DURATION).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.12 + 0.88 * progress),
         )
 }
 
@@ -2472,14 +2449,14 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_color(THEME.text_secondary)
                     .child("Output appears here"),
             )
             .child(
                 div()
                     .max_w(px(280.0))
                     .text_sm()
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_color(THEME.text_muted)
                     .child(
                         "Choose a document, media file, or paste a URL, path, or image — Shift converts it automatically.",
                     ),
@@ -2502,19 +2479,19 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .child(
                     div()
                         .text_2xl()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .child("↻")
                         .with_animation(
                             "conversion-pulse",
-                            Animation::new(Duration::from_millis(900)).repeat(),
-                            |element, progress| element.opacity(0.35 + progress * 0.65),
+                            Animation::new(animation::SPINNER_PERIOD).with_easing(pulsating_between(0.35, 1.0)).repeat(),
+                            |element, progress| element.opacity(progress),
                         ),
                 )
                 .child(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .child(progress_label),
                 )
                 .when_some(fraction, |panel, value| {
@@ -2525,21 +2502,21 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 .w(px(220.0))
                                 .h(px(6.0))
                                 .rounded_full()
-                                .bg(rgb(BG_ELEVATED))
+                                .bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(
                                     div()
                                         .h_full()
                                         .rounded_full()
-                                        .bg(rgb(TEXT_SECONDARY))
+                                        .bg(THEME.text_secondary)
                                         .w(px(220.0 * clamped)),
                                 ),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child(format!("{:.0}%", clamped * 100.0)),
                         )
                 })
@@ -2549,15 +2526,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(BG_ELEVATED))
+                        .bg(THEME.elevated)
                         .border_1()
-                        .border_color(rgb(BORDER_STRONG))
+                        .border_color(THEME.border_strong)
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(THEME.text_primary)
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
+                        .hover(|style| style.bg(THEME.active).border_color(THEME.border_focused))
+                        .active(|style| style.opacity(THEME.active_opacity))
                         .child("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_conversion(cx))),
                 )
@@ -2572,18 +2549,18 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
+                    .text_color(THEME.text)
                     .child("Conversion failed"),
             )
             .child(
                 div()
                     .p_4()
                     .rounded_lg()
-                    .bg(rgb(BG_ELEVATED))
+                    .bg(THEME.elevated)
                     .border_1()
-                    .border_color(rgb(BORDER_STRONG))
+                    .border_color(THEME.border_strong)
                     .text_sm()
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_color(THEME.text_secondary)
                     .child(message),
             )
             .children(install_hints.into_iter().enumerate().map(|(index, (label, hint))| {
@@ -2595,20 +2572,20 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .gap_2()
                     .p_3()
                     .rounded_lg()
-                    .bg(rgb(BG_RAISED))
+                    .bg(THEME.raised)
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(THEME.border)
                     .child(
                         div()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT_SECONDARY))
+                            .text_color(THEME.text_secondary)
                             .child(label),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(THEME.text_muted)
                             .child(hint.clone()),
                     )
                     .child(
@@ -2617,14 +2594,14 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(BG_ELEVATED))
+                            .bg(THEME.elevated)
                             .border_1()
-                            .border_color(rgb(BORDER_STRONG))
+                            .border_color(THEME.border_strong)
                             .text_xs()
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(THEME.text_primary)
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(BG_ACTIVE)))
-                            .active(|style| style.opacity(ACTIVE_OPACITY))
+                            .hover(|style| style.bg(THEME.active))
+                            .active(|style| style.opacity(THEME.active_opacity))
                             .child("Copy install command")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
@@ -2686,9 +2663,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .gap_3()
                         .p_4()
                         .rounded_xl()
-                        .bg(rgb(BG_ELEVATED))
+                        .bg(THEME.elevated)
                         .border_1()
-                        .border_color(rgb(BORDER_STRONG))
+                        .border_color(THEME.border_strong)
                         .shadow(card_shadow())
                         .child(
                             div()
@@ -2710,7 +2687,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                         .py_0p5()
                                         .rounded_md()
                                         .cursor_move()
-                                        .hover(|style| style.bg(rgb(BG_HOVER)))
+                                        .hover(|style| style.bg(THEME.hover))
                                         .on_drag(
                                             drag_payload,
                                             move |payload, position, window, cx| {
@@ -2732,7 +2709,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                 .child(
                                                     div()
                                                         .flex_shrink_0()
-                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .text_color(THEME.text_muted)
                                                         .child("⠿"),
                                                 )
                                                 .child(
@@ -2745,7 +2722,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .text_color(THEME.text_secondary)
                                                 .child(conversion_detail),
                                         )
                                         .child(
@@ -2759,15 +2736,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                         .px_2()
                                                         .py_1()
                                                         .rounded_md()
-                                                        .bg(rgb(BADGE_FILL))
+                                                        .bg(THEME.badge_fill)
                                                         .text_xs()
-                                                        .text_color(rgb(BADGE_TEXT))
+                                                        .text_color(THEME.badge_text)
                                                         .child(pipeline_badge),
                                                 )
                                                 .child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .text_color(THEME.text_muted)
                                                         .child("Drag to Downloads or Documents"),
                                                 ),
                                         ),
@@ -2832,7 +2809,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             card.child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(THEME.text_muted)
                                     .child(
                                         "Not shown inline — Download, drag the file above, or Open with your default app.",
                                     ),
@@ -2843,18 +2820,18 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                 div()
                                     .p_4()
                                     .rounded_lg()
-                                    .bg(rgb(BG_RAISED))
+                                    .bg(THEME.raised)
                                     .border_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(THEME.border)
                                     .text_sm()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(THEME.text_secondary)
                                     .child(excerpt),
                             )
                         })
                         .with_animation(
                             "output-result-card-in",
-                            Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
-                            |element, progress| element.opacity(0.4 + 0.6 * progress),
+                            Animation::new(animation::DIALOG_DURATION).with_easing(ease_out_quint()),
+                            |element, progress| element.opacity(0.12 + 0.88 * progress),
                         ),
                 )
                 .when_some(cached_ready_path.clone(), |panel, staged| {
@@ -2863,7 +2840,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     panel.child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(THEME.text_dim)
                             .child(format!("On disk (staged) · {}", staged.display())),
                     )
                 })
@@ -2875,26 +2852,26 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .gap_1()
                             .p_3()
                             .rounded_lg()
-                            .bg(rgb(BG_RAISED))
+                            .bg(THEME.raised)
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(THEME.border)
                             .child(
                                 div()
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(THEME.text_secondary)
                                     .child("Command"),
                             )
                             .children(commands.into_iter().map(|line| {
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(THEME.text_muted)
                                     .child(line)
                             })),
                     )
                 })
                 .when_some(save_status, |panel, status| {
-                    panel.child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(status))
+                    panel.child(div().text_xs().text_color(THEME.text_secondary).child(status))
                 })
         }
     };
@@ -2911,13 +2888,13 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .h(px(40.0))
                 .px_3()
                 .rounded_lg()
-                .bg(rgb(BG_SURFACE))
+                .bg(THEME.surface)
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(THEME.border)
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(BG_HOVER)))
-                .active(|style| style.opacity(ACTIVE_OPACITY))
-                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Output"))
+                .hover(|style| style.bg(THEME.hover))
+                .active(|style| style.opacity(THEME.active_opacity))
+                .child(div().text_xs().text_color(THEME.text_muted).child("Output"))
                 .child(
                     div()
                         .text_sm()
@@ -2931,7 +2908,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .justify_center()
                         .size(px(18.0))
                         .text_xs()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .child("▾"),
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2952,9 +2929,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .overflow_y_scroll()
                     .p_1()
                     .rounded_lg()
-                    .bg(rgb(BG_ELEVATED))
+                    .bg(THEME.elevated)
                     .border_1()
-                    .border_color(rgb(BORDER_STRONG))
+                    .border_color(THEME.border_strong)
                     .shadow_lg()
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(
@@ -2963,9 +2940,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .px_2()
                             .mb_1()
                             .rounded_md()
-                            .bg(rgb(BG_SURFACE))
+                            .bg(THEME.surface)
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(THEME.border)
                             .child(format_filter_input),
                     )
                     .children(
@@ -2987,11 +2964,11 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .map(|ready| ready.contains(&format))
                                     .unwrap_or(true);
                                 let label_color = if !enabled {
-                                    rgb(TEXT_DIM)
+                                    THEME.text_dim
                                 } else if !engine_ready {
-                                    rgb(TEXT_MUTED)
+                                    THEME.text_muted
                                 } else {
-                                    rgb(TEXT_PRIMARY)
+                                    THEME.text_primary
                                 };
                                 div()
                                     .id(("output-format", index))
@@ -3005,8 +2982,8 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .text_color(label_color)
                                     .when(enabled, |row| {
                                         row.cursor_pointer()
-                                            .hover(|style| style.bg(rgb(BG_HOVER)))
-                                            .active(|style| style.opacity(ACTIVE_OPACITY))
+                                            .hover(|style| style.bg(THEME.hover))
+                                            .active(|style| style.opacity(THEME.active_opacity))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.set_output_format(format, cx);
                                                 cx.stop_propagation();
@@ -3022,7 +2999,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                 row.child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(TEXT_DIM))
+                                                        .text_color(THEME.text_dim)
                                                         .child("engine not installed"),
                                                 )
                                             })
@@ -3030,13 +3007,13 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                 row.child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(TEXT_DIM))
+                                                        .text_color(THEME.text_dim)
                                                         .child("not for this source"),
                                                 )
                                             }),
                                     )
                                     .when(format == output_format, |row| {
-                                        row.child(div().text_color(rgb(TEXT)).child("✓"))
+                                        row.child(div().text_color(THEME.text).child("✓"))
                                     })
                             }),
                     ),
@@ -3090,15 +3067,15 @@ fn action_chip(
         .px_3()
         .py_1()
         .rounded_md()
-        .bg(rgb(BG_ELEVATED))
+        .bg(THEME.elevated)
         .border_1()
-        .border_color(rgb(BORDER_STRONG))
+        .border_color(THEME.border_strong)
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(TEXT_PRIMARY))
+        .text_color(THEME.text_primary)
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-        .active(|style| style.opacity(ACTIVE_OPACITY))
+        .hover(|style| style.bg(THEME.active).border_color(THEME.border_focused))
+        .active(|style| style.opacity(THEME.active_opacity))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -3194,26 +3171,26 @@ fn history_conversion_chip(
         .h(px(32.0))
         .px_2()
         .rounded_md()
-        .bg(rgb(BADGE_FILL))
+        .bg(THEME.badge_fill)
         .child(
             div()
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(BADGE_TEXT))
+                .text_color(THEME.badge_text)
                 .child(input_label),
         )
         .child(
             div()
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(THEME.text_muted)
                 .child("→"),
         )
         .child(
             div()
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(BADGE_TEXT))
+                .text_color(THEME.badge_text)
                 .child(output_label),
         )
 }
@@ -3325,7 +3302,12 @@ fn history_from_store(loaded: LoadedHistory) -> (Vec<ConversionHistoryEntry>, u6
     (entries, next_id)
 }
 
-fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl IntoElement {
+fn url_input_bar(
+    url_input: Entity<TextInput>,
+    window: &mut Window,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let url_focused = url_input.read(cx).focus_handle(cx).is_focused(window);
     div()
         .id("url-input-bar")
         .flex()
@@ -3337,11 +3319,15 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .flex_1()
                 .min_w_0()
                 .rounded_lg()
-                .bg(rgb(BG_SURFACE))
+                .bg(THEME.surface)
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(if url_focused {
+                    THEME.border_focused
+                } else {
+                    THEME.border
+                })
                 .text_sm()
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(THEME.text_primary)
                 .overflow_hidden()
                 .child(url_input),
         )
@@ -3354,15 +3340,15 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .h(px(40.0))
                 .px_4()
                 .rounded_lg()
-                .bg(rgb(BG_ELEVATED))
+                .bg(THEME.elevated)
                 .border_1()
-                .border_color(rgb(BORDER_STRONG))
+                .border_color(THEME.border_strong)
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(THEME.text_primary)
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-                .active(|style| style.opacity(ACTIVE_OPACITY))
+                .hover(|style| style.bg(THEME.active).border_color(THEME.border_focused))
+                .active(|style| style.opacity(THEME.active_opacity))
                 .child("Convert")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.submit_magic_paste_from_input(cx);
@@ -3387,17 +3373,25 @@ fn settings_nav_item(
         .py_2()
         .rounded_lg()
         .cursor_pointer()
-        .bg(if selected { rgb(BG_ELEVATED) } else { rgb(BG) })
+        .bg(if selected {
+            THEME.elevated
+        } else {
+            THEME.background
+        })
         .border_1()
-        .border_color(if selected { rgb(BORDER) } else { rgb(BG) })
+        .border_color(if selected {
+            THEME.border
+        } else {
+            THEME.background
+        })
         .hover(|style| {
             if selected {
                 style
             } else {
-                style.bg(rgb(BG_SURFACE))
+                style.bg(THEME.surface)
             }
         })
-        .active(|style| style.opacity(ACTIVE_OPACITY))
+        .active(|style| style.opacity(THEME.active_opacity))
         .child(
             div()
                 .text_sm()
@@ -3407,9 +3401,9 @@ fn settings_nav_item(
                     FontWeight::NORMAL
                 })
                 .text_color(if selected {
-                    rgb(TEXT_PRIMARY)
+                    THEME.text_primary
                 } else {
-                    rgb(TEXT_SECONDARY)
+                    THEME.text_secondary
                 })
                 .child(section.label()),
         )
@@ -3434,7 +3428,7 @@ fn settings_section_header(
             div()
                 .text_xl()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT))
+                .text_color(THEME.text)
                 .child(title.into()),
         )
         .child(
@@ -3442,7 +3436,7 @@ fn settings_section_header(
                 .w_full()
                 .min_w_0()
                 .text_sm()
-                .text_color(rgb(TEXT_SECONDARY))
+                .text_color(THEME.text_secondary)
                 .child(subtitle.into()),
         )
 }
@@ -3456,14 +3450,14 @@ fn settings_card(title: impl Into<SharedString>, body: impl IntoElement) -> impl
         .min_w_0()
         .p_4()
         .rounded_xl()
-        .bg(rgb(BG_SURFACE))
+        .bg(THEME.surface)
         .border_1()
-        .border_color(rgb(BORDER))
+        .border_color(THEME.border)
         .child(
             div()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT_SECONDARY))
+                .text_color(THEME.text_secondary)
                 .child(title.into()),
         )
         .child(body)
@@ -3472,15 +3466,15 @@ fn settings_card(title: impl Into<SharedString>, body: impl IntoElement) -> impl
 fn readiness_badge(readiness: Readiness) -> impl IntoElement {
     let (fill, text, border, label) = match readiness {
         Readiness::Ready => (
-            STATUS_READY_FILL,
-            STATUS_READY_TEXT,
-            STATUS_READY_BORDER,
+            THEME.status_ready_fill,
+            THEME.status_ready_text,
+            THEME.status_ready_border,
             "READY",
         ),
         Readiness::Missing => (
-            STATUS_MISSING_FILL,
-            STATUS_MISSING_TEXT,
-            STATUS_MISSING_BORDER,
+            THEME.status_missing_fill,
+            THEME.status_missing_text,
+            THEME.status_missing_border,
             "MISSING",
         ),
     };
@@ -3489,12 +3483,12 @@ fn readiness_badge(readiness: Readiness) -> impl IntoElement {
         .px_2()
         .py_0p5()
         .rounded_md()
-        .bg(rgb(fill))
+        .bg(fill)
         .border_1()
-        .border_color(rgb(border))
+        .border_color(border)
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(text))
+        .text_color(text)
         .child(label)
 }
 
@@ -3533,13 +3527,13 @@ fn settings_converters_panel(
                     .px_4()
                     .py_3()
                     .rounded_lg()
-                    .bg(rgb(BG_ELEVATED))
+                    .bg(THEME.elevated)
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .border_color(THEME.border)
+                    .text_color(THEME.text_primary)
                     .cursor_move()
                     .drag_over::<ModuleDrag>(|style, _, _, _| {
-                        style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
+                        style.bg(THEME.active).border_color(THEME.border_focused)
                     })
                     .on_drag(drag, |info: &ModuleDrag, position, _, cx| {
                         cx.new(|_| info.clone().position(position))
@@ -3547,7 +3541,7 @@ fn settings_converters_panel(
                     .on_drop(cx.listener(move |this, info: &ModuleDrag, _, cx| {
                         this.move_module(info.index, index, cx);
                     }))
-                    .child(div().flex_shrink_0().text_color(rgb(TEXT_MUTED)).child("⠿"))
+                    .child(div().flex_shrink_0().text_color(THEME.text_muted).child("⠿"))
                     .child(
                         div()
                             .flex()
@@ -3564,7 +3558,7 @@ fn settings_converters_panel(
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(THEME.text_muted)
                                     .child(description),
                             ),
                     )
@@ -3573,7 +3567,7 @@ fn settings_converters_panel(
                         div()
                             .flex_shrink_0()
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(THEME.text_muted)
                             .child(if index == 0 { "First" } else { "Fallback" }),
                     )
             }),
@@ -3585,11 +3579,11 @@ fn settings_converters_panel(
                     .min_w_0()
                     .p_3()
                     .rounded_lg()
-                    .bg(rgb(BG_ELEVATED))
+                    .bg(THEME.elevated)
                     .border_1()
-                    .border_color(rgb(BORDER_STRONG))
+                    .border_color(THEME.border_strong)
                     .text_xs()
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_color(THEME.text_secondary)
                     .child(error),
             )
         })
@@ -3598,7 +3592,7 @@ fn settings_converters_panel(
                 .w_full()
                 .min_w_0()
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(THEME.text_muted)
                 .child(
                     "Priority only applies when multiple modules support the selected conversion. Status badges show whether each engine is installed on this Mac (see Diagnostics).",
                 ),
@@ -3675,7 +3669,7 @@ fn settings_general_panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Same control as the main output menu. Choosing a format here updates the session and reconverts the current source when one is selected.",
                         ),
@@ -3688,7 +3682,7 @@ fn settings_general_panel(
                 .flex_col()
                 .gap_3()
                 .w_full()
-                .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(format!(
+                .child(div().text_sm().text_color(THEME.text_primary).child(format!(
                     "{history_count} entr{} retained (limit {history_limit}).",
                     if history_count == 1 { "y" } else { "ies" }
                 )))
@@ -3700,7 +3694,7 @@ fn settings_general_panel(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(THEME.text_secondary)
                                 .child("Keep up to:"),
                         )
                         .child(
@@ -3708,18 +3702,18 @@ fn settings_general_panel(
                                 .w(px(80.0))
                                 .min_w_0()
                                 .rounded_lg()
-                                .bg(rgb(BG_SURFACE))
+                                .bg(THEME.surface)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .text_sm()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(THEME.text_primary)
                                 .overflow_hidden()
                                 .child(history_limit_input),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(THEME.text_secondary)
                                 .child("entries"),
                         ),
                 )
@@ -3749,21 +3743,21 @@ fn settings_general_panel(
                         .h(px(36.0))
                         .px_4()
                         .rounded_lg()
-                        .bg(rgb(BG_ELEVATED))
+                        .bg(THEME.elevated)
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .text_sm()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
+                        .hover(|style| style.bg(THEME.hover).text_color(THEME.text_primary))
+                        .active(|style| style.opacity(THEME.active_opacity))
                         .child("Clear history")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.clear_history(cx);
                             cx.stop_propagation();
                         })),
                 )
-                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                .child(div().text_xs().text_color(THEME.text_muted).child(
                     "History is saved under Application Support and restored when you reopen Shift. Clear removes it from this Mac.",
                 )),
         ))
@@ -3810,29 +3804,29 @@ fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl I
                                 .font_weight(FontWeight::MEDIUM)
                                 .cursor_pointer()
                                 .bg(if is_selected {
-                                    rgb(TEXT)
+                                    THEME.text
                                 } else {
-                                    rgb(BG_SURFACE)
+                                    THEME.surface
                                 })
                                 .text_color(if is_selected {
-                                    rgb(TEXT_INVERSE)
+                                    THEME.text_inverse
                                 } else {
-                                    rgb(TEXT_SECONDARY)
+                                    THEME.text_secondary
                                 })
                                 .border_1()
                                 .border_color(if is_selected {
-                                    rgb(TEXT)
+                                    THEME.text
                                 } else {
-                                    rgb(BORDER)
+                                    THEME.border
                                 })
                                 .hover(|style| {
                                     if is_selected {
                                         style
                                     } else {
-                                        style.bg(rgb(BG_HOVER))
+                                        style.bg(THEME.hover)
                                     }
                                 })
-                                .active(|style| style.opacity(ACTIVE_OPACITY))
+                                .active(|style| style.opacity(THEME.active_opacity))
                                 .child(*label)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.set_ui_font_family(family_owned.clone(), cx);
@@ -3846,9 +3840,9 @@ fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl I
                         .min_w_0()
                         .p_3()
                         .rounded_lg()
-                        .bg(rgb(BG_RAISED))
+                        .bg(THEME.raised)
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -3856,21 +3850,21 @@ fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl I
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child(format!("Preview · {preview_label}")),
                         )
                         .child(
                             div()
                                 .font_family(preview_family)
                                 .text_sm()
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(THEME.text_primary)
                                 .child("The quick brown fox — MD → PDF 0123456789"),
                         ),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Uses fonts installed on this Mac. If a face is missing, the system falls back to a similar default.",
                         ),
@@ -3949,7 +3943,7 @@ fn settings_options_panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child("Tradeoff when re-encoding media. Ignored during stream copy."),
                 ),
         ))
@@ -3998,7 +3992,7 @@ fn settings_options_panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Auto re-encodes with quality presets. Stream copy remuxes without re-encoding. Re-encode always applies quality, mono, sample rate, and scale.",
                         ),
@@ -4229,11 +4223,11 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(home))
+                .child(div().text_sm().text_color(THEME.text_primary).child(home))
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Module priority is stored in module-priority; conversion history is stored in history.",
                         ),
@@ -4264,23 +4258,23 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
                                 .px_3()
                                 .py_2()
                                 .rounded_lg()
-                                .bg(rgb(BG_ELEVATED))
+                                .bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(THEME.border)
                                 .child(
                                     div()
                                         .text_xs()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(THEME.text_primary)
                                         .child(name),
                                 )
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(hint))
+                                .child(div().text_xs().text_color(THEME.text_muted).child(hint))
                         })),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Optional shell variables that override Shift’s automatic tool discovery. Set them in your terminal profile or launch environment; restart Shift after changing them. Leave unset to use PATH and project-local installs.",
                         ),
@@ -4325,7 +4319,7 @@ fn settings_diagnostics_panel(
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(THEME.text_primary)
                         .child(
                             "Format supported means a module registers the conversion pair. Conversion currently available means the required external engine is installed and ready.",
                         ),
@@ -4333,7 +4327,7 @@ fn settings_diagnostics_panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Use `shift-cli formats` for registered capability and `shift-cli doctor` for readiness (exit 0 = at least one engine ready; check complete= in --script for a full install).",
                         ),
@@ -4343,7 +4337,7 @@ fn settings_diagnostics_panel(
                         div()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT_SECONDARY))
+                            .text_color(THEME.text_secondary)
                             .child(text),
                     )
                 }),
@@ -4359,7 +4353,7 @@ fn settings_diagnostics_panel(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .child("Conversion engines"),
                 )
                 .child(
@@ -4371,14 +4365,14 @@ fn settings_diagnostics_panel(
                         .h(px(32.0))
                         .px_3()
                         .rounded_lg()
-                        .bg(rgb(BG_ELEVATED))
+                        .bg(THEME.elevated)
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .text_xs()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
+                        .hover(|style| style.bg(THEME.hover).text_color(THEME.text_primary))
+                        .active(|style| style.opacity(THEME.active_opacity))
                         .child(if loading { "Checking…" } else { "Refresh" })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_diagnostics(cx);
@@ -4425,9 +4419,9 @@ fn settings_diagnostics_panel(
                                         .px_4()
                                         .py_3()
                                         .rounded_lg()
-                                        .bg(rgb(BG_ELEVATED))
+                                        .bg(THEME.elevated)
                                         .border_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(THEME.border)
                                         .child(
                                             div()
                                                 .flex()
@@ -4447,7 +4441,7 @@ fn settings_diagnostics_panel(
                                                             div()
                                                                 .text_sm()
                                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_color(rgb(TEXT_PRIMARY))
+                                                                .text_color(THEME.text_primary)
                                                                 .overflow_hidden()
                                         .text_ellipsis()
                                         .line_clamp(1)
@@ -4456,7 +4450,7 @@ fn settings_diagnostics_panel(
                                                         .child(
                                                             div()
                                                                 .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED))
+                                                                .text_color(THEME.text_muted)
                                                                 .overflow_hidden()
                                         .text_ellipsis()
                                         .line_clamp(1)
@@ -4471,7 +4465,7 @@ fn settings_diagnostics_panel(
                                             card.child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .text_color(THEME.text_secondary)
                                                     .child(format!(
                                                         "Install: {} · or set {}",
                                                         engine.install_hint, engine.env_override
@@ -4482,7 +4476,7 @@ fn settings_diagnostics_panel(
                                             card.child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .text_color(THEME.text_muted)
                                                     .child(notes),
                                             )
                                         })
@@ -4493,7 +4487,7 @@ fn settings_diagnostics_panel(
                         .unwrap_or_else(|| {
                             vec![div()
                                 .text_sm()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child(if loading {
                                     "Probing engines…"
                                 } else {
@@ -4514,7 +4508,7 @@ fn settings_diagnostics_panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(
                             "Pandoc shells out to an external PDF engine. Typst is recommended for new installs (`brew install typst`). Override with SHIFT_PDF_ENGINE.",
                         ),
@@ -4540,9 +4534,9 @@ fn settings_diagnostics_panel(
                                         .px_3()
                                         .py_2()
                                         .rounded_lg()
-                                        .bg(rgb(BG_SURFACE))
+                                        .bg(THEME.surface)
                                         .border_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(THEME.border)
                                         .child(
                                             div()
                                                 .flex()
@@ -4554,13 +4548,13 @@ fn settings_diagnostics_panel(
                                                     div()
                                                         .text_sm()
                                                         .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .text_color(THEME.text_primary)
                                                         .child(format!("{}{selected}", engine.name)),
                                                 )
                                                 .child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .text_color(THEME.text_muted)
                                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .line_clamp(1)
@@ -4582,7 +4576,7 @@ fn settings_diagnostics_panel(
                         card.child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(THEME.text_secondary)
                                 .child(
                                     "Install: brew install typst  ·  or brew install --cask basictex  ·  or set SHIFT_PDF_ENGINE",
                                 ),
@@ -4613,13 +4607,13 @@ fn settings_about_panel(priority: &[String]) -> impl IntoElement + use<> {
                     div()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(THEME.text_primary)
                         .child(format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"))),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(THEME.text_secondary)
                         .child(
                             "Native macOS app and shift-cli share the same conversion modules and dispatch rules.",
                         ),
@@ -4640,20 +4634,20 @@ fn settings_about_panel(priority: &[String]) -> impl IntoElement + use<> {
                         .px_3()
                         .py_2()
                         .rounded_lg()
-                        .bg(rgb(BG_ELEVATED))
+                        .bg(THEME.elevated)
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .child(
                             div()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_color(THEME.text_primary)
                                 .child(module_label(id).to_owned()),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(THEME.text_muted)
                                 .child(id.clone()),
                         )
                 })),
@@ -4661,7 +4655,7 @@ fn settings_about_panel(priority: &[String]) -> impl IntoElement + use<> {
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(THEME.text_muted)
                 .child(
                     "MarkItDown · Pandoc · Defuddle · Docling · FFmpeg",
                 ),
@@ -4729,7 +4723,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         .min_w_0()
         .h_full()
         .overflow_hidden()
-        .bg(rgb(BG))
+        .bg(THEME.background)
         .child(
             div()
                 .id("settings-content-scroll")
@@ -4799,7 +4793,7 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
         .flex()
         .flex_col()
         .size_full()
-        .bg(rgb(BG))
+        .bg(THEME.background)
         .cursor_default()
         .on_click(|_, _, cx| cx.stop_propagation())
         .child(
@@ -4815,7 +4809,7 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                 .pt(px(40.0))
                 .pb_3()
                 .border_b_1()
-                .border_color(rgb(BORDER))
+                .border_color(THEME.border)
                 .child(
                     div()
                         .id("settings-back")
@@ -4825,16 +4819,16 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .h(px(36.0))
                         .px_3()
                         .rounded_lg()
-                        .bg(rgb(BG_SURFACE))
+                        .bg(THEME.surface)
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(THEME.text_primary)
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(BG_HOVER)))
-                        .active(|style| style.opacity(ACTIVE_OPACITY))
-                        .child(div().text_color(rgb(TEXT_SECONDARY)).child("←"))
+                        .hover(|style| style.bg(THEME.hover))
+                        .active(|style| style.opacity(THEME.active_opacity))
+                        .child(div().text_color(THEME.text_secondary).child("←"))
                         .child("Back")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.settings_open = false;
@@ -4850,15 +4844,15 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .gap_1()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(div().text_color(rgb(TEXT_SECONDARY)).child("Settings"))
-                        .child(div().text_color(rgb(TEXT_MUTED)).child("/"))
-                        .child(div().text_color(rgb(TEXT_PRIMARY)).child(section.label())),
+                        .child(div().text_color(THEME.text_secondary).child("Settings"))
+                        .child(div().text_color(THEME.text_muted).child("/"))
+                        .child(div().text_color(THEME.text_primary).child(section.label())),
                 )
                 .child(
                     div()
                         .flex_1()
                         .text_sm()
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(THEME.text_muted)
                         .child(section.description()),
                 ),
         )
@@ -4877,9 +4871,9 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .flex_shrink_0()
                         .w(px(SETTINGS_SIDEBAR_WIDTH))
                         .h_full()
-                        .bg(rgb(BG))
+                        .bg(THEME.background)
                         .border_r_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(THEME.border)
                         .px_3()
                         .py_4()
                         .gap_1()
@@ -4905,8 +4899,8 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
         )
         .with_animation(
             "settings-screen-in",
-            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
-            |element, progress| element.opacity(0.5 + 0.5 * progress),
+            Animation::new(animation::ENTER_DURATION).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.12 + 0.88 * progress),
         )
 }
 
@@ -6916,7 +6910,7 @@ impl Shift {
 }
 
 impl Render for Shift {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview = self.file_preview.clone();
         let has_selection = self.selected_file.is_some() || self.selected_url.is_some();
         let conversion = self.conversion.clone();
@@ -7041,8 +7035,8 @@ impl Render for Shift {
             .relative()
             .flex()
             .size_full()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(THEME.background)
+            .text_color(THEME.text)
             .font_family(ui_font_family.clone())
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.output_menu_open {
@@ -7074,7 +7068,7 @@ impl Render for Shift {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .child(url_input_bar(url_input, cx))
+                    .child(url_input_bar(url_input, window, cx))
                     .child({
                         // Hover styling uses hitbox hover (stays true while pressed).
                         // Do NOT drive ElementId / with_animation from on_hover: that
@@ -7090,11 +7084,11 @@ impl Render for Shift {
                             .items_center()
                             .justify_center()
                             .rounded_xl()
-                            .bg(rgb(DROP_ZONE_COLOR))
-                            .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
+                            .bg(THEME.drop_target)
+                            .hover(|style| style.bg(THEME.drop_target_hover))
                             .cursor_pointer()
-                            .active(|style| style.opacity(ACTIVE_OPACITY))
-                            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(BG_ELEVATED)))
+                            .active(|style| style.opacity(THEME.active_opacity))
+                            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(THEME.elevated))
                             .child(rounded_dashed_border(has_selection || show_batch))
                             .when_some(preview, |zone, preview| {
                                 zone.child(file_preview_card(preview, cx))
@@ -7123,7 +7117,7 @@ impl Render for Shift {
                     .h_full()
                     .min_h_0()
                     .overflow_hidden()
-                    .bg(rgb(BG))
+                    .bg(THEME.background)
                     .when(show_batch, |panel| {
                         panel.child(batch_queue_panel(
                             &batch_items,
@@ -7202,13 +7196,13 @@ impl Render for Shift {
                     .justify_center()
                     .size(px(40.0))
                     .rounded_lg()
-                    .bg(rgb(BG_SURFACE))
+                    .bg(THEME.surface)
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .border_color(THEME.border)
+                    .text_color(THEME.text_secondary)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
-                    .active(|style| style.opacity(ACTIVE_OPACITY))
+                    .hover(|style| style.bg(THEME.hover).text_color(THEME.text_primary))
+                    .active(|style| style.opacity(THEME.active_opacity))
                     .child("⚙")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.output_menu_open = false;
@@ -7254,7 +7248,7 @@ impl Render for Shift {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(hsla(0.0, 0.0, 0.0, 0.72))
+                        .bg(THEME.scrim)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.dismiss_folder_confirm(cx);
                             cx.stop_propagation();
@@ -7265,9 +7259,9 @@ impl Render for Shift {
                                 .w(px(420.0))
                                 .p_6()
                                 .rounded_xl()
-                                .bg(rgb(BG_ELEVATED))
+                                .bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER_STRONG))
+                                .border_color(THEME.border_strong)
                                 .shadow(card_shadow())
                                 .flex()
                                 .flex_col()
@@ -7282,7 +7276,7 @@ impl Render for Shift {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_color(THEME.text_secondary)
                                         .child(format!(
                                             "Queue {count} convertible file(s) (cap {MAX_EXPAND_FILES})."
                                         )),
@@ -7307,9 +7301,9 @@ impl Render for Shift {
                                 )
                                 .with_animation(
                                     "folder-confirm-dialog-in",
-                                    Animation::new(Duration::from_millis(220))
+                                    Animation::new(animation::DIALOG_DURATION)
                                         .with_easing(ease_out_quint()),
-                                    |element, progress| element.opacity(0.5 + 0.5 * progress),
+                                    |element, progress| element.opacity(0.12 + 0.88 * progress),
                                 ),
                         ),
                 )
@@ -7323,7 +7317,7 @@ impl Render for Shift {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(hsla(0.0, 0.0, 0.0, 0.72))
+                        .bg(THEME.scrim)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.shortcuts_help_open = false;
                             cx.notify();
@@ -7335,9 +7329,9 @@ impl Render for Shift {
                                 .w(px(420.0))
                                 .p_6()
                                 .rounded_xl()
-                                .bg(rgb(BG_ELEVATED))
+                                .bg(THEME.elevated)
                                 .border_1()
-                                .border_color(rgb(BORDER_STRONG))
+                                .border_color(THEME.border_strong)
                                 .shadow(card_shadow())
                                 .flex()
                                 .flex_col()
@@ -7369,22 +7363,22 @@ impl Render for Shift {
                                                 div()
                                                     .text_sm()
                                                     .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .text_color(THEME.text_primary)
                                                     .child(key),
                                             )
                                             .child(
                                                 div()
                                                     .text_sm()
-                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .text_color(THEME.text_secondary)
                                                     .child(desc),
                                             )
                                     }),
                                 )
                                 .with_animation(
                                     "shortcuts-help-dialog-in",
-                                    Animation::new(Duration::from_millis(220))
+                                    Animation::new(animation::DIALOG_DURATION)
                                         .with_easing(ease_out_quint()),
-                                    |element, progress| element.opacity(0.5 + 0.5 * progress),
+                                    |element, progress| element.opacity(0.12 + 0.88 * progress),
                                 ),
                         ),
                 )
