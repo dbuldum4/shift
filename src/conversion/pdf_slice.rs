@@ -4,12 +4,14 @@ use super::{
     ConversionError, max_output_bytes, process_timeout, resolve_tool_executable,
     run_command_cancellable,
 };
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-/// Extract inclusive 1-based pages into a temporary PDF.
+/// Extract inclusive 1-based pages into a temporary PDF, optionally decrypting
+/// it first with a password read from a restrictive temporary file.
 ///
 /// `to == None` means "through the last page" (`N-z` in qpdf). Uses
 /// `qpdf --empty --pages in.pdf N-M -- out.pdf`. The returned path lives in a
@@ -43,7 +45,26 @@ pub fn extract_pdf_pages(
     let mut command = Command::new(&executable);
     command.arg("--empty").arg("--pages").arg(input);
     if let Some(password) = password.map(str::trim).filter(|value| !value.is_empty()) {
-        command.arg(format!("--password={password}"));
+        let password_file = work_dir.join("password.txt");
+        fs::write(&password_file, password.as_bytes()).map_err(|error| {
+            ConversionError::new(format!("could not write PDF password file: {error}"))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&password_file)
+                .map_err(|error| {
+                    ConversionError::new(format!("could not stat password file: {error}"))
+                })?
+                .permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&password_file, permissions).map_err(|error| {
+                ConversionError::new(format!(
+                    "could not restrict password file permissions: {error}"
+                ))
+            })?;
+        }
+        command.arg(format!("--password-file={}", password_file.display()));
     }
     command.arg(&range).arg("--").arg(&output);
 
@@ -51,7 +72,7 @@ pub fn extract_pdf_pages(
         .map_err(|error| {
             if error.is_executable_not_found() {
                 ConversionError::new(
-                    "qpdf is not installed (needed for PDF page ranges). \
+                    "qpdf is not installed (needed for PDF page ranges and password-protected PDFs). \
                  Install it with `brew install qpdf`, or set SHIFT_QPDF_BIN.",
                 )
             } else {
@@ -143,6 +164,11 @@ impl Drop for TempDirGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // All tests that set SHIFT_QPDF_BIN must be serialized so they don't
+    // overwrite each other's executable environment.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn rejects_zero_based_or_inverted_ranges() {
@@ -158,9 +184,6 @@ mod tests {
     #[test]
     fn extract_uses_qpdf_argv_shape() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
-
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let directory = std::env::temp_dir();
@@ -190,7 +213,14 @@ mod tests {
         assert!(args.contains("--empty"), "args: {args}");
         assert!(args.contains("--pages"), "args: {args}");
         assert!(args.contains("2-4"), "args: {args}");
-        assert!(args.contains("--password=s3cret"), "args: {args}");
+        assert!(
+            args.contains("--password-file="),
+            "password must be passed through a file, args: {args}"
+        );
+        assert!(
+            !args.contains("--password=s3cret"),
+            "password must not appear on the command line, args: {args}"
+        );
 
         if let Some(parent) = sliced.parent() {
             let _ = std::fs::remove_dir_all(parent);
@@ -212,11 +242,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn password_only_decrypt_uses_full_range_and_password_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let fake = directory.join(format!("shift-qpdf-pwd-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-pwd-input-{suffix}.pdf"));
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\n# last arg is output path\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        // SAFETY: serialized behind ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let sliced = extract_pdf_pages(&input, 1, None, Some("s3cret"), None).unwrap();
+        assert!(sliced.is_file());
+
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert!(args.contains("1-z"), "full range expected, args: {args}");
+        assert!(
+            args.contains("--password-file="),
+            "password must be passed through a file, args: {args}"
+        );
+        assert!(
+            !args.contains("--password=s3cret"),
+            "password must not appear on argv, args: {args}"
+        );
+
+        if let Some(parent) = sliced.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fails_when_qpdf_returns_nonzero() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
-
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let directory = std::env::temp_dir();

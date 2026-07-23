@@ -521,6 +521,15 @@ impl PdfInputOptions {
         self.page_from.is_some() || self.page_to.is_some()
     }
 
+    /// True when qpdf should preprocess the PDF before any module runs.
+    ///
+    /// This includes page slicing and password decryption; both are handled
+    /// securely through `qpdf --password-file` rather than exposing the
+    /// password on a module command line.
+    pub fn needs_preprocessing(&self) -> bool {
+        self.needs_slice() || self.password.is_some()
+    }
+
     pub fn is_default(&self) -> bool {
         self == &Self::default()
     }
@@ -1068,10 +1077,12 @@ impl ConversionRegistry {
         route: ConversionRoute<'_>,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
-        // PDF page-range preprocess (qpdf). Password without a slice still flows
-        // through `options.pdf` to modules that understand it (Docling).
+        // PDF page-range / password preprocess (qpdf). If qpdf handles the
+        // password, remove it from the module options so it never reaches an
+        // external tool command line.
+        let mut options = options.clone();
         let mut slice_guard: Option<TempDirGuard> = None;
-        let convert_input = if is_pdf_path(input) && options.pdf.needs_slice() {
+        let convert_input = if is_pdf_path(input) && options.pdf.needs_preprocessing() {
             let sliced = extract_pdf_pages(
                 input,
                 options.pdf.page_from.unwrap_or(1),
@@ -1079,6 +1090,7 @@ impl ConversionRegistry {
                 options.pdf.password.as_deref(),
                 options.cancel.clone(),
             )?;
+            options.pdf.password = None;
             if let Some(parent) = sliced.parent() {
                 slice_guard = Some(TempDirGuard(parent.to_path_buf()));
             }
@@ -1091,7 +1103,7 @@ impl ConversionRegistry {
 
         match route {
             ConversionRoute::Direct(module) => {
-                let artifact = module.convert(input, output, options)?;
+                let artifact = module.convert(input, output, &options)?;
                 Ok(ensure_direct_provenance(artifact, module.id()))
             }
             ConversionRoute::TwoStep {
@@ -1102,9 +1114,9 @@ impl ConversionRegistry {
                 // First hop may be FFmpeg (trim/encode). Pass the full options
                 // snapshot on hop 2 so second-module knobs (e.g. MarkItDown
                 // keep-data-uris) still apply; modules ignore foreign fields.
-                let hop1 = first.convert(input, intermediate, options)?;
+                let hop1 = first.convert(input, intermediate, &options)?;
                 let hop1 = ensure_direct_provenance(hop1, first.id());
-                self.finish_chain(&hop1, output, second, options)
+                self.finish_chain(&hop1, output, second, &options)
             }
         }
     }
@@ -1427,6 +1439,7 @@ mod tests {
         chainable: &'static [OutputFormat],
         marker: &'static [u8],
         seen_input: Option<Arc<Mutex<Option<PathBuf>>>>,
+        assert_password_absent: bool,
     }
 
     impl ConversionModule for FakeModule {
@@ -1449,8 +1462,14 @@ mod tests {
             &self,
             input: &Path,
             output: OutputFormat,
-            _options: &ConversionOptions,
+            options: &ConversionOptions,
         ) -> Result<ConversionArtifact, ConversionError> {
+            if self.assert_password_absent {
+                assert!(
+                    options.pdf.password.is_none(),
+                    "PDF password should be removed by qpdf preprocessing before the module runs"
+                );
+            }
             if let Some(seen) = &self.seen_input {
                 *seen.lock().unwrap() = Some(input.to_owned());
                 assert_eq!(std::fs::read(input).unwrap(), b"intermediate");
@@ -1481,6 +1500,7 @@ mod tests {
             chainable,
             marker,
             seen_input: None,
+            assert_password_absent: false,
         }
     }
 
@@ -2151,5 +2171,61 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_password_is_preprocessed_and_not_passed_to_modules() {
+        use std::os::unix::fs::PermissionsExt;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let fake_qpdf = directory.join(format!("shift-qpdf-mod-test-{suffix}"));
+        let input = directory.join(format!("shift-password-input-{suffix}.pdf"));
+        std::fs::write(
+            &fake_qpdf,
+            "#!/bin/sh\n# Minimal fake qpdf: copy the .pdf input to the .pdf output.\ninput=\"\"\noutput=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in\n    --) ;;\n    *.pdf) if [ -z \"$input\" ]; then input=\"$a\"; else output=\"$a\"; fi ;;\n  esac\ndone\ncp \"$input\" \"$output\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_qpdf).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_qpdf, permissions).unwrap();
+        std::fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        // SAFETY: serialized behind ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake_qpdf);
+        }
+
+        let mut module = fake(
+            "no-password",
+            &["pdf"],
+            &[OutputFormat("plain")],
+            &[],
+            b"ok",
+        );
+        module.assert_password_absent = true;
+        let registry = ConversionRegistry::new().with_module(module);
+        let options = ConversionOptions {
+            pdf: PdfInputOptions {
+                password: Some("secret".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let artifact = registry
+            .convert_to_with_options(&input, OutputFormat("plain"), &options)
+            .unwrap();
+        assert_eq!(artifact.bytes, b"ok");
+
+        // Cleanup.
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake_qpdf);
+        let _ = std::fs::remove_file(&input);
     }
 }

@@ -4,14 +4,16 @@
 //! and (via helpers) clipboard image bytes staged as temporary files.
 
 use super::defuddle::{block_private_urls, ensure_public_url_fetch_allowed, looks_like_url};
-use super::process::run_command;
+use super::process::run_command_cancellable;
 use super::sources::supported_input_extensions;
 use super::{BatchSource, ConversionError, ConversionRegistry};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use url::Url;
 
@@ -74,7 +76,20 @@ pub fn parse_magic_paste(input: &str) -> MagicPaste {
 }
 
 /// Resolve a classified token into a [`BatchSource`], downloading remote files when needed.
-pub fn materialize_paste_token(token: &PasteToken) -> Result<BatchSource, ConversionError> {
+///
+/// `cancel` may be `None` for short-lived callers; when supplied, it is polled
+/// before each network fetch and passed to curl so a running download can be
+/// aborted.
+pub fn materialize_paste_token(
+    token: &PasteToken,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<BatchSource, ConversionError> {
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    {
+        return Err(ConversionError::cancelled());
+    }
     match token {
         PasteToken::LocalPath(path) => {
             let path = expand_user_path(path);
@@ -98,15 +113,22 @@ pub fn materialize_paste_token(token: &PasteToken) -> Result<BatchSource, Conver
         }
         PasteToken::RemoteFileUrl(url) => {
             ensure_url_fetch_allowed(url)?;
-            let path = download_remote_file(url)?;
+            let path = download_remote_file(url, cancel)?;
             Ok(BatchSource::File(path))
         }
     }
 }
 
 /// Materialize every token in a magic-paste parse result.
-pub fn materialize_magic_paste(paste: &MagicPaste) -> Result<Vec<BatchSource>, ConversionError> {
-    paste.tokens().iter().map(materialize_paste_token).collect()
+pub fn materialize_magic_paste(
+    paste: &MagicPaste,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Vec<BatchSource>, ConversionError> {
+    paste
+        .tokens()
+        .iter()
+        .map(|token| materialize_paste_token(token, cancel.clone()))
+        .collect()
 }
 
 /// Stage raw image bytes from the clipboard as a temporary source file.
@@ -295,7 +317,10 @@ fn ensure_url_fetch_allowed(url: &str) -> Result<(), ConversionError> {
     ensure_public_url_fetch_allowed(url)
 }
 
-fn download_remote_file(url: &str) -> Result<PathBuf, ConversionError> {
+fn download_remote_file(
+    url: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<PathBuf, ConversionError> {
     let dir = paste_staging_dir()?;
     let name = remote_file_name(url);
     let stamp = unique_stamp();
@@ -303,9 +328,9 @@ fn download_remote_file(url: &str) -> Result<PathBuf, ConversionError> {
 
     let result = if block_private_urls() {
         // Re-validate every hop so a public URL cannot redirect into private space.
-        download_with_redirect_revalidation(url, &path)
+        download_with_redirect_revalidation(url, &path, cancel)
     } else {
-        download_follow_redirects(url, &path)
+        download_follow_redirects(url, &path, cancel)
     };
 
     if let Err(error) = result {
@@ -338,7 +363,17 @@ fn download_remote_file(url: &str) -> Result<PathBuf, ConversionError> {
 }
 
 /// Fast path: curl follows redirects (no private-URL policy).
-fn download_follow_redirects(url: &str, path: &Path) -> Result<(), ConversionError> {
+fn download_follow_redirects(
+    url: &str,
+    path: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(), ConversionError> {
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    {
+        return Err(ConversionError::cancelled());
+    }
     let mut command = Command::new("curl");
     apply_curl_http_only(&mut command);
     command
@@ -351,11 +386,16 @@ fn download_follow_redirects(url: &str, path: &Path) -> Result<(), ConversionErr
         .arg(path)
         .arg(url);
 
-    let output = run_command(command, REMOTE_DOWNLOAD_TIMEOUT, 1024 * 1024).map_err(|error| {
-        ConversionError::new(format!(
-            "could not download {url}: {error}. Install curl or open the file locally."
-        ))
-    })?;
+    let output = run_command_cancellable(command, REMOTE_DOWNLOAD_TIMEOUT, 1024 * 1024, cancel)
+        .map_err(|error| {
+            if error.is_cancelled() {
+                error
+            } else {
+                ConversionError::new(format!(
+                    "could not download {url}: {error}. Install curl or open the file locally."
+                ))
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -377,9 +417,20 @@ fn download_follow_redirects(url: &str, path: &Path) -> Result<(), ConversionErr
 }
 
 /// Safer path when private URLs are blocked (default): no auto-follow; re-check each Location.
-fn download_with_redirect_revalidation(url: &str, path: &Path) -> Result<(), ConversionError> {
+fn download_with_redirect_revalidation(
+    url: &str,
+    path: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(), ConversionError> {
     let mut current = url.to_string();
     for hop in 0..=MAX_DOWNLOAD_REDIRECTS {
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            let _ = fs::remove_file(path);
+            return Err(ConversionError::cancelled());
+        }
         ensure_url_fetch_allowed(&current)?;
 
         let header_path = path.with_extension(format!("hdr{hop}"));
@@ -403,13 +454,22 @@ fn download_with_redirect_revalidation(url: &str, path: &Path) -> Result<(), Con
             .arg("%{http_code}")
             .arg(&current);
 
-        let output =
-            run_command(command, REMOTE_DOWNLOAD_TIMEOUT, 1024 * 1024).map_err(|error| {
-                let _ = fs::remove_file(&header_path);
+        let output = run_command_cancellable(
+            command,
+            REMOTE_DOWNLOAD_TIMEOUT,
+            1024 * 1024,
+            cancel.clone(),
+        )
+        .map_err(|error| {
+            let _ = fs::remove_file(&header_path);
+            if error.is_cancelled() {
+                error
+            } else {
                 ConversionError::new(format!(
                     "could not download {current}: {error}. Install curl or open the file locally."
                 ))
-            })?;
+            }
+        })?;
 
         let headers = fs::read_to_string(&header_path).unwrap_or_default();
         let _ = fs::remove_file(&header_path);
@@ -674,7 +734,7 @@ mod tests {
         let token = PasteToken::LocalPath(PathBuf::from(
             "/tmp/shift-magic-paste-definitely-missing-xyz.pdf",
         ));
-        let err = materialize_paste_token(&token).unwrap_err();
+        let err = materialize_paste_token(&token, None).unwrap_err();
         assert!(err.to_string().contains("file not found"));
     }
 
@@ -685,9 +745,17 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("note.md");
         fs::write(&path, b"# hi\n").unwrap();
-        let source = materialize_paste_token(&PasteToken::LocalPath(path.clone())).unwrap();
+        let source = materialize_paste_token(&PasteToken::LocalPath(path.clone()), None).unwrap();
         assert_eq!(source, BatchSource::File(path));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_honours_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let token = PasteToken::LocalPath(PathBuf::from("/tmp/shift-magic-paste-cancel-test.txt"));
+        let err = materialize_paste_token(&token, Some(cancel)).unwrap_err();
+        assert!(err.is_cancelled());
     }
 
     #[test]

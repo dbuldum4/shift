@@ -5817,6 +5817,7 @@ impl Shift {
         cx: &mut Context<Self>,
     ) {
         self.cancel_active_conversion();
+        self.conversion_cancel = Arc::new(AtomicBool::new(false));
         self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
@@ -5875,9 +5876,10 @@ impl Shift {
         self.conversion_progress = Some((None, label.into()));
         cx.notify();
 
+        let cancel = Arc::clone(&self.conversion_cancel);
         let resolve = cx
             .background_executor()
-            .spawn(async move { materialize_magic_paste(&paste) });
+            .spawn(async move { materialize_magic_paste(&paste, Some(cancel)) });
 
         cx.spawn(async move |this, cx| {
             let result = resolve.await;
@@ -5997,11 +5999,11 @@ impl Shift {
         // Keep session knobs durable when options change reconverts.
         self.persist_session_settings(cx);
         if let Some(path) = self.selected_file.clone() {
-            self.start_file_conversion(path, cx);
+            self.start_source_conversion(BatchSource::File(path), cx);
             return;
         }
         if let Some(url) = self.selected_url.clone() {
-            self.start_url_conversion(url, cx);
+            self.start_source_conversion(BatchSource::Url(url), cx);
             return;
         }
         self.conversion = ConversionState::Empty;
@@ -6358,7 +6360,7 @@ impl Shift {
         }
     }
 
-    fn start_file_conversion(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn start_source_conversion(&mut self, source: BatchSource, cx: &mut Context<Self>) {
         // Kill any previous single convert before starting a new one.
         self.cancel_active_conversion();
         self.conversion_cancel = Arc::new(AtomicBool::new(false));
@@ -6381,22 +6383,34 @@ impl Shift {
             let _ = progress_tx.send(progress);
         }));
         self.conversion = ConversionState::Converting;
-        self.conversion_progress = Some((
-            None,
-            format!("Converting to {}…", output_format.label()).into(),
-        ));
+        let progress_label = match &source {
+            BatchSource::Url(url) => {
+                format!(
+                    "Fetching {} → {}…",
+                    url_display_host(url),
+                    output_format.label()
+                )
+            }
+            BatchSource::File(_) => format!("Converting to {}…", output_format.label()),
+        };
+        self.conversion_progress = Some((None, progress_label.into()));
         self.cached_ready_path = None;
         self.save_status = None;
         self.active_history_id = None;
         cx.notify();
 
-        let conversion_path = path.clone();
+        let source_for_check = source.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         cx.background_executor()
             .spawn(async move {
-                let result = ConversionRegistry::default()
-                    .with_priority(&priority)
-                    .convert_to_with_options(&conversion_path, output_format, &options);
+                let result = match source {
+                    BatchSource::File(path) => ConversionRegistry::default()
+                        .with_priority(&priority)
+                        .convert_to_with_options(&path, output_format, &options),
+                    BatchSource::Url(url) => ConversionRegistry::default()
+                        .with_priority(&priority)
+                        .convert_url_with_options(&url, output_format, &options),
+                };
                 let _ = done_tx.send(result);
             })
             .detach();
@@ -6423,7 +6437,7 @@ impl Shift {
                     let _ = this.update(cx, |this, cx| {
                         if this.selection_generation == generation
                             && this.conversion_generation == conversion_generation
-                            && this.selected_file.as_ref() == Some(&path)
+                            && this.source_matches(&source_for_check)
                         {
                             this.conversion_progress = None;
                             match result {
@@ -6457,103 +6471,12 @@ impl Shift {
         .detach();
     }
 
-    fn start_url_conversion(&mut self, url: String, cx: &mut Context<Self>) {
-        self.cancel_active_conversion();
-        self.conversion_cancel = Arc::new(AtomicBool::new(false));
-        self.conversion_generation = self.conversion_generation.wrapping_add(1);
-        let conversion_generation = self.conversion_generation;
-        let generation = self.selection_generation;
-        let output_format = self.output_format;
-        let priority = self.module_priority.clone();
-        let mut options = match self.build_conversion_options(cx) {
-            Ok(options) => options,
-            Err(error) => {
-                self.conversion = ConversionState::Failed(error.into());
-                cx.notify();
-                return;
-            }
-        };
-        options.cancel = Some(Arc::clone(&self.conversion_cancel));
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<ConversionProgress>();
-        options.progress = Some(Arc::new(move |progress| {
-            let _ = progress_tx.send(progress);
-        }));
-        self.conversion = ConversionState::Converting;
-        let host = url_display_host(&url);
-        self.conversion_progress = Some((
-            None,
-            format!("Fetching {host} → {}…", output_format.label()).into(),
-        ));
-        self.cached_ready_path = None;
-        self.save_status = None;
-        self.active_history_id = None;
-        cx.notify();
-
-        let conversion_url = url.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        cx.background_executor()
-            .spawn(async move {
-                let result = ConversionRegistry::default()
-                    .with_priority(&priority)
-                    .convert_url_with_options(&conversion_url, output_format, &options);
-                let _ = done_tx.send(result);
-            })
-            .detach();
-
-        cx.spawn(async move |this, cx| {
-            loop {
-                while let Ok(progress) = progress_rx.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        if this.selection_generation != generation
-                            || this.conversion_generation != conversion_generation
-                        {
-                            return;
-                        }
-                        this.conversion_progress = Some(match progress {
-                            ConversionProgress::Phase(label) => (None, label.into()),
-                            ConversionProgress::Fraction { fraction, label } => {
-                                (Some(fraction), label.into())
-                            }
-                        });
-                        cx.notify();
-                    });
-                }
-                if let Ok(result) = done_rx.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        if this.selection_generation == generation
-                            && this.conversion_generation == conversion_generation
-                            && this.selected_url.as_ref() == Some(&url)
-                        {
-                            this.conversion_progress = None;
-                            match result {
-                                Ok(artifact) => {
-                                    let artifact = Arc::new(artifact);
-                                    this.record_history(HistoryOutcome::Ready(Arc::clone(
-                                        &artifact,
-                                    )));
-                                    this.set_ready_artifact(artifact);
-                                }
-                                Err(error) if error.is_cancelled() => {
-                                    this.conversion =
-                                        ConversionState::Failed("Conversion cancelled.".into());
-                                }
-                                Err(error) => {
-                                    let message: SharedString = error.to_string().into();
-                                    this.record_history(HistoryOutcome::Failed(message.clone()));
-                                    this.conversion = ConversionState::Failed(message);
-                                }
-                            }
-                            cx.notify();
-                        }
-                    });
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(40))
-                    .await;
-            }
-        })
-        .detach();
+    fn source_matches(&self, source: &BatchSource) -> bool {
+        match (source, &self.selected_file, &self.selected_url) {
+            (BatchSource::File(path), Some(selected), _) => selected == path,
+            (BatchSource::Url(url), _, Some(selected)) => selected == url,
+            _ => false,
+        }
     }
 
     fn set_output_format(&mut self, format: OutputFormat, cx: &mut Context<Self>) {

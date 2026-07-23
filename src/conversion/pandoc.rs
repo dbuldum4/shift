@@ -171,6 +171,7 @@ impl ConversionModule for PandocModule {
             command.arg("--toc");
         }
         if let Some(reference) = options.pandoc.reference_doc.as_ref() {
+            let reference = validate_reference_doc(reference)?;
             command.arg("--reference-doc").arg(reference);
         }
 
@@ -294,6 +295,43 @@ pub fn resolve_pdf_engine(override_engine: Option<&str>) -> Result<OsString, Con
          distribution such as `brew install --cask basictex`. You can also set \
          SHIFT_PDF_ENGINE to a specific engine binary.",
     ))
+}
+
+/// Validate a Pandoc `--reference-doc` path before it reaches the command line.
+///
+/// Rejects missing files, directories, and paths that escape the filesystem
+/// root. Relative paths are resolved against the current directory.
+fn validate_reference_doc(path: &Path) -> Result<PathBuf, ConversionError> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                ConversionError::new(format!(
+                    "could not resolve reference document path: {error}"
+                ))
+            })?
+            .join(path)
+    };
+
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ConversionError::new(format!(
+            "reference document path cannot contain parent-directory references: {}",
+            path.display()
+        )));
+    }
+
+    if !path.is_file() {
+        return Err(ConversionError::new(format!(
+            "reference document is not a readable file: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -554,5 +592,22 @@ mod tests {
     fn pdf_engine_candidates_prefer_typst() {
         assert_eq!(PDF_ENGINE_CANDIDATES[0], "typst");
         assert!(PDF_ENGINE_CANDIDATES.contains(&"pdflatex"));
+    }
+
+    #[test]
+    fn reference_doc_validation_rejects_missing_and_parent_dir() {
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let valid = directory.join(format!("shift-pandoc-ref-valid-{suffix}.docx"));
+        std::fs::write(&valid, "ref").unwrap();
+        assert!(validate_reference_doc(&valid).is_ok());
+
+        let missing = directory.join(format!("shift-pandoc-ref-missing-{suffix}.docx"));
+        assert!(validate_reference_doc(&missing).is_err());
+
+        let parent_dir = PathBuf::from(format!("../shift-pandoc-ref-traversal-{suffix}.docx"));
+        assert!(validate_reference_doc(&parent_dir).is_err());
+
+        let _ = std::fs::remove_file(&valid);
     }
 }

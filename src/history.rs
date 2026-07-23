@@ -79,6 +79,42 @@ pub fn support_dir() -> Option<PathBuf> {
         .map(|home| home.join("Library/Application Support/Shift"))
 }
 
+fn home_dir_for_history() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Store a file source in a privacy-friendlier form: absolute paths under the
+/// user's home directory are converted to a `~` prefix so the history database
+/// does not embed the full home directory name.
+fn store_source_path(path: &Path) -> String {
+    if let Some(home) = home_dir_for_history() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            let rest = rest.to_string_lossy();
+            if rest.is_empty() {
+                return "~".to_owned();
+            }
+            return format!("~/{rest}");
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Reverse [`store_source_path`], expanding `~/` to the current home directory.
+fn restore_source_path(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw == "~" {
+        if let Some(home) = home_dir_for_history() {
+            return home;
+        }
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home_dir_for_history() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
 /// Map a stored module id onto a known static string.
 pub fn intern_module_id(id: &str) -> &'static str {
     match id {
@@ -229,7 +265,7 @@ pub fn clear_history_store() -> io::Result<()> {
 
 fn insert_entry(tx: &Connection, entry: &StoredHistoryEntry) -> Result<(), rusqlite::Error> {
     let (source_kind, source) = match &entry.source {
-        StoredSource::File(path) => (0i64, path.to_string_lossy().into_owned()),
+        StoredSource::File(path) => (0i64, store_source_path(path)),
         StoredSource::Url(url) => (1i64, url.clone()),
     };
 
@@ -373,7 +409,7 @@ fn row_to_entry(row: &rusqlite::Row) -> Result<StoredHistoryEntry, rusqlite::Err
     let source_kind = row.get::<_, i64>("source_kind")?;
     let source_raw = row.get::<_, String>("source")?;
     let source = match source_kind {
-        0 => StoredSource::File(PathBuf::from(source_raw)),
+        0 => StoredSource::File(restore_source_path(&source_raw)),
         1 => StoredSource::Url(source_raw),
         _ => {
             return Err(rusqlite::Error::IntegralValueOutOfRange(0, source_kind));
@@ -471,7 +507,7 @@ fn write_entry(out: &mut Vec<u8>, entry: &StoredHistoryEntry) {
     match &entry.source {
         StoredSource::File(path) => {
             out.push(0);
-            write_string(out, &path.to_string_lossy());
+            write_string(out, &store_source_path(path));
         }
         StoredSource::Url(url) => {
             out.push(1);
@@ -517,7 +553,7 @@ fn read_entry(cursor: &mut Cursor<&[u8]>) -> io::Result<StoredHistoryEntry> {
     let source_kind = read_u8(cursor)?;
     let source_raw = read_string(cursor)?;
     let source = match source_kind {
-        0 => StoredSource::File(PathBuf::from(source_raw)),
+        0 => StoredSource::File(restore_source_path(&source_raw)),
         1 => StoredSource::Url(source_raw),
         _ => {
             return Err(io::Error::new(
@@ -656,6 +692,26 @@ mod tests {
             },
             archived,
         }
+    }
+
+    #[test]
+    fn source_paths_round_trip_and_use_home_prefix() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test requires HOME");
+        let under_home = home.join("Documents/report.docx");
+        let outside = PathBuf::from("/tmp/sample.txt");
+
+        assert_eq!(store_source_path(&under_home), "~/Documents/report.docx");
+        assert_eq!(store_source_path(&home), "~");
+        assert_eq!(
+            store_source_path(&outside),
+            outside.to_string_lossy().into_owned()
+        );
+
+        assert_eq!(restore_source_path("~/Documents/report.docx"), under_home);
+        assert_eq!(restore_source_path("~"), home);
+        assert_eq!(restore_source_path("/tmp/sample.txt"), outside);
     }
 
     #[test]

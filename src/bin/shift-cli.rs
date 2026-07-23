@@ -87,6 +87,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     }
 
     let registry = build_registry(parsed.preferred_module.as_deref())?;
+    let cancel = install_ctrl_c_handler();
     let mut options = ConversionOptions {
         ffmpeg: parsed.ffmpeg,
         markitdown: parsed.markitdown,
@@ -94,7 +95,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         defuddle: parsed.defuddle,
         docling: parsed.docling,
         pdf: parsed.pdf,
-        cancel: None,
+        cancel: Some(Arc::clone(&cancel)),
         progress: None,
     };
     if parsed.progress {
@@ -129,7 +130,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         network_urls_from_classified(std::slice::from_ref(&classified)),
         parsed.yes,
     )?;
-    let source = materialize_cli_input(classified)?;
+    let source = materialize_cli_input(classified, Some(Arc::clone(&cancel)))?;
     let artifact = match &source {
         BatchSource::Url(url) => {
             eprintln!("shift-cli: fetching {}", url_display_host(url));
@@ -601,10 +602,13 @@ fn network_urls_from_classified(items: &[ClassifiedInput]) -> Vec<&str> {
 }
 
 /// Materialize a classified input (downloads remote files when needed).
-fn materialize_cli_input(input: ClassifiedInput) -> Result<BatchSource, String> {
+fn materialize_cli_input(
+    input: ClassifiedInput,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<BatchSource, String> {
     match input {
         ClassifiedInput::Token(token) => {
-            materialize_paste_token(&token).map_err(|error| error.to_string())
+            materialize_paste_token(&token, cancel).map_err(|error| error.to_string())
         }
         ClassifiedInput::Path(path) => Ok(BatchSource::File(path)),
     }
@@ -694,6 +698,9 @@ fn run_batch_cli(
     enqueue.force = force;
     enqueue.output_dir = output_dir;
 
+    // Process-wide cancel flag installed once; each batch call resets it.
+    let cancel = install_ctrl_c_handler();
+
     // Classify first (no network), confirm all network tokens, then download.
     let mut classified = Vec::with_capacity(inputs.len());
     for input in &inputs {
@@ -701,7 +708,7 @@ fn run_batch_cli(
     }
     confirm_network_urls(network_urls_from_classified(&classified), yes)?;
     for item in classified {
-        let source = materialize_cli_input(item)?;
+        let source = materialize_cli_input(item, Some(Arc::clone(&cancel)))?;
         queue.enqueue(source, &enqueue);
     }
 
@@ -711,9 +718,6 @@ fn run_batch_cli(
             queue.items_mut()[0].destination = path;
         }
     }
-
-    // Process-wide cancel flag installed once; each batch call resets it.
-    let cancel = install_ctrl_c_handler();
 
     let summary = run_batch(&mut queue, registry, &cancel, |event| match event {
         BatchEvent::ItemStarted {

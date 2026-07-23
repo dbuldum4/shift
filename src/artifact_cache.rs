@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 const CACHE_DIR_NAME: &str = "artifact-cache";
 const EXPORT_SUBDIR: &str = "export";
 const PASTE_STAGING_SUBDIR: &str = "paste-staging";
+const VERSION_FILE_NAME: &str = ".version";
+const CACHE_VERSION: &str = "1";
 /// Default TTL for cached artifacts (7 days).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Soft cap on total cache size before oldest entries are purged (512 MiB).
@@ -28,6 +30,10 @@ pub fn default_paste_staging_dir() -> Option<PathBuf> {
 }
 
 /// Ensure the cache directory exists and return it.
+///
+/// If the on-disk cache predates the current `CACHE_VERSION`, stale entries are
+/// removed before the directory is returned so format/layout changes cannot
+/// serve obsolete artifacts.
 pub fn ensure_artifact_cache_dir() -> io::Result<PathBuf> {
     let dir = artifact_cache_dir().ok_or_else(|| {
         io::Error::new(
@@ -36,7 +42,31 @@ pub fn ensure_artifact_cache_dir() -> io::Result<PathBuf> {
         )
     })?;
     fs::create_dir_all(&dir)?;
+
+    let version_file = dir.join(VERSION_FILE_NAME);
+    let version_matches = fs::read_to_string(&version_file)
+        .map(|content| content.trim() == CACHE_VERSION)
+        .unwrap_or(false);
+    if !version_matches {
+        purge_cache_dir(&dir)?;
+    }
+    fs::write(&version_file, CACHE_VERSION)?;
     Ok(dir)
+}
+
+fn purge_cache_dir(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(VERSION_FILE_NAME) {
+            continue;
+        }
+        let _ = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+    }
+    Ok(())
 }
 
 /// Store `bytes` under a stable key derived from `name` + content hash prefix.
@@ -612,6 +642,46 @@ mod tests {
         ));
         assert!(sidecar.is_file() || path.parent().unwrap().join(".note.md.hash").is_file());
         assert!(!export_matches_bytes(&path, b"body"));
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_mismatch_purges_stale_cache_entries() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("version");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        // Simulate an old cache with a stale version file.
+        let stale = dir.join("stale-report.pdf");
+        fs::write(&stale, b"old").unwrap();
+        fs::write(dir.join(VERSION_FILE_NAME), "0").unwrap();
+
+        // Re-ensuring the cache directory should purge the stale entry.
+        let ensured = ensure_artifact_cache_dir().unwrap();
+        assert_eq!(ensured, dir);
+        assert!(!stale.exists(), "stale cache entry should be removed");
+        assert_eq!(
+            fs::read_to_string(dir.join(VERSION_FILE_NAME))
+                .unwrap()
+                .trim(),
+            CACHE_VERSION
+        );
+
+        // A second call with a matching version should leave the directory alone.
+        let retained = dir.join("fresh-report.pdf");
+        fs::write(&retained, b"new").unwrap();
+        let _ = ensure_artifact_cache_dir().unwrap();
+        assert!(
+            retained.exists(),
+            "matching version should not purge entries"
+        );
+
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
         }
