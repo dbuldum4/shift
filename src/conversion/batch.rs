@@ -1669,4 +1669,300 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn batch_source_helpers() {
+        // Plain file path.
+        let source = BatchSource::try_from_path_or_url("report.pdf").unwrap();
+        assert_eq!(source, BatchSource::File(PathBuf::from("report.pdf")));
+        assert_eq!(source.display_name(), "report.pdf");
+        assert_eq!(source.as_file(), Some(Path::new("report.pdf")));
+        assert_eq!(source.as_url(), None);
+
+        // HTTPS URL.
+        let source = BatchSource::try_from_path_or_url("https://example.com/a/b.pdf").unwrap();
+        assert_eq!(
+            source,
+            BatchSource::Url("https://example.com/a/b.pdf".into())
+        );
+        assert_eq!(source.display_name(), "https://example.com/a/b.pdf");
+        assert_eq!(source.as_file(), None);
+        assert_eq!(source.as_url(), Some("https://example.com/a/b.pdf"));
+
+        // File URL with a hostname cannot be resolved; from_path_or_url falls back.
+        let source = BatchSource::from_path_or_url("file://hostname/only");
+        assert!(matches!(source, BatchSource::File(_)));
+
+        // Display name falls back to the full path when there is no file name.
+        let source = BatchSource::File(PathBuf::from(""));
+        assert_eq!(source.display_name(), "");
+    }
+
+    #[test]
+    fn suggested_url_file_name_and_sanitize() {
+        assert_eq!(
+            suggested_url_file_name("https://example.com/a/b.pdf", OutputFormat::MARKDOWN),
+            "b.md"
+        );
+        assert_eq!(
+            suggested_url_file_name("https://example.com/", OutputFormat::HTML),
+            "example.html"
+        );
+        assert_eq!(
+            suggested_url_file_name("https://example.com", OutputFormat::MARKDOWN),
+            "example.md"
+        );
+        assert_eq!(
+            suggested_url_file_name("https://example.com/path?q=1&x=2", OutputFormat::PDF),
+            "path_q_1_x_2.pdf"
+        );
+
+        assert_eq!(sanitize_file_stem("my file.txt"), "my_file");
+        assert_eq!(sanitize_file_stem("my.archive.tar.gz"), "my.archive.tar");
+        assert_eq!(sanitize_file_stem("?.pdf"), "_");
+        assert_eq!(sanitize_file_stem(""), "page");
+    }
+
+    #[test]
+    fn resolve_destination_variants() {
+        let file = BatchSource::File(PathBuf::from("/docs/report.pdf"));
+        assert_eq!(
+            resolve_destination(&file, OutputFormat::MARKDOWN, None),
+            PathBuf::from("/docs/report.md")
+        );
+        assert_eq!(
+            resolve_destination(&file, OutputFormat::MARKDOWN, Some(Path::new("/out"))),
+            PathBuf::from("/out/report.md")
+        );
+
+        let url = BatchSource::Url("https://example.com/a/page.html".into());
+        assert_eq!(
+            resolve_destination(&url, OutputFormat::MARKDOWN, None),
+            PathBuf::from("page.md")
+        );
+        assert_eq!(
+            resolve_destination(&url, OutputFormat::MARKDOWN, Some(Path::new("/out"))),
+            PathBuf::from("/out/page.md")
+        );
+    }
+
+    #[test]
+    fn batch_queue_lifecycle_and_progress() {
+        let mut queue = BatchQueue::new();
+        assert!(queue.is_empty());
+
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let id = queue.enqueue(BatchSource::File(PathBuf::from("/tmp/a.pdf")), &opts);
+        assert_eq!(queue.len(), 1);
+        assert!(!queue.is_empty());
+        assert!(queue.get(id).is_some());
+        assert!(queue.get_mut(id).is_some());
+        assert!(queue.get(BatchItemId(999)).is_none());
+        assert_eq!(queue.progress().total, 1);
+        assert_eq!(queue.progress().queued, 1);
+
+        queue.cancel_queued();
+        assert_eq!(queue.progress().cancelled, 1);
+
+        assert!(queue.retry(id));
+        assert_eq!(queue.progress().queued, 1);
+        assert!(!queue.retry(BatchItemId(999)));
+
+        // set_output_dir updates queued items.
+        queue.set_output_dir(Some(Path::new("/out")));
+        assert_eq!(
+            queue.get(id).unwrap().destination,
+            PathBuf::from("/out/a.md")
+        );
+
+        // set_output_format_for_queued changes inherited items and destinations.
+        queue.set_output_format_for_queued(OutputFormat::HTML, Some(Path::new("/out")));
+        assert_eq!(queue.get(id).unwrap().output_format, OutputFormat::HTML);
+        assert_eq!(
+            queue.get(id).unwrap().destination,
+            PathBuf::from("/out/a.html")
+        );
+
+        queue.remove(id);
+        assert!(queue.is_empty());
+
+        // retry_failed, clear_finished, and clear.
+        let id1 = queue.enqueue(BatchSource::File(PathBuf::from("/tmp/b.pdf")), &opts);
+        let id2 = queue.enqueue(BatchSource::File(PathBuf::from("/tmp/c.pdf")), &opts);
+        queue.items_mut()[0].state = BatchItemState::Failed { error: "x".into() };
+        queue.items_mut()[1].state = BatchItemState::Succeeded {
+            written_path: PathBuf::from("/tmp/c.md"),
+            module_id: "m".into(),
+            byte_len: 1,
+        };
+        assert_eq!(queue.retry_failed(), 1);
+        assert!(matches!(
+            queue.get(id1).unwrap().state,
+            BatchItemState::Queued
+        ));
+
+        queue.clear_finished();
+        assert_eq!(queue.len(), 1);
+        assert!(queue.get(id2).is_none());
+
+        queue.clear();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn batch_item_resolved_format_and_state_helpers() {
+        let item = BatchItem {
+            id: BatchItemId(0),
+            source: BatchSource::File(PathBuf::from("/tmp/x.pdf")),
+            output_format: OutputFormat::MARKDOWN,
+            format_selection: BatchFormatSelection::Override(OutputFormat::HTML),
+            options: ConversionOptions::default(),
+            destination: PathBuf::from("/tmp/x.html"),
+            force: false,
+            state: BatchItemState::Queued,
+            attempts: 0,
+        };
+        assert_eq!(item.resolved_format(), OutputFormat::HTML);
+
+        for (state, terminal, retryable, label) in [
+            (BatchItemState::Queued, false, false, "queued"),
+            (BatchItemState::Running, false, false, "running"),
+            (
+                BatchItemState::Succeeded {
+                    written_path: PathBuf::new(),
+                    module_id: String::new(),
+                    byte_len: 0,
+                },
+                true,
+                false,
+                "succeeded",
+            ),
+            (
+                BatchItemState::Failed { error: "e".into() },
+                true,
+                true,
+                "failed",
+            ),
+            (BatchItemState::Cancelled, true, true, "cancelled"),
+        ] {
+            assert_eq!(state.is_terminal(), terminal, "{label}");
+            assert_eq!(state.is_retryable(), retryable, "{label}");
+            assert_eq!(state.label(), label);
+        }
+
+        assert_eq!(
+            BatchFormatSelection::Inherit.resolve(OutputFormat::PDF),
+            OutputFormat::PDF
+        );
+        assert_eq!(
+            BatchFormatSelection::Override(OutputFormat::DOCX).resolve(OutputFormat::PDF),
+            OutputFormat::DOCX
+        );
+    }
+
+    #[test]
+    fn batch_progress_and_summary_exit_codes() {
+        assert!(BatchProgress::default().is_idle());
+
+        let progress = BatchProgress {
+            total: 3,
+            succeeded: 1,
+            failed: 1,
+            cancelled: 1,
+            ..BatchProgress::default()
+        };
+        assert_eq!(progress.completed(), 3);
+        assert_eq!(progress.remaining(), 0);
+        assert!(progress.is_idle());
+
+        assert_eq!(
+            BatchSummary {
+                succeeded: 2,
+                failed: 0,
+                cancelled: 0
+            }
+            .exit_code(),
+            0
+        );
+        assert_eq!(
+            BatchSummary {
+                succeeded: 0,
+                failed: 1,
+                cancelled: 0
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            BatchSummary {
+                succeeded: 0,
+                failed: 0,
+                cancelled: 1
+            }
+            .exit_code(),
+            130
+        );
+        assert_eq!(
+            BatchSummary {
+                succeeded: 1,
+                failed: 0,
+                cancelled: 1
+            }
+            .exit_code(),
+            0
+        );
+    }
+
+    #[test]
+    fn prepare_batch_destination_and_uniquify() {
+        let dir = unique_dir("prepare");
+
+        // Parent directory is created on demand.
+        let nested = dir.join("new").join("out.md");
+        prepare_batch_destination(&nested, None, false).unwrap();
+        assert!(nested.parent().unwrap().is_dir());
+
+        // Refuses to overwrite an existing file without force.
+        let existing = dir.join("existing.md");
+        std::fs::write(&existing, b"x").unwrap();
+        let err = prepare_batch_destination(&existing, None, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+
+        // Refuses to overwrite the source.
+        let source = dir.join("source.md");
+        std::fs::write(&source, b"x").unwrap();
+        let err = prepare_batch_destination(&source, Some(&source), true).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite source"));
+
+        // Uniquify avoids an existing file.
+        let preferred = dir.join("report.md");
+        std::fs::write(&preferred, b"x").unwrap();
+        assert_eq!(
+            uniquify_destination(&preferred, false),
+            dir.join("report-1.md")
+        );
+        assert_eq!(uniquify_destination(&preferred, true), preferred);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uniquify_against_claimed_falls_back_to_token() {
+        let preferred = PathBuf::from("/out/report.md");
+        let mut claimed: Vec<PathBuf> = (1..10_000)
+            .map(|i| PathBuf::from(format!("/out/report-{i}.md")))
+            .collect();
+        claimed.push(preferred.clone());
+
+        let resolved = uniquify_against_claimed(&preferred, &claimed, false);
+        assert!(!claimed.contains(&resolved));
+        assert!(
+            resolved
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("report-") && n.ends_with(".md")),
+            "unexpected: {}",
+            resolved.display()
+        );
+    }
 }

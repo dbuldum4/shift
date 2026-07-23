@@ -1363,4 +1363,569 @@ esac
         let _ = fs::remove_file(format!("{}.args", executable.display()));
         let _ = fs::remove_file(&input);
     }
+
+    #[test]
+    fn ffmpeg_encode_mode_and_quality_helpers() {
+        assert_eq!(FfmpegEncodeMode::Auto.id(), "auto");
+        assert_eq!(FfmpegEncodeMode::PreferCopy.label(), "Stream copy");
+        assert_eq!(FfmpegEncodeMode::all().len(), 3);
+        assert_eq!(
+            "stream_copy".parse::<FfmpegEncodeMode>(),
+            Ok(FfmpegEncodeMode::PreferCopy)
+        );
+        assert!("unknown".parse::<FfmpegEncodeMode>().is_err());
+
+        assert_eq!(FfmpegQuality::High.id(), "high");
+        assert_eq!(FfmpegQuality::Small.label(), "Smaller file");
+        assert_eq!(FfmpegQuality::all().len(), 3);
+        assert_eq!("hq".parse::<FfmpegQuality>(), Ok(FfmpegQuality::High));
+        assert!("tiny".parse::<FfmpegQuality>().is_err());
+    }
+
+    #[test]
+    fn ffmpeg_options_default_and_forces_reencode() {
+        let default = FfmpegOptions::default();
+        assert!(default.is_default());
+        assert!(!default.forces_reencode());
+
+        let mut o = default.clone();
+        o.mono = true;
+        assert!(!o.is_default());
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.sample_rate_hz = Some(44100);
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.scale_width = Some(640);
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.fps = Some(30.0);
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.mute = true;
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.normalize_audio = true;
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.burn_subtitles = true;
+        assert!(o.forces_reencode());
+
+        o = FfmpegOptions::default();
+        o.frame_interval_secs = Some(1.0);
+        assert!(o.forces_reencode());
+    }
+
+    #[test]
+    fn output_format_classifiers() {
+        assert!(is_ffmpeg_output(OutputFormat::MP3));
+        assert!(is_ffmpeg_output(OutputFormat::PNG_SEQUENCE_ZIP));
+        assert!(!is_ffmpeg_output(OutputFormat::MARKDOWN));
+
+        assert!(is_audio_output(OutputFormat::FLAC));
+        assert!(is_audio_output(OutputFormat::CAF));
+        assert!(!is_audio_output(OutputFormat::MP4));
+
+        assert!(is_video_output(OutputFormat::MKV));
+        assert!(is_video_output(OutputFormat::GIF));
+        assert!(!is_video_output(OutputFormat::PNG));
+
+        assert!(is_image_output(OutputFormat::PNG));
+        assert!(is_image_output(OutputFormat::JPG));
+        assert!(!is_image_output(OutputFormat::SRT));
+
+        assert!(is_subtitle_output(OutputFormat::SRT));
+        assert!(is_subtitle_output(OutputFormat::VTT));
+        assert!(!is_subtitle_output(OutputFormat::WAV));
+    }
+
+    #[test]
+    fn validate_options_rejects_invalid_bounds() {
+        assert!(validate_options(&FfmpegOptions::default()).is_ok());
+
+        let o = FfmpegOptions {
+            start_secs: Some(-1.0),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("start")
+        );
+
+        let o = FfmpegOptions {
+            duration_secs: Some(f64::NAN),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("duration")
+        );
+
+        let o = FfmpegOptions {
+            frame_secs: Some(f64::INFINITY),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("frame")
+        );
+
+        let o = FfmpegOptions {
+            frame_interval_secs: Some(0.0),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("frame interval")
+        );
+
+        let o = FfmpegOptions {
+            fps: Some(300.0),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("fps")
+        );
+
+        let o = FfmpegOptions {
+            sample_rate_hz: Some(7000),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("sample rate")
+        );
+
+        let o = FfmpegOptions {
+            scale_width: Some(5),
+            ..FfmpegOptions::default()
+        };
+        assert!(
+            validate_options(&o)
+                .unwrap_err()
+                .to_string()
+                .contains("scale width")
+        );
+    }
+
+    #[test]
+    fn format_timestamp_rounds_and_truncates() {
+        assert_eq!(format_timestamp(5.0), "5");
+        assert_eq!(format_timestamp(5.0000000001), "5");
+        assert_eq!(format_timestamp(5.123456789), "5.123");
+        assert_eq!(format_timestamp(0.5), "0.500");
+    }
+
+    #[test]
+    fn zip_png_frames_empty_and_success() {
+        let dir = std::env::temp_dir().join(format!("shift-ffmpeg-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let zip_path = dir.join("out.zip");
+
+        assert!(zip_png_frames(&empty, &zip_path).is_err());
+
+        let frames = dir.join("frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::write(frames.join("frame_0001.png"), b"PNG1").unwrap();
+        std::fs::write(frames.join("frame_0002.png"), b"PNG2").unwrap();
+        std::fs::write(frames.join("ignore.txt"), b"text").unwrap();
+
+        zip_png_frames(&frames, &zip_path).unwrap();
+        assert!(zip_path.is_file());
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_stream_and_subtitle_stream_maps() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+
+        let mp3 = module
+            .build_command(
+                Path::new("clip.mp4"),
+                Path::new("out.mp3"),
+                OutputFormat::MP3,
+                &FfmpegOptions {
+                    audio_stream: Some(2),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = mp3
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"0:a:2".to_owned()));
+
+        let srt = module
+            .build_command(
+                Path::new("clip.mkv"),
+                Path::new("out.srt"),
+                OutputFormat::SRT,
+                &FfmpegOptions {
+                    subtitle_stream: Some(1),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = srt
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"0:s:1".to_owned()));
+    }
+
+    #[test]
+    fn mute_and_audio_stream_on_video() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.mp4"),
+                OutputFormat::MP4,
+                &FfmpegOptions {
+                    mute: true,
+                    audio_stream: Some(0),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Mute takes precedence; explicit audio stream is ignored.
+        assert!(
+            args.iter()
+                .any(|a| a == "-map"
+                    && args[args.iter().position(|x| x == a).unwrap() + 1] == "0:v:0")
+        );
+        assert!(args.contains(&"-an".to_owned()));
+    }
+
+    #[test]
+    fn gif_quality_presets() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+
+        for (quality, expected) in [
+            (FfmpegQuality::High, "fps=15,scale=640:-2:flags=lanczos"),
+            (FfmpegQuality::Balanced, "fps=10,scale=480:-2:flags=lanczos"),
+            (FfmpegQuality::Small, "fps=8,scale=320:-2:flags=lanczos"),
+        ] {
+            let command = module
+                .build_command(
+                    Path::new("in.mp4"),
+                    Path::new("out.gif"),
+                    OutputFormat::GIF,
+                    &FfmpegOptions {
+                        quality,
+                        ..FfmpegOptions::default()
+                    },
+                )
+                .unwrap();
+            let vf = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find(|w| w[0] == "-vf")
+                .map(|w| w[1].clone())
+                .unwrap_or_default();
+            assert!(vf.contains(expected), "quality {:?} got vf {vf}", quality);
+        }
+    }
+
+    #[test]
+    fn scale_and_fps_filters_apply_to_video_and_stills() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.mp4"),
+                OutputFormat::MP4,
+                &FfmpegOptions {
+                    scale_width: Some(640),
+                    fps: Some(30.0),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let vf = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].clone())
+            .unwrap_or_default();
+        assert!(vf.contains("scale=640:-2"), "vf: {vf}");
+        assert!(vf.contains("fps=30"), "vf: {vf}");
+
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.png"),
+                OutputFormat::PNG,
+                &FfmpegOptions {
+                    scale_width: Some(320),
+                    fps: Some(60.0),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let vf = args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].clone())
+            .unwrap_or_default();
+        assert!(vf.contains("scale=320:-2"), "vf: {vf}");
+        assert!(vf.contains("fps=60"), "vf: {vf}");
+    }
+
+    #[test]
+    fn subtitle_output_ignores_duration() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let command = module
+            .build_command(
+                Path::new("in.mkv"),
+                Path::new("out.srt"),
+                OutputFormat::SRT,
+                &FfmpegOptions {
+                    duration_secs: Some(10.0),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.contains(&"-t".to_owned()));
+    }
+
+    #[test]
+    fn mono_and_sample_rate_for_audio_output() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.mp3"),
+                OutputFormat::MP3,
+                &FfmpegOptions {
+                    mono: true,
+                    sample_rate_hz: Some(22050),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["-ac", "1"]));
+        assert!(args.windows(2).any(|w| w == ["-ar", "22050"]));
+    }
+
+    #[test]
+    fn webm_and_threegp_codec_selection() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+
+        let webm = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.webm"),
+                OutputFormat::WEBM,
+                &FfmpegOptions::default(),
+            )
+            .unwrap();
+        let args: Vec<String> = webm
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["-c:v", "libvpx-vp9"]));
+        assert!(args.windows(2).any(|w| w == ["-c:a", "libopus"]));
+        assert!(args.windows(2).any(|w| w == ["-b:v", "0"]));
+
+        let threegp = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.3gp"),
+                OutputFormat::THREEGP,
+                &FfmpegOptions::default(),
+            )
+            .unwrap();
+        let args: Vec<String> = threegp
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["-ar", "8000"]));
+        assert!(args.windows(2).any(|w| w == ["-ac", "1"]));
+    }
+
+    #[test]
+    fn image_quality_presets() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+
+        let png = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.png"),
+                OutputFormat::PNG,
+                &FfmpegOptions {
+                    quality: FfmpegQuality::Small,
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = png
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["-compression_level", "9"]));
+
+        let jpg = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.jpg"),
+                OutputFormat::JPG,
+                &FfmpegOptions {
+                    quality: FfmpegQuality::High,
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = jpg
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["-q:v", "2"]));
+    }
+
+    #[test]
+    fn burn_subtitles_with_video_forces_filter() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let command = module
+            .build_command(
+                Path::new("/tmp/clip.mp4"),
+                Path::new("out.mp4"),
+                OutputFormat::MP4,
+                &FfmpegOptions {
+                    burn_subtitles: true,
+                    encode_mode: FfmpegEncodeMode::Reencode,
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let vf = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].clone())
+            .unwrap_or_default();
+        assert!(vf.contains("subtitles='"), "vf: {vf}");
+    }
+
+    #[test]
+    fn png_sequence_rejects_invalid_options() {
+        let directory = std::env::temp_dir();
+        let suffix = std::process::id();
+        let executable = directory.join(format!("shift-ffmpeg-seq-err-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-seq-err-{suffix}.mp4"));
+        write_fake_ffmpeg(&executable);
+        fs::write(&input, b"fake").unwrap();
+
+        let err = FfmpegModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::PNG_SEQUENCE_ZIP,
+                &opts(FfmpegOptions {
+                    frame_interval_secs: Some(-1.0),
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("frame interval"));
+
+        let err = FfmpegModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::PNG_SEQUENCE_ZIP,
+                &opts(FfmpegOptions {
+                    encode_mode: FfmpegEncodeMode::PreferCopy,
+                    frame_interval_secs: Some(1.0),
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("stream copy"));
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn png_sequence_honours_scale_width() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-seq-scale", std::process::id());
+        let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        write_fake_ffmpeg(&executable);
+        fs::write(&input, b"fake").unwrap();
+
+        let artifact = FfmpegModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::PNG_SEQUENCE_ZIP,
+                &opts(FfmpegOptions {
+                    frame_interval_secs: Some(2.0),
+                    scale_width: Some(640),
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(artifact.format, OutputFormat::PNG_SEQUENCE_ZIP);
+
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("-vf"));
+        assert!(args.contains("fps=0.5"), "args: {args}");
+        assert!(args.contains("scale=640:-2"), "args: {args}");
+        assert!(args.contains("-frames:v"));
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
 }

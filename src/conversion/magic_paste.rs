@@ -636,6 +636,34 @@ fn unique_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    fn write_curl_script(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("curl");
+        fs::write(&path, body).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn prepend_to_path(dir: &Path) -> Option<std::ffi::OsString> {
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let mut parts: Vec<PathBuf> = vec![dir.to_path_buf()];
+        parts.extend(std::env::split_paths(&current));
+        std::env::join_paths(parts).ok()
+    }
 
     #[test]
     fn parses_page_urls() {
@@ -839,5 +867,490 @@ mod tests {
     #[test]
     fn remote_download_timeout_exceeds_default_process_timeout() {
         assert!(REMOTE_DOWNLOAD_TIMEOUT > super::super::process::DEFAULT_PROCESS_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    const FAKE_CURL_SCRIPT: &str = r###"#!/bin/sh
+header=""
+output=""
+status_arg=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -D) header="$2"; shift 2;;
+    -o) output="$2"; shift 2;;
+    -w) status_arg="$2"; shift 2;;
+    -*) shift;;
+    *) url="$1"; shift;;
+  esac
+done
+
+case "$url" in
+  *huge*)
+    code=200
+    if [ -n "$output" ]; then
+      rm -f "$output"
+      dd if=/dev/zero of="$output" bs=1048576 seek=513 count=0 2>/dev/null
+    fi
+    ;;
+  *empty*)
+    code=200
+    if [ -n "$output" ]; then
+      rm -f "$output"
+      : > "$output"
+    fi
+    ;;
+  *fail*)
+    echo "boom" >&2
+    exit 1
+    ;;
+  *nolocation*)
+    code=302
+    ;;
+  *loop*)
+    code=302
+    location="$url"
+    ;;
+  *redirect*)
+    code=302
+    location="http://example.com/final"
+    ;;
+  *final*)
+    code=200
+    if [ -n "$output" ]; then
+      rm -f "$output"
+      printf 'fake' > "$output"
+    fi
+    ;;
+  *)
+    code=200
+    if [ -n "$output" ]; then
+      rm -f "$output"
+      printf 'fake' > "$output"
+    fi
+    ;;
+esac
+
+if [ -n "$header" ]; then
+  if [ "$code" -eq 302 ] && [ -n "$location" ]; then
+    cat > "$header" <<EOF
+HTTP/1.1 302 Found
+Location: $location
+
+EOF
+  elif [ "$code" -eq 302 ]; then
+    cat > "$header" <<EOF
+HTTP/1.1 302 Found
+Server: x
+
+EOF
+  else
+    cat > "$header" <<EOF
+HTTP/1.1 200 OK
+Content-Length: 4
+
+EOF
+  fi
+fi
+
+if [ -n "$status_arg" ]; then
+  printf '%s' "$code"
+fi
+exit 0
+"###;
+
+    #[test]
+    fn magic_paste_tokens_and_is_empty() {
+        assert!(MagicPaste::Empty.is_empty());
+        assert_eq!(MagicPaste::Empty.tokens(), &[] as &[PasteToken]);
+        let single = MagicPaste::Single(PasteToken::PageUrl("https://example.com".into()));
+        assert!(!single.is_empty());
+        assert_eq!(single.tokens().len(), 1);
+        let multiple = MagicPaste::Multiple(vec![
+            PasteToken::PageUrl("https://a.com".into()),
+            PasteToken::PageUrl("https://b.com".into()),
+        ]);
+        assert!(!multiple.is_empty());
+        assert_eq!(multiple.tokens().len(), 2);
+    }
+
+    #[test]
+    fn url_looks_like_remote_file_rejects_non_http_and_malformed() {
+        assert!(!url_looks_like_remote_file("ftp://example.com/file.pdf"));
+        assert!(!url_looks_like_remote_file("not a url"));
+    }
+
+    #[test]
+    fn looks_like_path_token_branches() {
+        assert_eq!(
+            parse_magic_paste("relative/path/file.pdf"),
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
+                "relative/path/file.pdf"
+            )))
+        );
+        assert_eq!(
+            parse_magic_paste("relative\\path\\file.pdf"),
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
+                "relative\\path\\file.pdf"
+            )))
+        );
+        assert_eq!(
+            parse_magic_paste("document.pdf"),
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("document.pdf")))
+        );
+
+        let dir = std::env::temp_dir().join(format!("shift-magic-exist-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note");
+        fs::write(&file, b"hi").unwrap();
+        assert_eq!(
+            parse_magic_paste(file.to_str().unwrap()),
+            MagicPaste::Single(PasteToken::LocalPath(file.clone()))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_user_path_tilde() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("shift-magic-home-{}", std::process::id()));
+        fs::create_dir_all(&home).unwrap();
+        let old = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        assert_eq!(expand_user_path(Path::new("~")), home);
+        assert_eq!(expand_user_path(Path::new("~/Docs")), home.join("Docs"));
+        if let Some(old) = old {
+            unsafe {
+                std::env::set_var("HOME", old);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_user_path_non_utf8() {
+        let raw = OsString::from_vec(vec![0x80, 0x81, 0x82]);
+        let path = PathBuf::from(&raw);
+        assert_eq!(expand_user_path(path.as_path()), path);
+    }
+
+    #[test]
+    fn path_extension_from_url_path_edge_cases() {
+        assert_eq!(
+            path_extension_from_url_path("https://example.com/file."),
+            None
+        );
+        assert_eq!(
+            path_extension_from_url_path("https://example.com/file.verylongextensionname"),
+            None
+        );
+        assert_eq!(
+            path_extension_from_url_path("https://example.com/file.p$d"),
+            None
+        );
+        assert_eq!(
+            path_extension_from_url_path("https://example.com/dir/"),
+            None
+        );
+        assert_eq!(
+            path_extension_from_url_path("https://example.com/file"),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_file_name_and_remote_file_name() {
+        assert_eq!(sanitize_file_name("file@#$%^&*().pdf"), "file_________.pdf");
+        assert_eq!(sanitize_file_name("...hidden"), "hidden");
+        assert!(sanitize_file_name("   ").starts_with("download-"));
+        let long = "a".repeat(200) + ".pdf";
+        assert_eq!(sanitize_file_name(&long).len(), 180);
+
+        assert!(
+            remote_file_name("https://example.com/path/document.pdf").ends_with("document.pdf")
+        );
+        assert!(remote_file_name("not-a-url").starts_with("download-"));
+    }
+
+    #[test]
+    fn unique_stamp_contains_pid_and_nanos() {
+        let stamp = unique_stamp();
+        assert!(stamp.starts_with(&format!("{}-", std::process::id())));
+    }
+
+    #[test]
+    fn paste_staging_dir_env_override_and_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("shift-paste-staging-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        assert_eq!(paste_staging_dir().unwrap(), dir);
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        let file =
+            std::env::temp_dir().join(format!("shift-paste-staging-file-{}", std::process::id()));
+        fs::write(&file, b"x").unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &file);
+        }
+        let err = paste_staging_dir().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not create paste staging directory")
+        );
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn stage_pasted_image_edge_cases() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("shift-magic-img-edge-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        fs::create_dir_all(&dir).unwrap();
+
+        let err = stage_pasted_image(&[], "png").unwrap_err();
+        assert!(err.to_string().contains("clipboard image is empty"));
+        let err = stage_pasted_image(b"x", "").unwrap_err();
+        assert!(err.to_string().contains("clipboard image has no format"));
+        let err = stage_pasted_image(b"<svg/>", "svg").unwrap_err();
+        assert!(err.to_string().contains("not a supported conversion input"));
+
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_pasted_image_write_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("shift-magic-img-ro-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut permissions = fs::metadata(&dir).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&dir, permissions).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+
+        let err = stage_pasted_image(b"\x89PNG", "png").unwrap_err();
+        assert!(err.to_string().contains("could not stage clipboard image"));
+
+        let mut permissions = fs::metadata(&dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dir, permissions).unwrap();
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_directory_path_errors() {
+        let dir = std::env::temp_dir().join(format!("shift-magic-dir-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let err = materialize_paste_token(&PasteToken::LocalPath(dir.clone()), None).unwrap_err();
+        assert!(err.to_string().contains("is a directory"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_magic_paste_multiple_and_cancel() {
+        let dir = std::env::temp_dir().join(format!("shift-magic-multi-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p1 = dir.join("a.md");
+        fs::write(&p1, b"a").unwrap();
+        let p2 = dir.join("b.md");
+        fs::write(&p2, b"b").unwrap();
+        let paste = MagicPaste::Multiple(vec![
+            PasteToken::LocalPath(p1.clone()),
+            PasteToken::LocalPath(p2.clone()),
+        ]);
+        let sources = materialize_magic_paste(&paste, None).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().all(|s| matches!(s, BatchSource::File(_))));
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = materialize_magic_paste(&paste, Some(cancel)).unwrap_err();
+        assert!(err.is_cancelled());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_redirect_url_edge_cases() {
+        let err = resolve_redirect_url("not-a-url", "/x").unwrap_err();
+        assert!(err.to_string().contains("invalid redirect base URL"));
+    }
+
+    #[test]
+    fn apply_curl_http_only_adds_protocol_args() {
+        let mut cmd = Command::new("curl");
+        apply_curl_http_only(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(joined.contains("--proto"));
+        assert!(joined.contains("=https,http"));
+        assert!(joined.contains("--proto-redir"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_remote_file_url() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let staging =
+            std::env::temp_dir().join(format!("shift-magic-remote-{}", std::process::id()));
+        fs::create_dir_all(&staging).unwrap();
+        let fake_dir =
+            std::env::temp_dir().join(format!("shift-magic-fakecurl-{}", std::process::id()));
+        fs::create_dir_all(&fake_dir).unwrap();
+        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
+        }
+
+        let source = materialize_paste_token(
+            &PasteToken::RemoteFileUrl("http://example.com/ok".into()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(source, BatchSource::File(_)));
+
+        if let Some(p) = old_path {
+            unsafe {
+                std::env::set_var("PATH", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&fake_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_remote_file_scenarios() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let staging =
+            std::env::temp_dir().join(format!("shift-magic-download-{}", std::process::id()));
+        fs::create_dir_all(&staging).unwrap();
+        let fake_dir =
+            std::env::temp_dir().join(format!("shift-magic-fakecurl-{}", std::process::id()));
+        fs::create_dir_all(&fake_dir).unwrap();
+        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
+        }
+
+        let path = download_remote_file("http://example.com/ok", None).unwrap();
+        assert!(path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fake");
+        let _ = fs::remove_file(&path);
+
+        let err = download_remote_file("http://example.com/empty", None).unwrap_err();
+        assert!(err.to_string().contains("produced an empty file"));
+
+        let err = download_remote_file("http://example.com/huge", None).unwrap_err();
+        assert!(err.to_string().contains("exceeded size limit"));
+
+        let err = download_remote_file("http://example.com/fail", None).unwrap_err();
+        assert!(err.to_string().contains("could not download"));
+        assert!(err.to_string().contains("boom"));
+
+        if let Some(p) = old_path {
+            unsafe {
+                std::env::set_var("PATH", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&fake_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_with_redirect_revalidation_scenarios() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let staging =
+            std::env::temp_dir().join(format!("shift-magic-redirect-{}", std::process::id()));
+        fs::create_dir_all(&staging).unwrap();
+        let fake_dir =
+            std::env::temp_dir().join(format!("shift-magic-fakecurl2-{}", std::process::id()));
+        fs::create_dir_all(&fake_dir).unwrap();
+        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
+        }
+
+        let out = staging.join("downloaded");
+        download_with_redirect_revalidation("http://example.com/redirect", &out, None).unwrap();
+        assert_eq!(fs::read_to_string(&out).unwrap(), "fake");
+
+        let out2 = staging.join("missing");
+        let err = download_with_redirect_revalidation("http://example.com/nolocation", &out2, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("without Location header"));
+
+        let out3 = staging.join("loop");
+        let err = download_with_redirect_revalidation("http://example.com/loop", &out3, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("too many redirects"));
+
+        if let Some(p) = old_path {
+            unsafe {
+                std::env::set_var("PATH", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&fake_dir);
     }
 }

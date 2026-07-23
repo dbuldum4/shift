@@ -1067,4 +1067,314 @@ mod tests {
             vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
         );
     }
+
+    #[test]
+    fn readiness_and_availability_labels_and_display() {
+        assert_eq!(Readiness::Ready.to_string(), "ready");
+        assert_eq!(Readiness::Missing.to_string(), "missing");
+        assert_eq!(FormatAvailability::Available.label(), "available");
+        assert_eq!(
+            FormatAvailability::SupportedUnavailable.label(),
+            "supported (engine missing)"
+        );
+        assert_eq!(FormatAvailability::Unsupported.label(), "unsupported");
+    }
+
+    #[test]
+    fn report_lookups_and_pdf_readiness() {
+        let report = DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "markitdown",
+                    label: "MarkItDown",
+                    readiness: Readiness::Ready,
+                    version: Some("1.0".into()),
+                    resolved_path: Some(PathBuf::from("/bin/markitdown")),
+                    env_override: "SHIFT_MARKITDOWN_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "pandoc",
+                    label: "Pandoc",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_PANDOC_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![PdfEngineDiagnostic {
+                name: "typst".into(),
+                readiness: Readiness::Ready,
+                version: Some("0.15".into()),
+                resolved_path: Some(PathBuf::from("/bin/typst")),
+                selected: true,
+            }],
+            selected_pdf_engine: Some("typst".into()),
+        };
+
+        assert!(report.engine("markitdown").is_some());
+        assert!(report.engine("missing").is_none());
+        assert!(report.is_engine_ready("markitdown"));
+        assert!(!report.is_engine_ready("pandoc"));
+        assert!(report.any_pdf_engine_ready());
+        assert_eq!(report.missing_engines().count(), 1);
+        assert_eq!(report.ready_engine_count(), 1);
+        assert!(report.is_healthy());
+        assert!(!report.is_complete());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn any_pdf_engine_ready_falls_back_to_selected_executable() {
+        let dir = std::env::temp_dir().join(format!("shift-diag-pdf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("typst");
+        std::fs::write(&exe, "#!/bin/sh\necho typst 0.15.0\n").unwrap();
+        let mut permissions = std::fs::metadata(&exe).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe, permissions).unwrap();
+
+        let report = DiagnosticsReport {
+            engines: vec![],
+            pdf_engines: vec![],
+            selected_pdf_engine: Some(exe.to_string_lossy().into_owned()),
+        };
+        assert!(report.any_pdf_engine_ready());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_text_covers_notes_and_unknown_versions() {
+        let report = DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "markitdown",
+                    label: "MarkItDown",
+                    readiness: Readiness::Ready,
+                    version: None,
+                    resolved_path: Some(PathBuf::from("/bin/markitdown")),
+                    env_override: "SHIFT_MARKITDOWN_BIN",
+                    install_hint: String::new(),
+                    notes: Some("first runs may download models".into()),
+                },
+                EngineDiagnostic {
+                    id: "pandoc",
+                    label: "Pandoc",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_PANDOC_BIN",
+                    install_hint: "brew install pandoc".into(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+        let text = report.render_text();
+        assert!(text.contains("Shift diagnostics"));
+        assert!(text.contains("Conversion engines"));
+        assert!(text.contains("PDF engines (Pandoc)"));
+        assert!(text.contains("Summary"));
+        assert!(text.contains("unknown version"));
+        assert!(text.contains("first runs may download models"));
+        assert!(text.contains("brew install pandoc"));
+        assert!(text.contains("engines ready: 1/2"));
+        assert!(text.contains("pdf engine:    missing"));
+        assert!(text.contains("status:        ok (partial)"));
+    }
+
+    #[test]
+    fn render_script_includes_pdf_entries() {
+        let report = DiagnosticsReport {
+            engines: vec![],
+            pdf_engines: vec![PdfEngineDiagnostic {
+                name: "typst".into(),
+                readiness: Readiness::Ready,
+                version: Some("0.15".into()),
+                resolved_path: Some(PathBuf::from("/bin/typst")),
+                selected: true,
+            }],
+            selected_pdf_engine: Some("typst".into()),
+        };
+        let text = report.render_script();
+        assert!(text.contains("pdf.engine.typst=ready"));
+        assert!(text.contains("pdf.ready=true"));
+        assert!(text.contains("pdf.selected=typst"));
+        assert!(text.contains("healthy=false"));
+        assert!(text.contains("complete=true"));
+    }
+
+    #[test]
+    fn supported_and_ready_outputs_filtering() {
+        let registry = ConversionRegistry::default();
+        let mut report = DiagnosticsReport {
+            engines: vec![EngineDiagnostic {
+                id: "markitdown",
+                label: "MarkItDown",
+                readiness: Readiness::Missing,
+                version: None,
+                resolved_path: None,
+                env_override: "SHIFT_MARKITDOWN_BIN",
+                install_hint: String::new(),
+                notes: None,
+            }],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+
+        let txt = Path::new("notes.txt");
+        assert!(supported_outputs(&registry, txt).contains(&OutputFormat::MARKDOWN));
+        assert!(available_ready_outputs(&registry, &report, txt).is_empty());
+
+        report.engines[0].readiness = Readiness::Ready;
+        let ready = available_ready_outputs(&registry, &report, txt);
+        assert!(ready.contains(&OutputFormat::MARKDOWN));
+    }
+
+    #[test]
+    fn ready_url_outputs_require_defuddle_and_second_hop() {
+        let registry = ConversionRegistry::default();
+        let mut report = DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "defuddle",
+                    label: "Defuddle",
+                    readiness: Readiness::Ready,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_DEFUDDLE_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "pandoc",
+                    label: "Pandoc",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_PANDOC_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![PdfEngineDiagnostic {
+                name: "typst".into(),
+                readiness: Readiness::Ready,
+                version: None,
+                resolved_path: None,
+                selected: true,
+            }],
+            selected_pdf_engine: Some("typst".into()),
+        };
+
+        let ready = available_ready_url_outputs(&registry, &report);
+        assert!(ready.contains(&OutputFormat::MARKDOWN));
+        assert!(ready.contains(&OutputFormat::HTML));
+        assert!(!ready.contains(&OutputFormat::PDF));
+
+        report.engines[1].readiness = Readiness::Ready;
+        let ready = available_ready_url_outputs(&registry, &report);
+        assert!(ready.contains(&OutputFormat::PDF));
+    }
+
+    #[test]
+    fn format_availability_pandoc_pdf_needs_pdf_engine() {
+        let registry = ConversionRegistry::default();
+        let report = DiagnosticsReport {
+            engines: vec![EngineDiagnostic {
+                id: "pandoc",
+                label: "Pandoc",
+                readiness: Readiness::Ready,
+                version: None,
+                resolved_path: None,
+                env_override: "SHIFT_PANDOC_BIN",
+                install_hint: String::new(),
+                notes: None,
+            }],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+
+        assert_eq!(
+            format_availability(
+                &registry,
+                &report,
+                Path::new("report.md"),
+                OutputFormat::PDF
+            ),
+            FormatAvailability::SupportedUnavailable
+        );
+    }
+
+    #[test]
+    fn finish_engine_probe_handles_none_and_missing() {
+        let engine = finish_engine_probe(
+            "missing",
+            "Missing",
+            None,
+            "SHIFT_MISSING_BIN",
+            "install me".into(),
+            &["--version"],
+            None,
+        );
+        assert_eq!(engine.readiness, Readiness::Missing);
+        assert!(engine.resolved_path.is_none());
+
+        let dir = std::env::temp_dir().join(format!("shift-diag-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("broken");
+        std::fs::write(&broken, b"not executable").unwrap();
+        let engine = finish_engine_probe(
+            "broken",
+            "Broken",
+            Some(broken.clone()),
+            "SHIFT_BROKEN_BIN",
+            "install me".into(),
+            &["--version"],
+            None,
+        );
+        assert_eq!(engine.readiness, Readiness::Missing);
+        assert_eq!(engine.resolved_path, Some(broken));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_version_text_and_looks_like_version_edge_cases() {
+        assert_eq!(parse_version_text(""), None);
+        assert_eq!(parse_version_text("   "), None);
+        assert_eq!(parse_version_text("1.2.3"), Some("1.2.3".into()));
+        assert_eq!(parse_version_text("foo 1.2.3"), Some("1.2.3".into()));
+        assert_eq!(parse_version_text("name value extra"), Some("value".into()));
+        assert_eq!(
+            parse_version_text("Docling version: 2.0"),
+            Some("2.0".into())
+        );
+        assert_eq!(
+            parse_version_text("Docling version: 2.0\n"),
+            Some("2.0".into())
+        );
+
+        assert!(looks_like_version("1.2.3"));
+        assert!(!looks_like_version("v1.2"));
+        assert!(!looks_like_version("123"));
+        assert!(looks_like_version("1."));
+        assert!(!looks_like_version(".1"));
+    }
+
+    #[test]
+    fn normalize_tool_name_and_script_value_edge_cases() {
+        assert_eq!(normalize_tool_name("/usr/bin/ffmpeg"), "ffmpeg");
+        assert_eq!(normalize_tool_name("ffmpeg"), "ffmpeg");
+        assert_eq!(normalize_tool_name("/path/to/my-tool"), "my-tool");
+
+        assert_eq!(script_value("a b"), "\"a b\"");
+        assert_eq!(script_value("a\nb"), "\"a\\nb\"");
+        assert_eq!(script_value("a\rb"), "\"a\\rb\"");
+        assert_eq!(script_value(""), "");
+    }
 }

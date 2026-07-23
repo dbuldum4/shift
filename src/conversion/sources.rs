@@ -294,4 +294,133 @@ mod tests {
         assert!(found.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn supported_input_extensions_from_registry() {
+        let empty = ConversionRegistry::new();
+        assert!(supported_input_extensions(&empty).is_empty());
+
+        let default = ConversionRegistry::default();
+        let exts = supported_input_extensions(&default);
+        assert!(!exts.is_empty());
+        assert!(exts.contains("pdf"));
+        assert!(exts.contains("mp4"));
+    }
+
+    #[test]
+    fn empty_input_list_returns_empty() {
+        let exts = HashSet::new();
+        let found = expand_input_paths_with_extensions(&[] as &[PathBuf], true, &exts).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn missing_file_errors() {
+        let exts = HashSet::new();
+        let result = expand_input_paths_with_extensions(
+            &[PathBuf::from("/definitely-does-not-exist-12345.xyz")],
+            false,
+            &exts,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("could not read"));
+    }
+
+    #[test]
+    fn too_many_files_rejects_expansion() {
+        let dir = unique_dir("many");
+        let mut files = Vec::new();
+        for i in 0..MAX_EXPAND_FILES + 1 {
+            let path = dir.join(format!("doc{i}.txt"));
+            std::fs::write(&path, b"x").unwrap();
+            files.push(path);
+        }
+
+        let mut exts = HashSet::new();
+        exts.insert("txt".into());
+        let result = expand_input_paths_with_extensions(&files, false, &exts);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("too many input files")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_without_extension_or_unlisted_extension_ignored() {
+        let dir = unique_dir("filter");
+        let no_ext = dir.join("README");
+        let listed = dir.join("doc.txt");
+        std::fs::write(&no_ext, b"x").unwrap();
+        std::fs::write(&listed, b"x").unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("txt".into());
+        let found = expand_input_paths_with_extensions(&[&no_ext, &listed], false, &exts).unwrap();
+        assert_eq!(found, vec![listed]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn is_hidden_detects_dot_prefix() {
+        assert!(is_hidden(Path::new(".secret")));
+        assert!(!is_hidden(Path::new("visible")));
+        assert!(!is_hidden(Path::new("/tmp/.hidden/visible")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expansion_follows_symlink_to_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_dir("symlink-file");
+        let target = dir.join("real.pdf");
+        let link = dir.join("link.pdf");
+        std::fs::write(&target, b"%PDF").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found = expand_input_paths_with_extensions(&[link.as_path()], false, &exts).unwrap();
+        assert_eq!(found, vec![link]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_reports_follow_error() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_dir("broken-link");
+        let link = dir.join("missing.pdf");
+        symlink(Path::new("/nonexistent-target-12345"), &link).unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let result = expand_input_paths_with_extensions(&[link.as_path()], false, &exts);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not follow symlink")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_expand_input_paths_uses_registry_extensions() {
+        let dir = unique_dir("default-expand");
+        let pdf = dir.join("a.pdf");
+        let bin = dir.join("a.bin");
+        std::fs::write(&pdf, b"%PDF").unwrap();
+        std::fs::write(&bin, b"x").unwrap();
+
+        let found = expand_input_paths(&[&pdf, &bin], false).unwrap();
+        assert_eq!(found, vec![pdf]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

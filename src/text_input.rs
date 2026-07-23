@@ -686,9 +686,12 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 #[cfg(test)]
+#[allow(unexpected_cfgs)]
 mod tests {
     use super::utf8_offset_from_utf16;
+    #[cfg(not(coverage))]
     use std::hint::black_box;
+    #[cfg(not(coverage))]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -699,6 +702,9 @@ mod tests {
     }
 
     /// Caret / IME composition maps UTF-16 indices on every keystroke-adjacent path.
+    /// This is a throughput benchmark; coverage instrumentation inflates wall time,
+    /// so it is skipped under `cargo llvm-cov`.
+    #[cfg(not(coverage))]
     #[test]
     fn utf16_offset_mapping_stays_fast_on_long_url_bar_content() {
         // Magic-paste / URL bar can hold a long path list or URL.
@@ -725,9 +731,32 @@ mod tests {
             elapsed <= Duration::from_secs(2),
             "utf8_offset_from_utf16×34k took {elapsed:?}"
         );
+    }
+
+    /// Functional counterpart to the perf test: exercises the same long content
+    /// and boundary offsets so coverage is not lost when the benchmark is skipped.
+    #[test]
+    fn utf16_offset_mapping_is_correct_on_long_url_bar_content() {
+        let content = "https://example.com/articles/αβγ-🚀/".repeat(64)
+            + &"file:///Users/me/Documents/very long name with spaces.docx;".repeat(32);
+        let utf16_len: usize = content.chars().map(|c| c.len_utf16()).sum();
 
         assert_eq!(utf8_offset_from_utf16(&content, 0), 0);
         assert_eq!(utf8_offset_from_utf16(&content, utf16_len), content.len());
+        assert_eq!(
+            utf8_offset_from_utf16(&content, utf16_len.saturating_add(50)),
+            content.len()
+        );
+
+        for step in 0..32 {
+            let offset = (utf16_len * step) / 32;
+            let byte_offset = utf8_offset_from_utf16(&content, offset);
+            assert!(byte_offset <= content.len());
+            assert!(
+                content.is_char_boundary(byte_offset),
+                "offset {offset} mapped to non-char boundary {byte_offset}"
+            );
+        }
     }
 
     #[test]
