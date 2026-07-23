@@ -8,12 +8,12 @@ mod ui_tests;
 use crate::ui::animation;
 use crate::ui::theme::{THEME, card_shadow};
 use gpui::{
-    Animation, AnimationExt, App, Application, Bounds, ClipboardEntry, ClipboardItem, Context,
-    CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, ImageFormat,
-    KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder,
-    PathStyle, Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, point,
-    prelude::*, pulsating_between, px, rgb, size,
+    Action, Animation, AnimationExt, App, Application, Bounds, ClipboardEntry, ClipboardItem,
+    Context, CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    ImageFormat, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    PathBuilder, PathStyle, Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div,
+    ease_out_quint, point, prelude::*, pulsating_between, px, rgb, size,
 };
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
@@ -4915,8 +4915,22 @@ actions!(
         OpenSettings,
         ShowShortcuts,
         CancelWork,
+        OpenFile,
+        OpenAbout,
+        ClearRecent,
+        Minimize,
+        Zoom,
+        ToggleFullScreen,
     ]
 );
+
+/// Open a recently-converted source file from the application menu.
+/// Instances carry the file path because the menu is rebuilt when history changes.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = shift, no_json)]
+struct OpenRecent {
+    path: String,
+}
 
 /// Pending folder expansion confirmation before batch enqueue.
 #[derive(Clone)]
@@ -6498,9 +6512,10 @@ impl Shift {
                             match result {
                                 Ok(artifact) => {
                                     let artifact = Arc::new(artifact);
-                                    this.record_history(HistoryOutcome::Ready(Arc::clone(
-                                        &artifact,
-                                    )));
+                                    this.record_history(
+                                        HistoryOutcome::Ready(Arc::clone(&artifact)),
+                                        cx,
+                                    );
                                     this.set_ready_artifact(artifact);
                                 }
                                 Err(error) if error.is_cancelled() => {
@@ -6509,7 +6524,10 @@ impl Shift {
                                 }
                                 Err(error) => {
                                     let message: SharedString = error.to_string().into();
-                                    this.record_history(HistoryOutcome::Failed(message.clone()));
+                                    this.record_history(
+                                        HistoryOutcome::Failed(message.clone()),
+                                        cx,
+                                    );
                                     this.conversion = ConversionState::Failed(message);
                                 }
                             }
@@ -6600,6 +6618,105 @@ impl Shift {
         cx.notify();
     }
 
+    fn build_app_menus(&self) -> Vec<Menu> {
+        vec![
+            Menu {
+                name: APP_NAME.into(),
+                items: vec![
+                    MenuItem::action(format!("About {APP_NAME}"), OpenAbout),
+                    MenuItem::separator(),
+                    MenuItem::action("Preferences…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action(format!("Quit {APP_NAME}"), Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Open…", OpenFile),
+                    MenuItem::submenu(Menu {
+                        name: "Open Recent".into(),
+                        items: self.recent_file_menu_items(),
+                    }),
+                    MenuItem::separator(),
+                    MenuItem::action("Save…", SaveOutput),
+                ],
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Cut", text_input::Cut),
+                    MenuItem::action("Copy", text_input::Copy),
+                    MenuItem::action("Paste", text_input::Paste),
+                    MenuItem::separator(),
+                    MenuItem::action("Select All", text_input::SelectAll),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Format Menu", ToggleFormatMenu),
+                    MenuItem::action("Shortcuts", ShowShortcuts),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+                ],
+            },
+            Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("Minimize", Minimize),
+                    MenuItem::action("Zoom", Zoom),
+                ],
+            },
+            Menu {
+                name: "Help".into(),
+                items: vec![MenuItem::action("Keyboard Shortcuts", ShowShortcuts)],
+            },
+        ]
+    }
+
+    fn recent_file_menu_items(&self) -> Vec<MenuItem> {
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for entry in &self.history {
+            if let HistorySource::File(path) = &entry.source {
+                if seen.insert(path.clone()) {
+                    let label = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    items.push(MenuItem::action(
+                        label,
+                        OpenRecent {
+                            path: path.to_string_lossy().into_owned(),
+                        },
+                    ));
+                    if items.len() >= 10 {
+                        break;
+                    }
+                }
+            }
+        }
+        if items.is_empty() {
+            items.push(MenuItem::action(
+                "No Recent Items",
+                OpenRecent {
+                    path: String::new(),
+                },
+            ));
+        } else {
+            items.push(MenuItem::separator());
+            items.push(MenuItem::action("Clear Recent", ClearRecent));
+        }
+        items
+    }
+
+    fn rebuild_app_menus(&self, cx: &App) {
+        cx.set_menus(self.build_app_menus());
+    }
+
     fn action_save_output(&mut self, _: &SaveOutput, _window: &mut Window, cx: &mut Context<Self>) {
         self.save_output(cx);
     }
@@ -6674,7 +6791,67 @@ impl Shift {
         self.cancel_conversion(cx);
     }
 
-    fn record_history(&mut self, outcome: HistoryOutcome) {
+    fn action_open_file(&mut self, _: &OpenFile, _window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_file(cx);
+    }
+
+    fn action_open_about(&mut self, _: &OpenAbout, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_section = SettingsSection::About;
+        self.settings_open = true;
+        cx.notify();
+    }
+
+    fn action_open_recent(
+        &mut self,
+        action: &OpenRecent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if action.path.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(&action.path);
+        if !path.exists() {
+            self.conversion = ConversionState::Failed(
+                format!("Recent file not found: {}", path.display()).into(),
+            );
+            self.selected_file = Some(path);
+            self.selected_url = None;
+            self.file_preview = None;
+            self.cached_ready_path = None;
+            cx.notify();
+            return;
+        }
+        self.set_selected_file(path, cx);
+    }
+
+    fn action_minimize(&mut self, _: &Minimize, window: &mut Window, _cx: &mut Context<Self>) {
+        window.minimize_window();
+    }
+
+    fn action_zoom(&mut self, _: &Zoom, window: &mut Window, _cx: &mut Context<Self>) {
+        window.zoom_window();
+    }
+
+    fn action_toggle_fullscreen(
+        &mut self,
+        _: &ToggleFullScreen,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        window.toggle_fullscreen();
+    }
+
+    fn action_clear_recent(
+        &mut self,
+        _: &ClearRecent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_history(cx);
+    }
+
+    fn record_history(&mut self, outcome: HistoryOutcome, cx: &mut Context<Self>) {
         let (source, preview) = if let Some(path) = self.selected_file.clone() {
             let preview = self
                 .file_preview
@@ -6723,6 +6900,7 @@ impl Shift {
         self.history.truncate(self.history_limit);
         self.active_history_id = Some(id);
         self.persist_history();
+        self.rebuild_app_menus(cx);
     }
 
     fn persist_history(&self) {
@@ -6803,6 +6981,7 @@ impl Shift {
         self.active_history_id = None;
         let _ = clear_history_store();
         cx.notify();
+        self.rebuild_app_menus(cx);
     }
 
     fn set_history_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
@@ -7032,6 +7211,13 @@ impl Render for Shift {
             .on_action(cx.listener(Self::action_open_settings))
             .on_action(cx.listener(Self::action_show_shortcuts))
             .on_action(cx.listener(Self::action_cancel_work))
+            .on_action(cx.listener(Self::action_open_file))
+            .on_action(cx.listener(Self::action_open_about))
+            .on_action(cx.listener(Self::action_open_recent))
+            .on_action(cx.listener(Self::action_minimize))
+            .on_action(cx.listener(Self::action_zoom))
+            .on_action(cx.listener(Self::action_toggle_fullscreen))
+            .on_action(cx.listener(Self::action_clear_recent))
             .relative()
             .flex()
             .size_full()
@@ -7421,23 +7607,18 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-o", OpenFile, Some("Shift")),
             KeyBinding::new("cmd-s", SaveOutput, Some("Shift")),
             KeyBinding::new("cmd-c", CopyOutput, Some("Shift")),
             KeyBinding::new("cmd-r", RevealOutput, Some("Shift")),
             KeyBinding::new("cmd-shift-f", ToggleFormatMenu, Some("Shift")),
             KeyBinding::new("cmd-,", OpenSettings, Some("Shift")),
             KeyBinding::new("cmd-/", ShowShortcuts, Some("Shift")),
+            KeyBinding::new("cmd-m", Minimize, Some("Shift")),
+            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, Some("Shift")),
             KeyBinding::new("escape", CancelWork, Some("Shift")),
         ]);
         text_input::bind_keys(cx);
-        cx.set_menus(vec![Menu {
-            name: APP_NAME.into(),
-            items: vec![
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action(format!("Quit {APP_NAME}"), Quit),
-            ],
-        }]);
 
         // Load bundled Geist variable fonts (SIL Open Font License 1.1).
         // These are available as selectable UI font families in Theme settings.
@@ -7471,6 +7652,7 @@ fn main() {
                 let shift_entity = cx.new(|cx| Shift::new(cx, initial_window_width));
 
                 window.focus(&shift_entity.read(cx).focus_handle);
+                cx.set_menus(shift_entity.read(cx).build_app_menus());
 
                 // Route Enter / magic paste from the input bar back to the app entity.
                 let parent = shift_entity.downgrade();
