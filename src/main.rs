@@ -29,8 +29,8 @@ use shift_core::conversion::{
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
-    StoredHistoryEntry, StoredOutcome, StoredSource, clear_history_store, intern_module_id,
-    load_history, save_history,
+    StoredHistoryEntry, StoredOutcome, StoredSource, intern_module_id, load_history,
+    save_history_delta,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
@@ -38,7 +38,7 @@ use shift_core::{
     save_default_session_settings, stage_export_file,
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +79,26 @@ const CENTER_PANEL_MIN: f32 = 300.0;
 /// Hit target width for each vertical resize handle (visual line is 1px inside).
 const PANEL_RESIZE_HANDLE_WIDTH: f32 = 5.0;
 const SETTINGS_SIDEBAR_WIDTH: f32 = 220.0;
+
+/// Precomputed (format, lowercased label, lowercased id) tuples for the output
+/// format menu filter so the menu does not re-allocate lowercased strings per render.
+static OUTPUT_FORMAT_FILTER_CHOICES: std::sync::OnceLock<Vec<(OutputFormat, String, String)>> =
+    std::sync::OnceLock::new();
+
+fn output_format_filter_choices() -> &'static [(OutputFormat, String, String)] {
+    OUTPUT_FORMAT_FILTER_CHOICES.get_or_init(|| {
+        OutputFormat::ALL
+            .iter()
+            .map(|&format| {
+                (
+                    format,
+                    format.label().to_ascii_lowercase(),
+                    format.id().to_ascii_lowercase(),
+                )
+            })
+            .collect()
+    })
+}
 
 // Text overflow: prefer `.overflow_hidden().text_ellipsis().line_clamp(1)` over
 // `.truncate()`. The latter sets `whitespace_nowrap`, and GPUI then caches the
@@ -897,23 +917,15 @@ fn batch_queue_panel(
 }
 
 fn history_sidebar(
-    history: &[ConversionHistoryEntry],
+    visible: &[ConversionHistoryEntry],
+    history_total: usize,
     history_search: Entity<TextInput>,
-    show_archived: bool,
     active_history_id: Option<u64>,
     width: f32,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
-    let search = history_search.read(cx).content().to_lowercase();
-    let visible: Vec<_> = history
-        .iter()
-        .filter(|entry| {
-            (show_archived || !entry.archived)
-                && (search.is_empty() || history_matches_search(entry, &search))
-        })
-        .cloned()
-        .collect();
     let is_empty = visible.is_empty();
+    let has_any = history_total > 0;
 
     div()
         .id("history-sidebar")
@@ -943,7 +955,7 @@ fn history_sidebar(
                                 .text_color(THEME.text_secondary)
                                 .child("History"),
                         )
-                        .when(!is_empty, |header| {
+                        .when(has_any, |header| {
                             header.child(
                                 div()
                                     .id("clear-history")
@@ -1017,14 +1029,14 @@ fn history_sidebar(
                             ),
                     )
                 })
-                .children(visible.iter().cloned().map(|entry| {
+                .children(visible.iter().map(|entry| {
                     let id = entry.id;
                     let active = active_history_id == Some(id);
                     let failed = matches!(entry.outcome, HistoryOutcome::Failed(_));
-                    let output_format = history_output_format(&entry);
+                    let output_format = history_output_format(entry);
                     let output_badge_label: SharedString =
                         output_format_badge_label(output_format).into();
-                    let detail = history_entry_detail(&entry);
+                    let detail = history_entry_detail(entry);
                     let archive_label = if entry.archived {
                         "Unarchive"
                     } else {
@@ -1071,7 +1083,7 @@ fn history_sidebar(
                                 .gap_2()
                                 .w_full()
                                 .child(history_conversion_chip(
-                                    entry.extension_label,
+                                    entry.extension_label.clone(),
                                     output_badge_label,
                                 ))
                                 .child(
@@ -2946,18 +2958,17 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .child(format_filter_input),
                     )
                     .children(
-                        OutputFormat::ALL
+                        output_format_filter_choices()
                             .iter()
-                            .copied()
                             .enumerate()
-                            .filter(|(_, format)| {
+                            .filter(|(_, (_, label, id))| {
                                 if filter_lower.is_empty() {
                                     return true;
                                 }
-                                format.label().to_ascii_lowercase().contains(&filter_lower)
-                                    || format.id().to_ascii_lowercase().contains(&filter_lower)
+                                label.contains(&filter_lower) || id.contains(&filter_lower)
                             })
-                            .map(|(index, format)| {
+                            .map(|(index, (format, _, _))| {
+                                let format = *format;
                                 let enabled = available_outputs.contains(&format);
                                 let engine_ready = ready_outputs
                                     .as_ref()
@@ -3729,6 +3740,7 @@ fn settings_general_panel(
                             cx,
                             |this, cx| {
                                 this.show_archived = !this.show_archived;
+                                this.mark_history_cache_dirty();
                                 this.persist_session_settings(cx);
                                 cx.notify();
                             },
@@ -4960,8 +4972,15 @@ struct Shift {
     shortcuts_help_open: bool,
     show_command_inspect: bool,
     module_priority: Vec<String>,
+    /// Conversion registry with the current module priority applied.
+    /// Rebuilt when the priority changes so conversion routes stay consistent.
+    registry: Arc<ConversionRegistry>,
     diagnostics: Option<Arc<DiagnosticsReport>>,
     diagnostics_loading: bool,
+    /// Cached output formats for the current selection.
+    cached_available_outputs: Vec<OutputFormat>,
+    /// Formats whose engines are ready (when diagnostics are known).
+    cached_ready_outputs: Option<Vec<OutputFormat>>,
     url_input: Entity<TextInput>,
     history: Vec<ConversionHistoryEntry>,
     next_history_id: u64,
@@ -4970,6 +4989,14 @@ struct Shift {
     history_limit_input: Entity<TextInput>,
     history_limit: usize,
     show_archived: bool,
+    /// Cached visible history rows, rebuilt when history/search/archived changes.
+    cached_history_visible: Vec<ConversionHistoryEntry>,
+    cached_history_filter: (String, bool, usize),
+    history_cache_dirty: bool,
+    /// Ids that need to be persisted (upserted) in the next save.
+    history_dirty_ids: HashSet<u64>,
+    /// Ids that need to be deleted in the next save.
+    history_deleted_ids: HashSet<u64>,
     /// History sidebar width (logical pixels); resizable via left divider.
     history_sidebar_width: f32,
     /// Output panel width (logical pixels); resizable via right divider.
@@ -5153,6 +5180,12 @@ impl Shift {
         let history_limit_input =
             cx.new(|cx| TextInput::new(cx, "30", session.history_limit.to_string()));
         let (history, next_history_id) = history_from_store(load_history());
+        let module_priority = load_module_priority();
+        let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
+        let cached_available_outputs = OutputFormat::ALL.to_vec();
+        let cached_ready_outputs = None;
+        let cached_history_filter = (String::new(), session.show_archived, history.len());
+        let cached_history_visible = Vec::new();
         let mut batch_queue = BatchQueue::new();
         if let Some(dir) = session.batch_output_dir.as_ref() {
             batch_queue.set_output_dir(Some(dir.as_path()));
@@ -5187,9 +5220,12 @@ impl Shift {
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
-            module_priority: load_module_priority(),
+            module_priority,
+            registry,
             diagnostics: None,
             diagnostics_loading: false,
+            cached_available_outputs,
+            cached_ready_outputs,
             url_input,
             history,
             next_history_id,
@@ -5198,6 +5234,11 @@ impl Shift {
             history_limit_input,
             history_limit: session.history_limit,
             show_archived: session.show_archived,
+            cached_history_visible,
+            cached_history_filter,
+            history_cache_dirty: true,
+            history_dirty_ids: HashSet::new(),
+            history_deleted_ids: HashSet::new(),
             history_sidebar_width,
             output_panel_width,
             panel_resize: None,
@@ -5246,6 +5287,65 @@ impl Shift {
             markitdown_keep_data_uris: options.markitdown.keep_data_uris,
         }
     }
+
+    const MAX_HISTORY_RENDERED: usize = 200;
+
+    /// Recompute the cached available/ready output formats for the current
+    /// selection and diagnostics. Called when the selection, module priority,
+    /// or diagnostics change.
+    fn rebuild_output_caches(&mut self) {
+        self.cached_available_outputs = if self.selected_url.is_some() {
+            self.registry.available_url_outputs()
+        } else if let Some(path) = self.selected_file.as_ref() {
+            self.registry.available_outputs(path)
+        } else {
+            OutputFormat::ALL.to_vec()
+        };
+
+        self.cached_ready_outputs = self.diagnostics.as_ref().and_then(|report| {
+            if self.selected_url.is_some() {
+                Some(available_ready_url_outputs(&self.registry, report))
+            } else {
+                self.selected_file
+                    .as_ref()
+                    .map(|path| available_ready_outputs(&self.registry, report, path))
+            }
+        });
+    }
+
+    /// Rebuild the filtered, capped history list only when the search query,
+    /// archived filter, or history contents have changed.
+    fn ensure_history_cache(&mut self, cx: &mut Context<Self>) {
+        let search = self.history_search.read(cx).content().to_lowercase();
+        let show_archived = self.show_archived;
+        let len = self.history.len();
+        if !self.history_cache_dirty
+            && search == self.cached_history_filter.0
+            && show_archived == self.cached_history_filter.1
+            && len == self.cached_history_filter.2
+        {
+            return;
+        }
+
+        self.cached_history_filter = (search.clone(), show_archived, len);
+        self.cached_history_visible = self
+            .history
+            .iter()
+            .filter(|entry| {
+                (show_archived || !entry.archived)
+                    && (search.is_empty() || history_matches_search(entry, &search))
+            })
+            .take(Self::MAX_HISTORY_RENDERED)
+            .cloned()
+            .collect();
+        self.history_cache_dirty = false;
+    }
+
+    /// Invalidate the cached history list so the next render rebuilds it.
+    fn mark_history_cache_dirty(&mut self) {
+        self.history_cache_dirty = true;
+    }
+
     fn refresh_diagnostics(&mut self, cx: &mut Context<Self>) {
         if self.diagnostics_loading {
             return;
@@ -5261,6 +5361,7 @@ impl Shift {
             let _ = this.update(cx, |this, cx| {
                 this.diagnostics = Some(Arc::new(report));
                 this.diagnostics_loading = false;
+                this.rebuild_output_caches();
                 cx.notify();
             });
         })
@@ -5541,7 +5642,7 @@ impl Shift {
         self.batch_running = true;
         self.batch_generation = self.batch_generation.wrapping_add(1);
         let generation = self.batch_generation;
-        let priority = self.module_priority.clone();
+        let registry = Arc::clone(&self.registry);
         let cancel = Arc::clone(&self.batch_cancel);
         let mut queue = self.batch_queue.clone();
         self.batch_status = Some("Batch running…".into());
@@ -5554,8 +5655,7 @@ impl Shift {
         // Blocking convert/write work on GPUI's background executor (not a raw thread).
         cx.background_executor()
             .spawn(async move {
-                let registry = ConversionRegistry::default().with_priority(&priority);
-                let summary = run_batch(&mut queue, &registry, &cancel, |event| {
+                let summary = run_batch(&mut queue, &*registry, &cancel, |event| {
                     let _ = event_tx.send(event);
                 });
                 let _ = done_tx.send((queue, summary));
@@ -5780,7 +5880,8 @@ impl Shift {
             .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = Some(build_file_preview_with_size(&path, "…".into()));
         self.selected_file = Some(path.clone());
-        let available_outputs = ConversionRegistry::default().available_outputs(&path);
+        self.rebuild_output_caches();
+        let available_outputs = &self.cached_available_outputs;
         if !self.user_chose_format {
             let suggested = suggested_output_for_path(&path);
             if available_outputs.contains(&suggested) {
@@ -6031,8 +6132,9 @@ impl Shift {
         self.file_preview = Some(build_url_preview(&url));
         self.url_input
             .update(cx, |input, cx| input.set_content(url.clone(), cx));
+        self.rebuild_output_caches();
 
-        let available_outputs = ConversionRegistry::default().available_url_outputs();
+        let available_outputs = &self.cached_available_outputs;
         if !self.user_chose_format {
             let suggested = suggested_output_for_url();
             if available_outputs.contains(&suggested) {
@@ -6080,14 +6182,15 @@ impl Shift {
     }
 
     fn active_option_modules(&self) -> Vec<&'static str> {
-        let registry = ConversionRegistry::default().with_priority(&self.module_priority);
         if self.selected_url.is_some() {
-            return registry
+            return self
+                .registry
                 .url_route_module_ids(self.output_format)
                 .unwrap_or_default();
         }
         if let Some(path) = self.selected_file.as_ref() {
-            return registry
+            return self
+                .registry
                 .route_module_ids(path, self.output_format)
                 .unwrap_or_default();
         }
@@ -6437,7 +6540,7 @@ impl Shift {
         let conversion_generation = self.conversion_generation;
         let generation = self.selection_generation;
         let output_format = self.output_format;
-        let priority = self.module_priority.clone();
+        let registry = Arc::clone(&self.registry);
         let mut options = match self.build_conversion_options(cx) {
             Ok(options) => options,
             Err(error) => {
@@ -6473,12 +6576,12 @@ impl Shift {
         cx.background_executor()
             .spawn(async move {
                 let result = match source {
-                    BatchSource::File(path) => ConversionRegistry::default()
-                        .with_priority(&priority)
-                        .convert_to_with_options(&path, output_format, &options),
-                    BatchSource::Url(url) => ConversionRegistry::default()
-                        .with_priority(&priority)
-                        .convert_url_with_options(&url, output_format, &options),
+                    BatchSource::File(path) => {
+                        registry.convert_to_with_options(&path, output_format, &options)
+                    }
+                    BatchSource::Url(url) => {
+                        registry.convert_url_with_options(&url, output_format, &options)
+                    }
                 };
                 let _ = done_tx.send(result);
             })
@@ -6584,6 +6687,9 @@ impl Shift {
         }
         let module = self.module_priority.remove(from);
         self.module_priority.insert(to, module);
+        self.registry =
+            Arc::new(ConversionRegistry::default().with_priority(&self.module_priority));
+        self.rebuild_output_caches();
         // Apply the new order for this session even if persistence fails, but
         // surface the write error so the next launch is not silently different.
         match save_module_priority(&self.module_priority) {
@@ -6615,6 +6721,7 @@ impl Shift {
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
+        self.rebuild_output_caches();
         cx.notify();
     }
 
@@ -6897,16 +7004,27 @@ impl Shift {
         };
         entry.detail = history_entry_stored_detail(&entry).into();
         self.history.insert(0, entry);
-        self.history.truncate(self.history_limit);
+        if self.history.len() > self.history_limit {
+            for removed in self.history.split_off(self.history_limit) {
+                self.history_deleted_ids.insert(removed.id);
+                self.history_dirty_ids.remove(&removed.id);
+            }
+        }
+        self.history_dirty_ids.insert(id);
         self.active_history_id = Some(id);
+        self.mark_history_cache_dirty();
         self.persist_history();
         self.rebuild_app_menus(cx);
     }
 
-    fn persist_history(&self) {
+    fn persist_history(&mut self) {
         let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
+        let changed: Vec<u64> = self.history_dirty_ids.iter().copied().collect();
+        let deleted: Vec<u64> = self.history_deleted_ids.iter().copied().collect();
         // Best-effort: keep the in-memory list if the disk write fails.
-        let _ = save_history(&stored, self.next_history_id);
+        let _ = save_history_delta(&stored, &changed, &deleted);
+        self.history_dirty_ids.clear();
+        self.history_deleted_ids.clear();
     }
 
     fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -6977,9 +7095,14 @@ impl Shift {
     }
 
     fn clear_history(&mut self, cx: &mut Context<Self>) {
+        for entry in &self.history {
+            self.history_deleted_ids.insert(entry.id);
+        }
         self.history.clear();
+        self.history_dirty_ids.clear();
         self.active_history_id = None;
-        let _ = clear_history_store();
+        self.mark_history_cache_dirty();
+        self.persist_history();
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -6990,11 +7113,18 @@ impl Shift {
             return;
         }
         self.history_limit = limit;
-        self.history.truncate(self.history_limit);
+        if self.history.len() > self.history_limit {
+            for removed in self.history.split_off(self.history_limit) {
+                self.history_deleted_ids.insert(removed.id);
+                self.history_dirty_ids.remove(&removed.id);
+            }
+        }
         self.history_limit_input.update(cx, |input, cx| {
             input.set_content(limit.to_string(), cx);
         });
+        self.mark_history_cache_dirty();
         self.persist_session_settings(cx);
+        self.persist_history();
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -7005,6 +7135,8 @@ impl Shift {
             if entry.archived && !self.show_archived && self.active_history_id == Some(id) {
                 self.active_history_id = None;
             }
+            self.history_dirty_ids.insert(id);
+            self.mark_history_cache_dirty();
             self.persist_history();
             cx.notify();
             self.rebuild_app_menus(cx);
@@ -7013,9 +7145,12 @@ impl Shift {
 
     fn delete_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
         self.history.retain(|entry| entry.id != id);
+        self.history_deleted_ids.insert(id);
+        self.history_dirty_ids.remove(&id);
         if self.active_history_id == Some(id) {
             self.active_history_id = None;
         }
+        self.mark_history_cache_dirty();
         self.persist_history();
         cx.notify();
         self.rebuild_app_menus(cx);
@@ -7097,25 +7232,9 @@ impl Render for Shift {
         let has_selection = self.selected_file.is_some() || self.selected_url.is_some();
         let conversion = self.conversion.clone();
         let save_status = self.save_status.clone();
-        let registry = ConversionRegistry::default();
-        let available_outputs = if self.selected_url.is_some() {
-            registry.available_url_outputs()
-        } else if let Some(path) = self.selected_file.as_ref() {
-            registry.available_outputs(path)
-        } else {
-            OutputFormat::ALL.to_vec()
-        };
-        // When diagnostics are loaded for a concrete source, badge formats whose
-        // engines are missing so users see install hints before converting.
-        let ready_outputs = self.diagnostics.as_ref().and_then(|report| {
-            if self.selected_url.is_some() {
-                Some(available_ready_url_outputs(&registry, report))
-            } else {
-                self.selected_file
-                    .as_ref()
-                    .map(|path| available_ready_outputs(&registry, report, path))
-            }
-        });
+        let available_outputs = self.cached_available_outputs.clone();
+        let ready_outputs = self.cached_ready_outputs.clone();
+        self.ensure_history_cache(cx);
         let output_format = self.output_format;
         let output_menu_open = self.output_menu_open;
         let format_filter_input = self.format_filter_input.clone();
@@ -7135,8 +7254,8 @@ impl Render for Shift {
         let module_priority = self.module_priority.clone();
         let preference_error = self.preference_error.clone();
         let url_input = self.url_input.clone();
-        let history = self.history.clone();
-        let history_count = history.len();
+        let history_count = self.history.len();
+        let visible_history = &self.cached_history_visible;
         let active_history_id = self.active_history_id;
         let history_sidebar_width = self.history_sidebar_width;
         let history_search = self.history_search.clone();
@@ -7234,9 +7353,9 @@ impl Render for Shift {
                 }
             }))
             .child(history_sidebar(
-                &history,
+                visible_history,
+                history_count,
                 history_search,
-                show_archived,
                 active_history_id,
                 history_sidebar_width,
                 cx,
