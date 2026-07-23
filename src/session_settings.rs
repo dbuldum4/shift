@@ -18,8 +18,8 @@ const SETTINGS_FILE_NAME: &str = "session-settings.json";
 pub const DEFAULT_HISTORY_SIDEBAR_WIDTH: f32 = 240.0;
 /// Default output panel width in logical pixels (≈ half of remaining space at launch).
 pub const DEFAULT_OUTPUT_PANEL_WIDTH: f32 = 470.0;
-/// Default UI font family (historical fixed Menlo monospaced look).
-pub const DEFAULT_UI_FONT_FAMILY: &str = "Menlo";
+/// Default UI font family (Geist sans, bundled with the app).
+pub const DEFAULT_UI_FONT_FAMILY: &str = "Geist";
 
 fn default_history_sidebar_width() -> f32 {
     DEFAULT_HISTORY_SIDEBAR_WIDTH

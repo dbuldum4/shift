@@ -34,6 +34,7 @@ use shift_core::{
     cache_artifact_bytes, export_matches_bytes, load_default_session_settings,
     save_default_session_settings, stage_export_file,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,18 +43,23 @@ use std::time::Duration;
 use text_input::TextInput;
 
 const APP_NAME: &str = "Shift";
-/// Default UI font when session settings omit a family (legacy Menlo look).
-const FONT_MONO: &str = shift_core::session_settings::DEFAULT_UI_FONT_FAMILY;
+/// Default UI font for the app chrome; persisted settings fall back to this value.
+const DEFAULT_UI_FONT: &str = shift_core::session_settings::DEFAULT_UI_FONT_FAMILY;
+/// Monospace accent font, used for code-like labels (file drag ghosts, etc.).
+const FONT_MONO: &str = "Geist Mono";
 /// Curated font families for Theme settings (label, family name).
 /// Family names must match what Core Text / GPUI resolve on macOS.
+/// Bundled and system UI font choices. Bundled Geist fonts are registered in `main`.
 const UI_FONT_CHOICES: &[(&str, &str)] = &[
+    ("Geist", "Geist"),
+    ("Geist Mono", "Geist Mono"),
+    ("System", ".SystemUIFont"),
     ("Menlo", "Menlo"),
     ("SF Mono", "SF Mono"),
     ("Monaco", "Monaco"),
     ("Courier New", "Courier New"),
     ("Andale Mono", "Andale Mono"),
     ("Helvetica Neue", "Helvetica Neue"),
-    ("System", ".SystemUIFont"),
 ];
 const BG: u32 = 0x000000;
 const BG_RAISED: u32 = 0x0a0a0a;
@@ -61,6 +67,16 @@ const BG_SURFACE: u32 = 0x111111;
 const BG_ELEVATED: u32 = 0x1a1a1a;
 const BG_HOVER: u32 = 0x222222;
 const BG_ACTIVE: u32 = 0x2a2a2a;
+
+/// Consistent elevation shadow for raised cards and dialogs.
+fn card_shadow() -> Vec<gpui::BoxShadow> {
+    vec![gpui::BoxShadow {
+        color: hsla(0.0, 0.0, 0.0, 0.65),
+        blur_radius: px(24.0),
+        spread_radius: px(0.0),
+        offset: point(px(0.0), px(8.0)),
+    }]
+}
 const DROP_ZONE_COLOR: u32 = 0x0a0a0a;
 const DROP_ZONE_HOVER_COLOR: u32 = 0x111111;
 const BORDER: u32 = 0x222222;
@@ -72,6 +88,8 @@ const TEXT_SECONDARY: u32 = 0x888888;
 const TEXT_MUTED: u32 = 0x666666;
 const TEXT_DIM: u32 = 0x444444;
 const TEXT_INVERSE: u32 = 0x000000;
+/// Subtle press feedback for interactive surfaces (Emil Kowalski / Apple-style active states).
+const ACTIVE_OPACITY: f32 = 0.88;
 const BADGE_FILL: u32 = 0x1a1a1a;
 const BADGE_TEXT: u32 = 0xcccccc;
 const STATUS_READY_FILL: u32 = 0x1a1a1a;
@@ -625,6 +643,7 @@ fn batch_queue_panel(
                                 .hover(|style| {
                                     style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child("Folder")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.choose_output_folder(cx);
@@ -654,6 +673,7 @@ fn batch_queue_panel(
                                 .hover(|style| {
                                     style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child(force_label)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.toggle_batch_force(cx);
@@ -676,6 +696,7 @@ fn batch_queue_panel(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Start")
                                     .on_click(cx.listener(|this, _, _, cx| this.start_batch(cx))),
                             )
@@ -697,6 +718,7 @@ fn batch_queue_panel(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_batch(cx))),
                             )
@@ -718,6 +740,7 @@ fn batch_queue_panel(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Retry failed")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.retry_failed_batch(cx)),
@@ -740,6 +763,7 @@ fn batch_queue_panel(
                                 .hover(|style| {
                                     style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS))
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child("Clear")
                                 .on_click(cx.listener(|this, _, _, cx| this.clear_batch_queue(cx))),
                         ),
@@ -850,6 +874,7 @@ fn batch_queue_panel(
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child(if is_override { "Inherit" } else { "Override" })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_batch_item_format(id, cx);
@@ -868,6 +893,7 @@ fn batch_queue_panel(
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Reveal")
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         file_picker::reveal_in_finder(&path);
@@ -886,6 +912,7 @@ fn batch_queue_panel(
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT)))
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Retry")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.retry_batch_item(id, cx);
@@ -894,6 +921,11 @@ fn batch_queue_panel(
                             )
                         })
                 })),
+        )
+        .with_animation(
+            "batch-queue-in",
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.5 + 0.5 * progress),
         )
 }
 
@@ -957,6 +989,7 @@ fn history_sidebar(
                                     .hover(|style| {
                                         style.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_SECONDARY))
                                     })
+                                    .active(|style| style.opacity(ACTIVE_OPACITY))
                                     .child("Clear")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.clear_history(cx);
@@ -1041,6 +1074,7 @@ fn history_sidebar(
                         .py_2()
                         .rounded_lg()
                         .cursor_pointer()
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .when(active, |row| {
                             row.bg(rgb(BG_ELEVATED))
                                 .border_1()
@@ -1095,6 +1129,7 @@ fn history_sidebar(
                                             .text_color(rgb(TEXT_MUTED))
                                             .cursor_pointer()
                                             .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
+                                            .active(|style| style.opacity(ACTIVE_OPACITY))
                                             .child(archive_label)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.archive_history_entry(id, cx);
@@ -1108,6 +1143,7 @@ fn history_sidebar(
                                             .text_color(rgb(TEXT_MUTED))
                                             .cursor_pointer()
                                             .hover(|style| style.text_color(rgb(TEXT_PRIMARY)))
+                                            .active(|style| style.opacity(ACTIVE_OPACITY))
                                             .child("Delete")
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.delete_history_entry(id, cx);
@@ -1235,12 +1271,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                 .bg(rgb(BG_SURFACE))
                 .border_1()
                 .border_color(rgb(BORDER))
-                .shadow(vec![gpui::BoxShadow {
-                    color: hsla(0.0, 0.0, 0.0, 0.65),
-                    blur_radius: px(24.0),
-                    spread_radius: px(0.0),
-                    offset: point(px(0.0), px(8.0)),
-                }])
+                .shadow(card_shadow())
                 // File-type badge
                 .child(
                     div()
@@ -1304,7 +1335,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                                 .border_color(rgb(BORDER_FOCUS))
                                 .text_color(rgb(TEXT))
                         })
-                        .active(|style| style.opacity(0.85))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child(
                             div()
                                 .text_sm()
@@ -1392,6 +1423,7 @@ fn chip(
                 style.bg(rgb(BG_HOVER))
             }
         })
+        .active(|style| style.opacity(ACTIVE_OPACITY))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -1504,6 +1536,7 @@ fn conversion_options_panel(
         .bg(rgb(BG_RAISED))
         .border_1()
         .border_color(rgb(BORDER))
+        .shadow(card_shadow())
         .child(
             div()
                 .flex()
@@ -1530,6 +1563,7 @@ fn conversion_options_panel(
                         .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child("Apply")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.apply_conversion_options(cx);
@@ -2313,6 +2347,7 @@ fn conversion_options_panel(
                             .line_clamp(1)
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                            .active(|style| style.opacity(ACTIVE_OPACITY))
                             .child(ref_doc_label)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.pick_reference_doc(cx);
@@ -2370,6 +2405,11 @@ fn conversion_options_panel(
                 .text_xs()
                 .text_color(rgb(TEXT_DIM))
                 .child("Edit fields, then Apply. Chips reconvert immediately."),
+        )
+        .with_animation(
+            "conversion-options-in",
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.5 + 0.5 * progress),
         )
 }
 
@@ -2517,6 +2557,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_conversion(cx))),
                 )
@@ -2583,6 +2624,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .text_color(rgb(TEXT_PRIMARY))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(BG_ACTIVE)))
+                            .active(|style| style.opacity(ACTIVE_OPACITY))
                             .child("Copy install command")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
@@ -2647,6 +2689,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .bg(rgb(BG_ELEVATED))
                         .border_1()
                         .border_color(rgb(BORDER_STRONG))
+                        .shadow(card_shadow())
                         .child(
                             div()
                                 .flex()
@@ -2807,7 +2850,12 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(excerpt),
                             )
-                        }),
+                        })
+                        .with_animation(
+                            "output-result-card-in",
+                            Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                            |element, progress| element.opacity(0.4 + 0.6 * progress),
+                        ),
                 )
                 .when_some(cached_ready_path.clone(), |panel, staged| {
                     // Preview is not a permanent save; still show the staged path
@@ -2868,6 +2916,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .border_color(rgb(BORDER))
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(BG_HOVER)))
+                .active(|style| style.opacity(ACTIVE_OPACITY))
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Output"))
                 .child(
                     div()
@@ -2957,6 +3006,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .when(enabled, |row| {
                                         row.cursor_pointer()
                                             .hover(|style| style.bg(rgb(BG_HOVER)))
+                                            .active(|style| style.opacity(ACTIVE_OPACITY))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.set_output_format(format, cx);
                                                 cx.stop_propagation();
@@ -3048,6 +3098,7 @@ fn action_chip(
         .text_color(rgb(TEXT_PRIMARY))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
+        .active(|style| style.opacity(ACTIVE_OPACITY))
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -3311,7 +3362,7 @@ fn url_input_bar(url_input: Entity<TextInput>, cx: &mut Context<Shift>) -> impl 
                 .text_color(rgb(TEXT_PRIMARY))
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(BG_ACTIVE)).border_color(rgb(BORDER_FOCUS)))
-                .active(|style| style.opacity(0.82))
+                .active(|style| style.opacity(ACTIVE_OPACITY))
                 .child("Convert")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.submit_magic_paste_from_input(cx);
@@ -3346,6 +3397,7 @@ fn settings_nav_item(
                 style.bg(rgb(BG_SURFACE))
             }
         })
+        .active(|style| style.opacity(ACTIVE_OPACITY))
         .child(
             div()
                 .text_sm()
@@ -3704,6 +3756,7 @@ fn settings_general_panel(
                         .text_color(rgb(TEXT_SECONDARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child("Clear history")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.clear_history(cx);
@@ -3779,6 +3832,7 @@ fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl I
                                         style.bg(rgb(BG_HOVER))
                                     }
                                 })
+                                .active(|style| style.opacity(ACTIVE_OPACITY))
                                 .child(*label)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.set_ui_font_family(family_owned.clone(), cx);
@@ -4324,6 +4378,7 @@ fn settings_diagnostics_panel(
                         .text_color(rgb(TEXT_SECONDARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child(if loading { "Checking…" } else { "Refresh" })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_diagnostics(cx);
@@ -4778,6 +4833,7 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .text_color(rgb(TEXT_PRIMARY))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(BG_HOVER)))
+                        .active(|style| style.opacity(ACTIVE_OPACITY))
                         .child(div().text_color(rgb(TEXT_SECONDARY)).child("←"))
                         .child("Back")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -4846,6 +4902,11 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                         .child(settings_nav_item(SettingsSection::About, section, 6, cx)),
                 )
                 .child(settings_content(&view, cx)),
+        )
+        .with_animation(
+            "settings-screen-in",
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.5 + 0.5 * progress),
         )
 }
 
@@ -6134,7 +6195,7 @@ impl Shift {
     fn set_ui_font_family(&mut self, family: String, cx: &mut Context<Self>) {
         let family = family.trim().to_owned();
         let family = if family.is_empty() {
-            FONT_MONO.to_owned()
+            DEFAULT_UI_FONT.to_owned()
         } else {
             family
         };
@@ -7032,6 +7093,7 @@ impl Render for Shift {
                             .bg(rgb(DROP_ZONE_COLOR))
                             .hover(|style| style.bg(rgb(DROP_ZONE_HOVER_COLOR)))
                             .cursor_pointer()
+                            .active(|style| style.opacity(ACTIVE_OPACITY))
                             .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(BG_ELEVATED)))
                             .child(rounded_dashed_border(has_selection || show_batch))
                             .when_some(preview, |zone, preview| {
@@ -7146,6 +7208,7 @@ impl Render for Shift {
                     .text_color(rgb(TEXT_SECONDARY))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                    .active(|style| style.opacity(ACTIVE_OPACITY))
                     .child("⚙")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.output_menu_open = false;
@@ -7205,6 +7268,7 @@ impl Render for Shift {
                                 .bg(rgb(BG_ELEVATED))
                                 .border_1()
                                 .border_color(rgb(BORDER_STRONG))
+                                .shadow(card_shadow())
                                 .flex()
                                 .flex_col()
                                 .gap_4()
@@ -7240,6 +7304,12 @@ impl Render for Shift {
                                             cx,
                                             |this, cx| this.confirm_folder_expand(cx),
                                         )),
+                                )
+                                .with_animation(
+                                    "folder-confirm-dialog-in",
+                                    Animation::new(Duration::from_millis(220))
+                                        .with_easing(ease_out_quint()),
+                                    |element, progress| element.opacity(0.5 + 0.5 * progress),
                                 ),
                         ),
                 )
@@ -7268,6 +7338,7 @@ impl Render for Shift {
                                 .bg(rgb(BG_ELEVATED))
                                 .border_1()
                                 .border_color(rgb(BORDER_STRONG))
+                                .shadow(card_shadow())
                                 .flex()
                                 .flex_col()
                                 .gap_3()
@@ -7308,6 +7379,12 @@ impl Render for Shift {
                                                     .child(desc),
                                             )
                                     }),
+                                )
+                                .with_animation(
+                                    "shortcuts-help-dialog-in",
+                                    Animation::new(Duration::from_millis(220))
+                                        .with_easing(ease_out_quint()),
+                                    |element, progress| element.opacity(0.5 + 0.5 * progress),
                                 ),
                         ),
                 )
@@ -7367,6 +7444,19 @@ fn main() {
                 MenuItem::action(format!("Quit {APP_NAME}"), Quit),
             ],
         }]);
+
+        // Load bundled Geist variable fonts (SIL Open Font License 1.1).
+        // These are available as selectable UI font families in Theme settings.
+        if let Err(e) = cx.text_system().add_fonts(vec![
+            Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Variable.ttf").as_slice()),
+            Cow::Borrowed(include_bytes!("../assets/fonts/Geist-Italic-Variable.ttf").as_slice()),
+            Cow::Borrowed(include_bytes!("../assets/fonts/GeistMono-Variable.ttf").as_slice()),
+            Cow::Borrowed(
+                include_bytes!("../assets/fonts/GeistMono-Italic-Variable.ttf").as_slice(),
+            ),
+        ]) {
+            eprintln!("shift: failed to load bundled Geist fonts: {e}");
+        }
 
         let bounds = Bounds::centered(None, size(px(1180.0), px(720.0)), cx);
         let initial_window_width = f32::from(bounds.size.width);
