@@ -6996,6 +6996,7 @@ impl Shift {
         });
         self.persist_session_settings(cx);
         cx.notify();
+        self.rebuild_app_menus(cx);
     }
 
     fn archive_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -7006,6 +7007,7 @@ impl Shift {
             }
             self.persist_history();
             cx.notify();
+            self.rebuild_app_menus(cx);
         }
     }
 
@@ -7016,6 +7018,7 @@ impl Shift {
         }
         self.persist_history();
         cx.notify();
+        self.rebuild_app_menus(cx);
     }
 
     fn save_output(&mut self, cx: &mut Context<Self>) {
