@@ -43,8 +43,10 @@ use std::time::Duration;
 use text_input::TextInput;
 
 const APP_NAME: &str = "Shift";
-/// Default UI font when session settings omit a family (legacy Menlo look).
-const FONT_MONO: &str = shift_core::session_settings::DEFAULT_UI_FONT_FAMILY;
+/// Default UI font for the app chrome; persisted settings fall back to this value.
+const DEFAULT_UI_FONT: &str = shift_core::session_settings::DEFAULT_UI_FONT_FAMILY;
+/// Monospace accent font, used for code-like labels (file drag ghosts, etc.).
+const FONT_MONO: &str = "Geist Mono";
 /// Curated font families for Theme settings (label, family name).
 /// Family names must match what Core Text / GPUI resolve on macOS.
 /// Bundled and system UI font choices. Bundled Geist fonts are registered in `main`.
@@ -65,6 +67,16 @@ const BG_SURFACE: u32 = 0x111111;
 const BG_ELEVATED: u32 = 0x1a1a1a;
 const BG_HOVER: u32 = 0x222222;
 const BG_ACTIVE: u32 = 0x2a2a2a;
+
+/// Consistent elevation shadow for raised cards and dialogs.
+fn card_shadow() -> Vec<gpui::BoxShadow> {
+    vec![gpui::BoxShadow {
+        color: hsla(0.0, 0.0, 0.0, 0.65),
+        blur_radius: px(24.0),
+        spread_radius: px(0.0),
+        offset: point(px(0.0), px(8.0)),
+    }]
+}
 const DROP_ZONE_COLOR: u32 = 0x0a0a0a;
 const DROP_ZONE_HOVER_COLOR: u32 = 0x111111;
 const BORDER: u32 = 0x222222;
@@ -1259,12 +1271,7 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                 .bg(rgb(BG_SURFACE))
                 .border_1()
                 .border_color(rgb(BORDER))
-                .shadow(vec![gpui::BoxShadow {
-                    color: hsla(0.0, 0.0, 0.0, 0.65),
-                    blur_radius: px(24.0),
-                    spread_radius: px(0.0),
-                    offset: point(px(0.0), px(8.0)),
-                }])
+                .shadow(card_shadow())
                 // File-type badge
                 .child(
                     div()
@@ -1529,6 +1536,7 @@ fn conversion_options_panel(
         .bg(rgb(BG_RAISED))
         .border_1()
         .border_color(rgb(BORDER))
+        .shadow(card_shadow())
         .child(
             div()
                 .flex()
@@ -2398,6 +2406,11 @@ fn conversion_options_panel(
                 .text_color(rgb(TEXT_DIM))
                 .child("Edit fields, then Apply. Chips reconvert immediately."),
         )
+        .with_animation(
+            "conversion-options-in",
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |element, progress| element.opacity(0.5 + 0.5 * progress),
+        )
 }
 
 struct OutputPanelView {
@@ -2676,6 +2689,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .bg(rgb(BG_ELEVATED))
                         .border_1()
                         .border_color(rgb(BORDER_STRONG))
+                        .shadow(card_shadow())
                         .child(
                             div()
                                 .flex()
@@ -2836,7 +2850,12 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(excerpt),
                             )
-                        }),
+                        })
+                        .with_animation(
+                            "output-result-card-in",
+                            Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                            |element, progress| element.opacity(0.4 + 0.6 * progress),
+                        ),
                 )
                 .when_some(cached_ready_path.clone(), |panel, staged| {
                     // Preview is not a permanent save; still show the staged path
@@ -6176,7 +6195,7 @@ impl Shift {
     fn set_ui_font_family(&mut self, family: String, cx: &mut Context<Self>) {
         let family = family.trim().to_owned();
         let family = if family.is_empty() {
-            FONT_MONO.to_owned()
+            DEFAULT_UI_FONT.to_owned()
         } else {
             family
         };
@@ -7249,6 +7268,7 @@ impl Render for Shift {
                                 .bg(rgb(BG_ELEVATED))
                                 .border_1()
                                 .border_color(rgb(BORDER_STRONG))
+                                .shadow(card_shadow())
                                 .flex()
                                 .flex_col()
                                 .gap_4()
@@ -7284,6 +7304,12 @@ impl Render for Shift {
                                             cx,
                                             |this, cx| this.confirm_folder_expand(cx),
                                         )),
+                                )
+                                .with_animation(
+                                    "folder-confirm-dialog-in",
+                                    Animation::new(Duration::from_millis(220))
+                                        .with_easing(ease_out_quint()),
+                                    |element, progress| element.opacity(0.5 + 0.5 * progress),
                                 ),
                         ),
                 )
@@ -7312,6 +7338,7 @@ impl Render for Shift {
                                 .bg(rgb(BG_ELEVATED))
                                 .border_1()
                                 .border_color(rgb(BORDER_STRONG))
+                                .shadow(card_shadow())
                                 .flex()
                                 .flex_col()
                                 .gap_3()
@@ -7352,6 +7379,12 @@ impl Render for Shift {
                                                     .child(desc),
                                             )
                                     }),
+                                )
+                                .with_animation(
+                                    "shortcuts-help-dialog-in",
+                                    Animation::new(Duration::from_millis(220))
+                                        .with_easing(ease_out_quint()),
+                                    |element, progress| element.opacity(0.5 + 0.5 * progress),
                                 ),
                         ),
                 )
