@@ -116,28 +116,6 @@ fn initialize_history_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at DESC, id DESC);
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
-            name, source, detail, output_format, module_id,
-            content='history', content_rowid='id'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS history_fts_insert AFTER INSERT ON history BEGIN
-            INSERT INTO history_fts(rowid, name, source, detail, output_format, module_id)
-            VALUES (new.id, new.name, new.source, new.detail, new.output_format, new.module_id);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS history_fts_delete AFTER DELETE ON history BEGIN
-            INSERT INTO history_fts(history_fts, rowid, name, source, detail, output_format, module_id)
-            VALUES ('delete', old.id, old.name, old.source, old.detail, old.output_format, old.module_id);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS history_fts_update AFTER UPDATE ON history BEGIN
-            INSERT INTO history_fts(history_fts, rowid, name, source, detail, output_format, module_id)
-            VALUES ('delete', old.id, old.name, old.source, old.detail, old.output_format, old.module_id);
-            INSERT INTO history_fts(rowid, name, source, detail, output_format, module_id)
-            VALUES (new.id, new.name, new.source, new.detail, new.output_format, new.module_id);
-        END;
         ",
     )
 }
@@ -184,11 +162,12 @@ pub fn load_history() -> LoadedHistory {
         }
     };
 
-    if legacy_bytes.is_some() {
-        if let Some(ref legacy) = legacy_path {
-            let _ = import_legacy_history(&conn, legacy_bytes.as_deref().unwrap_or_default());
-            let backup = legacy.with_extension("legacy.bak");
-            let _ = std::fs::rename(legacy, &backup);
+    if let Some(ref legacy) = legacy_path {
+        if let Some(bytes) = legacy_bytes {
+            if import_legacy_history(&conn, &bytes).is_ok() {
+                let backup = legacy.with_extension("legacy.bak");
+                let _ = std::fs::rename(legacy, &backup);
+            }
         }
     }
 
@@ -324,6 +303,7 @@ fn insert_entry(tx: &Connection, entry: &StoredHistoryEntry) -> Result<(), rusql
 }
 
 /// Insert a single entry and trim the table so only the most recent `limit` rows remain.
+#[cfg(test)]
 pub fn add_history_entry(
     conn: &Connection,
     entry: &StoredHistoryEntry,
@@ -359,27 +339,8 @@ pub fn history_entries(
     rows.collect()
 }
 
-/// Search history entries using the FTS5 index. An empty query returns the most recent rows.
-pub fn search_history(
-    conn: &Connection,
-    query: &str,
-    include_archived: bool,
-) -> Result<Vec<StoredHistoryEntry>, rusqlite::Error> {
-    let query = query.trim();
-    if query.is_empty() {
-        return history_entries(conn, include_archived);
-    }
-    let mut stmt = conn.prepare(
-        "SELECT h.* FROM history AS h
-         JOIN history_fts ON h.id = history_fts.rowid
-         WHERE history_fts MATCH ?1 AND (h.archived = 0 OR ?2 = 1)
-         ORDER BY h.created_at DESC, h.id DESC",
-    )?;
-    let rows = stmt.query_map(params![query, include_archived as i64], row_to_entry)?;
-    rows.collect()
-}
-
 /// Mark an entry as archived. Returns `true` if the row existed.
+#[cfg(test)]
 pub fn archive_history(conn: &Connection, id: u64) -> Result<bool, rusqlite::Error> {
     let changed = conn.execute(
         "UPDATE history SET archived = 1 WHERE id = ?1",
@@ -389,15 +350,10 @@ pub fn archive_history(conn: &Connection, id: u64) -> Result<bool, rusqlite::Err
 }
 
 /// Delete an entry from history. Returns `true` if the row existed.
+#[cfg(test)]
 pub fn delete_history(conn: &Connection, id: u64) -> Result<bool, rusqlite::Error> {
     let changed = conn.execute("DELETE FROM history WHERE id = ?1", params![id as i64])?;
     Ok(changed > 0)
-}
-
-/// Delete every history row.
-pub fn clear_history(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute("DELETE FROM history", [])?;
-    Ok(())
 }
 
 /// Decode a legacy binary blob and import the rows it contains.
@@ -625,24 +581,24 @@ fn read_entry(cursor: &mut Cursor<&[u8]>) -> io::Result<StoredHistoryEntry> {
 
 #[cfg(test)]
 fn write_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_be_bytes());
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
     let mut bytes = [0u8; 8];
     cursor.read_exact(&mut bytes)?;
-    Ok(u64::from_be_bytes(bytes))
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
 fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_be_bytes());
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> io::Result<u32> {
     let mut bytes = [0u8; 4];
     cursor.read_exact(&mut bytes)?;
-    Ok(u32::from_be_bytes(bytes))
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn read_u8(cursor: &mut Cursor<&[u8]>) -> io::Result<u8> {
@@ -667,12 +623,12 @@ fn read_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
 
 #[cfg(test)]
 fn write_bytes(out: &mut Vec<u8>, value: &[u8]) {
-    write_u64(out, value.len() as u64);
+    write_u32(out, value.len() as u32);
     out.extend_from_slice(value);
 }
 
 fn read_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
-    let len = read_u64(cursor)? as usize;
+    let len = read_u32(cursor)? as usize;
     let mut bytes = vec![0u8; len];
     cursor.read_exact(&mut bytes)?;
     Ok(bytes)
@@ -729,23 +685,6 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, 3);
         assert_eq!(entries[1].id, 2);
-    }
-
-    #[test]
-    fn full_text_search_matches_name_and_detail() {
-        let conn = open_history(":memory:").unwrap();
-        let e1 = sample_entry(1, "quarterly report", false);
-        let mut e2 = sample_entry(2, "notes", false);
-        e2.detail = "report".to_owned();
-        add_history_entry(&conn, &e1, DEFAULT_HISTORY_LIMIT).unwrap();
-        add_history_entry(&conn, &e2, DEFAULT_HISTORY_LIMIT).unwrap();
-
-        let found = search_history(&conn, "report", false).unwrap();
-        assert_eq!(found.len(), 2);
-
-        let found = search_history(&conn, "quarterly", false).unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, 1);
     }
 
     #[test]
