@@ -13,9 +13,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use gpui::{AppContext, Entity, TestAppContext};
 
-use super::{
-    BatchFormatSelection, BatchItemState, ConversionState, HistoryOutcome, OutputFormat, Shift,
-};
+use crate::app::{ConversionState, HistoryOutcome, Shift};
+use shift_core::conversion::{BatchFormatSelection, BatchItemState, OutputFormat};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicU64 = AtomicU64::new(0);
