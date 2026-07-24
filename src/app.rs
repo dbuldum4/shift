@@ -226,10 +226,17 @@ pub(crate) struct Shift {
     pub(crate) cached_history_visible: Vec<ConversionHistoryEntry>,
     pub(crate) cached_history_filter: (String, bool, usize),
     pub(crate) history_cache_dirty: bool,
-    /// Ids that need to be persisted (upserted) in the next save.
-    pub(crate) history_dirty_ids: HashSet<u64>,
-    /// Ids that need to be deleted in the next save.
-    pub(crate) history_deleted_ids: HashSet<u64>,
+    /// Ids that need to be persisted (upserted) in the next save, each tagged
+    /// with the revision at which it was last modified.
+    pub(crate) history_dirty_ids: HashMap<u64, u64>,
+    /// Ids that need to be deleted in the next save, each tagged with the
+    /// revision at which the deletion was requested.
+    pub(crate) history_deleted_ids: HashMap<u64, u64>,
+    /// Monotonically increasing revision counter: every history mutation bumps
+    /// this so persistence can distinguish stale from current entries.
+    pub(crate) history_persist_revision: u64,
+    /// True while a background persistence task is in flight (serializes writes).
+    pub(crate) history_save_in_flight: bool,
     /// History sidebar width (logical pixels); resizable via left divider.
     pub(crate) history_sidebar_width: f32,
     /// Output panel width (logical pixels); resizable via right divider.
@@ -470,8 +477,10 @@ impl Shift {
             cached_history_visible,
             cached_history_filter,
             history_cache_dirty: true,
-            history_dirty_ids: HashSet::new(),
-            history_deleted_ids: HashSet::new(),
+            history_dirty_ids: HashMap::new(),
+            history_deleted_ids: HashMap::new(),
+            history_persist_revision: 0,
+            history_save_in_flight: false,
             history_sidebar_width,
             output_panel_width,
             panel_resize: None,
@@ -2265,6 +2274,10 @@ impl Shift {
             return;
         }
         let path = PathBuf::from(&action.path);
+        // Bump the selection generation so any prior in-flight recent-file check
+        // becomes stale and cannot overwrite a newer user action.
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        let generation = self.selection_generation;
         // Check existence on the background executor so the UI thread does not
         // block on a slow/missing network or removable volume.
         let task = cx.background_executor().spawn({
@@ -2272,10 +2285,14 @@ impl Shift {
             async move { path.exists() }
         });
         cx.spawn(async move |this, cx| {
-            if task.await {
-                let _ = this.update(cx, |this, cx| this.set_selected_file(path, cx));
-            } else {
-                let _ = this.update(cx, |this, cx| {
+            let exists = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_generation != generation {
+                    return;
+                }
+                if exists {
+                    this.set_selected_file(path, cx);
+                } else {
                     this.conversion = ConversionState::Failed(
                         format!("Recent file not found: {}", path.display()).into(),
                     );
@@ -2284,8 +2301,8 @@ impl Shift {
                     this.file_preview = None;
                     this.cached_ready_path = None;
                     cx.notify();
-                });
-            }
+                }
+            });
         })
         .detach();
     }
@@ -2367,13 +2384,15 @@ impl Shift {
         };
         entry.detail = history_entry_stored_detail(&entry).into();
         self.history.insert(0, entry);
+        self.history_persist_revision += 1;
+        let rev = self.history_persist_revision;
         if self.history.len() > self.history_limit {
             for removed in self.history.split_off(self.history_limit) {
-                self.history_deleted_ids.insert(removed.id);
+                self.history_deleted_ids.insert(removed.id, rev);
                 self.history_dirty_ids.remove(&removed.id);
             }
         }
-        self.history_dirty_ids.insert(id);
+        self.history_dirty_ids.insert(id, rev);
         self.active_history_id = Some(id);
         self.mark_history_cache_dirty();
         self.persist_history(cx);
@@ -2384,24 +2403,42 @@ impl Shift {
         if self.history_dirty_ids.is_empty() && self.history_deleted_ids.is_empty() {
             return;
         }
+        if self.history_save_in_flight {
+            // Another save will be triggered when the current one finishes.
+            return;
+        }
         let Some(db_path) = history_db_path() else {
             return;
         };
+        self.history_save_in_flight = true;
+
+        // Snapshot the revision at submission time. On completion we only clear
+        // IDs whose revision is <= this value, so newer mutations remain dirty.
+        let snapshot_revision = self.history_persist_revision;
         let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
-        let changed: Vec<u64> = self.history_dirty_ids.iter().copied().collect();
-        let deleted: Vec<u64> = self.history_deleted_ids.iter().copied().collect();
-        // Write to SQLite on the background executor; only clear the dirty/deleted
-        // sets when the write succeeds so a failed persist can be retried later.
+        let changed: Vec<u64> = self.history_dirty_ids.keys().copied().collect();
+        let deleted: Vec<u64> = self.history_deleted_ids.keys().copied().collect();
+
         let task = cx
             .background_executor()
             .spawn(async move { save_history_delta_to(db_path, &stored, &changed, &deleted) });
         cx.spawn(async move |this, cx| {
-            if task.await.is_ok() {
-                let _ = this.update(cx, |this, _cx| {
-                    this.history_dirty_ids.clear();
-                    this.history_deleted_ids.clear();
-                });
-            }
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.history_save_in_flight = false;
+                if result.is_ok() {
+                    // Only remove entries whose revision has not been bumped
+                    // since this snapshot was taken. Newer mutations survive.
+                    this.history_dirty_ids
+                        .retain(|_id, rev| *rev > snapshot_revision);
+                    this.history_deleted_ids
+                        .retain(|_id, rev| *rev > snapshot_revision);
+                }
+                // If mutations arrived while we were writing, start another save.
+                if !this.history_dirty_ids.is_empty() || !this.history_deleted_ids.is_empty() {
+                    this.persist_history(cx);
+                }
+            });
         })
         .detach();
     }
@@ -2493,8 +2530,10 @@ impl Shift {
     }
 
     pub(crate) fn clear_history(&mut self, cx: &mut Context<Self>) {
+        self.history_persist_revision += 1;
+        let rev = self.history_persist_revision;
         for entry in &self.history {
-            self.history_deleted_ids.insert(entry.id);
+            self.history_deleted_ids.insert(entry.id, rev);
         }
         self.history.clear();
         self.history_dirty_ids.clear();
@@ -2512,8 +2551,10 @@ impl Shift {
         }
         self.history_limit = limit;
         if self.history.len() > self.history_limit {
+            self.history_persist_revision += 1;
+            let rev = self.history_persist_revision;
             for removed in self.history.split_off(self.history_limit) {
-                self.history_deleted_ids.insert(removed.id);
+                self.history_deleted_ids.insert(removed.id, rev);
                 self.history_dirty_ids.remove(&removed.id);
             }
         }
@@ -2533,7 +2574,9 @@ impl Shift {
             if entry.archived && !self.show_archived && self.active_history_id == Some(id) {
                 self.active_history_id = None;
             }
-            self.history_dirty_ids.insert(id);
+            self.history_persist_revision += 1;
+            self.history_dirty_ids
+                .insert(id, self.history_persist_revision);
             self.mark_history_cache_dirty();
             self.persist_history(cx);
             cx.notify();
@@ -2543,7 +2586,9 @@ impl Shift {
 
     pub(crate) fn delete_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
         self.history.retain(|entry| entry.id != id);
-        self.history_deleted_ids.insert(id);
+        self.history_persist_revision += 1;
+        let rev = self.history_persist_revision;
+        self.history_deleted_ids.insert(id, rev);
         self.history_dirty_ids.remove(&id);
         if self.active_history_id == Some(id) {
             self.active_history_id = None;

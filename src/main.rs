@@ -40,7 +40,7 @@ use shift_core::{
     save_default_session_settings, stage_export_file,
 };
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -887,7 +887,7 @@ fn history_sidebar(
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let is_empty = visible.is_empty();
-    let has_any = history_total > 0 && !visible.is_empty();
+    let has_any = history_total > 0;
 
     div()
         .id("history-sidebar")

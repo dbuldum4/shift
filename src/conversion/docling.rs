@@ -196,11 +196,16 @@ impl DoclingModule {
 
     /// Discover the file Docling actually wrote, in case it renamed the output
     /// (for example when a same-named file already existed in the temp dir).
+    ///
+    /// Returns the exact expected path if present, or a single candidate with
+    /// the matching extension. Returns `None` if no candidates exist or if
+    /// multiple ambiguous candidates are found (callers should treat this as a
+    /// conversion failure rather than silently picking an arbitrary file).
     fn discover_output(work_dir: &Path, expected: &Path) -> Option<PathBuf> {
         let expected_ext = expected.extension().and_then(|value| value.to_str())?;
         let expected_name = expected.file_name()?;
 
-        let mut matches: Vec<PathBuf> = fs::read_dir(work_dir)
+        let matches: Vec<PathBuf> = fs::read_dir(work_dir)
             .ok()?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().ok().is_some_and(|t| t.is_file()))
@@ -223,8 +228,13 @@ impl DoclingModule {
             return Some(exact.clone());
         }
 
-        matches.sort();
-        matches.into_iter().next()
+        // Only accept a single unambiguous candidate; multiple candidates
+        // indicate an unexpected output layout and should fail explicitly.
+        if matches.len() == 1 {
+            return matches.into_iter().next();
+        }
+
+        None
     }
 
     fn convert_with_cli(
@@ -559,5 +569,44 @@ printf '%s' "$body" > "$output/$stem.$ext"
             )
             .unwrap_err();
         assert!(err.to_string().contains("Word") || err.to_string().contains("DOCX"));
+    }
+
+    #[test]
+    fn discover_output_returns_none_on_ambiguous_candidates() {
+        let work = std::env::temp_dir().join("shift-docling-ambig");
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("alpha.md"), b"# A").unwrap();
+        fs::write(work.join("beta.md"), b"# B").unwrap();
+        // Expected file does not exist; two candidates are ambiguous.
+        let expected = work.join("report.md");
+        let result = DoclingModule::discover_output(&work, &expected);
+        assert!(result.is_none(), "ambiguous candidates must return None");
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn discover_output_returns_single_renamed_candidate() {
+        let work = std::env::temp_dir().join("shift-docling-single");
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("renamed.md"), b"# OK").unwrap();
+        let expected = work.join("report.md");
+        let result = DoclingModule::discover_output(&work, &expected);
+        assert_eq!(result, Some(work.join("renamed.md")));
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn discover_output_prefers_exact_match() {
+        let work = std::env::temp_dir().join("shift-docling-exact");
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("report.md"), b"# exact").unwrap();
+        fs::write(work.join("other.md"), b"# other").unwrap();
+        let expected = work.join("report.md");
+        let result = DoclingModule::discover_output(&work, &expected);
+        assert_eq!(result, Some(work.join("report.md")));
+        let _ = fs::remove_dir_all(&work);
     }
 }

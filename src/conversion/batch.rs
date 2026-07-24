@@ -424,10 +424,10 @@ impl BatchQueue {
         self.items.retain(|item| !item.state.is_terminal());
     }
 
-    /// Drop everything.
+    /// Drop everything. IDs are not reset so stale handles from prior
+    /// enqueues can never collide with future items.
     pub fn clear(&mut self) {
         self.items.clear();
-        self.next_id = 0;
     }
 
     /// Update planned destinations after the user picks a new output folder.
@@ -2219,5 +2219,16 @@ mod tests {
             "unexpected: {}",
             resolved.display()
         );
+    }
+
+    #[test]
+    fn clear_does_not_reuse_ids() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let old = queue.enqueue(BatchSource::File(PathBuf::from("/a.txt")), &opts);
+        queue.clear();
+        let new = queue.enqueue(BatchSource::File(PathBuf::from("/b.txt")), &opts);
+        assert_ne!(old, new, "IDs must not be recycled after clear");
+        assert!(queue.get(old).is_none(), "old ID must not resolve");
     }
 }

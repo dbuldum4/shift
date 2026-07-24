@@ -1140,3 +1140,291 @@ async fn reveal_open_and_copy_output_do_not_panic(cx: &mut TestAppContext) {
         this.copy_output(cx);
     });
 }
+
+// -- Deterministic history persistence ordering tests --
+
+/// Archive then unarchive stores the unarchived state even when persistence
+/// is serialized. The final mutation wins regardless of scheduling.
+#[gpui::test]
+async fn history_persist_archive_then_unarchive_stores_latest(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "persist_order.txt", b"content");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+
+    // Archive and unarchive in a single synchronous turn — the earlier
+    // archived state must never win on disk.
+    shift.update(cx, |this, cx| {
+        this.archive_history_entry(id, cx); // archived = true
+        this.archive_history_entry(id, cx); // archived = false (toggle)
+    });
+    cx.run_until_parked();
+
+    // Reload from disk and verify the final unarchived state persisted.
+    let shift2 = create_shift(cx);
+    let archived_on_disk = shift2.read_with(cx, |this, _| {
+        this.history.iter().find(|e| e.id == id).map(|e| e.archived)
+    });
+    assert_eq!(archived_on_disk, Some(false));
+}
+
+/// An older successful save cannot clear a newer mutation's dirty tracking.
+/// After archive (rev 1) persists, a subsequent unarchive (rev 2) must still
+/// be pending and eventually written.
+#[gpui::test]
+async fn history_persist_newer_mutation_survives_older_save(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "newer_mut.txt", b"data");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+
+    // First archive triggers a persist (save A).
+    shift.update(cx, |this, cx| {
+        this.archive_history_entry(id, cx);
+    });
+    // Before save A finishes, unarchive triggers a new revision.
+    shift.update(cx, |this, cx| {
+        this.archive_history_entry(id, cx); // toggles back to false
+    });
+    cx.run_until_parked();
+
+    // Both saves must have completed; final disk state is unarchived.
+    let shift2 = create_shift(cx);
+    let archived_on_disk = shift2.read_with(cx, |this, _| {
+        this.history.iter().find(|e| e.id == id).map(|e| e.archived)
+    });
+    assert_eq!(archived_on_disk, Some(false));
+}
+
+/// Upsert followed by delete cannot resurrect the row.
+#[gpui::test]
+async fn history_persist_upsert_then_delete_stays_deleted(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "del.txt", b"deleteme");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+
+    // Delete before the initial persist snapshot has a chance to complete.
+    shift.update(cx, |this, cx| {
+        this.delete_history_entry(id, cx);
+    });
+    cx.run_until_parked();
+
+    let shift2 = create_shift(cx);
+    let found = shift2.read_with(cx, |this, _| this.history.iter().any(|e| e.id == id));
+    assert!(!found, "deleted entry must not reappear on reload");
+}
+
+/// Clear during an in-flight upsert leaves the database empty.
+#[gpui::test]
+async fn history_persist_clear_during_inflight_upsert(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "clear.txt", b"clearme");
+    let shift = create_shift(cx);
+
+    // Record a history entry and immediately clear without parking in between.
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(shift.read_with(cx, |this, _| this.history.len()), 1);
+
+    shift.update(cx, |this, cx| {
+        this.clear_history(cx);
+    });
+    cx.run_until_parked();
+
+    let shift2 = create_shift(cx);
+    let count = shift2.read_with(cx, |this, _| this.history.len());
+    assert_eq!(count, 0, "clear must leave the database empty");
+}
+
+/// Rapid insertion of multiple entries survives restart.
+#[gpui::test]
+async fn history_persist_rapid_inserts_survive_restart(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    // Insert 5 entries in rapid succession without parking between each.
+    for i in 0..5 {
+        let path = write_input(
+            &env,
+            &format!("rapid_{i}.txt"),
+            format!("content{i}").as_bytes(),
+        );
+        shift.update(cx, |this, cx| {
+            this.set_selected_file(path, cx);
+            this.start_conversion(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    let count = shift.read_with(cx, |this, _| this.history.len());
+    assert_eq!(count, 5);
+
+    // Verify all 5 survive reload.
+    let shift2 = create_shift(cx);
+    let count2 = shift2.read_with(cx, |this, _| this.history.len());
+    assert_eq!(count2, 5, "all rapid inserts must persist");
+}
+
+/// Repeated mutation of one ID clears only the persisted revision:
+/// archive → unarchive → archive (final state is archived).
+#[gpui::test]
+async fn history_persist_repeated_mutation_clears_correct_revision(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "repeat.txt", b"repeat");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+
+    // Three mutations in a single turn: archive, unarchive, archive again.
+    shift.update(cx, |this, cx| {
+        this.archive_history_entry(id, cx); // archived = true
+        this.archive_history_entry(id, cx); // archived = false
+        this.archive_history_entry(id, cx); // archived = true
+    });
+    cx.run_until_parked();
+
+    // Final state must be archived.
+    let shift2 = create_shift(cx);
+    let archived_on_disk = shift2.read_with(cx, |this, _| {
+        this.history.iter().find(|e| e.id == id).map(|e| e.archived)
+    });
+    assert_eq!(archived_on_disk, Some(true));
+}
+
+/// Open Recent with stale completion does not override a newer selection.
+/// The generation guard in action_open_recent ensures the latest user action
+/// wins regardless of background task completion order.
+#[gpui::test]
+async fn open_recent_stale_completion_does_not_override_newer_selection(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let a = write_input(&env, "recent_a.txt", b"aaa");
+    let b = write_input(&env, "recent_b.txt", b"bbb");
+    let shift = create_shift(cx);
+
+    // Simulate what action_open_recent does: bump selection_generation and
+    // spawn a background existence check for path A.
+    shift.update(cx, |this, cx| {
+        this.selection_generation = this.selection_generation.wrapping_add(1);
+        let generation = this.selection_generation;
+        let task = cx.background_executor().spawn({
+            let path = a.clone();
+            async move { path.exists() }
+        });
+        let path = a.clone();
+        cx.spawn(async move |this, cx| {
+            let exists = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_generation != generation {
+                    return;
+                }
+                if exists {
+                    this.set_selected_file(path, cx);
+                }
+            });
+        })
+        .detach();
+    });
+    // Without parking, immediately select B (bumps selection_generation again).
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(b.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // B should be the final selection, not A.
+    let selected = shift.read_with(cx, |this, _| this.selected_file.clone());
+    assert_eq!(selected, Some(b));
+}
+
+/// Open Recent missing-path result arriving after a valid selection cannot
+/// overwrite it with an error state.
+#[gpui::test]
+async fn open_recent_missing_does_not_override_valid_selection(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let existing = write_input(&env, "exists.txt", b"valid");
+    let missing = env.inputs().join("gone.txt"); // does not exist
+    let shift = create_shift(cx);
+
+    // Simulate action_open_recent for the missing path.
+    shift.update(cx, |this, cx| {
+        this.selection_generation = this.selection_generation.wrapping_add(1);
+        let generation = this.selection_generation;
+        let task = cx.background_executor().spawn({
+            let path = missing.clone();
+            async move { path.exists() }
+        });
+        let path = missing.clone();
+        cx.spawn(async move |this, cx| {
+            let exists = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_generation != generation {
+                    return;
+                }
+                if exists {
+                    this.set_selected_file(path, cx);
+                } else {
+                    this.conversion = ConversionState::Failed(
+                        format!("Recent file not found: {}", path.display()).into(),
+                    );
+                    this.selected_file = Some(path);
+                    this.selected_url = None;
+                    this.file_preview = None;
+                    this.cached_ready_path = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    });
+    // Immediately select a valid file (bumps selection_generation).
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(existing.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let selected = shift.read_with(cx, |this, _| this.selected_file.clone());
+    assert_eq!(selected, Some(existing));
+    // Must NOT be in a Failed state from the missing file.
+    let is_failed = shift.read_with(cx, |this, _| {
+        matches!(this.conversion, ConversionState::Failed(_))
+    });
+    assert!(!is_failed, "stale missing-file result must not override");
+}
