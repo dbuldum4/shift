@@ -178,17 +178,25 @@ fn kill_pid(pid: u32) {
     #[cfg(unix)]
     {
         // Negative PID kills the whole process group (set up via process_group(0)).
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        // Also target the process itself in case process-group setup failed.
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Use absolute system `kill` first because GUI apps often launch with a
+        // minimal PATH that does not include /bin or /usr/bin.
+        let group_arg = format!("-{pid}");
+        let pid_arg = pid.to_string();
+        for binary in ["/bin/kill", "/usr/bin/kill"] {
+            if Path::new(binary).is_file() {
+                let _ = Command::new(binary)
+                    .args(["-KILL", &group_arg])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                // Also target the process itself in case process-group setup failed.
+                let _ = Command::new(binary)
+                    .args(["-KILL", &pid_arg])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
     }
     #[cfg(not(unix))]
     {
