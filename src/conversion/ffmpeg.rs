@@ -227,7 +227,7 @@ pub fn is_video_output(format: OutputFormat) -> bool {
 }
 
 pub fn is_image_output(format: OutputFormat) -> bool {
-    matches!(format.id(), "png" | "jpg")
+    matches!(format.id(), "png" | "jpg" | "webp")
 }
 
 pub fn is_subtitle_output(format: OutputFormat) -> bool {
@@ -925,6 +925,14 @@ fn apply_image_encode(command: &mut Command, output_format: OutputFormat, option
                 FfmpegQuality::Small => "9",
             };
             command.arg("-compression_level").arg(level);
+        }
+        "webp" => {
+            let q = match options.quality {
+                FfmpegQuality::High => "90",
+                FfmpegQuality::Balanced => "75",
+                FfmpegQuality::Small => "40",
+            };
+            command.arg("-q:v").arg(q);
         }
         _ => {}
     }

@@ -93,6 +93,7 @@ impl OutputFormat {
     pub const THREEGP: Self = Self("3gp");
     pub const PNG: Self = Self("png");
     pub const JPG: Self = Self("jpg");
+    pub const WEBP: Self = Self("webp");
     pub const SRT: Self = Self("srt");
     pub const VTT: Self = Self("vtt");
     /// PNG frame sequence packaged as a single ZIP (FFmpeg).
@@ -206,6 +207,7 @@ impl OutputFormat {
         // Still frames
         Self::PNG,
         Self::JPG,
+        Self::WEBP,
         Self::PNG_SEQUENCE_ZIP,
         // Subtitles
         Self::SRT,
@@ -317,6 +319,7 @@ impl OutputFormat {
         Self::THREEGP,
         Self::PNG,
         Self::JPG,
+        Self::WEBP,
         Self::PNG_SEQUENCE_ZIP,
         Self::SRT,
         Self::VTT,
@@ -374,6 +377,7 @@ impl OutputFormat {
             "3gp" => "3GP Video",
             "png" => "PNG Image",
             "jpg" => "JPEG Image",
+            "webp" => "WebP Image",
             "srt" => "SubRip (SRT)",
             "vtt" => "WebVTT",
             "png-sequence-zip" => "PNG Sequence (ZIP)",
@@ -468,6 +472,7 @@ impl OutputFormat {
             "3gp" => "video/3gpp",
             "png" => "image/png",
             "jpg" => "image/jpeg",
+            "webp" => "image/webp",
             "srt" => "application/x-subrip",
             "vtt" => "text/vtt",
             "png-sequence-zip" => "application/zip",
