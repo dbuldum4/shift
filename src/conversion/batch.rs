@@ -10,6 +10,7 @@ use super::{
     OutputFormat, ProgressSink, default_output_path, looks_like_url, paths_refer_to_same_file,
 };
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -861,7 +862,21 @@ pub fn run_batch(
                         }
                         let task = &tasks[idx];
                         let _ = tx.send(WorkerMsg::Started { id: task.id });
-                        let outcome = run_task(registry, task, cancel, &tx);
+                        // Isolate a panicking module: a conversion bug should
+                        // become a single failed item, not an aborted batch.
+                        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            run_task(registry, task, cancel, &tx)
+                        }))
+                        .unwrap_or_else(|payload| {
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                                .unwrap_or("conversion worker panicked");
+                            BatchOutcome::Failed {
+                                error: message.to_string(),
+                            }
+                        });
                         let _ = tx.send(WorkerMsg::Finished {
                             id: task.id,
                             outcome,

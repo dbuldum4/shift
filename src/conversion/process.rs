@@ -10,7 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -465,6 +465,48 @@ fn resolve_path_cache() -> &'static Mutex<HashMap<ResolveKey, Option<PathBuf>>> 
 fn resolve_executable_cache() -> &'static Mutex<HashMap<ResolveKey, OsString>> {
     static CACHE: OnceLock<Mutex<HashMap<ResolveKey, OsString>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-wide counter for temporary directory names.
+///
+/// Combined with the process id in [`unique_temp_dir`], this guarantees no two
+/// parallel workers collide even if the system clock returns the same nanosecond.
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Create a process-unique temporary directory for one conversion step.
+///
+/// The name includes `prefix`, the process id, and a monotonically increasing
+/// counter, then the directory is created with `create_dir_all` so it can be
+/// reused safely even if the parent path already exists.
+pub fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
+    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("{prefix}-{}-{counter}", std::process::id()));
+    std::fs::create_dir_all(&base).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create temporary directory {}: {error}",
+            base.display()
+        ))
+    })?;
+    Ok(base)
+}
+
+/// Clear all memoized tool-discovery results so the next diagnostics/probe pass
+/// sees the current filesystem/PATH state.
+///
+/// `ConversionRegistry` does not need to be rebuilt for newly installed tools
+/// to show up in output menus, because it stores bare tool names that are
+/// resolved at spawn time. Refreshing diagnostics via this clear re-probes the
+/// executable paths and readiness.
+pub fn clear_tool_discovery_cache() {
+    if let Ok(mut cache) = find_executable_cache().lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = resolve_path_cache().lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = resolve_executable_cache().lock() {
+        cache.clear();
+    }
 }
 
 fn resolve_tool_path_uncached(

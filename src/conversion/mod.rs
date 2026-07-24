@@ -50,7 +50,7 @@ pub use pdf_slice::extract_pdf_pages;
 pub use process::{
     DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, find_executable, is_runnable,
     max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    resolve_tool_path, run_command, run_command_cancellable,
+    resolve_tool_path, run_command, run_command_cancellable, unique_temp_dir,
 };
 pub use sources::{
     MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
@@ -1439,24 +1439,6 @@ impl fmt::Display for ConversionError {
 }
 
 impl Error for ConversionError {}
-
-fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
-    let path = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir(&path).map_err(|error| {
-        ConversionError::new(format!(
-            "could not create temporary conversion workspace {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(path)
-}
 
 struct TempDirGuard(PathBuf);
 
