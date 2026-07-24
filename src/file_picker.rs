@@ -13,6 +13,7 @@
 //! crate (and its GUI tests) can be built and run elsewhere.
 
 #![allow(unexpected_cfgs)] // objc `msg_send!` cfg noise
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use futures::channel::oneshot;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,10 @@ static LAST_DIRECTORY: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Must be called on the main thread after `NSApplication` exists.
 #[cfg(target_os = "macos")]
 pub fn prewarm() {
+    use cocoa::appkit::NSOpenPanel;
+    use cocoa::base::{NO, YES, id, nil};
+    use objc::{msg_send, sel, sel_impl};
+
     unsafe {
         let panel = NSOpenPanel::openPanel(nil);
         panel.setCanChooseFiles_(YES);

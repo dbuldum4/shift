@@ -2688,8 +2688,13 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                                 )
                                                 .child(
                                                     div()
+                                                        .flex_1()
+                                                        .min_w_0()
                                                         .text_lg()
                                                         .font_weight(FontWeight::SEMIBOLD)
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .line_clamp(1)
                                                         .child(file_name_display),
                                                 ),
                                         )
