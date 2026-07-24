@@ -108,6 +108,10 @@ impl DiagnosticsReport {
     ///
     /// Engine and PDF probes run in parallel so Settings refresh is not blocked
     /// on sequential multi-second Python cold starts.
+    ///
+    /// Callers that cache a `ConversionRegistry` must rebuild it after calling
+    /// `collect()`, because module instances capture resolved executable paths
+    /// and a new probe may discover a tool installed since the registry was built.
     pub fn collect() -> Self {
         // A manual Refresh (or the first probe at startup) must see the current
         // PATH / install state, not a memoized answer from earlier in the process.

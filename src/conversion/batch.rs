@@ -13,7 +13,7 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Stable handle for one queue entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -838,7 +838,7 @@ pub fn run_batch(
         let worker_count = parallelism.min(tasks.len()).max(1);
 
         // Shared cursor: each worker claims the next index with fetch_add.
-        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let cursor = AtomicUsize::new(0);
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
 
         std::thread::scope(|scope| {
@@ -1018,6 +1018,8 @@ mod tests {
         payload: &'static [u8],
         fail_once: Option<Arc<Mutex<bool>>>,
         delay_ms: u64,
+        in_flight: Option<Arc<AtomicUsize>>,
+        peak: Option<Arc<AtomicUsize>>,
     }
 
     impl ConversionModule for CountingModule {
@@ -1042,6 +1044,13 @@ mod tests {
             output: OutputFormat,
             options: &ConversionOptions,
         ) -> Result<ConversionArtifact, ConversionError> {
+            if let Some(in_flight) = &self.in_flight {
+                let previous = in_flight.fetch_add(1, Ordering::SeqCst);
+                let current = previous + 1;
+                if let Some(peak) = &self.peak {
+                    peak.fetch_max(current, Ordering::SeqCst);
+                }
+            }
             if self.delay_ms > 0 {
                 let steps = (self.delay_ms / 10).max(1);
                 for _ in 0..steps {
@@ -1061,6 +1070,9 @@ mod tests {
                     *guard = true;
                     return Err(ConversionError::new("simulated failure"));
                 }
+            }
+            if let Some(in_flight) = &self.in_flight {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
             }
             let _ = input;
             Ok(ConversionArtifact {
@@ -1136,6 +1148,8 @@ mod tests {
             payload: b"# ok\n",
             fail_once: None,
             delay_ms: 0,
+            in_flight: None,
+            peak: None,
         });
 
         let mut queue = BatchQueue::new();
@@ -1175,8 +1189,6 @@ mod tests {
 
     #[test]
     fn run_batch_executes_items_in_parallel() {
-        // Each conversion sleeps for `per_item`; run enough items that a
-        // sequential runner would clearly exceed the parallel wall time.
         const ITEMS: usize = 4;
         const PER_ITEM_MS: u64 = 150;
 
@@ -1187,6 +1199,8 @@ mod tests {
             std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
         }
 
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
         let registry = ConversionRegistry::new().with_module(CountingModule {
             label: "slow",
             inputs: &["txt"],
@@ -1194,6 +1208,8 @@ mod tests {
             payload: b"# ok\n",
             fail_once: None,
             delay_ms: PER_ITEM_MS,
+            in_flight: Some(Arc::clone(&in_flight)),
+            peak: Some(Arc::clone(&peak)),
         });
 
         let mut queue = BatchQueue::new();
@@ -1208,12 +1224,9 @@ mod tests {
         }
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let start = std::time::Instant::now();
         let summary = run_batch(&mut queue, &registry, &cancel, |_| {});
-        let elapsed = start.elapsed();
 
-        // Correctness holds regardless of core count.
-        assert_eq!(summary.succeeded, ITEMS);
+        assert_eq!(summary.succeeded, 4);
         assert_eq!(summary.failed, 0);
         assert!(
             queue
@@ -1222,15 +1235,14 @@ mod tests {
                 .all(|item| matches!(item.state, BatchItemState::Succeeded { .. }))
         );
 
-        // On multi-core machines the pool must beat the sequential baseline.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         if cores >= 2 {
-            let sequential = std::time::Duration::from_millis(PER_ITEM_MS * ITEMS as u64);
             assert!(
-                elapsed < sequential,
-                "parallel run took {elapsed:?}, expected well under sequential {sequential:?}"
+                peak.load(Ordering::SeqCst) >= 2,
+                "conversions did not overlap (peak in-flight was {})",
+                peak.load(Ordering::SeqCst)
             );
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -1337,6 +1349,8 @@ mod tests {
             payload: b"done",
             fail_once: Some(Arc::clone(&fail_once)),
             delay_ms: 0,
+            in_flight: None,
+            peak: None,
         });
 
         let mut queue = BatchQueue::new();
@@ -1383,6 +1397,8 @@ mod tests {
             payload: b"x",
             fail_once: None,
             delay_ms: 80,
+            in_flight: None,
+            peak: None,
         });
 
         let mut queue = BatchQueue::new();
@@ -1482,6 +1498,8 @@ mod tests {
             payload: b"# ok\n",
             fail_once: None,
             delay_ms: 0,
+            in_flight: None,
+            peak: None,
         });
 
         let mut queue = BatchQueue::new();
@@ -1583,6 +1601,8 @@ mod tests {
             payload: b"# ok\n",
             fail_once: None,
             delay_ms: 0,
+            in_flight: None,
+            peak: None,
         });
 
         let mut queue = BatchQueue::new();

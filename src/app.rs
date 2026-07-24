@@ -579,6 +579,8 @@ impl Shift {
         cx.spawn(async move |this, cx| {
             let report = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.registry =
+                    Arc::new(ConversionRegistry::default().with_priority(&this.module_priority));
                 this.diagnostics = Some(Arc::new(report));
                 this.diagnostics_loading = false;
                 this.rebuild_output_caches();

@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default wall-clock budget for one converter invocation.
 pub const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
@@ -467,36 +467,52 @@ fn resolve_executable_cache() -> &'static Mutex<HashMap<ResolveKey, OsString>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Process-wide counter for temporary directory names.
+/// Atomic counter used to build temporary directory names.
 ///
-/// Combined with the process id in [`unique_temp_dir`], this guarantees no two
-/// parallel workers collide even if the system clock returns the same nanosecond.
+/// Combined with the process id, a high-resolution timestamp nonce, and
+/// [`std::fs::create_dir`] in [`unique_temp_dir`], this helps avoid collisions
+/// across parallel workers and reused process ids. It does not by itself
+/// guarantee uniqueness; the create-and-retry loop provides that property.
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Create a process-unique temporary directory for one conversion step.
+/// Create a unique temporary directory for one conversion step.
 ///
-/// The name includes `prefix`, the process id, and a monotonically increasing
-/// counter, then the directory is created with `create_dir_all` so it can be
-/// reused safely even if the parent path already exists.
+/// The name includes `prefix`, the process id, a monotonically increasing
+/// counter, and a high-resolution timestamp nonce. The directory is created
+/// atomically with [`std::fs::create_dir`]; if the name already exists, a new
+/// nonce is generated and the call retried.
 pub fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
-    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!("{prefix}-{}-{counter}", std::process::id()));
-    std::fs::create_dir_all(&base).map_err(|error| {
-        ConversionError::new(format!(
-            "could not create temporary directory {}: {error}",
-            base.display()
-        ))
-    })?;
-    Ok(base)
+    for _ in 0..100 {
+        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("{prefix}-{}-{counter}-{nanos}", std::process::id()));
+        match std::fs::create_dir(&base) {
+            Ok(()) => return Ok(base),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ConversionError::new(format!(
+                    "could not create temporary directory {}: {error}",
+                    base.display()
+                )));
+            }
+        }
+    }
+    Err(ConversionError::new(format!(
+        "could not create a unique temporary directory for prefix {prefix} after 100 attempts"
+    )))
 }
 
 /// Clear all memoized tool-discovery results so the next diagnostics/probe pass
 /// sees the current filesystem/PATH state.
 ///
-/// `ConversionRegistry` does not need to be rebuilt for newly installed tools
-/// to show up in output menus, because it stores bare tool names that are
-/// resolved at spawn time. Refreshing diagnostics via this clear re-probes the
-/// executable paths and readiness.
+/// `ConversionRegistry` instances capture resolved executable paths when they
+/// are built, so callers that refresh diagnostics and discover a newly installed
+/// tool must also rebuild their registry. Refreshing diagnostics via this clear
+/// re-probes the executable paths and readiness.
 pub fn clear_tool_discovery_cache() {
     if let Ok(mut cache) = find_executable_cache().lock() {
         cache.clear();
