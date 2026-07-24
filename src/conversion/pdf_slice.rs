@@ -2,7 +2,7 @@
 
 use super::{
     ConversionError, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command_cancellable,
+    run_command_cancellable, unique_temp_dir,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -133,24 +133,6 @@ fn validate_page_range(from: u32, to: Option<u32>) -> Result<(), ConversionError
         }
     }
     Ok(())
-}
-
-fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
-    let path = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir(&path).map_err(|error| {
-        ConversionError::new(format!(
-            "could not create temporary PDF slice directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(path)
 }
 
 struct TempDirGuard(PathBuf);

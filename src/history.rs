@@ -4,7 +4,8 @@
 //! virtual table for full-text search. Legacy binary blobs are imported once and
 //! then moved aside so they cannot block subsequent launches.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter};
+use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -220,9 +221,19 @@ pub fn load_history() -> LoadedHistory {
     }
 }
 
-/// Persist the in-memory history list to SQLite. The `next_id` is retained from
-/// the in-memory view but recomputed from the stored IDs on load.
-pub fn save_history(entries: &[StoredHistoryEntry], _next_id: u64) -> io::Result<()> {
+/// Incrementally persist history changes to SQLite.
+///
+/// Only the rows named in `changed_ids` (upserted from `entries`) and
+/// `deleted_ids` (removed) are touched; every other stored row is left intact.
+/// This avoids the O(n) rewrite of [`save_history`], which deletes and
+/// re-inserts every row on each save. IDs present in `changed_ids` but missing
+/// from `entries` are skipped, and IDs listed in both `deleted_ids` and
+/// `changed_ids` are deleted (deletions run first).
+pub fn save_history_delta(
+    entries: &[StoredHistoryEntry],
+    changed_ids: &[u64],
+    deleted_ids: &[u64],
+) -> io::Result<()> {
     let Some(db_path) = history_db_path() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -237,19 +248,64 @@ pub fn save_history(entries: &[StoredHistoryEntry], _next_id: u64) -> io::Result
     let tx = conn
         .transaction()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    tx.execute("DELETE FROM history", [])
+
+    delete_history_entries(&tx, deleted_ids)
         .map_err(|error| io::Error::other(error.to_string()))?;
-    for entry in entries {
-        if insert_entry(&tx, entry)
-            .map_err(|error| io::Error::other(error.to_string()))
-            .is_err()
-        {
-            break;
+
+    if !changed_ids.is_empty() {
+        let by_id: HashMap<u64, &StoredHistoryEntry> =
+            entries.iter().map(|entry| (entry.id, entry)).collect();
+        for id in changed_ids {
+            let Some(entry) = by_id.get(id) else {
+                continue;
+            };
+            upsert_history_entry(&tx, entry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
         }
     }
+
     tx.commit()
         .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
+}
+
+/// Persist the in-memory history list to SQLite by fully reconciling the stored
+/// rows with `entries`: every entry is upserted and any stored row absent from
+/// `entries` is deleted. This preserves the historical full-replace semantics
+/// while routing through [`save_history_delta`]. Prefer `save_history_delta`
+/// directly when the caller can track dirty and deleted IDs. The `next_id` is
+/// retained from the in-memory view but recomputed from the stored IDs on load.
+pub fn save_history(entries: &[StoredHistoryEntry], _next_id: u64) -> io::Result<()> {
+    let Some(db_path) = history_db_path() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not locate the user home directory",
+        ));
+    };
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let changed_ids: Vec<u64> = entries.iter().map(|entry| entry.id).collect();
+
+    let existing_ids = {
+        let conn = open_history(&db_path).map_err(|error| io::Error::other(error.to_string()))?;
+        stored_history_ids(&conn).map_err(|error| io::Error::other(error.to_string()))?
+    };
+    let kept: std::collections::HashSet<u64> = changed_ids.iter().copied().collect();
+    let deleted_ids: Vec<u64> = existing_ids
+        .into_iter()
+        .filter(|id| !kept.contains(id))
+        .collect();
+
+    save_history_delta(entries, &changed_ids, &deleted_ids)
+}
+
+/// Return the IDs of every row currently stored in the history table.
+fn stored_history_ids(conn: &Connection) -> Result<Vec<u64>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT id FROM history")?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(|id| id as u64))?;
+    rows.collect()
 }
 
 /// Remove the on-disk history store (no-op if missing).
@@ -263,7 +319,52 @@ pub fn clear_history_store() -> io::Result<()> {
     Ok(())
 }
 
+/// Columns written for a history row, shared by the plain-insert and upsert paths.
+const HISTORY_ROW_COLUMNS: &str = "id, source_kind, source, name, detail, extension_label,
+            badge_color, badge_text_color, output_format, module_id,
+            file_name, format, artifact_bytes, byte_len, error_message,
+            outcome_kind, archived";
+const HISTORY_ROW_PLACEHOLDERS: &str =
+    "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17";
+
 fn insert_entry(tx: &Connection, entry: &StoredHistoryEntry) -> Result<(), rusqlite::Error> {
+    write_entry_row(tx, entry, false)
+}
+
+/// Insert `entry`, or update the existing row with the same `id` in place.
+///
+/// `created_at` is intentionally left untouched on update so ordering by
+/// insertion time is preserved for pre-existing rows.
+fn upsert_history_entry(
+    tx: &Connection,
+    entry: &StoredHistoryEntry,
+) -> Result<(), rusqlite::Error> {
+    write_entry_row(tx, entry, true)
+}
+
+/// Delete history rows whose `id` appears in `ids`, chunking the `IN (...)`
+/// clause so very large lists stay within SQLite's bound-parameter limit.
+fn delete_history_entries(tx: &Connection, ids: &[u64]) -> Result<(), rusqlite::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    const CHUNK: usize = 512;
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM history WHERE id IN ({placeholders})");
+        let bound = chunk.iter().map(|&id| id as i64);
+        tx.execute(&sql, params_from_iter(bound))?;
+    }
+    Ok(())
+}
+
+fn write_entry_row(
+    tx: &Connection,
+    entry: &StoredHistoryEntry,
+    upsert: bool,
+) -> Result<(), rusqlite::Error> {
     let (source_kind, source) = match &entry.source {
         StoredSource::File(path) => (0i64, store_source_path(path)),
         StoredSource::Url(url) => (1i64, url.clone()),
@@ -308,13 +409,33 @@ fn insert_entry(tx: &Connection, entry: &StoredHistoryEntry) -> Result<(), rusql
             ),
         };
 
+    let conflict = if upsert {
+        " ON CONFLICT(id) DO UPDATE SET
+            source_kind = excluded.source_kind,
+            source = excluded.source,
+            name = excluded.name,
+            detail = excluded.detail,
+            extension_label = excluded.extension_label,
+            badge_color = excluded.badge_color,
+            badge_text_color = excluded.badge_text_color,
+            output_format = excluded.output_format,
+            module_id = excluded.module_id,
+            file_name = excluded.file_name,
+            format = excluded.format,
+            artifact_bytes = excluded.artifact_bytes,
+            byte_len = excluded.byte_len,
+            error_message = excluded.error_message,
+            outcome_kind = excluded.outcome_kind,
+            archived = excluded.archived"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "INSERT INTO history ({HISTORY_ROW_COLUMNS}) VALUES ({HISTORY_ROW_PLACEHOLDERS}){conflict}"
+    );
+
     tx.execute(
-        "INSERT INTO history (
-            id, source_kind, source, name, detail, extension_label,
-            badge_color, badge_text_color, output_format, module_id,
-            file_name, format, artifact_bytes, byte_len, error_message,
-            outcome_kind, archived
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        &sql,
         params![
             entry.id as i64,
             source_kind,
@@ -754,6 +875,58 @@ mod tests {
         assert!(delete_history(&conn, 1).unwrap());
         let all = history_entries(&conn, true).unwrap();
         assert!(all.is_empty());
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates_in_place() {
+        let conn = open_history(":memory:").unwrap();
+        upsert_history_entry(&conn, &sample_entry(1, "before", false)).unwrap();
+
+        // Pin created_at so we can prove the upsert does not overwrite it.
+        conn.execute("UPDATE history SET created_at = 100 WHERE id = 1", [])
+            .unwrap();
+
+        upsert_history_entry(&conn, &sample_entry(1, "after", true)).unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "upsert must not duplicate the row");
+
+        let all = history_entries(&conn, true).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "after");
+        assert!(all[0].archived);
+
+        let created_at: i64 = conn
+            .query_row("SELECT created_at FROM history WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(created_at, 100, "created_at must be preserved on update");
+    }
+
+    #[test]
+    fn delete_history_entries_removes_only_listed_ids() {
+        let conn = open_history(":memory:").unwrap();
+        for id in 1..=5 {
+            insert_entry(&conn, &sample_entry(id, "entry", false)).unwrap();
+        }
+
+        delete_history_entries(&conn, &[2, 4]).unwrap();
+
+        let mut remaining: Vec<u64> = history_entries(&conn, true)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec![1, 3, 5]);
+
+        // Empty list and unknown ids are no-ops.
+        delete_history_entries(&conn, &[]).unwrap();
+        delete_history_entries(&conn, &[999]).unwrap();
+        assert_eq!(history_entries(&conn, true).unwrap().len(), 3);
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! supplies install hints for both the Settings UI and `shift-cli doctor`.
 
 use super::pandoc::{pdf_engine_candidates, resolve_pdf_engine};
-use super::process::{find_executable, is_runnable, resolve_tool_path, run_command};
+use super::process::{
+    clear_tool_discovery_cache, find_executable, is_runnable, resolve_tool_path, run_command,
+};
 use super::{ConversionRegistry, OutputFormat};
 use std::ffi::OsStr;
 use std::fmt;
@@ -107,6 +109,10 @@ impl DiagnosticsReport {
     /// Engine and PDF probes run in parallel so Settings refresh is not blocked
     /// on sequential multi-second Python cold starts.
     pub fn collect() -> Self {
+        // A manual Refresh (or the first probe at startup) must see the current
+        // PATH / install state, not a memoized answer from earlier in the process.
+        clear_tool_discovery_cache();
+
         let engines = thread::scope(|scope| {
             let markitdown = scope.spawn(probe_markitdown);
             let pandoc = scope.spawn(probe_pandoc);

@@ -10,6 +10,7 @@ use super::{
     OutputFormat, ProgressSink, default_output_path, looks_like_url, paths_refer_to_same_file,
 };
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -697,12 +698,113 @@ fn write_artifact(
     }
 }
 
+/// Immutable per-item snapshot handed to a worker thread.
+struct BatchTask {
+    id: BatchItemId,
+    source: BatchSource,
+    format: OutputFormat,
+    options: ConversionOptions,
+    destination: PathBuf,
+    force: bool,
+}
+
+/// Terminal result of converting one item, reported back to the main thread.
+enum BatchOutcome {
+    Succeeded {
+        path: PathBuf,
+        module_id: String,
+        byte_len: usize,
+    },
+    Cancelled,
+    Failed {
+        error: String,
+    },
+}
+
+/// Message sent from worker threads to the main thread that owns the queue.
+///
+/// Workers never touch [`BatchQueue`] or `on_event`; the main thread applies
+/// every state transition and emits every event so ordering across threads
+/// stays correct even though items run concurrently.
+enum WorkerMsg {
+    Started {
+        id: BatchItemId,
+    },
+    Progress {
+        id: BatchItemId,
+        fraction: Option<f32>,
+        label: String,
+    },
+    Finished {
+        id: BatchItemId,
+        outcome: BatchOutcome,
+    },
+}
+
+/// Run one snapshotted task on a worker thread, honoring cooperative cancel.
+fn run_task(
+    registry: &ConversionRegistry,
+    task: &BatchTask,
+    cancel: &Arc<AtomicBool>,
+    tx: &std::sync::mpsc::Sender<WorkerMsg>,
+) -> BatchOutcome {
+    let mut options = task.options.clone();
+    options.cancel = Some(Arc::clone(cancel));
+
+    // Bridge module progress into batch events; the main thread relays them.
+    let progress_tx = tx.clone();
+    let progress_id = task.id;
+    let sink: ProgressSink = Arc::new(move |progress| {
+        let (fraction, label) = match progress {
+            ConversionProgress::Phase(label) => (None, label),
+            ConversionProgress::Fraction { fraction, label } => (Some(fraction), label),
+        };
+        let _ = progress_tx.send(WorkerMsg::Progress {
+            id: progress_id,
+            fraction,
+            label,
+        });
+    });
+    options.progress = Some(sink);
+
+    let result =
+        convert_source(registry, &task.source, task.format, &options).and_then(|artifact| {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(ConversionError::cancelled());
+            }
+            write_artifact(
+                &artifact,
+                &task.destination,
+                task.source.as_file(),
+                task.force,
+            )
+            .map(|path| (path, artifact.module_id.to_owned(), artifact.bytes.len()))
+        });
+
+    match result {
+        Ok((path, module_id, byte_len)) => BatchOutcome::Succeeded {
+            path,
+            module_id,
+            byte_len,
+        },
+        Err(error) if error.is_cancelled() || cancel.load(Ordering::SeqCst) => {
+            BatchOutcome::Cancelled
+        }
+        Err(error) => BatchOutcome::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
 /// Process every `Queued` item until the queue is idle or fully cancelled.
 ///
-/// Conversions run sequentially. `cancel` aborts the active external process
-/// (when modules honor [`ConversionOptions::cancel`]) and marks remaining
-/// queued items as cancelled. The `on_event` callback receives every state
-/// change so UIs and CLIs can report progress identically.
+/// Conversions run concurrently across a bounded worker pool (up to
+/// [`std::thread::available_parallelism`] workers). Events do not carry a
+/// strict per-item ordering, but every state transition on [`BatchQueue`] is
+/// applied on the calling thread, so queue state stays correct. `cancel` aborts
+/// active external processes (when modules honor [`ConversionOptions::cancel`])
+/// and marks not-yet-started queued items as cancelled. The `on_event` callback
+/// receives every state change so UIs and CLIs can report progress identically.
 pub fn run_batch(
     queue: &mut BatchQueue,
     registry: &ConversionRegistry,
@@ -713,163 +815,189 @@ pub fn run_batch(
     // Resolve cross-source destination collisions before any writes.
     queue.uniquify_planned_destinations();
 
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            let cancelled: Vec<_> = queue
-                .items
-                .iter()
-                .filter(|item| matches!(item.state, BatchItemState::Queued))
-                .map(|item| (item.id, item.source.display_name()))
-                .collect();
-            for (id, source_name) in cancelled {
-                if let Some(item) = queue.get_mut(id) {
-                    item.state = BatchItemState::Cancelled;
-                    summary.cancelled += 1;
-                    on_event(BatchEvent::ItemCancelled { id, source_name });
+    // Snapshot the queued work in order. Everything a worker needs is copied so
+    // the queue itself never has to be shared across threads.
+    let tasks: Vec<BatchTask> = queue
+        .items
+        .iter()
+        .filter(|item| matches!(item.state, BatchItemState::Queued))
+        .map(|item| BatchTask {
+            id: item.id,
+            source: item.source.clone(),
+            format: item.resolved_format(),
+            options: item.options.clone(),
+            destination: item.destination.clone(),
+            force: item.force,
+        })
+        .collect();
+
+    if !tasks.is_empty() {
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let worker_count = parallelism.min(tasks.len()).max(1);
+
+        // Shared cursor: each worker claims the next index with fetch_add.
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let tx = tx.clone();
+                let cursor = &cursor;
+                let tasks = &tasks;
+                scope.spawn(move || {
+                    loop {
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let idx = cursor.fetch_add(1, Ordering::SeqCst);
+                        if idx >= tasks.len() {
+                            break;
+                        }
+                        // Leave not-yet-started items Queued so they become
+                        // Cancelled once the pool drains.
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let task = &tasks[idx];
+                        let _ = tx.send(WorkerMsg::Started { id: task.id });
+                        // Isolate a panicking module: a conversion bug should
+                        // become a single failed item, not an aborted batch.
+                        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            run_task(registry, task, cancel, &tx)
+                        }))
+                        .unwrap_or_else(|payload| {
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                                .unwrap_or("conversion worker panicked");
+                            BatchOutcome::Failed {
+                                error: message.to_string(),
+                            }
+                        });
+                        let _ = tx.send(WorkerMsg::Finished {
+                            id: task.id,
+                            outcome,
+                        });
+                    }
+                });
+            }
+            // Drop the main sender so `rx` closes once every worker exits.
+            drop(tx);
+
+            for msg in rx {
+                match msg {
+                    WorkerMsg::Started { id } => {
+                        let mut started = None;
+                        if let Some(item) = queue.get_mut(id) {
+                            item.state = BatchItemState::Running;
+                            item.attempts = item.attempts.saturating_add(1);
+                            started = Some((item.source.display_name(), item.destination.clone()));
+                        }
+                        if let Some((source_name, destination)) = started {
+                            on_event(BatchEvent::ItemStarted {
+                                id,
+                                source_name,
+                                destination,
+                            });
+                            on_event(BatchEvent::Progress(queue.progress()));
+                        }
+                    }
+                    WorkerMsg::Progress {
+                        id,
+                        fraction,
+                        label,
+                    } => {
+                        on_event(BatchEvent::ItemProgress {
+                            id,
+                            fraction,
+                            label,
+                        });
+                    }
+                    WorkerMsg::Finished { id, outcome } => {
+                        let source_name = queue
+                            .get(id)
+                            .map(|item| item.source.display_name())
+                            .unwrap_or_default();
+                        match outcome {
+                            BatchOutcome::Succeeded {
+                                path,
+                                module_id,
+                                byte_len,
+                            } => {
+                                // Write already committed: always report success so
+                                // cancel-then-retry does not leave an on-disk file
+                                // marked Cancelled (which would fail with "already
+                                // exists" under force: false).
+                                if let Some(item) = queue.get_mut(id) {
+                                    item.state = BatchItemState::Succeeded {
+                                        written_path: path.clone(),
+                                        module_id: module_id.clone(),
+                                        byte_len,
+                                    };
+                                    item.destination = path.clone();
+                                }
+                                summary.succeeded += 1;
+                                on_event(BatchEvent::ItemSucceeded {
+                                    id,
+                                    source_name,
+                                    path,
+                                    module_id,
+                                    byte_len,
+                                });
+                            }
+                            BatchOutcome::Cancelled => {
+                                // Drop incomplete partial siblings; final path only
+                                // exists after a successful atomic rename.
+                                if let Some(destination) =
+                                    queue.get(id).map(|item| item.destination.clone())
+                                {
+                                    let _ = super::remove_partial_outputs(&destination);
+                                }
+                                if let Some(item) = queue.get_mut(id) {
+                                    item.state = BatchItemState::Cancelled;
+                                }
+                                summary.cancelled += 1;
+                                on_event(BatchEvent::ItemCancelled { id, source_name });
+                            }
+                            BatchOutcome::Failed { error } => {
+                                if let Some(item) = queue.get_mut(id) {
+                                    item.state = BatchItemState::Failed {
+                                        error: error.clone(),
+                                    };
+                                }
+                                summary.failed += 1;
+                                on_event(BatchEvent::ItemFailed {
+                                    id,
+                                    source_name,
+                                    error,
+                                });
+                            }
+                        }
+                        on_event(BatchEvent::Progress(queue.progress()));
+                    }
                 }
             }
-            on_event(BatchEvent::Progress(queue.progress()));
-            break;
-        }
-
-        let next_id = queue
-            .items
-            .iter()
-            .find(|item| matches!(item.state, BatchItemState::Queued))
-            .map(|item| item.id);
-
-        let Some(id) = next_id else {
-            break;
-        };
-
-        // Snapshot fields needed for conversion before mutating state.
-        let Some(item) = queue.get(id) else {
-            break;
-        };
-        let source = item.source.clone();
-        let format = item.resolved_format();
-        let mut options = item.options.clone();
-        let destination = item.destination.clone();
-        let force = item.force;
-        let source_name = item.source.display_name();
-
-        options.cancel = Some(Arc::clone(cancel));
-        // Bridge module progress into batch events while conversion is running.
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<BatchEvent>();
-        let progress_id = id;
-        let progress_tx_sink = progress_tx.clone();
-        let sink: ProgressSink = Arc::new(move |progress| {
-            let (fraction, label) = match progress {
-                ConversionProgress::Phase(label) => (None, label),
-                ConversionProgress::Fraction { fraction, label } => (Some(fraction), label),
-            };
-            let _ = progress_tx_sink.send(BatchEvent::ItemProgress {
-                id: progress_id,
-                fraction,
-                label,
-            });
         });
-        options.progress = Some(sink);
-        drop(progress_tx);
+    }
 
-        let Some(item) = queue.get_mut(id) else {
-            break;
-        };
-        item.state = BatchItemState::Running;
-        item.attempts = item.attempts.saturating_add(1);
-        on_event(BatchEvent::ItemStarted {
-            id,
-            source_name: source_name.clone(),
-            destination: destination.clone(),
-        });
-        on_event(BatchEvent::Progress(queue.progress()));
-
-        if cancel.load(Ordering::SeqCst) {
+    // Any items never picked up (cancel fired before a worker claimed them)
+    // remain Queued; mark them Cancelled to match sequential behavior.
+    let leftover: Vec<_> = queue
+        .items
+        .iter()
+        .filter(|item| matches!(item.state, BatchItemState::Queued))
+        .map(|item| (item.id, item.source.display_name()))
+        .collect();
+    if !leftover.is_empty() {
+        for (id, source_name) in leftover {
             if let Some(item) = queue.get_mut(id) {
                 item.state = BatchItemState::Cancelled;
             }
             summary.cancelled += 1;
-            on_event(BatchEvent::ItemCancelled {
-                id,
-                source_name: source_name.clone(),
-            });
-            on_event(BatchEvent::Progress(queue.progress()));
-            continue;
-        }
-
-        let write_destination = destination.clone();
-        let result = std::thread::scope(|scope| {
-            let worker = scope.spawn(move || {
-                convert_source(registry, &source, format, &options).and_then(|artifact| {
-                    if cancel.load(Ordering::SeqCst) {
-                        return Err(ConversionError::cancelled());
-                    }
-                    write_artifact(&artifact, &write_destination, source.as_file(), force)
-                        .map(|path| (path, artifact.module_id.to_owned(), artifact.bytes.len()))
-                })
-            });
-
-            while !worker.is_finished() {
-                match progress_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(event) => on_event(event),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            for event in progress_rx.try_iter() {
-                on_event(event);
-            }
-            worker
-                .join()
-                .unwrap_or_else(|_| Err(ConversionError::new("conversion worker panicked")))
-        });
-
-        match result {
-            Ok((path, module_id, byte_len)) => {
-                // Write already committed: always report success so cancel-then-retry
-                // does not leave an on-disk file marked Cancelled (which would fail
-                // with "already exists" under force: false).
-                if let Some(item) = queue.get_mut(id) {
-                    item.state = BatchItemState::Succeeded {
-                        written_path: path.clone(),
-                        module_id: module_id.clone(),
-                        byte_len,
-                    };
-                    item.destination = path.clone();
-                    summary.succeeded += 1;
-                    on_event(BatchEvent::ItemSucceeded {
-                        id,
-                        source_name,
-                        path,
-                        module_id,
-                        byte_len,
-                    });
-                }
-            }
-            Err(error) if error.is_cancelled() || cancel.load(Ordering::SeqCst) => {
-                // Drop incomplete partial siblings; final path only exists after
-                // a successful atomic rename.
-                let _ = super::remove_partial_outputs(&destination);
-                if let Some(item) = queue.get_mut(id) {
-                    item.state = BatchItemState::Cancelled;
-                }
-                summary.cancelled += 1;
-                on_event(BatchEvent::ItemCancelled { id, source_name });
-            }
-            Err(error) => {
-                let message = error.to_string();
-                if let Some(item) = queue.get_mut(id) {
-                    item.state = BatchItemState::Failed {
-                        error: message.clone(),
-                    };
-                }
-                summary.failed += 1;
-                on_event(BatchEvent::ItemFailed {
-                    id,
-                    source_name,
-                    error: message,
-                });
-            }
+            on_event(BatchEvent::ItemCancelled { id, source_name });
         }
         on_event(BatchEvent::Progress(queue.progress()));
     }
@@ -1042,6 +1170,69 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, BatchEvent::ItemSucceeded { .. }))
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_batch_executes_items_in_parallel() {
+        // Each conversion sleeps for `per_item`; run enough items that a
+        // sequential runner would clearly exceed the parallel wall time.
+        const ITEMS: usize = 4;
+        const PER_ITEM_MS: u64 = 150;
+
+        let dir = unique_dir("parallel");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        for i in 0..ITEMS {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "slow",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN],
+            payload: b"# ok\n",
+            fail_once: None,
+            delay_ms: PER_ITEM_MS,
+        });
+
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out.clone()),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        for i in 0..ITEMS {
+            queue.enqueue(BatchSource::File(dir.join(format!("f{i}.txt"))), &opts);
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let start = std::time::Instant::now();
+        let summary = run_batch(&mut queue, &registry, &cancel, |_| {});
+        let elapsed = start.elapsed();
+
+        // Correctness holds regardless of core count.
+        assert_eq!(summary.succeeded, ITEMS);
+        assert_eq!(summary.failed, 0);
+        assert!(
+            queue
+                .items()
+                .iter()
+                .all(|item| matches!(item.state, BatchItemState::Succeeded { .. }))
+        );
+
+        // On multi-core machines the pool must beat the sequential baseline.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if cores >= 2 {
+            let sequential = std::time::Duration::from_millis(PER_ITEM_MS * ITEMS as u64);
+            assert!(
+                elapsed < sequential,
+                "parallel run took {elapsed:?}, expected well under sequential {sequential:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

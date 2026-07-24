@@ -4,7 +4,7 @@ use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
     InvocationRecord, OutputFormat, command_argv_parts, format_argv_display, map_spawn_error,
     max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command_cancellable,
+    run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -677,14 +677,13 @@ fn zip_png_frames(frames_dir: &Path, zip_path: &Path) -> Result<(), ConversionEr
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("frame.png");
-        let bytes = fs::read(path).map_err(|error| {
+        let mut reader = BufReader::new(fs::File::open(path).map_err(|error| {
             ConversionError::new(format!("could not read frame {}: {error}", path.display()))
-        })?;
+        })?);
         zip.start_file(name, options).map_err(|error| {
             ConversionError::new(format!("could not add {name} to ZIP: {error}"))
         })?;
-        use std::io::Write;
-        zip.write_all(&bytes).map_err(|error| {
+        std::io::copy(&mut reader, &mut zip).map_err(|error| {
             ConversionError::new(format!("could not write {name} into ZIP: {error}"))
         })?;
     }
@@ -1000,24 +999,6 @@ impl ConversionModule for FfmpegModule {
     ) -> Result<ConversionArtifact, ConversionError> {
         self.convert_with_cli(input, output_format, options)
     }
-}
-
-fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
-    let base = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    fs::create_dir_all(&base).map_err(|error| {
-        ConversionError::new(format!(
-            "could not create temporary directory {}: {error}",
-            base.display()
-        ))
-    })?;
-    Ok(base)
 }
 
 struct TempDirGuard(PathBuf);

@@ -37,5 +37,7 @@ objc = "0.2"
 gpui = { version = "=0.2.2", features = ["test-support"] }
 
 [profile.release]
-lto = "thin"
+lto = true
+codegen-units = 1
+panic = "unwind"
 strip = true

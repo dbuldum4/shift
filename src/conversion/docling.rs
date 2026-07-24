@@ -2,7 +2,7 @@ use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
     OutputFormat, command_argv_parts, format_argv_display, map_spawn_error, max_output_bytes,
     process_timeout, read_file_limited, redact_flag_value, resolve_tool_executable,
-    run_command_cancellable,
+    run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -355,24 +355,6 @@ impl ConversionModule for DoclingModule {
         }
         self.convert_with_cli(input, output_format, options)
     }
-}
-
-fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
-    let base = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    fs::create_dir_all(&base).map_err(|error| {
-        ConversionError::new(format!(
-            "could not create temporary directory {}: {error}",
-            base.display()
-        ))
-    })?;
-    Ok(base)
 }
 
 struct TempDirGuard(PathBuf);
