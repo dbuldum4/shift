@@ -27,19 +27,26 @@ fn main() -> ExitCode {
 fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     if arguments.is_empty() {
         print_help();
-        return Ok(ExitCode::SUCCESS);
+        return Ok(ExitCode::FAILURE);
     }
 
     if arguments
         .first()
         .is_some_and(|value| matches!(value.to_string_lossy().as_ref(), "-h" | "--help" | "help"))
-        && arguments.len() == 1
     {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
 
-    if arguments.first().is_some_and(|value| value == "formats") && arguments.len() == 1 {
+    if arguments
+        .first()
+        .is_some_and(|value| value == "--version" || value == "version")
+    {
+        println!("shift-cli {}", env!("CARGO_PKG_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if arguments.first().is_some_and(|value| value == "formats") {
         print_formats();
         return Ok(ExitCode::SUCCESS);
     }
@@ -493,14 +500,36 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                 parsed.pdf.page_from = from;
                 parsed.pdf.page_to = to;
             }
+            "--" => {
+                cursor += 1;
+                while cursor < arguments.len() {
+                    parsed.inputs.push(arguments[cursor].clone());
+                    cursor += 1;
+                }
+                break;
+            }
             value if value.starts_with('-') => {
-                return Err(format!("unknown argument: {value}"));
+                return Err(format!(
+                    "unknown argument: {value} (try `shift-cli --help`)"
+                ));
             }
             _ => {
                 parsed.inputs.push(arguments[cursor].clone());
             }
         }
         cursor += 1;
+    }
+
+    if parsed.pdf.page_from == Some(0) {
+        return Err("--page-from must be a 1-based page number".to_owned());
+    }
+    if parsed.pdf.page_to == Some(0) {
+        return Err("--page-to must be a 1-based page number".to_owned());
+    }
+    if let (Some(from), Some(to)) = (parsed.pdf.page_from, parsed.pdf.page_to) {
+        if from > to {
+            return Err("--page-from must be <= --page-to".to_owned());
+        }
     }
 
     if parsed.inputs.is_empty() {
@@ -857,7 +886,7 @@ fn run_doctor(arguments: &[OsString]) -> Result<ExitCode, String> {
         }
     }
 
-    Ok(ExitCode::from(report.exit_code() as u8))
+    Ok(ExitCode::from(report.exit_code().clamp(0, 255) as u8))
 }
 
 fn print_doctor_help() {

@@ -242,6 +242,14 @@ fn export_file_matches(path: &Path, bytes: &[u8], hash_hex: &str) -> bool {
     export_file_matches_len(path, bytes.len() as u64, hash_hex)
 }
 
+fn read_hash_sidecar(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let dir = path.parent().unwrap_or(Path::new(""));
+    fs::read_to_string(hash_sidecar_path(dir, file_name))
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
 fn export_file_matches_len(path: &Path, len: u64, hash_hex: &str) -> bool {
     if !path.is_file() {
         return false;
@@ -252,8 +260,16 @@ fn export_file_matches_len(path: &Path, len: u64, hash_hex: &str) -> bool {
     if meta.len() != len {
         return false;
     }
-    // Always re-hash the staged file. A sidecar alone is not enough: a same-length
-    // edit (or a stale sidecar left after a partial write) would otherwise pass.
+    // A mismatching sidecar is authoritative: we only write it when staging, so
+    // it means the file content is definitely different. A matching sidecar is
+    // not enough by itself (the file may have been edited without updating the
+    // sidecar, or mtimes may have equal resolution), so we always verify by
+    // hashing the actual file content.
+    if let Some(sidecar) = read_hash_sidecar(path) {
+        if sidecar != hash_hex {
+            return false;
+        }
+    }
     let Ok(actual) = hash_file(path) else {
         return false;
     };
@@ -375,9 +391,8 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
         }
     }
 
-    // Drop empty export / paste-staging directories left behind.
-    let _ = remove_empty_subdir(&dir, EXPORT_SUBDIR);
-    let _ = remove_empty_subdir(&dir, PASTE_STAGING_SUBDIR);
+    // Drop any empty subdirectories left behind.
+    remove_empty_subdirs(&dir);
 
     Ok(stats)
 }
@@ -461,13 +476,19 @@ fn remove_cache_path(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
-fn remove_empty_subdir(root: &Path, name: &str) -> io::Result<()> {
-    let dir = root.join(name);
-    if is_real_dir(&dir) {
-        // Only remove if empty; ignore errors if not.
-        let _ = fs::remove_dir(&dir);
+fn remove_empty_subdirs(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && !file_type.is_symlink() {
+            // Only removes if empty; ignore errors otherwise.
+            let _ = fs::remove_dir(entry.path());
+        }
     }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

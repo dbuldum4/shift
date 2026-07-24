@@ -358,8 +358,16 @@ pub fn application_support_dir() -> Option<PathBuf> {
     if let Some(override_dir) = std::env::var_os("SHIFT_APP_SUPPORT_DIR") {
         return Some(PathBuf::from(override_dir));
     }
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/Shift"))
+    if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/Shift"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("shift"))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/shift"))
+            })
+    }
 }
 
 /// Load session settings from `path`, or defaults when missing / invalid.

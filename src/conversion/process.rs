@@ -158,7 +158,8 @@ fn wait_with_timeout(
             Err(error) => return WaitOutcome::Error(error),
         }
 
-        if start.elapsed() >= timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
             force_kill(child);
             return WaitOutcome::TimedOut;
         }
@@ -170,7 +171,9 @@ fn wait_with_timeout(
             return WaitOutcome::Cancelled;
         }
 
-        thread::sleep(Duration::from_millis(50));
+        // Sleep only as long as is left of the timeout so cancel/timeout fire
+        // promptly instead of overshooting by up to 50 ms.
+        thread::sleep(Duration::from_millis(50).min(timeout - elapsed));
     }
 }
 
@@ -369,7 +372,7 @@ pub fn find_executable(name: impl AsRef<OsStr>) -> Option<PathBuf> {
     let cache = find_executable_cache();
     if let Some(cached) = cache
         .lock()
-        .expect("executable discovery cache poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .get(name)
     {
         return cached.clone();
@@ -377,7 +380,7 @@ pub fn find_executable(name: impl AsRef<OsStr>) -> Option<PathBuf> {
     let resolved = find_executable_uncached(name);
     cache
         .lock()
-        .expect("executable discovery cache poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .insert(name.to_owned(), resolved.clone());
     resolved
 }
@@ -395,6 +398,11 @@ fn find_executable_uncached(name: &OsStr) -> Option<PathBuf> {
 
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
+            // Empty PATH components conventionally mean the current directory,
+            // which would let a bare tool name resolve to a file in cwd.
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
             let candidate = dir.join(name);
             if is_runnable(&candidate) {
                 return Some(candidate);
@@ -429,18 +437,22 @@ pub fn resolve_tool_path(
 ) -> Option<PathBuf> {
     let key = ResolveKey::capture(env_override, default_name, local_candidates);
     let cache = resolve_path_cache();
-    if let Some(cached) = cache.lock().expect("tool path cache poisoned").get(&key) {
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+    {
         return cached.clone();
     }
     let resolved = resolve_tool_path_uncached(env_override, default_name, local_candidates);
     cache
         .lock()
-        .expect("tool path cache poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .insert(key, resolved.clone());
     resolved
 }
 
-/// Cache key for [`resolve_tool_path`] / [`resolve_tool_executable`].
+/// Cache key for [`resolve_tool_path`].
 ///
 /// Includes the env override name, default name, and local candidates as
 /// required, plus the env override's current value so a changed override does
@@ -467,11 +479,6 @@ impl ResolveKey {
 
 fn resolve_path_cache() -> &'static Mutex<HashMap<ResolveKey, Option<PathBuf>>> {
     static CACHE: OnceLock<Mutex<HashMap<ResolveKey, Option<PathBuf>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn resolve_executable_cache() -> &'static Mutex<HashMap<ResolveKey, OsString>> {
-    static CACHE: OnceLock<Mutex<HashMap<ResolveKey, OsString>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -522,15 +529,14 @@ pub fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
 /// tool must also rebuild their registry. Refreshing diagnostics via this clear
 /// re-probes the executable paths and readiness.
 pub fn clear_tool_discovery_cache() {
-    if let Ok(mut cache) = find_executable_cache().lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = resolve_path_cache().lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = resolve_executable_cache().lock() {
-        cache.clear();
-    }
+    find_executable_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    resolve_path_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
 }
 
 fn resolve_tool_path_uncached(
@@ -578,23 +584,9 @@ pub fn resolve_tool_executable(
     default_name: &str,
     local_candidates: &[PathBuf],
 ) -> OsString {
-    let key = ResolveKey::capture(env_override, default_name, local_candidates);
-    let cache = resolve_executable_cache();
-    if let Some(cached) = cache
-        .lock()
-        .expect("tool executable cache poisoned")
-        .get(&key)
-    {
-        return cached.clone();
-    }
-    let resolved = resolve_tool_path(env_override, default_name, local_candidates)
+    resolve_tool_path(env_override, default_name, local_candidates)
         .map(|path| path.into_os_string())
-        .unwrap_or_else(|| OsString::from(default_name));
-    cache
-        .lock()
-        .expect("tool executable cache poisoned")
-        .insert(key, resolved.clone());
-    resolved
+        .unwrap_or_else(|| OsString::from(default_name))
 }
 
 #[cfg(all(test, unix))]

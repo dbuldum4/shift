@@ -1,8 +1,8 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
-    OutputFormat, command_argv_parts, format_argv_display, map_spawn_error, max_output_bytes,
-    process_timeout, read_file_limited, resolve_tool_executable, run_command_cancellable,
-    unique_temp_dir,
+    OutputFormat, TempDirGuard, command_argv_parts, format_argv_display, map_spawn_error,
+    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -194,6 +194,39 @@ impl DoclingModule {
         output
     }
 
+    /// Discover the file Docling actually wrote, in case it renamed the output
+    /// (for example when a same-named file already existed in the temp dir).
+    fn discover_output(work_dir: &Path, expected: &Path) -> Option<PathBuf> {
+        let expected_ext = expected.extension().and_then(|value| value.to_str())?;
+        let expected_name = expected.file_name()?;
+
+        let mut matches: Vec<PathBuf> = fs::read_dir(work_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().ok().is_some_and(|t| t.is_file()))
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(expected_ext))
+            })
+            .collect();
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        if let Some(exact) = matches
+            .iter()
+            .find(|path| path.file_name() == Some(expected_name))
+        {
+            return Some(exact.clone());
+        }
+
+        matches.sort();
+        matches.into_iter().next()
+    }
+
     fn convert_with_cli(
         &self,
         input: &Path,
@@ -284,7 +317,9 @@ impl DoclingModule {
             )));
         }
 
-        let produced = work_dir.join(Self::output_file_name(stem, output_format));
+        let expected = Self::output_file_name(stem, output_format);
+        let produced =
+            Self::discover_output(&work_dir, &expected).unwrap_or_else(|| work_dir.join(&expected));
         let bytes = read_file_limited(&produced, max_output_bytes()).map_err(|error| {
             ConversionError::new(format!(
                 "Docling finished but did not write {}: {error}",
@@ -343,14 +378,6 @@ impl ConversionModule for DoclingModule {
             )));
         }
         self.convert_with_cli(input, output_format, options)
-    }
-}
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

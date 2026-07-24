@@ -407,7 +407,7 @@ fn url_file_stem(url: &str) -> String {
     let stem: String = last
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.') {
                 ch
             } else {
                 '-'

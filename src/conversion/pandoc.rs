@@ -122,6 +122,14 @@ impl PandocModule {
     }
 }
 
+/// Outputs from Pandoc that downstream modules (MarkItDown, Defuddle, Docling)
+/// can consume as inputs for a second conversion hop.
+const CHAINABLE: &[OutputFormat] = &[
+    OutputFormat::MARKDOWN,
+    OutputFormat::HTML,
+    OutputFormat("plain"),
+];
+
 impl ConversionModule for PandocModule {
     fn id(&self) -> &'static str {
         "pandoc"
@@ -140,7 +148,7 @@ impl ConversionModule for PandocModule {
     }
 
     fn chainable_output_formats(&self) -> &'static [OutputFormat] {
-        OutputFormat::PANDOC
+        CHAINABLE
     }
 
     fn convert(

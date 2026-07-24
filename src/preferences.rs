@@ -52,9 +52,21 @@ fn normalize<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
 }
 
 fn preferences_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support/Shift/module-priority"))
+    if let Some(override_dir) = std::env::var_os("SHIFT_APP_SUPPORT_DIR") {
+        return Some(PathBuf::from(override_dir).join("module-priority"));
+    }
+    if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library/Application Support/Shift/module-priority"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("shift/module-priority"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".config/shift/module-priority"))
+            })
+    }
 }
 
 #[cfg(test)]

@@ -590,10 +590,11 @@ pub struct ConversionOptions {
     pub pdf: PdfInputOptions,
     /// When set and true, external converter processes should abort.
     ///
-    /// Used by the shared batch runner for cooperative cancellation. Ignored by
-    /// equality checks so option snapshots compare by engine knobs only.
+    /// Used by the shared batch runner for cooperative cancellation. Compared
+    /// by pointer identity for equality so snapshots with the same engine knobs
+    /// but different cancel flags are not considered equal.
     pub cancel: Option<Arc<AtomicBool>>,
-    /// Optional progress sink (not compared for equality).
+    /// Optional progress sink (compared by pointer identity for equality).
     pub progress: Option<ProgressSink>,
 }
 
@@ -615,6 +616,14 @@ impl std::fmt::Debug for ConversionOptions {
     }
 }
 
+fn arc_ptr_eq<T: ?Sized>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl PartialEq for ConversionOptions {
     fn eq(&self, other: &Self) -> bool {
         self.ffmpeg == other.ffmpeg
@@ -623,6 +632,8 @@ impl PartialEq for ConversionOptions {
             && self.defuddle == other.defuddle
             && self.docling == other.docling
             && self.pdf == other.pdf
+            && arc_ptr_eq(&self.cancel, &other.cancel)
+            && arc_ptr_eq(&self.progress, &other.progress)
     }
 }
 
@@ -878,20 +889,51 @@ fn format_byte_size(bytes: u64) -> String {
 }
 
 /// Join argv for display; caller must already redact secrets.
+///
+/// Quoting follows POSIX shell rules: safe bare words stay bare; anything with
+/// whitespace or shell metacharacters is wrapped in single quotes, with embedded
+/// single quotes escaped as `'"'"'`.
 pub fn format_argv_display(argv: &[impl AsRef<str>]) -> String {
-    argv.iter()
-        .map(|part| {
-            let part = part.as_ref();
-            if part.is_empty()
-                || part
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\''))
-            {
-                format!("\"{}\"", part.replace('"', "\\\""))
-            } else {
-                part.to_owned()
-            }
+    fn needs_quote(part: &str) -> bool {
+        if part.is_empty() {
+            return true;
+        }
+        part.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\\' | '"'
+                        | '\''
+                        | '`'
+                        | '$'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '!'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '#'
+                )
         })
+    }
+
+    fn quote(part: &str) -> String {
+        if !needs_quote(part) {
+            return part.to_owned();
+        }
+        format!("'{}'", part.replace('\'', "'\"'\"'"))
+    }
+
+    argv.iter()
+        .map(|part| quote(part.as_ref()))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -907,12 +949,20 @@ pub fn command_argv_parts(command: &Command) -> Vec<String> {
 }
 
 /// Replace the value following `flag` in an argv list (e.g. password → `••••`).
+///
+/// Handles both `--flag value` and `--flag=value` forms.
 pub fn redact_flag_value(parts: &mut [String], flag: &str, replacement: &str) {
+    let prefix = format!("{}=", flag);
     let mut index = 0;
-    while index + 1 < parts.len() {
-        if parts[index] == flag {
+    while index < parts.len() {
+        if parts[index] == flag && index + 1 < parts.len() {
             parts[index + 1] = replacement.to_owned();
             index += 2;
+        } else if let Some(rest) = parts[index].strip_prefix(&prefix) {
+            if !rest.is_empty() {
+                parts[index] = format!("{}={}", flag, replacement);
+            }
+            index += 1;
         } else {
             index += 1;
         }
@@ -1457,7 +1507,7 @@ impl fmt::Display for ConversionError {
 
 impl Error for ConversionError {}
 
-struct TempDirGuard(PathBuf);
+pub(crate) struct TempDirGuard(pub(crate) PathBuf);
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
@@ -1484,25 +1534,56 @@ pub fn default_output_path(input: &Path, output: OutputFormat) -> PathBuf {
     }
 }
 
+/// Lexically normalize a path, resolving `.` and `..` segments without
+/// requiring the path to exist. Relative paths are made absolute against the
+/// current directory first so two relative forms that point to the same place
+/// compare equal.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized = PathBuf::from(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 /// True when `left` and `right` name the same filesystem object.
 ///
-/// Used to refuse writing conversion output over the selected source. When the
-/// destination does not exist yet, compares the source's canonical path with
-/// the destination's parent (canonicalized when possible) plus file name.
+/// Used to refuse writing conversion output over the selected source. Starts
+/// with a lexical normalization (covers `a/../out/x.md` vs `out/x.md`), then
+/// falls back to filesystem canonicalization when the paths exist.
 pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
 
-    if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+    let left_norm = normalize_path(left);
+    let right_norm = normalize_path(right);
+    if left_norm == right_norm {
+        return true;
+    }
+
+    if let (Ok(left), Ok(right)) = (
+        std::fs::canonicalize(&left_norm),
+        std::fs::canonicalize(&right_norm),
+    ) {
         return left == right;
     }
 
-    let Ok(left_canonical) = std::fs::canonicalize(left) else {
+    let Ok(left_canonical) = std::fs::canonicalize(&left_norm) else {
         return false;
     };
 
-    let right_parent = right
+    let right_parent = right_norm
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     let right_parent = match right_parent {
@@ -1512,7 +1593,7 @@ pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     let Some(right_parent) = right_parent else {
         return false;
     };
-    let Some(file_name) = right.file_name() else {
+    let Some(file_name) = right_norm.file_name() else {
         return false;
     };
     right_parent.join(file_name) == left_canonical

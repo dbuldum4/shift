@@ -7,13 +7,15 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
-    OutputFormat, ProgressSink, default_output_path, looks_like_url, paths_refer_to_same_file,
+    OutputFormat, ProgressSink, default_output_path, looks_like_url, normalize_path,
+    paths_refer_to_same_file,
 };
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use url::Url;
 
 /// Stable handle for one queue entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -72,7 +74,7 @@ impl BatchSource {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
-            Self::Url(url) => url.clone(),
+            Self::Url(url) => redact_url_credentials(url),
         }
     }
 
@@ -89,6 +91,16 @@ impl BatchSource {
             Self::File(_) => None,
         }
     }
+}
+
+/// Strip userinfo from a URL before showing it in the UI or logs.
+fn redact_url_credentials(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        return parsed.to_string();
+    }
+    url.to_owned()
 }
 
 /// Lifecycle of one batch item.
@@ -415,6 +427,7 @@ impl BatchQueue {
     /// Drop everything.
     pub fn clear(&mut self) {
         self.items.clear();
+        self.next_id = 0;
     }
 
     /// Update planned destinations after the user picks a new output folder.
@@ -634,12 +647,17 @@ pub fn uniquify_destination(preferred: &Path, force: bool) -> PathBuf {
 }
 
 /// Pick a path not present in `claimed` (and optionally not already on disk).
+///
+/// All paths are lexically normalized first so equivalent forms like
+/// `a/../out/x.md` and `out/x.md` are detected as collisions.
 fn uniquify_against_claimed(preferred: &Path, claimed: &[PathBuf], check_disk: bool) -> PathBuf {
+    let preferred = normalize_path(preferred);
+    let claimed: Vec<PathBuf> = claimed.iter().map(|p| normalize_path(p)).collect();
     let is_taken = |path: &Path| -> bool {
         claimed.iter().any(|other| other == path) || (check_disk && path.exists())
     };
-    if !is_taken(preferred) {
-        return preferred.to_path_buf();
+    if !is_taken(&preferred) {
+        return preferred;
     }
     let parent = preferred.parent().unwrap_or_else(|| Path::new(""));
     let stem = preferred
@@ -707,6 +725,7 @@ fn write_artifact(
 }
 
 /// Immutable per-item snapshot handed to a worker thread.
+#[derive(Clone)]
 struct BatchTask {
     id: BatchItemId,
     source: BatchSource,
@@ -869,11 +888,18 @@ pub fn run_batch(
                             break;
                         }
                         let task = &tasks[idx];
-                        let _ = tx.send(WorkerMsg::Started { id: task.id });
+                        let task_id = task.id;
+                        let _ = tx.send(WorkerMsg::Started { id: task_id });
                         // Isolate a panicking module: a conversion bug should
                         // become a single failed item, not an aborted batch.
-                        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            run_task(registry, task, cancel, &tx)
+                        // Clone the task-local data so a panic cannot corrupt
+                        // shared queue or registry state.
+                        let registry = ConversionRegistry::clone(registry);
+                        let task = BatchTask::clone(task);
+                        let cancel = Arc::clone(cancel);
+                        let tx_for_task = tx.clone();
+                        let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                            run_task(&registry, &task, &cancel, &tx_for_task)
                         }))
                         .unwrap_or_else(|payload| {
                             let message = payload
@@ -886,7 +912,7 @@ pub fn run_batch(
                             }
                         });
                         let _ = tx.send(WorkerMsg::Finished {
-                            id: task.id,
+                            id: task_id,
                             outcome,
                         });
                     }
@@ -918,6 +944,7 @@ pub fn run_batch(
                         fraction,
                         label,
                     } => {
+                        let fraction = fraction.map(|value| value.clamp(0.0, 1.0));
                         on_event(BatchEvent::ItemProgress {
                             id,
                             fraction,
@@ -1067,6 +1094,9 @@ mod tests {
                         .as_ref()
                         .is_some_and(|flag| flag.load(Ordering::SeqCst))
                     {
+                        if let Some(in_flight) = &self.in_flight {
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                        }
                         return Err(ConversionError::cancelled());
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1076,6 +1106,9 @@ mod tests {
                 let mut guard = flag.lock().unwrap();
                 if !*guard {
                     *guard = true;
+                    if let Some(in_flight) = &self.in_flight {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                    }
                     return Err(ConversionError::new("simulated failure"));
                 }
             }
@@ -1178,15 +1211,11 @@ mod tests {
 
         assert_eq!(summary.succeeded, 2);
         assert_eq!(summary.failed, 0);
-        assert!(out.join("a.md").is_file() || out.join("out.md").is_file());
+        assert!(out.join("a.md").is_file(), "a.md should be written");
+        assert!(out.join("b.md").is_file(), "b.md should be written");
         // Destination uses default_output_path stem from input name.
-        assert!(
-            std::fs::read_to_string(out.join("a.md")).unwrap_or_default() == "# ok\n"
-                || queue
-                    .items()
-                    .iter()
-                    .all(|item| matches!(item.state, BatchItemState::Succeeded { .. }))
-        );
+        assert_eq!(std::fs::read_to_string(out.join("a.md")).unwrap(), "# ok\n");
+        assert_eq!(std::fs::read_to_string(out.join("b.md")).unwrap(), "# ok\n");
         assert!(
             events
                 .iter()
@@ -1427,13 +1456,20 @@ mod tests {
             }
         });
 
-        assert!(summary.cancelled >= 1 || summary.succeeded + summary.cancelled == 2);
+        assert!(
+            summary.cancelled >= 1,
+            "at least one item should be cancelled"
+        );
+        assert_eq!(
+            summary.succeeded + summary.cancelled,
+            2,
+            "every item should end as succeeded or cancelled"
+        );
         assert!(
             queue
                 .items()
                 .iter()
                 .any(|item| matches!(item.state, BatchItemState::Cancelled))
-                || queue.progress().cancelled >= 1
         );
         let _ = std::fs::remove_dir_all(dir);
     }

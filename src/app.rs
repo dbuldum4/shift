@@ -1,4 +1,6 @@
 use crate::*;
+use futures::StreamExt;
+use futures::channel::{mpsc, oneshot};
 use std::io;
 use std::sync::mpsc::TryRecvError;
 
@@ -1871,10 +1873,12 @@ impl Shift {
             }
         };
         options.cancel = Some(Arc::clone(&self.conversion_cancel));
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<ConversionProgress>();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded::<ConversionProgress>();
         options.progress = Some(Arc::new(move |progress| {
-            let _ = progress_tx.send(progress);
+            let _ = progress_tx.unbounded_send(progress);
         }));
+
         self.conversion = ConversionState::Converting;
         let progress_label = match &source {
             BatchSource::Url(url) => {
@@ -1893,7 +1897,7 @@ impl Shift {
         cx.notify();
 
         let source_for_check = source.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = oneshot::channel();
         cx.background_executor()
             .spawn(async move {
                 let result = match source {
@@ -1909,80 +1913,58 @@ impl Shift {
             .detach();
 
         cx.spawn(async move |this, cx| {
-            loop {
-                while let Ok(progress) = progress_rx.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        if this.selection_generation != generation
-                            || this.conversion_generation != conversion_generation
-                        {
-                            return;
+            while let Some(progress) = progress_rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.selection_generation != generation
+                        || this.conversion_generation != conversion_generation
+                    {
+                        return;
+                    }
+                    this.conversion_progress = Some(match progress {
+                        ConversionProgress::Phase(label) => (None, label.into()),
+                        ConversionProgress::Fraction { fraction, label } => {
+                            (Some(fraction), label.into())
                         }
-                        this.conversion_progress = Some(match progress {
-                            ConversionProgress::Phase(label) => (None, label.into()),
-                            ConversionProgress::Fraction { fraction, label } => {
-                                (Some(fraction), label.into())
-                            }
-                        });
-                        cx.notify();
                     });
-                }
-                match done_rx.try_recv() {
-                    Ok(result) => {
-                        let _ = this.update(cx, |this, cx| {
-                            if this.selection_generation == generation
-                                && this.conversion_generation == conversion_generation
-                                && this.source_matches(&source_for_check)
-                            {
-                                this.conversion_progress = None;
-                                match result {
-                                    Ok(artifact) => {
-                                        let artifact = Arc::new(artifact);
-                                        this.record_history(
-                                            HistoryOutcome::Ready(Arc::clone(&artifact)),
-                                            cx,
-                                        );
-                                        this.set_ready_artifact(artifact);
-                                    }
-                                    Err(error) if error.is_cancelled() => {
-                                        this.conversion =
-                                            ConversionState::Failed("Conversion cancelled.".into());
-                                    }
-                                    Err(error) => {
-                                        let message: SharedString = error.to_string().into();
-                                        this.record_history(
-                                            HistoryOutcome::Failed(message.clone()),
-                                            cx,
-                                        );
-                                        this.conversion = ConversionState::Failed(message);
-                                    }
-                                }
-                                cx.notify();
-                            }
-                        });
-                        break;
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        let _ = this.update(cx, |this, cx| {
-                            if this.selection_generation == generation
-                                && this.conversion_generation == conversion_generation
-                                && this.source_matches(&source_for_check)
-                            {
-                                this.conversion_progress = None;
-                                let message: SharedString =
-                                    "Conversion worker stopped unexpectedly.".into();
-                                this.record_history(HistoryOutcome::Failed(message.clone()), cx);
-                                this.conversion = ConversionState::Failed(message);
-                                cx.notify();
-                            }
-                        });
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => {}
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(40))
-                    .await;
+                    cx.notify();
+                });
             }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let result = done_rx.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_generation == generation
+                    && this.conversion_generation == conversion_generation
+                    && this.source_matches(&source_for_check)
+                {
+                    this.conversion_progress = None;
+                    match result {
+                        Ok(Ok(artifact)) => {
+                            let artifact = Arc::new(artifact);
+                            this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)), cx);
+                            this.set_ready_artifact(artifact);
+                        }
+                        Ok(Err(error)) if error.is_cancelled() => {
+                            this.conversion =
+                                ConversionState::Failed("Conversion cancelled.".into());
+                        }
+                        Ok(Err(error)) => {
+                            let message: SharedString = error.to_string().into();
+                            this.record_history(HistoryOutcome::Failed(message.clone()), cx);
+                            this.conversion = ConversionState::Failed(message);
+                        }
+                        Err(_) => {
+                            let message: SharedString =
+                                "Conversion worker stopped unexpectedly.".into();
+                            this.record_history(HistoryOutcome::Failed(message.clone()), cx);
+                            this.conversion = ConversionState::Failed(message);
+                        }
+                    }
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -2283,18 +2265,29 @@ impl Shift {
             return;
         }
         let path = PathBuf::from(&action.path);
-        if !path.exists() {
-            self.conversion = ConversionState::Failed(
-                format!("Recent file not found: {}", path.display()).into(),
-            );
-            self.selected_file = Some(path);
-            self.selected_url = None;
-            self.file_preview = None;
-            self.cached_ready_path = None;
-            cx.notify();
-            return;
-        }
-        self.set_selected_file(path, cx);
+        // Check existence on the background executor so the UI thread does not
+        // block on a slow/missing network or removable volume.
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { path.exists() }
+        });
+        cx.spawn(async move |this, cx| {
+            if task.await {
+                let _ = this.update(cx, |this, cx| this.set_selected_file(path, cx));
+            } else {
+                let _ = this.update(cx, |this, cx| {
+                    this.conversion = ConversionState::Failed(
+                        format!("Recent file not found: {}", path.display()).into(),
+                    );
+                    this.selected_file = Some(path);
+                    this.selected_url = None;
+                    this.file_preview = None;
+                    this.cached_ready_path = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn action_minimize(
@@ -2383,21 +2376,34 @@ impl Shift {
         self.history_dirty_ids.insert(id);
         self.active_history_id = Some(id);
         self.mark_history_cache_dirty();
-        self.persist_history();
+        self.persist_history(cx);
         self.rebuild_app_menus(cx);
     }
 
-    pub(crate) fn persist_history(&mut self) {
+    pub(crate) fn persist_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_dirty_ids.is_empty() && self.history_deleted_ids.is_empty() {
+            return;
+        }
+        let Some(db_path) = history_db_path() else {
+            return;
+        };
         let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
         let changed: Vec<u64> = self.history_dirty_ids.iter().copied().collect();
         let deleted: Vec<u64> = self.history_deleted_ids.iter().copied().collect();
-        // Best-effort: keep the in-memory list and the dirty/deleted sets so a
-        // failed SQLite write can be retried on the next persist, instead of
-        // silently dropping archive/delete/clear/new-entry changes.
-        if save_history_delta(&stored, &changed, &deleted).is_ok() {
-            self.history_dirty_ids.clear();
-            self.history_deleted_ids.clear();
-        }
+        // Write to SQLite on the background executor; only clear the dirty/deleted
+        // sets when the write succeeds so a failed persist can be retried later.
+        let task = cx
+            .background_executor()
+            .spawn(async move { save_history_delta_to(db_path, &stored, &changed, &deleted) });
+        cx.spawn(async move |this, cx| {
+            if task.await.is_ok() {
+                let _ = this.update(cx, |this, _cx| {
+                    this.history_dirty_ids.clear();
+                    this.history_deleted_ids.clear();
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -2426,19 +2432,38 @@ impl Shift {
                 self.selected_url = None;
                 self.url_input
                     .update(cx, |input, cx| input.set_content("", cx));
-                // Prefer a live preview when the source is still on disk; fall
-                // back to the snapshot captured at conversion time.
-                self.file_preview = Some(if path.exists() {
-                    build_file_preview(path)
-                } else {
-                    FilePreview {
-                        name: entry.name.clone(),
-                        subtitle: entry.detail.clone(),
-                        extension_label: entry.extension_label.clone(),
-                        badge_color: entry.badge_color,
-                        badge_text_color: entry.badge_text_color,
-                    }
+                // Show the captured snapshot immediately, then update from disk
+                // on the background executor so the UI thread does not block on
+                // metadata/exists calls.
+                let snapshot = FilePreview {
+                    name: entry.name.clone(),
+                    subtitle: entry.detail.clone(),
+                    extension_label: entry.extension_label.clone(),
+                    badge_color: entry.badge_color,
+                    badge_text_color: entry.badge_text_color,
+                };
+                self.file_preview = Some(snapshot);
+                let path = path.clone();
+                let preview_path = path.clone();
+                let generation = self.selection_generation;
+                let task = cx.background_executor().spawn(async move {
+                    preview_path
+                        .exists()
+                        .then(|| build_file_preview(&preview_path))
                 });
+                cx.spawn(async move |this, cx| {
+                    if let Some(preview) = task.await {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.selection_generation == generation
+                                && this.selected_file.as_ref() == Some(&path)
+                            {
+                                this.file_preview = Some(preview);
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
             }
             HistorySource::Url(url) => {
                 self.selected_file = None;
@@ -2475,7 +2500,7 @@ impl Shift {
         self.history_dirty_ids.clear();
         self.active_history_id = None;
         self.mark_history_cache_dirty();
-        self.persist_history();
+        self.persist_history(cx);
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -2497,7 +2522,7 @@ impl Shift {
         });
         self.mark_history_cache_dirty();
         self.persist_session_settings(cx);
-        self.persist_history();
+        self.persist_history(cx);
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -2510,7 +2535,7 @@ impl Shift {
             }
             self.history_dirty_ids.insert(id);
             self.mark_history_cache_dirty();
-            self.persist_history();
+            self.persist_history(cx);
             cx.notify();
             self.rebuild_app_menus(cx);
         }
@@ -2524,7 +2549,7 @@ impl Shift {
             self.active_history_id = None;
         }
         self.mark_history_cache_dirty();
-        self.persist_history();
+        self.persist_history(cx);
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -2604,7 +2629,7 @@ impl Render for Shift {
         let preview = self.file_preview.clone();
         let has_selection = self.selected_file.is_some() || self.selected_url.is_some();
         let conversion = self.conversion.clone();
-        let can_convert = has_selection && matches!(conversion, ConversionState::Empty);
+        let can_convert = has_selection && !matches!(conversion, ConversionState::Converting);
         let save_status = self.save_status.clone();
         let available_outputs = self.cached_available_outputs.clone();
         let ready_outputs = self.cached_ready_outputs.clone();

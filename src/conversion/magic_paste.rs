@@ -154,12 +154,13 @@ pub fn stage_pasted_image(bytes: &[u8], extension: &str) -> Result<PathBuf, Conv
     let dir = paste_staging_dir()?;
     let stamp = unique_stamp();
     let path = dir.join(format!("clipboard-image-{stamp}.{ext}"));
-    fs::write(&path, bytes).map_err(|error| {
-        ConversionError::new(format!(
+    if let Err(error) = fs::write(&path, bytes) {
+        let _ = fs::remove_file(&path);
+        return Err(ConversionError::new(format!(
             "could not stage clipboard image {}: {error}",
             path.display()
-        ))
-    })?;
+        )));
+    }
     Ok(path)
 }
 
@@ -282,7 +283,19 @@ fn expand_user_path(path: &Path) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Strip credentials from a URL before logging or reporting it.
+fn redact_url_credentials(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        return parsed.to_string();
+    }
+    url.to_owned()
 }
 
 fn path_extension_from_url_path(path: &str) -> Option<String> {
@@ -321,6 +334,7 @@ fn download_remote_file(
     url: &str,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, ConversionError> {
+    let display_url = redact_url_credentials(url);
     let dir = paste_staging_dir()?;
     let name = remote_file_name(url);
     let stamp = unique_stamp();
@@ -335,7 +349,9 @@ fn download_remote_file(
 
     if let Err(error) = result {
         let _ = fs::remove_file(&path);
-        return Err(error);
+        return Err(ConversionError::new(
+            error.to_string().replace(url, &display_url),
+        ));
     }
 
     let meta = fs::metadata(&path).map_err(|error| {
@@ -348,13 +364,13 @@ fn download_remote_file(
     if meta.len() == 0 {
         let _ = fs::remove_file(&path);
         return Err(ConversionError::new(format!(
-            "download of {url} produced an empty file"
+            "download of {display_url} produced an empty file"
         )));
     }
     if meta.len() > MAX_REMOTE_FILE_BYTES {
         let _ = fs::remove_file(&path);
         return Err(ConversionError::new(format!(
-            "download of {url} exceeded size limit ({} bytes)",
+            "download of {display_url} exceeded size limit ({} bytes)",
             MAX_REMOTE_FILE_BYTES
         )));
     }
@@ -368,6 +384,7 @@ fn download_follow_redirects(
     path: &Path,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(), ConversionError> {
+    let display_url = redact_url_credentials(url);
     if cancel
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -392,7 +409,7 @@ fn download_follow_redirects(
                 error
             } else {
                 ConversionError::new(format!(
-                    "could not download {url}: {error}. Install curl or open the file locally."
+                    "could not download {display_url}: {error}. Install curl or open the file locally."
                 ))
             }
         })?;
@@ -401,16 +418,19 @@ fn download_follow_redirects(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
         return Err(ConversionError::new(if detail.is_empty() {
-            format!("could not download {url} (curl exit {})", output.status)
+            format!(
+                "could not download {display_url} (curl exit {})",
+                output.status
+            )
         } else if detail.contains("maximum file size exceeded") || detail.contains("max-filesize") {
             format!(
-                "could not download {url}: exceeded size limit ({} bytes)",
+                "could not download {display_url}: exceeded size limit ({} bytes)",
                 MAX_REMOTE_FILE_BYTES
             )
         } else if detail.contains("timed out") || detail.contains("Timeout") {
-            format!("could not download {url}: download timed out")
+            format!("could not download {display_url}: download timed out")
         } else {
-            format!("could not download {url}: {detail}")
+            format!("could not download {display_url}: {detail}")
         }));
     }
     Ok(())
@@ -424,6 +444,7 @@ fn download_with_redirect_revalidation(
 ) -> Result<(), ConversionError> {
     let mut current = url.to_string();
     for hop in 0..=MAX_DOWNLOAD_REDIRECTS {
+        let display_current = redact_url_credentials(&current);
         if cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -466,7 +487,7 @@ fn download_with_redirect_revalidation(
                 error
             } else {
                 ConversionError::new(format!(
-                    "could not download {current}: {error}. Install curl or open the file locally."
+                    "could not download {display_current}: {error}. Install curl or open the file locally."
                 ))
             }
         })?;
@@ -478,9 +499,12 @@ fn download_with_redirect_revalidation(
             let stderr = String::from_utf8_lossy(&output.stderr);
             let detail = stderr.trim();
             return Err(ConversionError::new(if detail.is_empty() {
-                format!("could not download {current} (curl exit {})", output.status)
+                format!(
+                    "could not download {display_current} (curl exit {})",
+                    output.status
+                )
             } else {
-                format!("could not download {current}: {detail}")
+                format!("could not download {display_current}: {detail}")
             }));
         }
 
@@ -490,7 +514,7 @@ fn download_with_redirect_revalidation(
         if (300..400).contains(&code) {
             let Some(location) = location_header(&headers) else {
                 return Err(ConversionError::new(format!(
-                    "could not download {current}: redirect ({code}) without Location header"
+                    "could not download {display_current}: redirect ({code}) without Location header"
                 )));
             };
             current = resolve_redirect_url(&current, &location)?;
@@ -506,12 +530,13 @@ fn download_with_redirect_revalidation(
         }
 
         return Err(ConversionError::new(format!(
-            "could not download {current}: HTTP {code}"
+            "could not download {display_current}: HTTP {code}"
         )));
     }
 
     Err(ConversionError::new(format!(
-        "could not download {url}: too many redirects (max {MAX_DOWNLOAD_REDIRECTS})"
+        "could not download {}: too many redirects (max {MAX_DOWNLOAD_REDIRECTS})",
+        redact_url_credentials(url)
     )))
 }
 

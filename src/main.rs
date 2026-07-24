@@ -31,8 +31,8 @@ use shift_core::conversion::{
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
-    StoredHistoryEntry, StoredOutcome, StoredSource, intern_module_id, load_history,
-    save_history_delta,
+    StoredHistoryEntry, StoredOutcome, StoredSource, history_db_path, intern_module_id,
+    load_history, save_history_delta_to,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
@@ -887,7 +887,7 @@ fn history_sidebar(
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let is_empty = visible.is_empty();
-    let has_any = history_total > 0;
+    let has_any = history_total > 0 && !visible.is_empty();
 
     div()
         .id("history-sidebar")
@@ -1399,6 +1399,8 @@ fn chip(
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
+            this.persist_session_settings(cx);
+            cx.notify();
             cx.stop_propagation();
         }))
 }

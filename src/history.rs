@@ -75,9 +75,20 @@ fn history_legacy_path() -> Option<PathBuf> {
 
 /// Parent Application Support directory used by preferences and history.
 pub fn support_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support/Shift"))
+    if let Some(override_dir) = std::env::var_os("SHIFT_APP_SUPPORT_DIR") {
+        return Some(PathBuf::from(override_dir));
+    }
+    if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library/Application Support/Shift"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("shift"))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/shift"))
+            })
+    }
 }
 
 fn home_dir_for_history() -> Option<PathBuf> {
@@ -240,11 +251,22 @@ pub fn save_history_delta(
             "could not locate the user home directory",
         ));
     };
+    save_history_delta_to(db_path, entries, changed_ids, deleted_ids)
+}
+
+/// Write a history delta to a specific SQLite path.
+pub fn save_history_delta_to(
+    db_path: impl AsRef<Path>,
+    entries: &[StoredHistoryEntry],
+    changed_ids: &[u64],
+    deleted_ids: &[u64],
+) -> io::Result<()> {
+    let db_path = db_path.as_ref();
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut conn = open_history(&db_path).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut conn = open_history(db_path).map_err(|error| io::Error::other(error.to_string()))?;
     let tx = conn
         .transaction()
         .map_err(|error| io::Error::other(error.to_string()))?;

@@ -2,8 +2,8 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
-    InvocationRecord, OutputFormat, command_argv_parts, format_argv_display, map_spawn_error,
-    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    InvocationRecord, OutputFormat, TempDirGuard, command_argv_parts, format_argv_display,
+    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
     run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
@@ -17,11 +17,12 @@ use std::time::Duration;
 /// Broad demux surface FFmpeg handles without exotic builds.
 const INPUTS: &[&str] = &[
     // Audio
-    "aac", "ac3", "aif", "aiff", "amr", "ape", "caf", "dts", "eac3", "flac", "m4a", "mp3", "mpc",
-    "oga", "ogg", "opus", "spx", "wav", "wma", // Video / containers
-    "3gp", "asf", "avi", "divx", "flv", "gif", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg",
-    "mts", "mxf", "rm", "rmvb", "ts", "vob", "webm",
-    "wmv", // Stills (slideshow / image→image)
+    "aac", "ac3", "aif", "aiff", "amr", "ape", "caf", "dts", "eac3", "flac", "m4a", "m4b", "m4p",
+    "mka", "mp3", "mpc", "oga", "ogg", "opus", "spx", "wav", "weba", "wma",
+    // Video / containers
+    "3gp", "asf", "avi", "divx", "flv", "gif", "m2ts", "m4v", "mk3d", "mkv", "mov", "mp4", "mpeg",
+    "mpg", "mts", "mxf", "ogv", "rm", "rmvb", "ts", "vob", "webm", "wmv",
+    // Stills (slideshow / image→image)
     "bmp", "jpeg", "jpg", "png", "tif", "tiff", "webp",
 ];
 
@@ -585,7 +586,10 @@ fn report_phase(options: &ConversionOptions, label: &str) {
     }
 }
 
-struct ProgressWatchStop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+struct ProgressWatchStop(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread::JoinHandle<()>,
+);
 
 fn spawn_progress_watcher(
     progress_path: Option<PathBuf>,
@@ -596,7 +600,7 @@ fn spawn_progress_watcher(
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_flag = std::sync::Arc::clone(&stop);
     let duration_hint = options.ffmpeg.duration_secs;
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mut last_out_time_ms: Option<u64> = None;
         while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             if let Ok(file) = fs::File::open(&path) {
@@ -637,12 +641,13 @@ fn spawn_progress_watcher(
             thread::sleep(Duration::from_millis(200));
         }
     });
-    Some(ProgressWatchStop(stop))
+    Some(ProgressWatchStop(stop, handle))
 }
 
 fn stop_progress_watcher(stop: Option<ProgressWatchStop>) {
-    if let Some(ProgressWatchStop(flag)) = stop {
+    if let Some(ProgressWatchStop(flag, handle)) = stop {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.join();
     }
 }
 
@@ -808,8 +813,17 @@ fn apply_encode_settings(
             filters.push("fps=10".into());
         }
     }
-    if !filters.is_empty() {
-        command.arg("-vf").arg(filters.join(","));
+    let mut filter_string = filters.join(",");
+    if output_format == OutputFormat::GIF {
+        let palette = "split[s0][s1];[s0]palettegen=max_colors=256[p];[s1][p]paletteuse";
+        if filter_string.is_empty() {
+            filter_string = palette.to_owned();
+        } else {
+            filter_string = format!("{filter_string},{palette}");
+        }
+    }
+    if !filter_string.is_empty() {
+        command.arg("-vf").arg(filter_string);
     }
 
     // Audio filters (loudnorm).
@@ -933,48 +947,50 @@ fn apply_video_encode(command: &mut Command, output_format: OutputFormat, option
         FfmpegQuality::Small => "96k",
     };
 
-    match output_format.id() {
-        "webm" => {
-            command.arg("-c:v").arg("libvpx-vp9");
-            command.arg("-crf").arg(crf);
-            command.arg("-b:v").arg("0");
-            if !options.mute {
-                command.arg("-c:a").arg("libopus");
-                command.arg("-b:a").arg(audio_bitrate);
-            }
+    if output_format.id() == "webm" {
+        command.arg("-c:v").arg("libvpx-vp9");
+        command.arg("-crf").arg(crf);
+        command.arg("-b:v").arg("0");
+        if !options.mute {
+            command.arg("-c:a").arg("libopus");
+            command.arg("-b:a").arg(audio_bitrate);
         }
-        "mp4" | "m4v" | "mov" | "mkv" | "avi" | "mpeg" | "ts" | "3gp" => {
-            command.arg("-c:v").arg("libx264");
-            command.arg("-preset").arg(match options.quality {
-                FfmpegQuality::High => "slow",
-                FfmpegQuality::Balanced => "medium",
-                FfmpegQuality::Small => "veryfast",
+    } else if matches!(
+        output_format.id(),
+        "mp4" | "m4v" | "mov" | "mkv" | "avi" | "mpeg" | "ts" | "3gp"
+    ) {
+        command.arg("-c:v").arg("libx264");
+        command.arg("-preset").arg(match options.quality {
+            FfmpegQuality::High => "slow",
+            FfmpegQuality::Balanced => "medium",
+            FfmpegQuality::Small => "veryfast",
+        });
+        command.arg("-crf").arg(crf);
+        if !options.mute {
+            command.arg("-c:a").arg(if output_format.id() == "mpeg" {
+                "mp2"
+            } else {
+                "aac"
             });
-            command.arg("-crf").arg(crf);
-            if !options.mute {
-                command.arg("-c:a").arg(if output_format.id() == "mpeg" {
-                    "mp2"
-                } else {
-                    "aac"
-                });
-                command.arg("-b:a").arg(audio_bitrate);
+            command.arg("-b:a").arg(audio_bitrate);
+        }
+        if matches!(output_format.id(), "mp4" | "m4v" | "mov") {
+            command.arg("-movflags").arg("+faststart");
+        }
+        if output_format.id() == "3gp" && !options.mute {
+            // 3GP is picky; force baseline-friendly audio rate if user did not.
+            if options.sample_rate_hz.is_none() {
+                command.arg("-ar").arg("8000");
             }
-            if matches!(output_format.id(), "mp4" | "m4v" | "mov") {
-                command.arg("-movflags").arg("+faststart");
-            }
-            if output_format.id() == "3gp" && !options.mute {
-                // 3GP is picky; force baseline-friendly audio rate if user did not.
-                if options.sample_rate_hz.is_none() {
-                    command.arg("-ar").arg("8000");
-                }
-                if !options.mono {
-                    command.arg("-ac").arg("1");
-                }
+            if !options.mono {
+                command.arg("-ac").arg("1");
             }
         }
-        _ => {
-            command.arg("-crf").arg(crf);
-        }
+    } else {
+        unreachable!(
+            "apply_video_encode called with unsupported video output: {}",
+            output_format.id()
+        );
     }
 }
 
@@ -1006,14 +1022,6 @@ impl ConversionModule for FfmpegModule {
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
         self.convert_with_cli(input, output_format, options)
-    }
-}
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

@@ -282,6 +282,13 @@ impl DiagnosticsReport {
 
     /// Human-readable multi-line report (stdout for doctor).
     pub fn render_text(&self) -> String {
+        let sanitize = |value: &str| -> String {
+            value
+                .chars()
+                .map(|ch| if ch.is_control() { '\u{FFFD}' } else { ch })
+                .collect()
+        };
+
         let mut out = String::new();
         out.push_str("Shift diagnostics\n");
         out.push_str("=================\n\n");
@@ -293,19 +300,20 @@ impl DiagnosticsReport {
         out.push_str("Conversion engines\n");
         out.push_str("------------------\n");
         for engine in &self.engines {
-            let version = engine
-                .version
-                .as_deref()
-                .unwrap_or(if engine.readiness.is_ready() {
+            let version = sanitize(engine.version.as_deref().unwrap_or(
+                if engine.readiness.is_ready() {
                     "unknown version"
                 } else {
                     "—"
-                });
-            let path = engine
-                .resolved_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "not found".into());
+                },
+            ));
+            let path = sanitize(
+                &engine
+                    .resolved_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "not found".into()),
+            );
             out.push_str(&format!(
                 "{:<12} {:<8} {:<16} {}\n",
                 engine.label,
@@ -314,14 +322,17 @@ impl DiagnosticsReport {
                 path
             ));
             if !engine.readiness.is_ready() {
-                out.push_str(&format!("             install: {}\n", engine.install_hint));
+                out.push_str(&format!(
+                    "             install: {}\n",
+                    sanitize(&engine.install_hint)
+                ));
                 out.push_str(&format!(
                     "             config:  set {} to an absolute path\n",
                     engine.env_override
                 ));
             }
             if let Some(notes) = &engine.notes {
-                out.push_str(&format!("             note:    {notes}\n"));
+                out.push_str(&format!("             note:    {}\n", sanitize(notes)));
             }
         }
 
@@ -329,25 +340,26 @@ impl DiagnosticsReport {
         out.push_str("PDF engines (Pandoc)\n");
         out.push_str("--------------------\n");
         if let Some(selected) = &self.selected_pdf_engine {
-            out.push_str(&format!("selected: {selected}\n"));
+            out.push_str(&format!("selected: {}\n", sanitize(selected)));
         } else {
             out.push_str("selected: none\n");
         }
         for engine in &self.pdf_engines {
             let marker = if engine.selected { " *" } else { "" };
-            let version = engine
-                .version
-                .as_deref()
-                .unwrap_or(if engine.readiness.is_ready() {
+            let version = sanitize(engine.version.as_deref().unwrap_or(
+                if engine.readiness.is_ready() {
                     "unknown"
                 } else {
                     "—"
-                });
-            let path = engine
-                .resolved_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "not found".into());
+                },
+            ));
+            let path = sanitize(
+                &engine
+                    .resolved_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "not found".into()),
+            );
             out.push_str(&format!(
                 "  {:<12} {:<8} {:<16} {}{}\n",
                 engine.name,
