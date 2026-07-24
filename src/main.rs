@@ -1185,7 +1185,11 @@ fn build_url_preview(url: &str) -> FilePreview {
     }
 }
 
-fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl IntoElement {
+fn file_preview_card(
+    preview: FilePreview,
+    can_convert: bool,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
     let badge_color = preview.badge_color;
     let badge_text_color = preview.badge_text_color;
 
@@ -1289,6 +1293,33 @@ fn file_preview_card(preview: FilePreview, cx: &mut Context<Shift>) -> impl Into
                         })),
                 ),
         )
+        .when(can_convert, |this| {
+            this.child(
+                div()
+                    .id("convert-selected")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w_full()
+                    .h(px(40.0))
+                    .px_4()
+                    .rounded_lg()
+                    .bg(THEME.elevated)
+                    .border_1()
+                    .border_color(THEME.border_strong)
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(THEME.text_primary)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(THEME.active).border_color(THEME.border_focused))
+                    .active(|style| style.opacity(THEME.active_opacity))
+                    .child("Convert")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_conversion(cx);
+                        cx.stop_propagation();
+                    })),
+            )
+        })
         .child(
             div()
                 .text_xs()
@@ -1540,9 +1571,8 @@ fn conversion_options_panel(
                             FfmpegQuality::Balanced.label(),
                             quality == FfmpegQuality::Balanced,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_quality = FfmpegQuality::Balanced;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1550,9 +1580,8 @@ fn conversion_options_panel(
                             FfmpegQuality::High.label(),
                             quality == FfmpegQuality::High,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_quality = FfmpegQuality::High;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1560,9 +1589,8 @@ fn conversion_options_panel(
                             FfmpegQuality::Small.label(),
                             quality == FfmpegQuality::Small,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_quality = FfmpegQuality::Small;
-                                this.start_conversion(cx);
                             },
                         )),
                 )
@@ -1578,9 +1606,8 @@ fn conversion_options_panel(
                             FfmpegEncodeMode::Auto.label(),
                             encode_mode == FfmpegEncodeMode::Auto,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_encode_mode = FfmpegEncodeMode::Auto;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1588,9 +1615,8 @@ fn conversion_options_panel(
                             FfmpegEncodeMode::PreferCopy.label(),
                             encode_mode == FfmpegEncodeMode::PreferCopy,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_encode_mode = FfmpegEncodeMode::PreferCopy;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1598,9 +1624,8 @@ fn conversion_options_panel(
                             FfmpegEncodeMode::Reencode.label(),
                             encode_mode == FfmpegEncodeMode::Reencode,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_encode_mode = FfmpegEncodeMode::Reencode;
-                                this.start_conversion(cx);
                             },
                         )),
                 );
@@ -1698,7 +1723,6 @@ fn conversion_options_panel(
                                 |this, cx| {
                                     this.ffmpeg_mono = !this.ffmpeg_mono;
                                     this.persist_session_settings(cx);
-                                    this.start_conversion(cx);
                                 },
                             ))
                             .child(chip(
@@ -1709,7 +1733,6 @@ fn conversion_options_panel(
                                 |this, cx| {
                                     this.ffmpeg_mute = !this.ffmpeg_mute;
                                     this.persist_session_settings(cx);
-                                    this.start_conversion(cx);
                                 },
                             ))
                             .child(chip(
@@ -1724,7 +1747,6 @@ fn conversion_options_panel(
                                 |this, cx| {
                                     this.ffmpeg_normalize = !this.ffmpeg_normalize;
                                     this.persist_session_settings(cx);
-                                    this.start_conversion(cx);
                                 },
                             ))
                             .child(chip(
@@ -1735,7 +1757,6 @@ fn conversion_options_panel(
                                 |this, cx| {
                                     this.ffmpeg_sample_rate_hz = None;
                                     this.persist_session_settings(cx);
-                                    this.start_conversion(cx);
                                 },
                             ))
                             .child(chip(
@@ -1743,9 +1764,8 @@ fn conversion_options_panel(
                                 "44.1 kHz",
                                 sample_rate_hz == Some(44_100),
                                 cx,
-                                |this, cx| {
+                                |this, _cx| {
                                     this.ffmpeg_sample_rate_hz = Some(44_100);
-                                    this.start_conversion(cx);
                                 },
                             ))
                             .child(chip(
@@ -1753,9 +1773,8 @@ fn conversion_options_panel(
                                 "48 kHz",
                                 sample_rate_hz == Some(48_000),
                                 cx,
-                                |this, cx| {
+                                |this, _cx| {
                                     this.ffmpeg_sample_rate_hz = Some(48_000);
-                                    this.start_conversion(cx);
                                 },
                             )),
                     )
@@ -1795,9 +1814,8 @@ fn conversion_options_panel(
                             "Auto",
                             scale_width.is_none(),
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_scale_width = None;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1805,9 +1823,8 @@ fn conversion_options_panel(
                             "720",
                             scale_width == Some(720),
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_scale_width = Some(720);
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1815,9 +1832,8 @@ fn conversion_options_panel(
                             "1280",
                             scale_width == Some(1280),
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.ffmpeg_scale_width = Some(1280);
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1828,7 +1844,6 @@ fn conversion_options_panel(
                             |this, cx| {
                                 this.ffmpeg_scale_width = Some(1920);
                                 this.persist_session_settings(cx);
-                                this.start_conversion(cx);
                             },
                         )),
                 );
@@ -1862,7 +1877,6 @@ fn conversion_options_panel(
                         |this, cx| {
                             this.ffmpeg_burn_subs = !this.ffmpeg_burn_subs;
                             this.persist_session_settings(cx);
-                            this.start_conversion(cx);
                         },
                     )));
             }
@@ -1937,9 +1951,8 @@ fn conversion_options_panel(
                             DoclingImageExportMode::Placeholder.label(),
                             docling_images == DoclingImageExportMode::Placeholder,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.docling_images = DoclingImageExportMode::Placeholder;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1947,9 +1960,8 @@ fn conversion_options_panel(
                             DoclingImageExportMode::Embedded.label(),
                             docling_images == DoclingImageExportMode::Embedded,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.docling_images = DoclingImageExportMode::Embedded;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1957,9 +1969,8 @@ fn conversion_options_panel(
                             DoclingImageExportMode::Referenced.label(),
                             docling_images == DoclingImageExportMode::Referenced,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.docling_images = DoclingImageExportMode::Referenced;
-                                this.start_conversion(cx);
                             },
                         )),
                 )
@@ -1974,9 +1985,8 @@ fn conversion_options_panel(
                             if docling_ocr { "OCR ✓" } else { "OCR" },
                             docling_ocr,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.docling_ocr = !this.docling_ocr;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1988,9 +1998,8 @@ fn conversion_options_panel(
                             },
                             docling_tables,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.docling_tables = !this.docling_tables;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -1998,9 +2007,8 @@ fn conversion_options_panel(
                             DoclingTableMode::Fast.label(),
                             docling_table_mode == DoclingTableMode::Fast,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.docling_table_mode = DoclingTableMode::Fast;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -2011,7 +2019,6 @@ fn conversion_options_panel(
                             |this, cx| {
                                 this.docling_table_mode = DoclingTableMode::Accurate;
                                 this.persist_session_settings(cx);
-                                this.start_conversion(cx);
                             },
                         )),
                 )
@@ -2145,9 +2152,8 @@ fn conversion_options_panel(
                     },
                     defuddle_frontmatter,
                     cx,
-                    |this, cx| {
+                    |this, _cx| {
                         this.defuddle_frontmatter = !this.defuddle_frontmatter;
-                        this.start_conversion(cx);
                     },
                 )))
                 .child(
@@ -2197,9 +2203,8 @@ fn conversion_options_panel(
                             },
                             pandoc_standalone,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.pandoc_standalone = !this.pandoc_standalone;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -2207,9 +2212,8 @@ fn conversion_options_panel(
                             if pandoc_toc { "TOC ✓" } else { "TOC" },
                             pandoc_toc,
                             cx,
-                            |this, cx| {
+                            |this, _cx| {
                                 this.pandoc_toc = !this.pandoc_toc;
-                                this.start_conversion(cx);
                             },
                         ))
                         .child(chip(
@@ -2224,7 +2228,6 @@ fn conversion_options_panel(
                             |this, cx| {
                                 this.pandoc_citations = !this.pandoc_citations;
                                 this.persist_session_settings(cx);
-                                this.start_conversion(cx);
                             },
                         )),
                 );
@@ -2245,9 +2248,8 @@ fn conversion_options_panel(
                         "Auto",
                         pandoc_pdf_engine.is_none(),
                         cx,
-                        |this, cx| {
+                        |this, _cx| {
                             this.pandoc_pdf_engine = None;
-                            this.start_conversion(cx);
                         },
                     ));
                 for (index, name) in pdf_engine_candidates().iter().take(5).enumerate() {
@@ -2261,7 +2263,6 @@ fn conversion_options_panel(
                         move |this, cx| {
                             this.pandoc_pdf_engine = Some(label.clone());
                             this.persist_session_settings(cx);
-                            this.start_conversion(cx);
                         },
                     ));
                 }
@@ -2314,7 +2315,6 @@ fn conversion_options_panel(
                             |this, cx| {
                                 this.pandoc_reference_doc = None;
                                 this.persist_session_settings(cx);
-                                this.start_conversion(cx);
                             },
                         ))
                     }),
@@ -2339,9 +2339,8 @@ fn conversion_options_panel(
                     },
                     markitdown_keep_data_uris,
                     cx,
-                    |this, cx| {
+                    |this, _cx| {
                         this.markitdown_keep_data_uris = !this.markitdown_keep_data_uris;
-                        this.start_conversion(cx);
                     },
                 )))
                 .child(

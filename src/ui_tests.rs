@@ -266,7 +266,10 @@ async fn selecting_a_text_file_converts_to_markdown(cx: &mut TestAppContext) {
     let path = write_input(&env, "notes.txt", b"hello shift");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path.clone(), cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
 
     let (format, bytes, module) = shift.read_with(cx, |this, _| match &this.conversion {
@@ -286,7 +289,10 @@ async fn changing_output_format_reconverts(cx: &mut TestAppContext) {
     let path = write_input(&env, "notes.md", b"# hello shift");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path.clone(), cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
     assert!(matches!(
         shift.read_with(cx, |this, _| this.conversion.clone()),
@@ -312,7 +318,8 @@ async fn selecting_a_url_converts_via_defuddle(cx: &mut TestAppContext) {
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://example.com/article.html".into(), cx)
+        this.set_selected_url("http://example.com/article.html".into(), cx);
+        this.start_conversion(cx);
     });
     cx.run_until_parked();
 
@@ -336,7 +343,11 @@ async fn magic_paste_with_local_path_converts(cx: &mut TestAppContext) {
     let shift = create_shift(cx);
 
     let text = path.to_string_lossy().to_string();
-    shift.update(cx, |this, cx| this.submit_magic_paste_text(text, cx));
+    shift.update(cx, |this, cx| {
+        this.submit_magic_paste_text(text, cx);
+        this.selection_generation = this.selection_generation.wrapping_add(1);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
 
     let selected = shift.read_with(cx, |this, _| this.selected_file.clone());
@@ -356,6 +367,8 @@ async fn magic_paste_with_url_converts(cx: &mut TestAppContext) {
     shift.update(cx, |this, cx| {
         this.submit_magic_paste_text("http://example.com/page.html".into(), cx)
     });
+    cx.run_until_parked();
+    shift.update(cx, |this, cx| this.start_conversion(cx));
     cx.run_until_parked();
 
     let url = shift.read_with(cx, |this, _| this.selected_url.clone());
@@ -443,7 +456,10 @@ async fn history_records_and_restores_conversions(cx: &mut TestAppContext) {
     let path = write_input(&env, "history.txt", b"keep me");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path.clone(), cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
 
     let (history_len, active_id) =
@@ -685,7 +701,10 @@ async fn module_priority_change_reroutes_conversions(cx: &mut TestAppContext) {
     let path = write_input(&env, "priority.md", b"# route via pandoc");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path, cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
     let first_module = shift.read_with(cx, |this, _| match &this.conversion {
         ConversionState::Ready(artifact) => artifact.module_id,
@@ -712,7 +731,8 @@ async fn invalid_ffmpeg_options_fail(cx: &mut TestAppContext) {
     shift.update(cx, |this, cx| {
         this.ffmpeg_start_input
             .update(cx, |input, cx| input.set_content("not-a-number", cx));
-        this.set_selected_file(path, cx)
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
     });
     cx.run_until_parked();
 
@@ -728,7 +748,8 @@ async fn clipboard_image_converts_via_ffmpeg(cx: &mut TestAppContext) {
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.ingest_clipboard_image(vec![1, 2, 3, 4], "png", cx)
+        this.ingest_clipboard_image(vec![1, 2, 3, 4], "png", cx);
+        this.start_conversion(cx);
     });
     cx.run_until_parked();
 
@@ -746,7 +767,10 @@ async fn cancel_single_conversion_leaves_failed_state(cx: &mut TestAppContext) {
     let path = write_input(&env, "cancel.txt", b"hello");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path, cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
     shift.update(cx, |this, cx| this.cancel_conversion(cx));
     cx.run_until_parked();
 
@@ -763,7 +787,10 @@ async fn clear_selected_file_resets_state(cx: &mut TestAppContext) {
     let path = write_input(&env, "clear.txt", b"hello");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path, cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
     assert!(matches!(
         shift.read_with(cx, |this, _| this.conversion.clone()),
@@ -819,7 +846,10 @@ async fn history_persists_across_sessions(cx: &mut TestAppContext) {
     let path = write_input(&env, "persist.txt", b"history");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path, cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
 
     let id = shift
@@ -874,7 +904,8 @@ async fn private_url_is_blocked_when_private_urls_disallowed(cx: &mut TestAppCon
 
     let shift = create_shift(cx);
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://192.168.1.1/page.html".into(), cx)
+        this.set_selected_url("http://192.168.1.1/page.html".into(), cx);
+        this.start_conversion(cx);
     });
     cx.run_until_parked();
 
@@ -893,7 +924,10 @@ async fn history_can_be_cleared_archived_and_deleted(cx: &mut TestAppContext) {
     let path = write_input(&env, "hist.txt", b"hello");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path, cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
 
     let id = shift
@@ -928,7 +962,10 @@ async fn history_limit_truncates_entries_and_updates_input(cx: &mut TestAppConte
     let shift = create_shift(cx);
 
     for path in &paths {
-        shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+        shift.update(cx, |this, cx| {
+            this.set_selected_file(path.clone(), cx);
+            this.start_conversion(cx);
+        });
         cx.run_until_parked();
     }
     assert_eq!(shift.read_with(cx, |this, _| this.history.len()), 3);
@@ -954,7 +991,10 @@ async fn conversion_failure_records_history_and_can_be_restored(cx: &mut TestApp
     let path = write_input(&env, "fails.txt", b"FAIL intentional");
     let shift = create_shift(cx);
 
-    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path.clone(), cx);
+        this.start_conversion(cx);
+    });
     cx.run_until_parked();
 
     let (failed, history_failed) = shift.read_with(cx, |this, _| {

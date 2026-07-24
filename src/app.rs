@@ -1123,7 +1123,7 @@ impl Shift {
                 .copied()
                 .unwrap_or(OutputFormat::MARKDOWN);
         }
-        self.conversion = ConversionState::Converting;
+        self.conversion = ConversionState::Empty;
         self.conversion_progress = None;
         self.cached_ready_path = None;
         self.show_command_inspect = false;
@@ -1150,8 +1150,6 @@ impl Shift {
             });
         })
         .detach();
-
-        self.start_conversion(cx);
     }
 
     pub(crate) fn submit_magic_paste_from_input(&mut self, cx: &mut Context<Self>) {
@@ -1381,7 +1379,7 @@ impl Shift {
                 .copied()
                 .unwrap_or(OutputFormat::MARKDOWN);
         }
-        self.conversion = ConversionState::Converting;
+        self.conversion = ConversionState::Empty;
         self.conversion_progress = None;
         self.cached_ready_path = None;
         self.show_command_inspect = false;
@@ -1389,7 +1387,6 @@ impl Shift {
         self.output_menu_open = false;
         self.active_history_id = None;
         cx.notify();
-        self.start_conversion(cx);
     }
 
     pub(crate) fn start_conversion(&mut self, cx: &mut Context<Self>) {
@@ -2491,6 +2488,7 @@ impl Render for Shift {
         let preview = self.file_preview.clone();
         let has_selection = self.selected_file.is_some() || self.selected_url.is_some();
         let conversion = self.conversion.clone();
+        let can_convert = has_selection && matches!(conversion, ConversionState::Empty);
         let save_status = self.save_status.clone();
         let available_outputs = self.cached_available_outputs.clone();
         let ready_outputs = self.cached_ready_outputs.clone();
@@ -2659,7 +2657,7 @@ impl Render for Shift {
                             .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(THEME.elevated))
                             .child(rounded_dashed_border(has_selection || show_batch))
                             .when_some(preview, |zone, preview| {
-                                zone.child(file_preview_card(preview, cx))
+                                zone.child(file_preview_card(preview, can_convert, cx))
                             })
                             .when(!has_selection && !show_batch, |zone| {
                                 zone.child(empty_drop_prompt())
