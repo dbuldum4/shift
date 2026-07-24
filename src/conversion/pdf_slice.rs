@@ -14,9 +14,10 @@ use std::sync::atomic::AtomicBool;
 /// it first with a password read from a restrictive temporary file.
 ///
 /// `to == None` means "through the last page" (`N-z` in qpdf). Uses
-/// `qpdf --empty --pages in.pdf N-M -- out.pdf`. The returned path lives in a
-/// unique temp directory; callers should delete the parent directory when done
-/// (registry does this via a temp-dir guard).
+/// `qpdf in.pdf --password-file=... --pages . N-M -- out.pdf` so the password
+/// file applies to the primary input. The returned path lives in a unique temp
+/// directory; callers should delete the parent directory when done (registry
+/// does this via a temp-dir guard).
 pub fn extract_pdf_pages(
     input: &Path,
     from: u32,
@@ -43,7 +44,7 @@ pub fn extract_pdf_pages(
         None => format!("{from}-z"),
     };
     let mut command = Command::new(&executable);
-    command.arg("--empty").arg("--pages").arg(input);
+    command.arg(input);
     if let Some(password) = password.map(str::trim).filter(|value| !value.is_empty()) {
         let password_file = work_dir.join("password.txt");
         fs::write(&password_file, password.as_bytes()).map_err(|error| {
@@ -66,7 +67,12 @@ pub fn extract_pdf_pages(
         }
         command.arg(format!("--password-file={}", password_file.display()));
     }
-    command.arg(&range).arg("--").arg(&output);
+    command
+        .arg("--pages")
+        .arg(".")
+        .arg(&range)
+        .arg("--")
+        .arg(&output);
 
     let result = run_command_cancellable(command, process_timeout(), max_output_bytes(), cancel)
         .map_err(|error| {
@@ -166,7 +172,7 @@ mod tests {
     #[test]
     fn extract_uses_qpdf_argv_shape() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -192,8 +198,11 @@ mod tests {
         assert_eq!(std::fs::read(&sliced).unwrap(), b"%PDF-1.4 sliced");
 
         let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
-        assert!(args.contains("--empty"), "args: {args}");
         assert!(args.contains("--pages"), "args: {args}");
+        assert!(
+            args.contains("--pages . 2-4"),
+            "args should use '.' for primary input, args: {args}"
+        );
         assert!(args.contains("2-4"), "args: {args}");
         assert!(
             args.contains("--password-file="),
@@ -226,7 +235,7 @@ mod tests {
     #[test]
     fn password_only_decrypt_uses_full_range_and_password_file() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -253,6 +262,10 @@ mod tests {
         let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
         assert!(args.contains("1-z"), "full range expected, args: {args}");
         assert!(
+            args.contains("--pages . 1-z"),
+            "args should use '.' for primary input, args: {args}"
+        );
+        assert!(
             args.contains("--password-file="),
             "password must be passed through a file, args: {args}"
         );
@@ -276,7 +289,7 @@ mod tests {
     #[test]
     fn fails_when_qpdf_returns_nonzero() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();

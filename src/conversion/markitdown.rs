@@ -1,7 +1,7 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-    map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command_cancellable,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
+    OutputFormat, command_argv_parts, format_argv_display, map_spawn_error, max_output_bytes,
+    process_timeout, resolve_tool_executable, run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -59,14 +59,9 @@ impl MarkItDownModule {
 
     fn run(
         &self,
-        input: &Path,
+        command: Command,
         options: &ConversionOptions,
     ) -> Result<super::LimitedOutput, ConversionError> {
-        let mut command = Command::new(&self.executable);
-        command.arg(input);
-        if options.markitdown.keep_data_uris {
-            command.arg("--keep-data-uris");
-        }
         run_command_cancellable(
             command,
             process_timeout(),
@@ -113,7 +108,17 @@ impl ConversionModule for MarkItDownModule {
         if output_format != OutputFormat::MARKDOWN {
             return Err(ConversionError::new("MarkItDown only produces Markdown"));
         }
-        let output = self.run(input, options)?;
+
+        let mut command = Command::new(&self.executable);
+        command.arg(input);
+        if options.markitdown.keep_data_uris {
+            command.arg("--keep-data-uris");
+        }
+
+        let display_parts = command_argv_parts(&command);
+        let argv_display = format_argv_display(&display_parts);
+
+        let output = self.run(command, options)?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let detail = if detail.is_empty() {
@@ -139,8 +144,11 @@ impl ConversionModule for MarkItDownModule {
             bytes: output.stdout,
             format: OutputFormat::MARKDOWN,
             module_id: self.id(),
-            pipeline: Vec::new(),
-            invocations: Vec::new(),
+            pipeline: vec![self.id()],
+            invocations: vec![InvocationRecord {
+                module_id: self.id(),
+                argv_display,
+            }],
         })
     }
 }

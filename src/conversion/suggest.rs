@@ -40,10 +40,7 @@ pub fn suggested_output_for_path(path: impl AsRef<Path>) -> OutputFormat {
             return OutputFormat::MP3;
         }
         if is_image_output(as_format)
-            || matches!(
-                ext.as_str(),
-                "bmp" | "tif" | "tiff" | "webp" | "heic" | "jpeg"
-            )
+            || matches!(ext.as_str(), "bmp" | "tif" | "tiff" | "webp" | "jpeg")
         {
             return OutputFormat::PNG;
         }
@@ -54,13 +51,14 @@ pub fn suggested_output_for_path(path: impl AsRef<Path>) -> OutputFormat {
 
     match ext.as_str() {
         // Video demux extensions without matching OutputFormat ids.
-        "m2ts" | "mts" | "vob" | "wmv" | "flv" | "rm" | "rmvb" | "asf" | "divx" | "mxf" => {
-            OutputFormat::MP4
-        }
+        "m2ts" | "mts" | "vob" | "wmv" | "flv" | "rm" | "rmvb" | "asf" | "divx" | "mxf" | "mpg"
+        | "mpg2" => OutputFormat::MP4,
         // Audio
-        "amr" | "ape" | "dts" | "eac3" | "mpc" | "oga" | "spx" => OutputFormat::MP3,
+        "amr" | "ape" | "dts" | "eac3" | "mpc" | "oga" | "spx" | "aif" | "aiff" => {
+            OutputFormat::MP3
+        }
         // Stills
-        "bmp" | "tif" | "tiff" | "webp" | "heic" | "jpeg" => OutputFormat::PNG,
+        "bmp" | "tif" | "tiff" | "webp" | "jpeg" => OutputFormat::PNG,
         // Documents / web → Markdown
         "pdf" | "docx" | "pptx" | "xlsx" | "xls" | "odt" | "ods" | "odp" | "epub" | "html"
         | "htm" | "xhtml" | "rtf" | "md" | "markdown" | "txt" | "csv" | "json" | "xml" => {

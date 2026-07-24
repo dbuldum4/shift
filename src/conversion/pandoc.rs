@@ -51,6 +51,7 @@ const INPUTS: &[&str] = &[
     "textile",
     "tikiwiki",
     "tsv",
+    "txt",
     "twiki",
     "typ",
     "typst",
@@ -148,6 +149,12 @@ impl ConversionModule for PandocModule {
         output_format: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        if !OutputFormat::PANDOC.contains(&output_format) {
+            return Err(ConversionError::new(format!(
+                "Pandoc cannot produce {}",
+                output_format.label()
+            )));
+        }
         let target = output_format.id();
         let input_format = input
             .extension()

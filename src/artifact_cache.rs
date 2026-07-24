@@ -16,6 +16,16 @@ pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Soft cap on total cache size before oldest entries are purged (512 MiB).
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
+/// True when `path` is a real directory and not a symbolic link.
+///
+/// Used to prevent cache purge logic from following a symlink and recursively
+/// deleting an unintended target directory.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// Directory for cached conversion binaries.
 pub fn artifact_cache_dir() -> Option<PathBuf> {
     if let Some(override_dir) = std::env::var_os("SHIFT_ARTIFACT_CACHE_DIR") {
@@ -41,7 +51,25 @@ pub fn ensure_artifact_cache_dir() -> io::Result<PathBuf> {
             "could not locate artifact cache directory",
         )
     })?;
-    fs::create_dir_all(&dir)?;
+
+    // Refuse to operate through a symlink: an attacker (or stale link) could
+    // redirect cache operations onto an unrelated directory.
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("artifact cache path is a symlink: {}", dir.display()),
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("artifact cache path is not a directory: {}", dir.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => fs::create_dir_all(&dir)?,
+    }
 
     let version_file = dir.join(VERSION_FILE_NAME);
     let version_matches = fs::read_to_string(&version_file)
@@ -55,12 +83,22 @@ pub fn ensure_artifact_cache_dir() -> io::Result<PathBuf> {
 }
 
 fn purge_cache_dir(dir: &Path) -> io::Result<()> {
+    if !is_real_dir(dir) {
+        return Ok(());
+    }
     for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
         let path = entry.path();
         if path.file_name().and_then(|name| name.to_str()) == Some(VERSION_FILE_NAME) {
             continue;
         }
-        let _ = if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            // Never follow symlinks; leave them in place.
+            continue;
+        }
+        let _ = if file_type.is_dir() {
             fs::remove_dir_all(&path)
         } else {
             fs::remove_file(&path)
@@ -299,7 +337,7 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
     let Some(dir) = artifact_cache_dir() else {
         return Ok(PurgeStats::default());
     };
-    if !dir.is_dir() {
+    if !is_real_dir(&dir) {
         return Ok(PurgeStats::default());
     }
 
@@ -353,7 +391,7 @@ pub fn purge_paste_staging(ttl: Duration) -> io::Result<PurgeStats> {
     } else {
         std::env::temp_dir().join("shift-paste-staging")
     };
-    if !dir.is_dir() {
+    if !is_real_dir(&dir) {
         return Ok(PurgeStats::default());
     }
 
@@ -392,14 +430,20 @@ fn collect_cache_files(dir: &Path, now: &SystemTime, out: &mut Vec<CacheEntry>) 
         for entry in fs::read_dir(&current)? {
             let entry = entry?;
             let path = entry.path();
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
+            // file_type() does not follow symlinks; this keeps us from traversing
+            // a symlink to an unrelated directory or deleting a symlink target.
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
-            if !meta.is_file() {
+            if !file_type.is_file() {
                 continue;
             }
+            let meta = entry.metadata()?;
             let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let age = now.duration_since(modified).unwrap_or_default();
             out.push(CacheEntry {
@@ -419,7 +463,7 @@ fn remove_cache_path(path: &Path) -> io::Result<()> {
 
 fn remove_empty_subdir(root: &Path, name: &str) -> io::Result<()> {
     let dir = root.join(name);
-    if dir.is_dir() {
+    if is_real_dir(&dir) {
         // Only remove if empty; ignore errors if not.
         let _ = fs::remove_dir(&dir);
     }

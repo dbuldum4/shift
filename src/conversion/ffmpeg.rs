@@ -500,17 +500,22 @@ impl FfmpegModule {
             .arg("-nostdin")
             .arg("-y");
 
-        // Input-side seek is faster for long media.
-        let input_seek = if is_image_output(output_format) {
-            options.frame_secs.or(options.start_secs)
-        } else {
-            options.start_secs
-        };
-        if let Some(secs) = input_seek {
-            command.arg("-ss").arg(format_timestamp(secs));
+        // Input-side seek is faster for long media, but still-image extraction
+        // needs output-side `-ss` so it lands on the exact frame (not the
+        // nearest keyframe) for long-GOP sources.
+        if let Some(secs) = options.start_secs {
+            if !is_image_output(output_format) {
+                command.arg("-ss").arg(format_timestamp(secs));
+            }
         }
 
         command.arg("-i").arg(input);
+
+        if is_image_output(output_format) {
+            if let Some(secs) = options.frame_secs.or(options.start_secs) {
+                command.arg("-ss").arg(format_timestamp(secs));
+            }
+        }
 
         if let Some(secs) = options.duration_secs {
             if !is_image_output(output_format) && !is_subtitle_output(output_format) {
@@ -527,17 +532,20 @@ impl FfmpegModule {
 }
 
 fn validate_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
-    for (label, value) in [
-        ("start", options.start_secs),
-        ("duration", options.duration_secs),
-        ("frame", options.frame_secs),
-    ] {
+    for (label, value) in [("start", options.start_secs), ("frame", options.frame_secs)] {
         if let Some(secs) = value {
             if !secs.is_finite() || secs < 0.0 {
                 return Err(ConversionError::new(format!(
                     "FFmpeg {label} must be a non-negative number of seconds"
                 )));
             }
+        }
+    }
+    if let Some(secs) = options.duration_secs {
+        if !secs.is_finite() || secs <= 0.0 {
+            return Err(ConversionError::new(
+                "FFmpeg duration must be a positive number of seconds".to_string(),
+            ));
         }
     }
     if let Some(secs) = options.frame_interval_secs {

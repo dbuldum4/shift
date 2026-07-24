@@ -1,4 +1,6 @@
 use crate::*;
+use std::io;
+use std::sync::mpsc::TryRecvError;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ConversionState {
@@ -7,6 +9,15 @@ pub(crate) enum ConversionState {
     /// Shared so render clones stay cheap for large artifacts.
     Ready(Arc<ConversionArtifact>),
     Failed(SharedString),
+}
+
+impl ConversionState {
+    pub(crate) fn ready_artifact(&self) -> Option<Arc<ConversionArtifact>> {
+        match self {
+            ConversionState::Ready(artifact) => Some(Arc::clone(artifact)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -903,44 +914,58 @@ impl Shift {
                         cx.notify();
                     });
                 }
-                if let Ok((queue, summary)) = done_rx.try_recv() {
-                    // Apply any trailing events first.
-                    while let Ok(event) = event_rx.try_recv() {
+                match done_rx.try_recv() {
+                    Ok((queue, summary)) => {
+                        // Apply any trailing events first.
+                        while let Ok(event) = event_rx.try_recv() {
+                            let _ = this.update(cx, |this, cx| {
+                                if this.batch_generation == generation {
+                                    this.apply_batch_event(event);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                        let _ = this.update(cx, |this, cx| {
+                            if this.batch_generation != generation {
+                                // Abandoned by Clear: release the running lock so a new
+                                // batch can start. Do not restore the worker's queue onto
+                                // the UI (user already cleared it).
+                                this.batch_running = false;
+                                if this
+                                    .batch_status
+                                    .as_ref()
+                                    .is_some_and(|s| s.as_ref().starts_with("Clearing"))
+                                {
+                                    this.batch_status = Some("Queue cleared.".into());
+                                }
+                                cx.notify();
+                                return;
+                            }
+                            this.batch_queue = queue;
+                            this.batch_running = false;
+                            this.batch_status = Some(
+                                format!(
+                                    "Batch complete: {} succeeded, {} failed, {} cancelled",
+                                    summary.succeeded, summary.failed, summary.cancelled
+                                )
+                                .into(),
+                            );
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
                         let _ = this.update(cx, |this, cx| {
                             if this.batch_generation == generation {
-                                this.apply_batch_event(event);
+                                this.batch_running = false;
+                                this.batch_status =
+                                    Some("Batch worker stopped unexpectedly.".into());
                                 cx.notify();
                             }
                         });
+                        break;
                     }
-                    let _ = this.update(cx, |this, cx| {
-                        if this.batch_generation != generation {
-                            // Abandoned by Clear: release the running lock so a new
-                            // batch can start. Do not restore the worker's queue onto
-                            // the UI (user already cleared it).
-                            this.batch_running = false;
-                            if this
-                                .batch_status
-                                .as_ref()
-                                .is_some_and(|s| s.as_ref().starts_with("Clearing"))
-                            {
-                                this.batch_status = Some("Queue cleared.".into());
-                            }
-                            cx.notify();
-                            return;
-                        }
-                        this.batch_queue = queue;
-                        this.batch_running = false;
-                        this.batch_status = Some(
-                            format!(
-                                "Batch complete: {} succeeded, {} failed, {} cancelled",
-                                summary.succeeded, summary.failed, summary.cancelled
-                            )
-                            .into(),
-                        );
-                        cx.notify();
-                    });
-                    break;
+                    Err(TryRecvError::Empty) => {}
                 }
                 if drained == 0 {
                     cx.background_executor()
@@ -1183,16 +1208,24 @@ impl Shift {
         extension: &str,
         cx: &mut Context<Self>,
     ) {
-        match stage_pasted_image(&bytes, extension) {
-            Ok(path) => {
-                self.url_input
+        // Clipboard images can be large, so write to the staging directory on
+        // the background executor instead of blocking the UI thread.
+        let extension = extension.to_owned();
+        let task = cx
+            .background_executor()
+            .spawn(async move { stage_pasted_image(&bytes, &extension) });
+
+        cx.spawn(async move |this, cx| match task.await {
+            Ok(path) => this.update(cx, |this, cx| {
+                this.url_input
                     .update(cx, |input, cx| input.set_content("", cx));
-                self.set_selected_file(path, cx);
-            }
-            Err(error) => {
-                self.fail_magic_paste(&error.to_string(), cx);
-            }
-        }
+                this.set_selected_file(path, cx);
+            }),
+            Err(error) => this.update(cx, |this, cx| {
+                this.fail_magic_paste(&error.to_string(), cx);
+            }),
+        })
+        .detach();
     }
 
     pub(crate) fn fail_magic_paste(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -1623,33 +1656,28 @@ impl Shift {
             .collect()
     }
 
-    pub(crate) fn ensure_cached_ready_path(&mut self) -> Option<PathBuf> {
+    /// Return the already-staged export path if it still matches the active
+    /// artifact's bytes. This check is cheap (metadata + hash), so it is safe
+    /// on the UI thread.
+    fn ready_cached_path(&self) -> Option<PathBuf> {
         let ConversionState::Ready(artifact) = &self.conversion else {
             return None;
         };
-        // Reuse only when the staged file still matches this artifact's bytes.
         if let Some(path) = self.cached_ready_path.clone() {
             if path.is_file() && export_matches_bytes(&path, &artifact.bytes) {
                 return Some(path);
             }
-            self.cached_ready_path = None;
         }
-        // Write once to the content-hash cache, then hard-link/copy into the
-        // user-facing export name so large media is not rewritten on drag.
-        let staged = (|| {
-            let cache_path = cache_artifact_bytes(&artifact.file_name, &artifact.bytes)?;
-            stage_export_file(&artifact.file_name, &cache_path)
-        })();
-        match staged {
-            Ok(path) => {
-                self.cached_ready_path = Some(path.clone());
-                Some(path)
-            }
-            Err(error) => {
-                self.save_status = Some(format!("Could not cache artifact: {error}").into());
-                None
-            }
-        }
+        None
+    }
+
+    /// Cache an in-memory artifact and stage it under a user-facing file name.
+    ///
+    /// This writes bytes to disk and may hard-link/copy large files, so it must
+    /// run on the background executor, not the UI thread.
+    fn stage_ready_artifact(artifact: &ConversionArtifact) -> Result<PathBuf, io::Error> {
+        let cache_path = cache_artifact_bytes(&artifact.file_name, &artifact.bytes)?;
+        stage_export_file(&artifact.file_name, &cache_path)
     }
 
     /// Mark conversion Ready. Export staging is lazy (first Reveal / Open / drag)
@@ -1671,29 +1699,93 @@ impl Shift {
                 return;
             }
         }
-        if let Some(path) = self.ensure_cached_ready_path() {
+
+        if let Some(path) = self.ready_cached_path() {
             cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
             self.save_status = Some("Copied artifact path to clipboard.".into());
             cx.notify();
-        } else {
-            cx.notify();
+            return;
         }
+
+        // Large binary artifacts are staged on the background executor so the
+        // UI thread does not block on disk writes / hard-links.
+        let artifact = Arc::clone(artifact);
+        let task = cx
+            .background_executor()
+            .spawn(async move { Self::stage_ready_artifact(&artifact) });
+        cx.spawn(async move |this, cx| match task.await {
+            Ok(path) => this.update(cx, |this, cx| {
+                this.cached_ready_path = Some(path.clone());
+                cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+                this.save_status = Some("Copied artifact path to clipboard.".into());
+                cx.notify();
+            }),
+            Err(error) => this.update(cx, |this, cx| {
+                this.save_status = Some(format!("Could not cache artifact: {error}").into());
+                cx.notify();
+            }),
+        })
+        .detach();
     }
 
     pub(crate) fn reveal_output(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.ensure_cached_ready_path() {
+        if let Some(path) = self.ready_cached_path() {
             file_picker::reveal_in_finder(&path);
             self.save_status = Some(format!("Revealed · {}", path.display()).into());
+            cx.notify();
+            return;
         }
-        cx.notify();
+
+        let Some(artifact) = self.conversion.ready_artifact() else {
+            return;
+        };
+        let artifact = Arc::clone(&artifact);
+        let task = cx
+            .background_executor()
+            .spawn(async move { Self::stage_ready_artifact(&artifact) });
+        cx.spawn(async move |this, cx| match task.await {
+            Ok(path) => this.update(cx, |this, cx| {
+                this.cached_ready_path = Some(path.clone());
+                file_picker::reveal_in_finder(&path);
+                this.save_status = Some(format!("Revealed · {}", path.display()).into());
+                cx.notify();
+            }),
+            Err(error) => this.update(cx, |this, cx| {
+                this.save_status = Some(format!("Could not cache artifact: {error}").into());
+                cx.notify();
+            }),
+        })
+        .detach();
     }
 
     pub(crate) fn open_output(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.ensure_cached_ready_path() {
+        if let Some(path) = self.ready_cached_path() {
             file_picker::open_path(&path);
             self.save_status = Some(format!("Opened · {}", path.display()).into());
+            cx.notify();
+            return;
         }
-        cx.notify();
+
+        let Some(artifact) = self.conversion.ready_artifact() else {
+            return;
+        };
+        let artifact = Arc::clone(&artifact);
+        let task = cx
+            .background_executor()
+            .spawn(async move { Self::stage_ready_artifact(&artifact) });
+        cx.spawn(async move |this, cx| match task.await {
+            Ok(path) => this.update(cx, |this, cx| {
+                this.cached_ready_path = Some(path.clone());
+                file_picker::open_path(&path);
+                this.save_status = Some(format!("Opened · {}", path.display()).into());
+                cx.notify();
+            }),
+            Err(error) => this.update(cx, |this, cx| {
+                this.save_status = Some(format!("Could not cache artifact: {error}").into());
+                cx.notify();
+            }),
+        })
+        .detach();
     }
 
     pub(crate) fn pick_reference_doc(&mut self, cx: &mut Context<Self>) {
@@ -1834,39 +1926,58 @@ impl Shift {
                         cx.notify();
                     });
                 }
-                if let Ok(result) = done_rx.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        if this.selection_generation == generation
-                            && this.conversion_generation == conversion_generation
-                            && this.source_matches(&source_for_check)
-                        {
-                            this.conversion_progress = None;
-                            match result {
-                                Ok(artifact) => {
-                                    let artifact = Arc::new(artifact);
-                                    this.record_history(
-                                        HistoryOutcome::Ready(Arc::clone(&artifact)),
-                                        cx,
-                                    );
-                                    this.set_ready_artifact(artifact);
+                match done_rx.try_recv() {
+                    Ok(result) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.selection_generation == generation
+                                && this.conversion_generation == conversion_generation
+                                && this.source_matches(&source_for_check)
+                            {
+                                this.conversion_progress = None;
+                                match result {
+                                    Ok(artifact) => {
+                                        let artifact = Arc::new(artifact);
+                                        this.record_history(
+                                            HistoryOutcome::Ready(Arc::clone(&artifact)),
+                                            cx,
+                                        );
+                                        this.set_ready_artifact(artifact);
+                                    }
+                                    Err(error) if error.is_cancelled() => {
+                                        this.conversion =
+                                            ConversionState::Failed("Conversion cancelled.".into());
+                                    }
+                                    Err(error) => {
+                                        let message: SharedString = error.to_string().into();
+                                        this.record_history(
+                                            HistoryOutcome::Failed(message.clone()),
+                                            cx,
+                                        );
+                                        this.conversion = ConversionState::Failed(message);
+                                    }
                                 }
-                                Err(error) if error.is_cancelled() => {
-                                    this.conversion =
-                                        ConversionState::Failed("Conversion cancelled.".into());
-                                }
-                                Err(error) => {
-                                    let message: SharedString = error.to_string().into();
-                                    this.record_history(
-                                        HistoryOutcome::Failed(message.clone()),
-                                        cx,
-                                    );
-                                    this.conversion = ConversionState::Failed(message);
-                                }
+                                cx.notify();
                             }
-                            cx.notify();
-                        }
-                    });
-                    break;
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.selection_generation == generation
+                                && this.conversion_generation == conversion_generation
+                                && this.source_matches(&source_for_check)
+                            {
+                                this.conversion_progress = None;
+                                let message: SharedString =
+                                    "Conversion worker stopped unexpectedly.".into();
+                                this.record_history(HistoryOutcome::Failed(message.clone()), cx);
+                                this.conversion = ConversionState::Failed(message);
+                                cx.notify();
+                            }
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {}
                 }
                 cx.background_executor()
                     .timer(Duration::from_millis(40))
@@ -2280,10 +2391,13 @@ impl Shift {
         let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
         let changed: Vec<u64> = self.history_dirty_ids.iter().copied().collect();
         let deleted: Vec<u64> = self.history_deleted_ids.iter().copied().collect();
-        // Best-effort: keep the in-memory list if the disk write fails.
-        let _ = save_history_delta(&stored, &changed, &deleted);
-        self.history_dirty_ids.clear();
-        self.history_deleted_ids.clear();
+        // Best-effort: keep the in-memory list and the dirty/deleted sets so a
+        // failed SQLite write can be retried on the next persist, instead of
+        // silently dropping archive/delete/clear/new-entry changes.
+        if save_history_delta(&stored, &changed, &deleted).is_ok() {
+            self.history_dirty_ids.clear();
+            self.history_deleted_ids.clear();
+        }
     }
 
     pub(crate) fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {

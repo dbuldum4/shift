@@ -482,7 +482,9 @@ async fn history_records_and_restores_conversions(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn batch_output_format_change_writes_correct_extension(cx: &mut TestAppContext) {
     let env = TestEnv::new();
-    let path = write_input(&env, "batch_format.txt", b"hello");
+    // Use a PDF so the HTML route goes through Docling (txt now has a Pandoc
+    // route, which would change the expected fake output).
+    let path = write_input(&env, "batch_format.pdf", b"%PDF-1.4 fake");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
@@ -749,6 +751,9 @@ async fn clipboard_image_converts_via_ffmpeg(cx: &mut TestAppContext) {
 
     shift.update(cx, |this, cx| {
         this.ingest_clipboard_image(vec![1, 2, 3, 4], "png", cx);
+    });
+    cx.run_until_parked();
+    shift.update(cx, |this, cx| {
         this.start_conversion(cx);
     });
     cx.run_until_parked();

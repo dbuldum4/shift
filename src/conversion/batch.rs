@@ -527,15 +527,23 @@ pub fn resolve_destination(
 ) -> PathBuf {
     match source {
         BatchSource::File(path) => {
-            let default = default_output_path(path, format);
             if let Some(dir) = output_dir {
-                let name = default
-                    .file_name()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(format!("converted.{}", format.extension())));
-                dir.join(name)
+                // Use the source stem with the target extension. Only insert the
+                // `.converted` guard when the resulting path would still point at
+                // the source file (for example, an output_dir equal to the source
+                // directory with a same-extension conversion).
+                let mut file_name = PathBuf::from(path.file_stem().unwrap_or_default());
+                if file_name.as_os_str().is_empty() {
+                    file_name = PathBuf::from("converted");
+                }
+                file_name.set_extension(format.extension());
+                let candidate = dir.join(&file_name);
+                if paths_refer_to_same_file(path, &candidate) {
+                    file_name.set_extension(format!("converted.{}", format.extension()));
+                }
+                dir.join(file_name)
             } else {
-                default
+                default_output_path(path, format)
             }
         }
         BatchSource::Url(url) => {

@@ -56,11 +56,28 @@ pub fn expand_input_paths_with_extensions(
     let mut visited = HashSet::new();
 
     for path in paths {
-        let path = path.as_ref();
-        expand_one(path, recursive, extensions, 0, &mut visited, &mut out)?;
+        let path = expand_tilde(path.as_ref());
+        expand_one(&path, recursive, extensions, 0, &mut visited, &mut out)?;
     }
 
     Ok(out)
+}
+
+/// Expand a leading `~` (and `~/...`) using `$HOME` / `$USERPROFILE`.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if raw == "~" {
+        home.map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn expand_one(

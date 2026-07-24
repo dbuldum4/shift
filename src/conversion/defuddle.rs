@@ -1,7 +1,7 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, LimitedOutput,
-    OutputFormat, map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command_cancellable,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
+    LimitedOutput, OutputFormat, command_argv_parts, format_argv_display, map_spawn_error,
+    max_output_bytes, process_timeout, resolve_tool_executable, run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ impl DefuddleModule {
         source: &str,
         markdown: bool,
         options: &ConversionOptions,
-    ) -> Result<LimitedOutput, ConversionError> {
+    ) -> Result<(LimitedOutput, InvocationRecord), ConversionError> {
         let mut command = Command::new(&self.executable);
         command.arg("parse").arg(source);
         if markdown {
@@ -70,7 +70,15 @@ impl DefuddleModule {
         {
             command.arg("--lang").arg(lang);
         }
-        run_command_cancellable(
+
+        let display_parts = command_argv_parts(&command);
+        let argv_display = format_argv_display(&display_parts);
+        let invocation = InvocationRecord {
+            module_id: self.id(),
+            argv_display,
+        };
+
+        let output = run_command_cancellable(
             command,
             process_timeout(),
             max_output_bytes(),
@@ -82,7 +90,8 @@ impl DefuddleModule {
                 "Defuddle is not installed. Install it with `npm install -g defuddle`, \
                  or set SHIFT_DEFUDDLE_BIN.",
             )
-        })
+        })?;
+        Ok((output, invocation))
     }
 
     fn artifact_from_output(
@@ -91,6 +100,7 @@ impl DefuddleModule {
         file_stem: &str,
         output_format: OutputFormat,
         output: LimitedOutput,
+        invocation: InvocationRecord,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -110,8 +120,8 @@ impl DefuddleModule {
             bytes: output.stdout,
             format: output_format,
             module_id: self.id(),
-            pipeline: Vec::new(),
-            invocations: Vec::new(),
+            pipeline: vec![self.id()],
+            invocations: vec![invocation],
         })
     }
 
@@ -143,8 +153,8 @@ impl DefuddleModule {
         ensure_public_url_fetch_allowed(url)?;
 
         let markdown = output_format == OutputFormat::MARKDOWN;
-        let output = self.run(url, markdown, options)?;
-        self.artifact_from_output(url, &url_file_stem(url), output_format, output)
+        let (output, invocation) = self.run(url, markdown, options)?;
+        self.artifact_from_output(url, &url_file_stem(url), output_format, output, invocation)
     }
 }
 
@@ -190,13 +200,19 @@ impl ConversionModule for DefuddleModule {
         let source = input
             .to_str()
             .ok_or_else(|| ConversionError::new("input path is not valid UTF-8"))?;
-        let output = self.run(source, markdown, options)?;
+        let (output, invocation) = self.run(source, markdown, options)?;
         let stem = input
             .file_stem()
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .unwrap_or("converted");
-        self.artifact_from_output(&input.display().to_string(), stem, output_format, output)
+        self.artifact_from_output(
+            &input.display().to_string(),
+            stem,
+            output_format,
+            output,
+            invocation,
+        )
     }
 
     fn convert_url(

@@ -18,8 +18,9 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use batch::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
@@ -521,6 +522,8 @@ impl std::str::FromStr for OutputFormat {
         let lowered = value.to_ascii_lowercase();
         let key = match lowered.as_str() {
             "jpeg" => "jpg",
+            "mpg" | "mpg2" => "mpeg",
+            "aif" => "aiff",
             "png-zip" | "png_sequence" | "frames-zip" | "png-sequence-zip" => "png-sequence-zip",
             other => other,
         };
@@ -553,7 +556,9 @@ pub struct PdfInputOptions {
 
 impl PdfInputOptions {
     pub fn needs_slice(&self) -> bool {
-        self.page_from.is_some() || self.page_to.is_some()
+        // `page_from == 1` with no `page_to` is the same as the full document,
+        // so there is no need to run it through qpdf.
+        self.page_from.is_some_and(|page| page > 1) || self.page_to.is_some()
     }
 
     /// True when qpdf should preprocess the PDF before any module runs.
@@ -694,6 +699,25 @@ impl ConversionArtifact {
     }
 }
 
+static WRITE_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+fn file_stem_for_temp(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "output".into())
+}
+
+fn unique_temp_file_name(stem: &str, suffix: &str) -> String {
+    let pid = std::process::id();
+    let count = WRITE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(".{stem}.{pid}-{count}-{nanos}{suffix}")
+}
+
 /// Write `bytes` to `path` via a unique `*.shift-partial` sibling, then rename.
 ///
 /// On failure the partial file is removed. The final path appears only after a
@@ -701,15 +725,8 @@ impl ConversionArtifact {
 pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("output");
-    let token = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let partial = dir.join(format!(".{stem}.{token}.shift-partial"));
+    let stem = file_stem_for_temp(path);
+    let partial = dir.join(unique_temp_file_name(&stem, ".shift-partial"));
 
     if let Err(error) = std::fs::write(&partial, bytes) {
         let _ = std::fs::remove_file(&partial);
@@ -722,9 +739,10 @@ pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), Conversio
     if let Err(error) = std::fs::rename(&partial, path) {
         // Some platforms refuse rename-over-existing. Move the previous file
         // aside first so a failed second rename can restore it (never delete
-        // the only good copy before the new file is in place).
+        // the only good copy before the new file is in place). The backup name
+        // uses its own unique token so it cannot collide with the partial.
         if path.exists() {
-            let backup = dir.join(format!(".{stem}.{token}.shift-bak"));
+            let backup = dir.join(unique_temp_file_name(&stem, ".shift-bak"));
             match std::fs::rename(path, &backup) {
                 Ok(()) => match std::fs::rename(&partial, path) {
                     Ok(()) => {
@@ -760,12 +778,11 @@ pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), Conversio
 
 /// Remove incomplete `*.shift-partial` siblings next to a planned destination.
 pub fn remove_partial_outputs(planned: &Path) -> usize {
-    let Some(parent) = planned.parent() else {
-        return 0;
-    };
-    let Some(stem) = planned.file_name().and_then(|value| value.to_str()) else {
-        return 0;
-    };
+    let parent = planned
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = file_stem_for_temp(planned);
     let prefix = format!(".{stem}.");
     let Ok(entries) = std::fs::read_dir(parent) else {
         return 0;
@@ -777,7 +794,7 @@ pub fn remove_partial_outputs(planned: &Path) -> usize {
             continue;
         };
         if name.starts_with(&prefix)
-            && name.ends_with(".shift-partial")
+            && (name.ends_with(".shift-partial") || name.ends_with(".shift-bak"))
             && std::fs::remove_file(entry.path()).is_ok()
         {
             removed += 1;

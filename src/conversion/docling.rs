@@ -1,8 +1,8 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
     OutputFormat, command_argv_parts, format_argv_display, map_spawn_error, max_output_bytes,
-    process_timeout, read_file_limited, redact_flag_value, resolve_tool_executable,
-    run_command_cancellable, unique_temp_dir,
+    process_timeout, read_file_limited, resolve_tool_executable, run_command_cancellable,
+    unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -245,19 +245,8 @@ impl DoclingModule {
         {
             command.arg("--ocr-lang").arg(lang);
         }
-        // PDF password lives on shared PdfInputOptions (never persisted / never shown).
-        if let Some(password) = options
-            .pdf
-            .password
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            command.arg("--pdf-password").arg(password);
-        }
 
-        let mut display_parts = command_argv_parts(&command);
-        redact_flag_value(&mut display_parts, "--pdf-password", "••••");
+        let display_parts = command_argv_parts(&command);
         let invocation = InvocationRecord {
             module_id: self.id(),
             argv_display: format_argv_display(&display_parts),
@@ -465,10 +454,6 @@ printf '%s' "$body" > "$output/$stem.$ext"
                 tables: false,
                 table_mode: DoclingTableMode::Accurate,
             },
-            pdf: super::super::PdfInputOptions {
-                password: Some("s3cret".into()),
-                ..Default::default()
-            },
             ..ConversionOptions::default()
         };
         let artifact = DoclingModule::with_executable(&executable)
@@ -483,20 +468,15 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert!(args.contains("accurate"), "args: {args}");
         assert!(args.contains("--ocr-lang"), "args: {args}");
         assert!(args.contains("eng+deu"), "args: {args}");
-        assert!(args.contains("--pdf-password"), "args: {args}");
-        assert!(args.contains("s3cret"), "args: {args}");
-        // Password must never appear in the redacted invocation display.
+        assert!(
+            !args.contains("--pdf-password"),
+            "PDF password should be handled by qpdf preprocess, not passed to docling, args: {args}"
+        );
+        assert!(
+            !args.contains("s3cret"),
+            "PDF password should not appear on the docling command line, args: {args}"
+        );
         assert_eq!(artifact.invocations.len(), 1);
-        assert!(
-            artifact.invocations[0].argv_display.contains("••••"),
-            "display: {}",
-            artifact.invocations[0].argv_display
-        );
-        assert!(
-            !artifact.invocations[0].argv_display.contains("s3cret"),
-            "display leaked password: {}",
-            artifact.invocations[0].argv_display
-        );
 
         let _ = fs::remove_file(&executable);
         let _ = fs::remove_file(format!("{}.args", executable.display()));

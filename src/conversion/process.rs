@@ -533,18 +533,23 @@ fn resolve_tool_path_uncached(
     if let Some(override_path) = std::env::var_os(env_override) {
         if !override_path.is_empty() {
             let path = PathBuf::from(&override_path);
-            if is_runnable(&path) {
+            let as_path = Path::new(&override_path);
+            if as_path.is_absolute() || as_path.components().count() > 1 {
+                // Explicit absolute or relative path: use it as-is.
+                if is_runnable(&path) {
+                    return Some(path);
+                }
+                // Surface configured-but-broken paths so diagnostics can show them.
+                if path.exists() {
+                    return Some(path);
+                }
                 return Some(path);
             }
-            // Surface configured-but-broken paths so diagnostics can show them.
-            if path.exists() {
-                return Some(path);
-            }
-            // Bare name (or relative) in the env override.
+            // Bare name: search PATH/common dirs first, never the current directory.
             if let Some(found) = find_executable(&override_path) {
                 return Some(found);
             }
-            return Some(PathBuf::from(override_path));
+            return Some(path);
         }
     }
 
