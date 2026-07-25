@@ -3,7 +3,9 @@
 //! Accepts page URLs, local paths, `file://` URLs, remote file downloads,
 //! and (via helpers) clipboard image bytes staged as temporary files.
 
-use super::defuddle::{block_private_urls, ensure_public_url_fetch_allowed, looks_like_url};
+use super::defuddle::{
+    block_private_urls, ensure_public_url_fetch_allowed, looks_like_url, redact_url_credentials,
+};
 use super::process::run_command_cancellable;
 use super::sources::supported_input_extensions;
 use super::{BatchSource, ConversionError, ConversionRegistry};
@@ -286,16 +288,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-}
-
-/// Strip credentials from a URL before logging or reporting it.
-fn redact_url_credentials(url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url) {
-        let _ = parsed.set_username("");
-        let _ = parsed.set_password(None);
-        return parsed.to_string();
-    }
-    url.to_owned()
 }
 
 fn path_extension_from_url_path(path: &str) -> Option<String> {

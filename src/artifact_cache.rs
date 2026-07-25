@@ -3,7 +3,10 @@
 use crate::session_settings::application_support_dir;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 const CACHE_DIR_NAME: &str = "artifact-cache";
@@ -11,6 +14,12 @@ const EXPORT_SUBDIR: &str = "export";
 const PASTE_STAGING_SUBDIR: &str = "paste-staging";
 const VERSION_FILE_NAME: &str = ".version";
 const CACHE_VERSION: &str = "1";
+static STAGING_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+fn staging_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 /// Default TTL for cached artifacts (7 days).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Soft cap on total cache size before oldest entries are purged (512 MiB).
@@ -111,6 +120,9 @@ fn purge_cache_dir(dir: &Path) -> io::Result<()> {
 ///
 /// Returns the path of the written cache file.
 pub fn cache_artifact_bytes(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let _guard = staging_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let dir = ensure_artifact_cache_dir()?;
     let safe = sanitize_cache_name(name);
     let hash = simple_hash(bytes);
@@ -126,9 +138,7 @@ pub fn cache_artifact_bytes(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     };
     let path = dir.join(file_name);
     if !path.exists() {
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, &path)?;
+        write_bytes_via_unique_temp(&path, bytes)?;
     }
     Ok(path)
 }
@@ -150,6 +160,9 @@ pub fn cache_artifact_file(source: &Path) -> io::Result<PathBuf> {
 /// already occupied by different content, a short content-hash disambiguator is
 /// inserted so existing staged files are not overwritten underfoot.
 pub fn stage_export_bytes(file_name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let _guard = staging_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let dir = ensure_artifact_cache_dir()?.join(EXPORT_SUBDIR);
     fs::create_dir_all(&dir)?;
     let safe = export_file_name(file_name);
@@ -182,6 +195,9 @@ pub fn stage_export_bytes(file_name: &str, bytes: &[u8]) -> io::Result<PathBuf> 
 /// Prefer this when the artifact is already on disk so large media is not rewritten.
 /// Content is hashed by streaming (not loaded fully into RAM).
 pub fn stage_export_file(file_name: &str, source: &Path) -> io::Result<PathBuf> {
+    let _guard = staging_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let dir = ensure_artifact_cache_dir()?.join(EXPORT_SUBDIR);
     fs::create_dir_all(&dir)?;
     let safe = export_file_name(file_name);
@@ -209,11 +225,16 @@ pub fn stage_export_file(file_name: &str, source: &Path) -> io::Result<PathBuf> 
         return Ok(path);
     }
 
-    if path.exists() {
-        fs::remove_file(&path)?;
+    let tmp = unique_staging_path(&path);
+    if fs::hard_link(source, &tmp).is_err() {
+        if let Err(error) = fs::copy(source, &tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
     }
-    if fs::hard_link(source, &path).is_err() {
-        fs::copy(source, &path)?;
+    if let Err(error) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
     let _ = fs::write(hash_sidecar_path(&dir, &target_name), &hash_hex);
     Ok(path)
@@ -227,11 +248,36 @@ pub fn export_matches_bytes(path: &Path, bytes: &[u8]) -> bool {
 
 fn write_export_file(dir: &Path, name: &str, bytes: &[u8], hash_hex: &str) -> io::Result<()> {
     let path = dir.join(name);
-    let tmp = dir.join(format!(".{name}.tmp"));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
+    write_bytes_via_unique_temp(&path, bytes)?;
     let _ = fs::write(hash_sidecar_path(dir, name), hash_hex);
     Ok(())
+}
+
+fn unique_staging_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    let token = STAGING_TOKEN.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{name}.{}-{token}.tmp", std::process::id()))
+}
+
+fn write_bytes_via_unique_temp(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = unique_staging_path(path);
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn hash_sidecar_path(dir: &Path, name: &str) -> PathBuf {
@@ -647,6 +693,36 @@ mod tests {
         // Second stage with same content reuses the path.
         let export2 = stage_export_file("clip.bin", &source).unwrap();
         assert_eq!(export, export2);
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_cache_and_export_staging_reuses_complete_artifact() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("concurrent");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let cache = cache_artifact_bytes("shared.bin", b"shared-payload").unwrap();
+                    stage_export_file("shared.bin", &cache).unwrap()
+                })
+            })
+            .collect();
+        let paths: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"shared-payload");
 
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");

@@ -4,6 +4,7 @@
 //! virtual table for full-text search. Legacy binary blobs are imported once and
 //! then moved aside so they cannot block subsequent launches.
 
+use crate::conversion::redact_url_credentials;
 use rusqlite::{Connection, params, params_from_iter};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
@@ -389,7 +390,7 @@ fn write_entry_row(
 ) -> Result<(), rusqlite::Error> {
     let (source_kind, source) = match &entry.source {
         StoredSource::File(path) => (0i64, store_source_path(path)),
-        StoredSource::Url(url) => (1i64, url.clone()),
+        StoredSource::Url(url) => (1i64, redact_url_credentials(url)),
     };
 
     let (outcome_kind, module_id, file_name, format, artifact_bytes, byte_len, error_message) =

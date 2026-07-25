@@ -50,6 +50,7 @@ impl DefuddleModule {
     fn run(
         &self,
         source: &str,
+        display_source: &str,
         markdown: bool,
         options: &ConversionOptions,
     ) -> Result<(LimitedOutput, InvocationRecord), ConversionError> {
@@ -71,7 +72,12 @@ impl DefuddleModule {
             command.arg("--lang").arg(lang);
         }
 
-        let display_parts = command_argv_parts(&command);
+        let mut display_parts = command_argv_parts(&command);
+        for part in &mut display_parts {
+            if part == source {
+                *part = display_source.to_owned();
+            }
+        }
         let argv_display = format_argv_display(&display_parts);
         let invocation = InvocationRecord {
             module_id: self.id(),
@@ -153,8 +159,15 @@ impl DefuddleModule {
         ensure_public_url_fetch_allowed(url)?;
 
         let markdown = output_format == OutputFormat::MARKDOWN;
-        let (output, invocation) = self.run(url, markdown, options)?;
-        self.artifact_from_output(url, &url_file_stem(url), output_format, output, invocation)
+        let display_url = redact_url_credentials(url);
+        let (output, invocation) = self.run(url, &display_url, markdown, options)?;
+        self.artifact_from_output(
+            &display_url,
+            &url_file_stem(url),
+            output_format,
+            output,
+            invocation,
+        )
     }
 }
 
@@ -200,7 +213,7 @@ impl ConversionModule for DefuddleModule {
         let source = input
             .to_str()
             .ok_or_else(|| ConversionError::new("input path is not valid UTF-8"))?;
-        let (output, invocation) = self.run(source, markdown, options)?;
+        let (output, invocation) = self.run(source, source, markdown, options)?;
         let stem = input
             .file_stem()
             .and_then(|value| value.to_str())
@@ -274,17 +287,18 @@ fn env_flag_truthy(name: &str) -> bool {
 /// inherent to separate name lookup; hop revalidation still applies to remote
 /// file downloads.
 pub fn ensure_public_url_fetch_allowed(url: &str) -> Result<(), ConversionError> {
+    let display_url = redact_url_credentials(url);
     if !block_private_urls() {
         return Ok(());
     }
     if url_targets_non_public_host(url) {
         return Err(ConversionError::new(format!(
-            "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {url}"
+            "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
         )));
     }
     if url_resolves_to_non_public_host(url) {
         return Err(ConversionError::new(format!(
-            "refusing URL whose host resolves to a non-public address (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {url}"
+            "refusing URL whose host resolves to a non-public address (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
         )));
     }
     Ok(())
@@ -296,6 +310,16 @@ pub fn url_display_host(url: &str) -> String {
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_owned))
         .unwrap_or_else(|| "url".into())
+}
+
+/// Strip URL userinfo before a URL is displayed, logged, or persisted.
+pub fn redact_url_credentials(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url.trim()) {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        return parsed.to_string();
+    }
+    url.to_owned()
 }
 
 /// True when the URL host is loopback, private, link-local, or a localhost-style name.
@@ -494,6 +518,14 @@ mod tests {
     }
 
     #[test]
+    fn redacts_url_credentials_for_display() {
+        let redacted = redact_url_credentials("https://user:s3cret@example.com/private?q=1");
+        assert_eq!(redacted, "https://example.com/private?q=1");
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("s3cret"));
+    }
+
+    #[test]
     fn url_stem_uses_last_path_segment() {
         assert_eq!(
             url_file_stem("https://example.com/blog/my-post?ref=1"),
@@ -538,6 +570,21 @@ mod tests {
         assert!(args.contains("parse"));
         assert!(args.contains("https://example.com/hello-world"));
         assert!(args.contains("--markdown"));
+
+        let credentialed = DefuddleModule::with_executable(&executable)
+            .convert_url(
+                "https://user:s3cret@example.com/hello-world",
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            credentialed
+                .invocations
+                .iter()
+                .all(|record| !record.argv_display.contains("user")
+                    && !record.argv_display.contains("s3cret"))
+        );
 
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_file(format!("{}.args", executable.display()));

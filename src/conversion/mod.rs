@@ -29,7 +29,7 @@ pub use batch::{
 };
 pub use defuddle::{
     DefuddleModule, DefuddleOptions, block_private_urls, ensure_public_url_fetch_allowed,
-    looks_like_url, url_display_host, url_targets_non_public_host,
+    looks_like_url, redact_url_credentials, url_display_host, url_targets_non_public_host,
 };
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,

@@ -56,7 +56,9 @@ pub(crate) struct ConversionHistoryEntry {
 pub(crate) fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEntry {
     let source = match &entry.source {
         HistorySource::File(path) => StoredSource::File(path.clone()),
-        HistorySource::Url(url) => StoredSource::Url(url.clone()),
+        HistorySource::Url(url) => {
+            StoredSource::Url(shift_core::conversion::redact_url_credentials(url))
+        }
     };
     let outcome = match &entry.outcome {
         HistoryOutcome::Ready(artifact) => StoredOutcome::Ready {
@@ -1720,18 +1722,30 @@ impl Shift {
 
         // Large binary artifacts are staged on the background executor so the
         // UI thread does not block on disk writes / hard-links.
+        let selection_generation = self.selection_generation;
+        let conversion_generation = self.conversion_generation;
         let artifact = Arc::clone(artifact);
         let task = cx
             .background_executor()
             .spawn(async move { Self::stage_ready_artifact(&artifact) });
         cx.spawn(async move |this, cx| match task.await {
             Ok(path) => this.update(cx, |this, cx| {
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.cached_ready_path = Some(path.clone());
                 cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
                 this.save_status = Some("Copied artifact path to clipboard.".into());
                 cx.notify();
             }),
             Err(error) => this.update(cx, |this, cx| {
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.save_status = Some(format!("Could not cache artifact: {error}").into());
                 cx.notify();
             }),
@@ -1750,18 +1764,30 @@ impl Shift {
         let Some(artifact) = self.conversion.ready_artifact() else {
             return;
         };
+        let selection_generation = self.selection_generation;
+        let conversion_generation = self.conversion_generation;
         let artifact = Arc::clone(&artifact);
         let task = cx
             .background_executor()
             .spawn(async move { Self::stage_ready_artifact(&artifact) });
         cx.spawn(async move |this, cx| match task.await {
             Ok(path) => this.update(cx, |this, cx| {
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.cached_ready_path = Some(path.clone());
                 file_picker::reveal_in_finder(&path);
                 this.save_status = Some(format!("Revealed · {}", path.display()).into());
                 cx.notify();
             }),
             Err(error) => this.update(cx, |this, cx| {
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.save_status = Some(format!("Could not cache artifact: {error}").into());
                 cx.notify();
             }),
@@ -1780,18 +1806,30 @@ impl Shift {
         let Some(artifact) = self.conversion.ready_artifact() else {
             return;
         };
+        let selection_generation = self.selection_generation;
+        let conversion_generation = self.conversion_generation;
         let artifact = Arc::clone(&artifact);
         let task = cx
             .background_executor()
             .spawn(async move { Self::stage_ready_artifact(&artifact) });
         cx.spawn(async move |this, cx| match task.await {
             Ok(path) => this.update(cx, |this, cx| {
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.cached_ready_path = Some(path.clone());
                 file_picker::open_path(&path);
                 this.save_status = Some(format!("Opened · {}", path.display()).into());
                 cx.notify();
             }),
             Err(error) => this.update(cx, |this, cx| {
+                if this.selection_generation != selection_generation
+                    || this.conversion_generation != conversion_generation
+                {
+                    return;
+                }
                 this.save_status = Some(format!("Could not cache artifact: {error}").into());
                 cx.notify();
             }),

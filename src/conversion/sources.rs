@@ -165,6 +165,7 @@ fn expand_directory(
         ))
     })?;
 
+    let mut children = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             ConversionError::new(format!(
@@ -172,7 +173,11 @@ fn expand_directory(
                 path.display()
             ))
         })?;
-        let child = entry.path();
+        children.push(entry.path());
+    }
+    children.sort();
+
+    for child in children {
         if is_hidden(&child) {
             continue;
         }
@@ -275,6 +280,22 @@ mod tests {
         exts.insert("pdf".into());
         let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
         assert_eq!(found, vec![visible]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recursive_expansion_is_sorted_by_path() {
+        let dir = unique_dir("sorted");
+        for name in ["z.pdf", "a.pdf", "m.pdf"] {
+            std::fs::write(dir.join(name), b"%PDF").unwrap();
+        }
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
+        assert_eq!(
+            found,
+            vec![dir.join("a.pdf"), dir.join("m.pdf"), dir.join("z.pdf")]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
