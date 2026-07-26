@@ -17,3 +17,6 @@ pub use session_settings::{
     default_session_settings_path, load_default_session_settings, load_session_settings,
     save_default_session_settings, save_session_settings,
 };
+
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

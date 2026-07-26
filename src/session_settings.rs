@@ -430,6 +430,7 @@ pub fn save_default_session_settings(settings: &SessionSettings) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     fn unique_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -443,6 +444,51 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    struct EnvGuard {
+        home: Option<OsString>,
+        app_support_dir: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                home: std::env::var_os("HOME"),
+                app_support_dir: std::env::var_os("SHIFT_APP_SUPPORT_DIR"),
+            }
+        }
+
+        fn apply(&self, home: Option<&std::path::Path>, app_support_dir: Option<&std::path::Path>) {
+            unsafe {
+                if let Some(path) = home {
+                    std::env::set_var("HOME", path.as_os_str());
+                } else {
+                    std::env::remove_var("HOME");
+                }
+
+                if let Some(path) = app_support_dir {
+                    std::env::set_var("SHIFT_APP_SUPPORT_DIR", path.as_os_str());
+                } else {
+                    std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+                }
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.home.take() {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.app_support_dir.take() {
+                    Some(value) => std::env::set_var("SHIFT_APP_SUPPORT_DIR", value),
+                    None => std::env::remove_var("SHIFT_APP_SUPPORT_DIR"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -577,5 +623,254 @@ mod tests {
             elapsed <= Duration::from_secs(2),
             "session settings serde×1k took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn corrupt_json_returns_defaults() {
+        let dir = unique_dir("corrupt");
+        let path = dir.join("session-settings.json");
+        fs::write(&path, b"{not valid json").unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded, SessionSettings::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_limit_clamps_on_load() {
+        let dir = unique_dir("history-clamp");
+        let path = dir.join("session-settings.json");
+
+        let mut too_low = SessionSettings::default();
+        too_low.history_limit = 0;
+        save_session_settings(&path, &too_low).unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded.history_limit, crate::history::MIN_HISTORY_LIMIT);
+
+        let mut too_high = SessionSettings::default();
+        too_high.history_limit = crate::history::MAX_HISTORY_LIMIT + 1;
+        save_session_settings(&path, &too_high).unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded.history_limit, crate::history::MAX_HISTORY_LIMIT);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_zero_rewritten_to_current() {
+        let dir = unique_dir("version-zero");
+        let path = dir.join("session-settings.json");
+
+        let mut legacy = SessionSettings::default();
+        legacy.version = 0;
+        let json = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&path, json).unwrap();
+
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded.version, SETTINGS_VERSION);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unknown_output_format_falls_back_to_markdown() {
+        let mut settings = SessionSettings::default();
+        settings.output_format = "not-a-real-format".into();
+        assert_eq!(settings.output_format(), OutputFormat::MARKDOWN);
+    }
+
+    #[test]
+    fn full_engine_options_round_trip() {
+        let dir = unique_dir("full-options");
+        let path = dir.join("session-settings.json");
+
+        let mut settings = SessionSettings::default();
+        settings.options.ffmpeg = SessionFfmpegOptions {
+            start_secs: Some(1.5),
+            duration_secs: Some(10.0),
+            frame_secs: Some(0.5),
+            frame_interval_secs: Some(0.25),
+            audio_stream: Some(0),
+            subtitle_stream: Some(1),
+            encode_mode: "reencode".into(),
+            quality: "small".into(),
+            mono: true,
+            sample_rate_hz: Some(44100),
+            scale_width: Some(1280),
+            fps: Some(30.0),
+            mute: true,
+            normalize_audio: true,
+            burn_subtitles: true,
+        };
+        settings.options.markitdown.keep_data_uris = true;
+        settings.options.pandoc = SessionPandocOptions {
+            pdf_engine: Some("xelatex".into()),
+            standalone: true,
+            toc: true,
+            reference_doc: Some(PathBuf::from("/tmp/ref.docx")),
+            citations: true,
+        };
+        settings.options.defuddle = SessionDefuddleOptions {
+            frontmatter: true,
+            lang: Some("en".into()),
+        };
+        settings.options.docling = SessionDoclingOptions {
+            image_export_mode: "referenced".into(),
+            ocr: true,
+            ocr_lang: Some("fra".into()),
+            tables: true,
+            table_mode: "accurate".into(),
+        };
+        settings.options.pdf = SessionPdfInputOptions {
+            page_from: Some(3),
+            page_to: Some(7),
+        };
+
+        save_session_settings(&path, &settings).unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded, settings);
+
+        let conversion = loaded.to_conversion_options();
+        assert_eq!(conversion.ffmpeg.encode_mode, FfmpegEncodeMode::Reencode);
+        assert_eq!(conversion.ffmpeg.quality, FfmpegQuality::Small);
+        assert_eq!(conversion.ffmpeg.start_secs, Some(1.5));
+        assert!(conversion.ffmpeg.mono);
+        assert!(conversion.ffmpeg.mute);
+        assert!(conversion.ffmpeg.normalize_audio);
+        assert!(conversion.ffmpeg.burn_subtitles);
+        assert_eq!(conversion.markitdown.keep_data_uris, true);
+        assert_eq!(conversion.pandoc.pdf_engine.as_deref(), Some("xelatex"));
+        assert!(conversion.pandoc.standalone);
+        assert!(conversion.pandoc.toc);
+        assert_eq!(
+            conversion.pandoc.reference_doc,
+            Some(PathBuf::from("/tmp/ref.docx"))
+        );
+        assert!(conversion.pandoc.citations);
+        assert!(conversion.defuddle.frontmatter);
+        assert_eq!(conversion.defuddle.lang.as_deref(), Some("en"));
+        assert_eq!(
+            conversion.docling.image_export_mode,
+            DoclingImageExportMode::Referenced
+        );
+        assert!(conversion.docling.ocr);
+        assert_eq!(conversion.docling.ocr_lang.as_deref(), Some("fra"));
+        assert!(conversion.docling.tables);
+        assert_eq!(conversion.docling.table_mode, DoclingTableMode::Accurate);
+        assert_eq!(conversion.pdf.page_from, Some(3));
+        assert_eq!(conversion.pdf.page_to, Some(7));
+        assert_eq!(conversion.pdf.password, None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn app_support_dir_override_resolves_default_path() {
+        let _lock = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new();
+        let override_dir = unique_dir("override");
+        let fake_home = unique_dir("fake-home");
+        guard.apply(Some(&fake_home), Some(&override_dir));
+
+        assert_eq!(application_support_dir(), Some(override_dir.clone()));
+        assert_eq!(
+            default_session_settings_path(),
+            Some(override_dir.join(SETTINGS_FILE_NAME))
+        );
+
+        let mut settings = SessionSettings::default();
+        settings.history_limit = 7;
+        save_default_session_settings(&settings).unwrap();
+        let loaded = load_default_session_settings();
+        assert_eq!(loaded.history_limit, 7);
+
+        let _ = fs::remove_dir_all(override_dir);
+        let _ = fs::remove_dir_all(fake_home);
+    }
+
+    #[test]
+    fn save_creates_parents_and_writes_pretty_json() {
+        let dir = unique_dir("nested");
+        let path = dir.join("deeply/nested/session-settings.json");
+        let settings = SessionSettings {
+            output_format: OutputFormat::HTML.id().into(),
+            ..Default::default()
+        };
+        save_session_settings(&path, &settings).unwrap();
+
+        assert!(path.exists());
+        assert!(path.parent().unwrap().exists());
+
+        let bytes = fs::read(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"].as_u64(), Some(1));
+        assert_eq!(value["output_format"].as_str(), Some("html"));
+        assert_eq!(
+            value["history_limit"].as_u64(),
+            Some(crate::history::DEFAULT_HISTORY_LIMIT as u64)
+        );
+        assert!(bytes.contains(&b'\n'));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_limit_and_show_archived_round_trip_and_legacy_defaults() {
+        let dir = unique_dir("history-legacy");
+        let path = dir.join("session-settings.json");
+
+        let settings = SessionSettings {
+            history_limit: 7,
+            show_archived: true,
+            ..Default::default()
+        };
+        save_session_settings(&path, &settings).unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded.history_limit, 7);
+        assert!(loaded.show_archived);
+
+        let mut legacy = serde_json::to_value(SessionSettings::default()).expect("serialize");
+        let obj = legacy.as_object_mut().expect("object");
+        obj.remove("history_limit");
+        obj.remove("show_archived");
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).expect("json")).unwrap();
+        let migrated = load_session_settings(&path);
+        assert_eq!(
+            migrated.history_limit,
+            crate::history::DEFAULT_HISTORY_LIMIT
+        );
+        assert!(!migrated.show_archived);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_conversion_options_strips_password_and_maps_ffmpeg_enums() {
+        let mut live = ConversionOptions::default();
+        live.ffmpeg.encode_mode = FfmpegEncodeMode::Reencode;
+        live.ffmpeg.quality = FfmpegQuality::Small;
+        live.ffmpeg.mono = true;
+        live.pdf.password = Some("secret".into());
+        live.pdf.page_from = Some(5);
+        live.pdf.page_to = Some(9);
+
+        let mut settings = SessionSettings::default();
+        settings.apply_conversion_options(&live);
+
+        assert_eq!(settings.options.ffmpeg.encode_mode, "reencode");
+        assert_eq!(settings.options.ffmpeg.quality, "small");
+        assert!(settings.options.ffmpeg.mono);
+        assert_eq!(settings.options.pdf.page_from, Some(5));
+        assert_eq!(settings.options.pdf.page_to, Some(9));
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("password"));
+        assert!(!json.contains("secret"));
+
+        let conversion = settings.to_conversion_options();
+        assert_eq!(conversion.ffmpeg.encode_mode, FfmpegEncodeMode::Reencode);
+        assert_eq!(conversion.ffmpeg.quality, FfmpegQuality::Small);
+        assert!(conversion.ffmpeg.mono);
+        assert_eq!(conversion.pdf.password, None);
+        assert_eq!(conversion.pdf.page_from, Some(5));
+        assert_eq!(conversion.pdf.page_to, Some(9));
     }
 }

@@ -73,12 +73,10 @@ fn preferences_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         home: Option<OsString>,
+        app_support_dir: Option<OsString>,
         module_priority: Option<OsString>,
     }
 
@@ -86,16 +84,32 @@ mod tests {
         fn new() -> Self {
             Self {
                 home: std::env::var_os("HOME"),
+                app_support_dir: std::env::var_os("SHIFT_APP_SUPPORT_DIR"),
                 module_priority: std::env::var_os("SHIFT_MODULE_PRIORITY"),
             }
         }
 
         fn apply(&self, home: Option<&std::path::Path>, module_priority: Option<&str>) {
+            self.apply_with_app_support(home, None, module_priority);
+        }
+
+        fn apply_with_app_support(
+            &self,
+            home: Option<&std::path::Path>,
+            app_support_dir: Option<&std::path::Path>,
+            module_priority: Option<&str>,
+        ) {
             unsafe {
                 if let Some(path) = home {
                     std::env::set_var("HOME", path.as_os_str());
                 } else {
                     std::env::remove_var("HOME");
+                }
+
+                if let Some(path) = app_support_dir {
+                    std::env::set_var("SHIFT_APP_SUPPORT_DIR", path.as_os_str());
+                } else {
+                    std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
                 }
 
                 if let Some(value) = module_priority {
@@ -113,6 +127,10 @@ mod tests {
                 match self.home.take() {
                     Some(value) => std::env::set_var("HOME", value),
                     None => std::env::remove_var("HOME"),
+                }
+                match self.app_support_dir.take() {
+                    Some(value) => std::env::set_var("SHIFT_APP_SUPPORT_DIR", value),
+                    None => std::env::remove_var("SHIFT_APP_SUPPORT_DIR"),
                 }
                 match self.module_priority.take() {
                     Some(value) => std::env::set_var("SHIFT_MODULE_PRIORITY", value),
@@ -143,7 +161,7 @@ mod tests {
 
     #[test]
     fn load_priority_from_env_var() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let guard = EnvGuard::new();
         guard.apply(None, Some("docling,pandoc,unknown,docling"));
 
@@ -155,7 +173,7 @@ mod tests {
 
     #[test]
     fn load_priority_from_file() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("file");
         std::fs::create_dir_all(home.join("Library/Application Support/Shift")).unwrap();
         std::fs::write(
@@ -176,7 +194,7 @@ mod tests {
 
     #[test]
     fn missing_file_uses_defaults() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("missing");
         std::fs::create_dir_all(&home).unwrap();
 
@@ -189,7 +207,7 @@ mod tests {
 
     #[test]
     fn save_and_load_priority_round_trips() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("save");
         std::fs::create_dir_all(&home).unwrap();
 
@@ -213,6 +231,82 @@ mod tests {
             load_module_priority(),
             vec!["pandoc", "docling", "markitdown", "defuddle", "ffmpeg"]
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn app_support_dir_override_is_preferred_for_preferences_path_and_save_load() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        let home = unique_temp("home");
+        let override_dir = unique_temp("override");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&override_dir).unwrap();
+        env_guard.apply_with_app_support(Some(&home), Some(&override_dir), None);
+
+        assert_eq!(
+            preferences_path(),
+            Some(override_dir.join("module-priority"))
+        );
+
+        save_module_priority(&["docling".to_owned(), "ffmpeg".to_owned()]).unwrap();
+        let saved = std::fs::read_to_string(override_dir.join("module-priority")).unwrap();
+        assert_eq!(saved, "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle");
+
+        assert_eq!(
+            load_module_priority(),
+            vec!["docling", "ffmpeg", "markitdown", "pandoc", "defuddle"]
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&override_dir);
+    }
+
+    #[test]
+    fn module_priority_env_with_whitespace_and_empty_segments() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        env_guard.apply_with_app_support(None, None, Some("  pandoc , , ffmpeg  "));
+
+        assert_eq!(
+            load_module_priority(),
+            vec!["pandoc", "ffmpeg", "markitdown", "defuddle", "docling"]
+        );
+    }
+
+    #[test]
+    fn empty_or_unknown_env_module_priority_yields_defaults() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        for value in ["", "unknown,also-unknown"] {
+            env_guard.apply_with_app_support(None, None, Some(value));
+            assert_eq!(
+                load_module_priority(),
+                default_module_priority(),
+                "value: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_module_priority_overrides_file() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        let home = unique_temp("env-over-file");
+        std::fs::create_dir_all(home.join("Library/Application Support/Shift")).unwrap();
+        std::fs::write(
+            home.join("Library/Application Support/Shift/module-priority"),
+            "pandoc\ndocling\n",
+        )
+        .unwrap();
+
+        env_guard.apply_with_app_support(Some(&home), None, Some("ffmpeg,markitdown"));
+
+        assert_eq!(
+            load_module_priority(),
+            vec!["ffmpeg", "markitdown", "pandoc", "defuddle", "docling"]
+        );
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }
