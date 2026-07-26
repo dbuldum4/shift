@@ -605,11 +605,11 @@ pub use stub::*;
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    /// Serialize env + static LAST_DIRECTORY / DIALOG_OPEN mutations.
-    static LOCK: Mutex<()> = Mutex::new(());
+    // Serialize env + static LAST_DIRECTORY / DIALOG_OPEN mutations via the
+    // binary-wide `crate::ENV_LOCK` so file_picker and ui_tests cannot race
+    // on HOME / SHIFT_* while running in the same test process.
 
     struct HomeGuard {
         previous: Option<OsString>,
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn default_start_directory_prefers_documents() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("documents");
         std::fs::create_dir_all(home.join("Documents")).unwrap();
         let _home_guard = HomeGuard::set(&home);
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn default_start_directory_falls_back_to_home_when_documents_missing() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("home-no-docs");
         std::fs::create_dir_all(&home).unwrap();
         // Explicitly ensure Documents is absent
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn default_start_directory_falls_back_to_home_when_documents_is_file() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("docs-is-file");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("Documents"), b"not a dir").unwrap();
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn default_start_directory_returns_home_path_even_if_missing() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = unique_temp("missing-home");
         // Do not create `missing`; HOME points at a nonexistent path.
         let _ = std::fs::remove_dir_all(&missing);
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn home_dir_reads_env_override() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("home-env");
         std::fs::create_dir_all(&home).unwrap();
         let _home_guard = HomeGuard::set(&home);
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_prefers_provided_directory() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("provided");
         let provided = home.join("provided");
         let last = home.join("last");
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_ignores_provided_file_and_uses_last() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("provided-file");
         let last = home.join("last");
         std::fs::create_dir_all(&last).unwrap();
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_ignores_provided_missing_path() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("provided-missing");
         let last = home.join("last");
         std::fs::create_dir_all(&last).unwrap();
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_falls_back_to_last_directory() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("last");
         let last = home.join("last");
         std::fs::create_dir_all(&last).unwrap();
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_ignores_non_dir_last_directory() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("last-file");
         std::fs::create_dir_all(home.join("Documents")).unwrap();
         let file = home.join("was-a-dir-now-file");
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_ignores_missing_last_directory() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("last-missing");
         std::fs::create_dir_all(&home).unwrap();
         let _home_guard = HomeGuard::set(&home);
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_falls_back_to_default() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("default");
         std::fs::create_dir_all(home.join("Documents")).unwrap();
         let _home_guard = HomeGuard::set(&home);
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_priority_provided_over_last_over_default() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("priority");
         let provided = home.join("provided");
         let last = home.join("last");
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn remember_directory_stores_parent_for_files_and_directory_itself() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember");
         let parent = home.join("parent");
         std::fs::create_dir_all(&parent).unwrap();
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn remember_directory_nested_file_uses_immediate_parent() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-nested");
         let nested = home.join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
@@ -904,7 +904,7 @@ mod tests {
 
     #[test]
     fn remember_directory_nested_dir_stores_that_dir() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-nested-dir");
         let nested = home.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn remember_directory_missing_file_with_existing_parent_stores_parent() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-missing-parent-ok");
         std::fs::create_dir_all(&home).unwrap();
         reset();
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn remember_directory_ignores_path_when_resolved_dir_missing() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-missing-deep");
         std::fs::create_dir_all(&home).unwrap();
         reset();
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn remember_directory_overwrites_previous_value() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-overwrite");
         let d1 = home.join("one");
         let d2 = home.join("two");
@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn remember_directory_does_not_clear_on_unresolvable_path() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-keep");
         let good = home.join("good");
         std::fs::create_dir_all(&good).unwrap();
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn begin_dialog_and_is_busy_guard_reentry() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
 
         assert!(!is_busy());
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn concurrent_begin_dialog_false_when_busy() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
 
         assert!(begin_dialog());
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn is_busy_false_after_reset() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         assert!(!is_busy());
         assert!(begin_dialog());
@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_with_none_and_empty_state_uses_home_env() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("env-resolve");
         std::fs::create_dir_all(home.join("Documents")).unwrap();
         let _home_guard = HomeGuard::set(&home);
@@ -1055,7 +1055,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stub_pickers_return_empty_selections() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
 
         // `try_recv` on a oneshot receiver returns `Result<Option<T>, Canceled>`.
@@ -1075,7 +1075,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stub_pickers_clear_busy_and_accept_starting_directory() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
 
         // Even if busy was set, stubs force-clear DIALOG_OPEN.
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[test]
     fn home_dir_none_when_home_unset() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("HOME");
         unsafe {
             std::env::remove_var("HOME");
@@ -1135,7 +1135,7 @@ mod tests {
 
     #[test]
     fn remember_directory_root_like_paths() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("remember-rootish");
         std::fs::create_dir_all(&home).unwrap();
         reset();
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn resolve_start_dir_provided_empty_path_buf_falls_through() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("empty-pathbuf");
         std::fs::create_dir_all(home.join("Documents")).unwrap();
         let _home_guard = HomeGuard::set(&home);
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn is_busy_reflects_dialog_open_store() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         assert!(!is_busy());
         DIALOG_OPEN.store(true, Ordering::SeqCst);
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn remember_directory_relative_path_when_cwd_parent_exists() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         // Relative file name: parent is "" / current semantics via Path::parent.
         // If parent resolves to something that is_dir (often "." or ""), may or may not store.
@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn begin_dialog_exclusive_then_reset_allows_again() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         assert!(begin_dialog());
         assert!(!begin_dialog());

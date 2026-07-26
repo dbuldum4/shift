@@ -8,8 +8,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 use gpui::{AppContext, Entity, TestAppContext};
 
@@ -29,7 +29,7 @@ use shift_core::conversion::{
 use shift_core::history::{MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use std::sync::Arc;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+// Binary-wide lock shared with `file_picker` tests (see `crate::ENV_LOCK` in main.rs).
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MARKITDOWN_FAKE: &str = r#"#!/bin/sh
@@ -142,7 +142,7 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pid = std::process::id();
         let count = COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp = std::env::temp_dir().join(format!("shift-ui-test-{pid}-{count}"));

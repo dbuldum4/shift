@@ -6,6 +6,13 @@ mod ui;
 #[cfg(test)]
 mod ui_tests;
 
+/// Serializes binary-crate tests that mutate process-global state: env vars
+/// (`HOME`, `SHIFT_*`) and `file_picker` statics (`LAST_DIRECTORY`, `DIALOG_OPEN`).
+/// Every env-mutating test in this binary must hold this lock for the full
+/// mutation window and restore via `Drop` (not only on the success path).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use crate::app::{ConversionHistoryEntry, ConversionState, HistoryOutcome, HistorySource, Shift};
 use crate::ui::animation;
 use crate::ui::theme::{THEME, card_shadow};
@@ -1102,16 +1109,19 @@ fn history_sidebar(
 }
 
 fn history_matches_search(entry: &ConversionHistoryEntry, query: &str) -> bool {
-    entry.name.to_lowercase().contains(query)
-        || entry.detail.to_lowercase().contains(query)
-        || entry.extension_label.to_lowercase().contains(query)
+    // Case-insensitive: lowercase both sides so callers (and direct tests) do
+    // not need to pre-normalize the query. The UI also lowercases before calling.
+    let query = query.to_lowercase();
+    entry.name.to_lowercase().contains(&query)
+        || entry.detail.to_lowercase().contains(&query)
+        || entry.extension_label.to_lowercase().contains(&query)
         || history_output_format(entry)
             .label()
             .to_lowercase()
-            .contains(query)
+            .contains(&query)
         || match &entry.source {
-            HistorySource::File(path) => path.to_string_lossy().to_lowercase().contains(query),
-            HistorySource::Url(url) => url.to_lowercase().contains(query),
+            HistorySource::File(path) => path.to_string_lossy().to_lowercase().contains(&query),
+            HistorySource::Url(url) => url.to_lowercase().contains(&query),
         }
 }
 
@@ -6328,11 +6338,11 @@ mod pure_ui_helpers {
             OutputFormat::MARKDOWN,
             HistoryOutcome::Failed("missing".into()),
         );
-        // Name (entry fields lowercased; query used as-is).
+        // Name (case-insensitive on both sides).
         assert!(history_matches_search(&entry, "q3-report"));
         assert!(history_matches_search(&entry, "report"));
         assert!(history_matches_search(&entry, ".docx"));
-        assert!(!history_matches_search(&entry, "Q3-REPORT")); // query not lowercased
+        assert!(history_matches_search(&entry, "Q3-REPORT")); // uppercase query still matches
         assert!(!history_matches_search(&entry, "xyzzy"));
 
         // Detail.
@@ -6342,7 +6352,7 @@ mod pure_ui_helpers {
 
         // Extension label.
         assert!(history_matches_search(&entry, "docx"));
-        assert!(!history_matches_search(&entry, "DOCX")); // uppercase query misses
+        assert!(history_matches_search(&entry, "DOCX")); // case-insensitive
     }
 
     #[test]
@@ -6396,7 +6406,7 @@ mod pure_ui_helpers {
         assert!(history_matches_search(&file, "secret-project"));
         assert!(history_matches_search(&file, "/volumes/exports"));
         assert!(history_matches_search(&file, "final.mov"));
-        assert!(!history_matches_search(&file, "Secret-Project")); // case of query
+        assert!(history_matches_search(&file, "Secret-Project")); // case-insensitive
 
         let url = sample_history_entry_custom(
             2,
@@ -6410,7 +6420,7 @@ mod pure_ui_helpers {
         assert!(history_matches_search(&url, "news.example.com"));
         assert!(history_matches_search(&url, "articles/42"));
         assert!(history_matches_search(&url, "https://"));
-        assert!(!history_matches_search(&url, "NEWS.EXAMPLE"));
+        assert!(history_matches_search(&url, "NEWS.EXAMPLE")); // case-insensitive
     }
 
     #[test]
@@ -6423,7 +6433,7 @@ mod pure_ui_helpers {
         assert!(history_matches_search(&entry, "port9"));
         assert!(history_matches_search(&entry, "documents"));
         assert!(!history_matches_search(&entry, "no-such-token-zzz"));
-        assert!(!history_matches_search(&entry, "REPORT9.DOCX"));
+        assert!(history_matches_search(&entry, "REPORT9.DOCX")); // case-insensitive
     }
 
     // ── history_output_format / history_entry_detail / stored_detail ─────
@@ -6946,9 +6956,8 @@ mod pure_ui_helpers {
         assert!(!preview.is_empty());
         // Text-previewable markdown should surface content.
         assert!(
-            preview.as_ref().contains("Heading")
-                || preview.as_ref().contains("body")
-                || !preview.is_empty()
+            preview.as_ref().contains("Heading") || preview.as_ref().contains("body"),
+            "markdown preview should include document text, got: {preview}"
         );
 
         let binary = ConversionArtifact {
@@ -7404,14 +7413,23 @@ mod pure_ui_helpers {
     fn artifact_preview_empty_and_non_utf8() {
         let empty = sample_artifact(1, Vec::new());
         let preview = artifact_preview(&empty);
-        // Empty markdown still yields a defined summary string.
-        let _ = preview.as_ref();
+        // Empty markdown still yields a defined non-empty summary string.
+        assert!(!preview.as_ref().is_empty());
 
         let binary = sample_artifact_with(2, OutputFormat::PDF, "pandoc", vec![0xff, 0xfe, 0x00]);
         let preview = artifact_preview(&binary);
         // Non-text formats should not claim the raw bytes as UTF-8 text.
         assert_ne!(preview.as_ref(), "\u{FFFE}\0");
-        assert!(!preview.as_ref().is_empty() || preview.as_ref().is_empty());
+        assert!(
+            !preview.as_ref().is_empty(),
+            "binary artifact preview must be non-empty"
+        );
+        assert!(
+            preview.as_ref().contains("Not shown inline")
+                || preview.as_ref().contains("Binary")
+                || preview.as_ref().contains("PDF"),
+            "binary preview should describe the artifact, got: {preview}"
+        );
     }
 
     #[test]
