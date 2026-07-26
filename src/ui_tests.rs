@@ -2520,14 +2520,12 @@ async fn missing_tool_binary_fails_with_failed_state(cx: &mut TestAppContext) {
     });
     let msg = failed_msg.unwrap();
     let lower = msg.to_ascii_lowercase();
+    // Production maps missing binaries to install hints / "executable not found".
     assert!(
-        lower.contains("not found")
-            || lower.contains("no such file")
-            || lower.contains("failed")
-            || lower.contains("executable")
+        lower.contains("executable not found")
             || lower.contains("not installed")
-            || lower.contains("markitdown"),
-        "unexpected failure message: {msg}"
+            || lower.contains("markitdown is not installed"),
+        "expected install-hint / not-found messaging, got: {msg}"
     );
 }
 
@@ -4063,6 +4061,49 @@ async fn build_conversion_options_ok_with_defaults(cx: &mut TestAppContext) {
         assert!(options.pdf.password.is_none());
         assert!(options.pdf.page_from.is_none());
     });
+}
+
+#[gpui::test]
+async fn persist_session_settings_never_writes_pdf_password(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let shift = create_shift(cx);
+    let secret = "s3cret-ui-password-must-not-persist";
+
+    shift.update(cx, |this, cx| {
+        this.pdf_password_input
+            .update(cx, |input, cx| input.set_content(secret, cx));
+        this.pdf_page_from_input
+            .update(cx, |input, cx| input.set_content("2", cx));
+        this.pdf_page_to_input
+            .update(cx, |input, cx| input.set_content("4", cx));
+        // Live options carry the password; disk must not.
+        let options = this.build_conversion_options(cx).expect("options ok");
+        assert_eq!(options.pdf.password.as_deref(), Some(secret));
+        assert_eq!(options.pdf.page_from, Some(2));
+        assert_eq!(options.pdf.page_to, Some(4));
+        this.persist_session_settings(cx);
+    });
+    cx.run_until_parked();
+
+    let json = fs::read_to_string(env.session_path()).unwrap();
+    assert!(
+        !json.contains(secret),
+        "password value must not appear in session-settings.json: {json}"
+    );
+    assert!(
+        !json.contains("\"password\""),
+        "password key must never be serialized: {json}"
+    );
+    // Page range knobs still persist.
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let page_from = value
+        .pointer("/options/pdf/page_from")
+        .and_then(|v| v.as_u64());
+    let page_to = value
+        .pointer("/options/pdf/page_to")
+        .and_then(|v| v.as_u64());
+    assert_eq!(page_from, Some(2), "page_from should persist: {json}");
+    assert_eq!(page_to, Some(4), "page_to should persist: {json}");
 }
 
 #[gpui::test]

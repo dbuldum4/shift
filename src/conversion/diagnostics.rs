@@ -822,12 +822,9 @@ fn normalize_tool_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
     fn write_script(path: &Path, body: &str) {
@@ -988,7 +985,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_respects_env_override_and_version() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "shift-diag-probe-{}-{}",
             std::process::id(),
@@ -1019,7 +1016,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_engine_is_reported() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         let missing = std::env::temp_dir().join(format!(
             "shift-diag-missing-{}-no-such-bin",
             std::process::id()

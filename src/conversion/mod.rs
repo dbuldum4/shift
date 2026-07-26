@@ -2691,8 +2691,7 @@ mod tests {
     fn pdf_password_is_preprocessed_and_not_passed_to_modules() {
         use std::os::unix::fs::PermissionsExt;
 
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -2708,7 +2707,7 @@ mod tests {
         std::fs::set_permissions(&fake_qpdf, permissions).unwrap();
         std::fs::write(&input, b"%PDF-1.4 fake").unwrap();
 
-        // SAFETY: serialized behind ENV_LOCK.
+        // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::set_var("SHIFT_QPDF_BIN", &fake_qpdf);
         }

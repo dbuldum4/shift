@@ -679,12 +679,58 @@ pub fn bundled_runtime_tool(name: &str) -> Option<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    use std::sync::Mutex;
     use std::time::Instant;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Restores an env var on drop (including panic unwind).
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: caller must hold crate::ENV_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with set under crate::ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Restores the process working directory on drop (including panic unwind).
+    struct CwdGuard {
+        previous: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
 
     fn write_script(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
@@ -879,7 +925,7 @@ mod tests {
 
     #[test]
     fn process_timeout_respects_env_and_default() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("SHIFT_CONVERSION_TIMEOUT_SECS").ok();
         unsafe { std::env::remove_var("SHIFT_CONVERSION_TIMEOUT_SECS") };
         assert_eq!(process_timeout(), DEFAULT_PROCESS_TIMEOUT);
@@ -895,7 +941,7 @@ mod tests {
 
     #[test]
     fn max_output_bytes_respects_env_and_default() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES").ok();
         unsafe { std::env::remove_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES") };
         assert_eq!(max_output_bytes(), DEFAULT_MAX_OUTPUT_BYTES);
@@ -911,7 +957,7 @@ mod tests {
 
     #[test]
     fn is_runnable_requires_regular_executable_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exec_path =
             std::env::temp_dir().join(format!("shift-process-runnable-{}", std::process::id()));
         write_script(&exec_path, "#!/bin/sh\necho ok\n");
@@ -937,7 +983,7 @@ mod tests {
 
     #[test]
     fn find_executable_searches_path_and_common_dirs() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let bin_dir =
             std::env::temp_dir().join(format!("shift-process-bin-{}", std::process::id()));
         std::fs::create_dir_all(&bin_dir).unwrap();
@@ -969,7 +1015,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_path_prefers_env_override_local_candidate_and_default() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = std::env::temp_dir().join(format!("shift-resolve-{}", std::process::id()));
         std::fs::create_dir_all(&temp).unwrap();
 
@@ -1049,7 +1095,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_executable_falls_back_to_bare_name() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env_key = "SHIFT_PROCESS_RESOLVE_EXEC_BIN";
         unsafe { std::env::remove_var(env_key) };
         assert_eq!(
@@ -1117,7 +1163,7 @@ mod tests {
 
     #[test]
     fn common_bin_dirs_includes_nvm_layout_under_home() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("shift-home-nvm-{}", std::process::id()));
         let node_bin = home.join("versions/node/v22.23.1/bin");
         std::fs::create_dir_all(&node_bin).unwrap();
@@ -1218,7 +1264,7 @@ mod tests {
 
     #[test]
     fn clear_tool_discovery_cache_invalidates_memoized_paths() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("cache-clear");
         let bin_dir = std::env::temp_dir().join(format!("shift-process-cache-{suffix}"));
         std::fs::create_dir_all(&bin_dir).unwrap();
@@ -1268,7 +1314,7 @@ mod tests {
 
     #[test]
     fn clear_tool_discovery_cache_also_clears_resolve_tool_path_cache() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("resolve-cache");
         let temp = std::env::temp_dir().join(format!("shift-process-resolve-cache-{suffix}"));
         std::fs::create_dir_all(&temp).unwrap();
@@ -1309,27 +1355,31 @@ mod tests {
     }
 
     #[test]
-    fn bundled_runtime_tool_returns_none_or_path_under_resources() {
-        // Test binary is not inside a .app bundle, so ancestors typically lack
-        // Resources/Contents. The function must still return a well-formed Option.
-        let result = bundled_runtime_tool("pandoc");
-        if let Some(path) = result {
-            let rendered = path.to_string_lossy();
-            assert!(
-                rendered.contains("runtime/bin") || rendered.contains("pandoc"),
-                "unexpected bundled path: {rendered}"
-            );
-            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("pandoc"));
-        }
-        // Empty tool name still builds a path when a Resources ancestor exists.
-        let empty = bundled_runtime_tool("");
-        if let Some(path) = empty {
-            assert!(
-                path.to_string_lossy().contains("runtime/bin"),
-                "empty name should still sit under runtime/bin: {}",
-                path.display()
-            );
-        }
+    fn bundled_runtime_tool_returns_none_for_cargo_test_binary() {
+        // Cargo test binaries live under target/.../deps and have no Resources or
+        // Contents ancestor, so bundled discovery must return None (not a soft
+        // either-way assertion that always passes).
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe = exe.canonicalize().unwrap_or(exe);
+        let has_bundle_ancestor = exe.ancestors().any(|ancestor| {
+            matches!(
+                ancestor.file_name().and_then(|n| n.to_str()),
+                Some("Resources" | "Contents")
+            )
+        });
+        assert!(
+            !has_bundle_ancestor,
+            "test binary unexpectedly under app bundle layout: {}",
+            exe.display()
+        );
+        assert!(
+            bundled_runtime_tool("pandoc").is_none(),
+            "cargo test binary must not resolve a bundled runtime tool"
+        );
+        assert!(
+            bundled_runtime_tool("").is_none(),
+            "empty tool name must also be None outside a bundle"
+        );
     }
 
     #[test]
@@ -1381,7 +1431,7 @@ mod tests {
 
     #[test]
     fn common_bin_dirs_includes_home_local_cargo_volta_asdf_mise() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("home-layout");
         let home = std::env::temp_dir().join(format!("shift-home-layout-{suffix}"));
         let expected_relative = [
@@ -1445,7 +1495,7 @@ mod tests {
 
     #[test]
     fn common_bin_dirs_orders_nvm_versions_newest_first() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("nvm-order");
         let home = std::env::temp_dir().join(format!("shift-home-nvm-order-{suffix}"));
         let nvm_root = home.join(".nvm");
@@ -1492,7 +1542,7 @@ mod tests {
 
     #[test]
     fn common_bin_dirs_includes_fnm_layout_under_home_and_fnm_dir() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("fnm-layout");
         let home = std::env::temp_dir().join(format!("shift-home-fnm-{suffix}"));
         let fnm_custom = home.join("custom-fnm");
@@ -1606,7 +1656,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_path_empty_env_override_falls_through() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("empty-override");
         let temp = std::env::temp_dir().join(format!("shift-resolve-empty-{suffix}"));
         std::fs::create_dir_all(&temp).unwrap();
@@ -1637,7 +1687,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_path_absolute_missing_override_is_still_surfaced() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("abs-missing");
         let missing = std::env::temp_dir().join(format!("shift-resolve-abs-missing-{suffix}"));
         let _ = std::fs::remove_file(&missing);
@@ -1670,7 +1720,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_path_relative_multi_component_override() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("rel-multi");
         let work = std::env::temp_dir().join(format!("shift-resolve-rel-{suffix}"));
         std::fs::create_dir_all(work.join("nested")).unwrap();
@@ -1707,7 +1757,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_path_skips_non_runnable_local_candidates() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("local-skip");
         let temp = std::env::temp_dir().join(format!("shift-resolve-local-skip-{suffix}"));
         std::fs::create_dir_all(&temp).unwrap();
@@ -1740,7 +1790,7 @@ mod tests {
 
     #[test]
     fn resolve_tool_executable_returns_resolved_absolute_path() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("exec-abs");
         let temp = std::env::temp_dir().join(format!("shift-resolve-exec-abs-{suffix}"));
         std::fs::create_dir_all(&temp).unwrap();
@@ -1787,34 +1837,28 @@ mod tests {
 
     #[test]
     fn find_executable_skips_empty_path_components() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("empty-path");
         let cwd_tool = format!("shift_cwd_tool_{suffix}");
         // Place a same-named file in cwd; empty PATH component must not find it.
-        let previous_cwd = std::env::current_dir().unwrap();
         let work = std::env::temp_dir().join(format!("shift-empty-path-{suffix}"));
         std::fs::create_dir_all(&work).unwrap();
-        std::env::set_current_dir(&work).unwrap();
+        let _cwd = CwdGuard::enter(&work);
         write_script(Path::new(&cwd_tool), "#!/bin/sh\necho cwd\n");
 
-        let previous_path = std::env::var_os("PATH");
         // Leading empty component + only system bins — must not resolve via cwd.
-        unsafe { std::env::set_var("PATH", ":/usr/bin:/bin") };
+        // PATH restore is RAII so assertion failure cannot poison later tests.
+        let _path = EnvVarGuard::set("PATH", ":/usr/bin:/bin");
         clear_tool_discovery_cache();
         assert!(
             find_executable(&cwd_tool).is_none(),
             "empty PATH component must not resolve tools from cwd"
         );
 
-        unsafe {
-            match previous_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         clear_tool_discovery_cache();
         let _ = std::fs::remove_file(&cwd_tool);
-        std::env::set_current_dir(previous_cwd).unwrap();
+        // Drop cwd guard before removing work dir.
+        drop(_cwd);
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -1917,7 +1961,7 @@ mod tests {
 
     #[test]
     fn process_timeout_ignores_zero_and_invalid_env() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("SHIFT_CONVERSION_TIMEOUT_SECS").ok();
         unsafe { std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", "0") };
         assert_eq!(process_timeout(), DEFAULT_PROCESS_TIMEOUT);
@@ -1935,7 +1979,7 @@ mod tests {
 
     #[test]
     fn max_output_bytes_ignores_zero_and_invalid_env() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES").ok();
         unsafe { std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", "0") };
         assert_eq!(max_output_bytes(), DEFAULT_MAX_OUTPUT_BYTES);
@@ -2045,29 +2089,46 @@ mod tests {
 
     #[test]
     fn cancel_after_process_exit_still_reports_cancelled() {
-        // wait_with_timeout returns Exited when the child is already reaped even if
-        // cancel is set; the post-wait check then maps that to cancelled.
-        let path = std::env::temp_dir().join(format!(
-            "shift-process-post-cancel-{}",
-            unique_suffix("post-cancel")
-        ));
-        // Sleep long enough that we can set cancel while still running, but exit
-        // before the outer timeout. The wait loop prefers try_wait's Exited over
-        // cancel when both race — force the post-exit path by setting cancel true
-        // and using an instant-exit script after a brief window.
-        write_script(&path, "#!/bin/sh\nexit 0\n");
+        // Deterministic cancel: keep the child alive until we arm cancel, then
+        // allow it to exit. Arming cancel while the child is still running means
+        // either the wait-loop Cancelled path or the post-exit cancel check fires
+        // — never Ok — so this cannot flake under scheduling races.
+        let suffix = unique_suffix("post-cancel");
+        let path = std::env::temp_dir().join(format!("shift-process-post-cancel-{suffix}"));
+        let running =
+            std::env::temp_dir().join(format!("shift-process-post-cancel-{suffix}.running"));
+        let exit_signal =
+            std::env::temp_dir().join(format!("shift-process-post-cancel-{suffix}.exit"));
+        let _ = std::fs::remove_file(&running);
+        let _ = std::fs::remove_file(&exit_signal);
+
+        write_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nexit 0\n",
+                running.display(),
+                exit_signal.display()
+            ),
+        );
+
         let cancel = Arc::new(AtomicBool::new(false));
-        // Flip cancel true after spawn would have started: run in a helper that
-        // sets cancel immediately, then invokes a process that has already exited
-        // from a previous wait isn't available — instead use a shared flag set
-        // from a side thread before the process is polled.
         let cancel_flag = Arc::clone(&cancel);
-        let starter = thread::spawn(move || {
-            // Set cancel true almost immediately so that if the process is still
-            // running we take Cancelled from wait; if it already exited we take
-            // the post-exit cancelled branch. Either way we exercise cancel paths.
+        let running_flag = running.clone();
+        let exit_flag = exit_signal.clone();
+        let helper = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !running_flag.is_file() {
+                if Instant::now() > deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Child is known alive: arm cancel first so success is impossible.
             cancel_flag.store(true, Ordering::SeqCst);
+            // Then allow the child to exit (may race with force_kill — both yield cancelled).
+            let _ = std::fs::write(&exit_flag, b"");
         });
+
         let error = run_command_cancellable(
             shell_command(&path),
             Duration::from_secs(5),
@@ -2075,18 +2136,16 @@ mod tests {
             Some(Arc::clone(&cancel)),
         )
         .unwrap_err();
-        let _ = starter.join();
-        // May be pre-spawn cancel or post-exit cancel depending on timing.
-        assert!(
-            error.is_cancelled() || error.to_string().contains("cancel"),
-            "error: {error}"
-        );
-        let _ = std::fs::remove_file(path);
+        let _ = helper.join();
+        assert!(error.is_cancelled(), "error: {error}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&running);
+        let _ = std::fs::remove_file(&exit_signal);
     }
 
     #[test]
     fn resolve_tool_path_bare_name_missing_still_surfaces_name() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_tool_discovery_cache();
         let env_key = "SHIFT_TEST_BARE_MISSING_BIN";
         let old = std::env::var_os(env_key);
@@ -2118,14 +2177,13 @@ mod tests {
 
     #[test]
     fn unique_temp_dir_fails_when_tmpdir_is_a_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let blocker =
-            std::env::temp_dir().join(format!("shift-tmpdir-blocker-{}", unique_suffix("tmpdir")));
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Create blocker under the real temp root, then point TMPDIR at the file.
+        let real_tmp = std::env::temp_dir();
+        let blocker = real_tmp.join(format!("shift-tmpdir-blocker-{}", unique_suffix("tmpdir")));
         std::fs::write(&blocker, b"not-a-dir").unwrap();
-        let old = std::env::var_os("TMPDIR");
-        unsafe {
-            std::env::set_var("TMPDIR", &blocker);
-        }
+        // RAII restore so a panicked assertion cannot leave TMPDIR poisoned.
+        let _tmpdir = EnvVarGuard::set("TMPDIR", &blocker);
         let err = unique_temp_dir("shift-unwritable").unwrap_err();
         assert!(
             err.to_string()
@@ -2133,12 +2191,7 @@ mod tests {
                 || err.to_string().contains("temporary directory"),
             "error: {err}"
         );
-        unsafe {
-            match old {
-                Some(value) => std::env::set_var("TMPDIR", value),
-                None => std::env::remove_var("TMPDIR"),
-            }
-        }
+        drop(_tmpdir);
         let _ = std::fs::remove_file(blocker);
     }
 

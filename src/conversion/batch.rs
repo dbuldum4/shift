@@ -2246,17 +2246,11 @@ mod tests {
         assert_eq!(summary.cancelled, 0);
         assert_eq!(summary.exit_code(), 0);
         assert!(queue.is_empty());
+        // Empty queue must emit no events — freeze the current noop contract so
+        // accidental batch-level side effects fail this test deliberately.
         assert!(
-            events.is_empty()
-                || events.iter().all(|e| {
-                    // Some implementations may emit a batch-level event; none should mark items.
-                    !matches!(
-                        e,
-                        BatchEvent::ItemSucceeded { .. }
-                            | BatchEvent::ItemFailed { .. }
-                            | BatchEvent::ItemStarted { .. }
-                    )
-                })
+            events.is_empty(),
+            "empty queue must be a pure noop, got events: {events:?}"
         );
     }
 

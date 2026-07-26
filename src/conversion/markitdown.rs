@@ -586,8 +586,7 @@ mod tests {
         assert_eq!(artifact.format, OutputFormat::MARKDOWN);
 
         // Drive a tight limit via env override used by max_output_bytes().
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES").ok();
         unsafe {
             std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", "64");

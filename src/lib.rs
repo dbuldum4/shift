@@ -18,5 +18,9 @@ pub use session_settings::{
     save_default_session_settings, save_session_settings,
 };
 
+/// Serializes `shift_core` tests that mutate process-global state: env vars
+/// (`HOME`, `PATH`, `TMPDIR`, `SHIFT_*`), and `std::env::set_current_dir`.
+/// Every env-mutating test in this crate must hold this lock for the full
+/// mutation window and restore via `Drop` (not only on the success path).
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

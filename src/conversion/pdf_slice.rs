@@ -152,11 +152,8 @@ impl Drop for TempDirGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // All tests that set SHIFT_QPDF_BIN must be serialized so they don't
-    // overwrite each other's executable environment.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env mutations are serialized via crate::ENV_LOCK (shared across shift_core).
 
     #[test]
     fn rejects_zero_based_or_inverted_ranges() {
@@ -172,7 +169,7 @@ mod tests {
     #[test]
     fn extract_uses_qpdf_argv_shape() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -188,7 +185,7 @@ mod tests {
         std::fs::set_permissions(&fake, permissions).unwrap();
         std::fs::write(&input, b"%PDF-1.4 source").unwrap();
 
-        // SAFETY: serialized behind ENV_LOCK.
+        // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::set_var("SHIFT_QPDF_BIN", &fake);
         }
@@ -235,7 +232,7 @@ mod tests {
     #[test]
     fn password_only_decrypt_uses_full_range_and_password_file() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -251,7 +248,7 @@ mod tests {
         std::fs::set_permissions(&fake, permissions).unwrap();
         std::fs::write(&input, b"%PDF-1.4 source").unwrap();
 
-        // SAFETY: serialized behind ENV_LOCK.
+        // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::set_var("SHIFT_QPDF_BIN", &fake);
         }
@@ -289,7 +286,7 @@ mod tests {
     #[test]
     fn fails_when_qpdf_returns_nonzero() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -397,7 +394,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_qpdf_executable_reports_install_hint() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("no-qpdf");
         let missing = directory.join(format!("shift-qpdf-absent-{suffix}"));
@@ -434,7 +431,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn page_range_without_password_omits_password_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("no-pwd");
         let fake = directory.join(format!("shift-qpdf-nopwd-{suffix}"));
@@ -473,7 +470,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn password_and_bounded_range_write_restricted_password_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("pwd-range");
         let fake = directory.join(format!("shift-qpdf-pwdrange-{suffix}"));
@@ -481,7 +478,7 @@ mod tests {
         // Capture password file path and contents via the argv + side-channel dump.
         write_fake_qpdf(
             &fake,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nfor a in \"$@\"; do\n  case \"$a\" in\n    --password-file=*)\n      pf=\"${a#--password-file=}\"\n      cp \"$pf\" \"${0}.pwd\"\n      ls -l \"$pf\" > \"${0}.pwdmeta\" 2>/dev/null || true\n      ;;\n  esac\ndone\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nfor a in \"$@\"; do\n  case \"$a\" in\n    --password-file=*)\n      pf=\"${a#--password-file=}\"\n      cp \"$pf\" \"${0}.pwd\"\n      ;;\n  esac\ndone\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
         );
         std::fs::write(&input, b"%PDF-1.4 source").unwrap();
 
@@ -502,21 +499,21 @@ mod tests {
         let pwd_dump = std::fs::read_to_string(format!("{}.pwd", fake.display())).unwrap();
         assert_eq!(pwd_dump, password);
 
-        // Password file should have been mode 0600 when written.
-        let meta =
-            std::fs::read_to_string(format!("{}.pwdmeta", fake.display())).unwrap_or_default();
-        // On macOS ls -l shows -rw------- for 0600.
-        assert!(
-            meta.contains("rw-------") || meta.is_empty(),
-            "expected restrictive perms in ls output: {meta}"
-        );
-
         if let Some(parent) = sliced.parent() {
             // Password file lives next to sliced.pdf; callers delete the whole work dir.
+            let password_path = parent.join("password.txt");
             assert!(
-                parent.join("password.txt").is_file(),
+                password_path.is_file(),
                 "password.txt should remain in the work dir until the caller cleans it up"
             );
+            // Assert mode 0600 via metadata — do not parse `ls` (can be empty/fail open).
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&password_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "password file mode must be 0600, got {mode:o}");
             let _ = std::fs::remove_dir_all(parent);
         }
         unsafe {
@@ -525,14 +522,13 @@ mod tests {
         let _ = std::fs::remove_file(&fake);
         let _ = std::fs::remove_file(format!("{}.args", fake.display()));
         let _ = std::fs::remove_file(format!("{}.pwd", fake.display()));
-        let _ = std::fs::remove_file(format!("{}.pwdmeta", fake.display()));
         let _ = std::fs::remove_file(&input);
     }
 
     #[cfg(unix)]
     #[test]
     fn empty_and_whitespace_password_treated_as_absent() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("empty-pwd");
         let fake = directory.join(format!("shift-qpdf-emptypwd-{suffix}"));
@@ -570,7 +566,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_ended_range_uses_z_suffix() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("open-end");
         let fake = directory.join(format!("shift-qpdf-open-{suffix}"));
@@ -605,7 +601,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn qpdf_failure_includes_range_label_for_open_ended() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("fail-open");
         let fake = directory.join(format!("shift-qpdf-failopen-{suffix}"));
@@ -635,7 +631,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn qpdf_success_without_output_file_errors() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("no-out");
         let fake = directory.join(format!("shift-qpdf-noout-{suffix}"));
@@ -661,7 +657,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancel_before_qpdf_returns_cancelled() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("cancel");
         let fake = directory.join(format!("shift-qpdf-cancel-{suffix}"));
@@ -688,7 +684,7 @@ mod tests {
     #[test]
     fn non_pdf_extension_still_invokes_qpdf_when_file_exists() {
         // extract_pdf_pages does not validate magic/extension — only is_file.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("nonpdf");
         let fake = directory.join(format!("shift-qpdf-nonpdf-{suffix}"));
@@ -725,7 +721,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn single_page_range_argv_shape() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("single");
         let fake = directory.join(format!("shift-qpdf-single-{suffix}"));
@@ -760,7 +756,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn qpdf_failure_prefers_stderr_stdout_then_status() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("fail-detail");
         let input = directory.join(format!("shift-qpdf-fail-in-{suffix}.pdf"));

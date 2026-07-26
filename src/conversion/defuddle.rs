@@ -516,13 +516,12 @@ mod tests {
     }
 
     /// Serializes tests that mutate `SHIFT_*_PRIVATE_URLS` process env.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn public_url_policy_blocks_private_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         // Isolate from the developer's shell env for this process.
-        // SAFETY: serialized behind ENV_LOCK.
+        // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -871,8 +870,8 @@ mod tests {
 
     #[test]
     fn block_private_urls_env_matrix() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: serialized behind ENV_LOCK.
+        let _guard = crate::ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -920,7 +919,7 @@ mod tests {
 
     #[test]
     fn ensure_public_url_fetch_allowed_private_hosts_matrix() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -995,7 +994,7 @@ mod tests {
         );
 
         // Private host rejected before the fake binary runs.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");

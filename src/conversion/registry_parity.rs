@@ -172,3 +172,72 @@ fn default_registry_module_ids_are_unique_and_stable() {
         assert!(!id.is_empty());
     }
 }
+
+/// Golden default winners for overlapping pairs + URL route capability.
+/// Complements the cartesian supports walk with product precedence contracts.
+#[test]
+fn default_registry_url_routes_and_overlap_winners() {
+    let registry = ConversionRegistry::default();
+
+    // URL conversion is Defuddle for Markdown and HTML.
+    assert_eq!(
+        registry
+            .module_for_url(OutputFormat::MARKDOWN)
+            .map(|m| m.id()),
+        Some("defuddle")
+    );
+    assert_eq!(
+        registry.module_for_url(OutputFormat::HTML).map(|m| m.id()),
+        Some("defuddle")
+    );
+    assert!(registry.module_for_url(OutputFormat::PDF).is_none());
+
+    let url_outputs = registry.available_url_outputs();
+    assert!(
+        url_outputs.contains(&OutputFormat::MARKDOWN),
+        "url outputs: {url_outputs:?}"
+    );
+    assert!(
+        url_outputs.contains(&OutputFormat::HTML),
+        "url outputs: {url_outputs:?}"
+    );
+
+    let md_route = registry
+        .url_route_module_ids(OutputFormat::MARKDOWN)
+        .expect("markdown URL route");
+    assert_eq!(
+        md_route.first().copied(),
+        Some("defuddle"),
+        "URL Markdown route should start with defuddle: {md_route:?}"
+    );
+
+    // Default file-path winners for known overlaps (markitdown first in registry).
+    assert_eq!(
+        registry
+            .module_for(
+                PathBuf::from("REPORT.DOCX").as_path(),
+                OutputFormat::MARKDOWN
+            )
+            .map(|m| m.id()),
+        Some("markitdown")
+    );
+    assert_eq!(
+        registry
+            .module_for(PathBuf::from("scan.pdf").as_path(), OutputFormat::MARKDOWN)
+            .map(|m| m.id()),
+        Some("markitdown")
+    );
+    assert_eq!(
+        registry
+            .module_for(PathBuf::from("page.html").as_path(), OutputFormat::MARKDOWN)
+            .map(|m| m.id()),
+        Some("markitdown")
+    );
+    // PDF → HTML is Docling-only among default modules.
+    assert_eq!(
+        registry
+            .module_for(PathBuf::from("scan.pdf").as_path(), OutputFormat::HTML)
+            .map(|m| m.id()),
+        Some("docling")
+    );
+}

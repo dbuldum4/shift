@@ -353,13 +353,11 @@ fn validate_reference_doc(path: &Path) -> Result<PathBuf, ConversionError> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Mutex;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     // Serializes env-mutating tests so parallel cargo test doesn't race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn advertises_publishing_outputs_for_docx() {
@@ -522,8 +520,8 @@ mod tests {
 
     #[test]
     fn pdf_engine_env_override_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: serialized behind ENV_LOCK for the duration of this test.
+        let _guard = crate::ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK for the duration of this test.
         unsafe {
             std::env::set_var("SHIFT_PDF_ENGINE", "/custom/bin/typst");
         }
@@ -540,7 +538,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pdf_conversion_passes_resolved_pdf_engine() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
         let executable = directory.join(format!("shift-pandoc-pdf-test-{suffix}"));
@@ -978,9 +976,9 @@ mod tests {
 
     #[test]
     fn resolve_pdf_engine_override_paths_and_whitespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         let previous = std::env::var_os("SHIFT_PDF_ENGINE");
-        // SAFETY: serialized behind ENV_LOCK.
+        // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::remove_var("SHIFT_PDF_ENGINE");
         }
@@ -1209,7 +1207,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pdf_engine_option_passed_on_argv() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("pdf-opt");
         let executable = directory.join(format!("shift-pandoc-pdf-opt-{suffix}"));
