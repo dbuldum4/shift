@@ -640,14 +640,18 @@ mod tests {
         let dir = unique_dir("history-clamp");
         let path = dir.join("session-settings.json");
 
-        let mut too_low = SessionSettings::default();
-        too_low.history_limit = 0;
+        let too_low = SessionSettings {
+            history_limit: 0,
+            ..Default::default()
+        };
         save_session_settings(&path, &too_low).unwrap();
         let loaded = load_session_settings(&path);
         assert_eq!(loaded.history_limit, crate::history::MIN_HISTORY_LIMIT);
 
-        let mut too_high = SessionSettings::default();
-        too_high.history_limit = crate::history::MAX_HISTORY_LIMIT + 1;
+        let too_high = SessionSettings {
+            history_limit: crate::history::MAX_HISTORY_LIMIT + 1,
+            ..Default::default()
+        };
         save_session_settings(&path, &too_high).unwrap();
         let loaded = load_session_settings(&path);
         assert_eq!(loaded.history_limit, crate::history::MAX_HISTORY_LIMIT);
@@ -660,8 +664,10 @@ mod tests {
         let dir = unique_dir("version-zero");
         let path = dir.join("session-settings.json");
 
-        let mut legacy = SessionSettings::default();
-        legacy.version = 0;
+        let legacy = SessionSettings {
+            version: 0,
+            ..Default::default()
+        };
         let json = serde_json::to_vec(&legacy).unwrap();
         fs::write(&path, json).unwrap();
 
@@ -672,8 +678,10 @@ mod tests {
 
     #[test]
     fn unknown_output_format_falls_back_to_markdown() {
-        let mut settings = SessionSettings::default();
-        settings.output_format = "not-a-real-format".into();
+        let settings = SessionSettings {
+            output_format: "not-a-real-format".into(),
+            ..Default::default()
+        };
         assert_eq!(settings.output_format(), OutputFormat::MARKDOWN);
     }
 
@@ -736,7 +744,7 @@ mod tests {
         assert!(conversion.ffmpeg.mute);
         assert!(conversion.ffmpeg.normalize_audio);
         assert!(conversion.ffmpeg.burn_subtitles);
-        assert_eq!(conversion.markitdown.keep_data_uris, true);
+        assert!(conversion.markitdown.keep_data_uris);
         assert_eq!(conversion.pandoc.pdf_engine.as_deref(), Some("xelatex"));
         assert!(conversion.pandoc.standalone);
         assert!(conversion.pandoc.toc);
@@ -776,8 +784,10 @@ mod tests {
             Some(override_dir.join(SETTINGS_FILE_NAME))
         );
 
-        let mut settings = SessionSettings::default();
-        settings.history_limit = 7;
+        let settings = SessionSettings {
+            history_limit: 7,
+            ..Default::default()
+        };
         save_default_session_settings(&settings).unwrap();
         let loaded = load_default_session_settings();
         assert_eq!(loaded.history_limit, 7);

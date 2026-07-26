@@ -828,4 +828,240 @@ mod tests {
         }
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn cache_artifact_bytes_sanitizes_path_traversal_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("traversal");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let path = cache_artifact_bytes("../../evil.pdf", b"%PDF-evil").unwrap();
+        assert!(
+            path.starts_with(&dir),
+            "cached path must stay under cache dir: {}",
+            path.display()
+        );
+        // Single file_name component under cache — not a real parent walk.
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert!(path.is_file());
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(!name.contains('/'));
+        assert!(!name.contains('\\'));
+        assert!(name.ends_with(".pdf"));
+        assert_eq!(fs::read(&path).unwrap(), b"%PDF-evil");
+
+        // sanitize_cache_name itself collapses separators to underscores.
+        let sanitized = sanitize_cache_name("../../evil.pdf");
+        assert_eq!(sanitized, ".._.._evil.pdf");
+        assert!(!sanitized.contains('/'));
+        assert_eq!(sanitize_cache_name(""), "artifact");
+        assert_eq!(sanitize_cache_name("!!!"), "___");
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_artifact_file_copies_source_content() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("cache-file");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let source_dir = unique_temp_dir("cache-file-src");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("input.wav");
+        fs::write(&source, b"RIFF-fake-wav").unwrap();
+
+        let cached = cache_artifact_file(&source).unwrap();
+        assert!(cached.starts_with(&dir));
+        assert!(cached.is_file());
+        assert_eq!(fs::read(&cached).unwrap(), b"RIFF-fake-wav");
+        let name = cached.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name.contains("input") || name.ends_with(".wav"));
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
+    #[test]
+    fn purge_paste_staging_with_zero_ttl_removes_external_staging_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cache_dir = unique_temp_dir("paste-cache");
+        let paste_dir = unique_temp_dir("paste-staging");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&paste_dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &cache_dir);
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &paste_dir);
+        }
+
+        // Keep a regular cache artifact so we can assert paste purge does not touch it.
+        let cached = cache_artifact_bytes("keep.bin", b"keep-me").unwrap();
+        let paste_file = paste_dir.join("clipboard.png");
+        fs::write(&paste_file, b"png").unwrap();
+
+        let stats = purge_paste_staging(Duration::from_secs(0)).unwrap();
+        assert!(stats.removed >= 1);
+        assert!(!paste_file.exists());
+        assert!(
+            cached.exists(),
+            "purge_paste_staging must not remove artifact-cache files"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(cache_dir);
+        let _ = fs::remove_dir_all(paste_dir);
+    }
+
+    #[test]
+    fn stage_export_bytes_defaults_blank_names_to_artifact() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("blank-name");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let empty = stage_export_bytes("", b"empty-name").unwrap();
+        assert_eq!(empty.file_name().and_then(|n| n.to_str()), Some("artifact"));
+        assert_eq!(fs::read(&empty).unwrap(), b"empty-name");
+
+        // Dot / double-dot bases also fall back to "artifact"; different
+        // content under that default name is disambiguated rather than clobbered.
+        let dot = stage_export_bytes(".", b"dot").unwrap();
+        assert_ne!(empty, dot);
+        assert!(
+            dot.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("artifact"))
+        );
+        assert_eq!(fs::read(&dot).unwrap(), b"dot");
+        assert_eq!(fs::read(&empty).unwrap(), b"empty-name");
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disambiguated_export_preserves_extension_and_content() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("disambiguate");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let first = stage_export_bytes("report.pdf", b"pdf-one").unwrap();
+        assert_eq!(
+            first.file_name().and_then(|n| n.to_str()),
+            Some("report.pdf")
+        );
+        let second = stage_export_bytes("report.pdf", b"pdf-two").unwrap();
+        assert_ne!(first, second);
+        let second_name = second.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(second_name.starts_with("report-") && second_name.ends_with(".pdf"));
+        assert_eq!(fs::read(&first).unwrap(), b"pdf-one");
+        assert_eq!(fs::read(&second).unwrap(), b"pdf-two");
+        // Same content again reuses the matching staged path (preferred or disambiguated).
+        let again = stage_export_bytes("report.pdf", b"pdf-two").unwrap();
+        assert_eq!(again, second);
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn purge_artifact_cache_evicts_by_max_bytes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("max-bytes");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        // Write several sized artifacts with a long TTL so only the size budget triggers.
+        let a = cache_artifact_bytes("a.bin", &vec![1u8; 4_000]).unwrap();
+        let b = cache_artifact_bytes("b.bin", &vec![2u8; 4_000]).unwrap();
+        let c = cache_artifact_bytes("c.bin", &vec![3u8; 4_000]).unwrap();
+        assert!(a.is_file() && b.is_file() && c.is_file());
+
+        // Budget small enough that at least one full file must be removed.
+        let stats = purge_artifact_cache(Duration::from_secs(86_400), 5_000).unwrap();
+        assert!(
+            stats.removed >= 1,
+            "size budget should free at least one entry, freed={}",
+            stats.freed_bytes
+        );
+        assert!(stats.freed_bytes > 0);
+
+        let remaining: u64 = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter(|e| e.file_name() != VERSION_FILE_NAME)
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            remaining <= 5_000,
+            "remaining cache payload {remaining} should be under budget"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn artifact_cache_dir_and_paste_staging_honor_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("env-override");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        assert_eq!(artifact_cache_dir().as_deref(), Some(dir.as_path()));
+        assert_eq!(
+            default_paste_staging_dir().as_deref(),
+            Some(dir.join(PASTE_STAGING_SUBDIR).as_path())
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_matches_bytes_false_for_missing_path() {
+        let missing = std::env::temp_dir().join(format!(
+            "shift-missing-export-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(!missing.exists());
+        assert!(!export_matches_bytes(&missing, b"anything"));
+    }
 }

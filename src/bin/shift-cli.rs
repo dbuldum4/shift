@@ -1662,4 +1662,246 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn rejects_stdout_with_multi_input_batch() {
+        let error = run(args(&["a.md", "b.md", "-t", "html", "--stdout"])).unwrap_err();
+        assert!(error.contains("--stdout"), "{error}");
+        assert!(
+            error.contains("batch") || error.contains("output-dir"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_stdout_with_output_dir() {
+        let error = run(args(&["a.md", "-t", "html", "--stdout", "-O", "/tmp/out"])).unwrap_err();
+        assert!(
+            error.contains("--stdout")
+                && (error.contains("output path") || error.contains("batch")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_output_and_output_dir_together() {
+        let error = run(args(&[
+            "a.md", "-t", "html", "-o", "out.html", "-O", "/tmp/out",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("--output") && error.contains("--output-dir"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_output_format() {
+        let error = run(args(&["file.md", "-t", "not-a-format"])).unwrap_err();
+        assert!(
+            error.contains("unknown output format") || error.contains("not-a-format"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_ffmpeg_numeric_flags_and_rejects_invalid() {
+        let parsed = parse_convert_args(&args(&[
+            "clip.mp4",
+            "--start",
+            "1.5",
+            "--duration",
+            "10",
+            "--frame",
+            "0",
+            "--audio-stream",
+            "1",
+            "--sample-rate",
+            "48000",
+            "--scale-width",
+            "1280",
+            "--encode",
+            "reencode",
+            "--quality",
+            "high",
+            "-t",
+            "mp3",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.ffmpeg.start_secs, Some(1.5));
+        assert_eq!(parsed.ffmpeg.duration_secs, Some(10.0));
+        assert_eq!(parsed.ffmpeg.frame_secs, Some(0.0));
+        assert_eq!(parsed.ffmpeg.audio_stream, Some(1));
+        assert_eq!(parsed.ffmpeg.sample_rate_hz, Some(48000));
+        assert_eq!(parsed.ffmpeg.scale_width, Some(1280));
+        assert_eq!(parsed.ffmpeg.encode_mode, FfmpegEncodeMode::Reencode);
+        assert_eq!(parsed.ffmpeg.quality, FfmpegQuality::High);
+
+        let bad_start =
+            parse_convert_args(&args(&["clip.mp4", "--start", "nope", "-t", "mp3"])).unwrap_err();
+        assert!(bad_start.contains("--start"), "{bad_start}");
+        assert!(
+            bad_start.contains("seconds") || bad_start.contains("number"),
+            "{bad_start}"
+        );
+
+        let bad_fps =
+            parse_convert_args(&args(&["clip.mp4", "--fps", "x", "-t", "mp4"])).unwrap_err();
+        assert!(bad_fps.contains("--fps"), "{bad_fps}");
+
+        let bad_stream =
+            parse_convert_args(&args(&["clip.mp4", "--audio-stream", "-1", "-t", "mp3"]))
+                .unwrap_err();
+        assert!(
+            bad_stream.contains("--audio-stream") || bad_stream.contains("integer"),
+            "{bad_stream}"
+        );
+
+        let bad_encode =
+            parse_convert_args(&args(&["clip.mp4", "--encode", "turbo", "-t", "mp4"])).unwrap_err();
+        assert!(
+            bad_encode.contains("encode") || bad_encode.contains("turbo"),
+            "{bad_encode}"
+        );
+
+        let bad_quality =
+            parse_convert_args(&args(&["clip.mp4", "--quality", "max", "-t", "mp4"])).unwrap_err();
+        assert!(
+            bad_quality.contains("quality") || bad_quality.contains("max"),
+            "{bad_quality}"
+        );
+    }
+
+    #[test]
+    fn parse_secs_and_u32_helpers() {
+        assert_eq!(parse_secs(OsStr::new("2.5"), "--start").unwrap(), 2.5);
+        assert_eq!(parse_secs(OsStr::new("0"), "--duration").unwrap(), 0.0);
+        let err = parse_secs(OsStr::new("abc"), "--fps").unwrap_err();
+        assert!(err.contains("--fps"), "{err}");
+
+        assert_eq!(parse_u32(OsStr::new("42"), "--sample-rate").unwrap(), 42);
+        let err = parse_u32(OsStr::new("3.5"), "--scale-width").unwrap_err();
+        assert!(err.contains("--scale-width"), "{err}");
+        let err = parse_u32(OsStr::new("-2"), "--audio-stream").unwrap_err();
+        assert!(err.contains("--audio-stream"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_zero_and_inverted_page_flags() {
+        let zero_from =
+            parse_convert_args(&args(&["doc.pdf", "--page-from", "0", "--page-to", "3"]))
+                .unwrap_err();
+        assert!(
+            zero_from.contains("1-based") || zero_from.contains("page-from"),
+            "{zero_from}"
+        );
+
+        let inverted =
+            parse_convert_args(&args(&["doc.pdf", "--page-from", "9", "--page-to", "2"]))
+                .unwrap_err();
+        assert!(
+            inverted.contains("page-from") && inverted.contains("page-to"),
+            "{inverted}"
+        );
+    }
+
+    #[test]
+    fn parse_pages_rejects_zero_and_non_numeric() {
+        let zero = parse_pages_range(OsStr::new("0-2"), "--pages").unwrap_err();
+        assert!(zero.contains("1-based") || zero.contains("page"), "{zero}");
+
+        let bad = parse_pages_range(OsStr::new("a-b"), "--pages").unwrap_err();
+        assert!(bad.contains("--pages"), "{bad}");
+
+        let empty = parse_pages_range(OsStr::new(""), "--pages").unwrap_err();
+        assert!(empty.contains("--pages"), "{empty}");
+    }
+
+    #[test]
+    fn preferred_module_promotes_via_build_registry() {
+        let registry = build_registry(Some("pandoc")).unwrap();
+        assert!(registry.has_module("pandoc"));
+        // Unknown module is rejected with a helpful list.
+        let error = match build_registry(Some("not-a-module")) {
+            Ok(_) => panic!("expected unknown module error"),
+            Err(message) => message,
+        };
+        assert!(error.contains("unknown module"), "{error}");
+        assert!(error.contains("not-a-module"), "{error}");
+    }
+
+    #[test]
+    fn default_output_path_unicode_stem_and_prepare_destination() {
+        let dir = unique_temp("unicode-dest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("rapor-ç.html");
+        std::fs::write(&source, b"<p>src</p>").unwrap();
+
+        let dest = default_output_path(&source, OutputFormat::HTML);
+        assert_eq!(dest, dir.join("rapor-ç.converted.html"));
+        assert_ne!(dest, source);
+
+        assert!(prepare_batch_destination(&dest, Some(&source), false).is_ok());
+        // Existing destination still requires --force.
+        std::fs::write(&dest, b"old").unwrap();
+        let error = prepare_batch_destination(&dest, Some(&source), false).unwrap_err();
+        assert!(error.to_string().contains("--force"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn is_network_or_file_url_input_classifies_urls() {
+        assert!(is_network_or_file_url_input(OsStr::new(
+            "https://example.com/a"
+        )));
+        assert!(is_network_or_file_url_input(OsStr::new(
+            "http://example.com"
+        )));
+        assert!(is_network_or_file_url_input(OsStr::new("file:///tmp/x.md")));
+        assert!(is_network_or_file_url_input(OsStr::new(
+            "FILE://localhost/tmp/x"
+        )));
+        assert!(!is_network_or_file_url_input(OsStr::new("report.pdf")));
+        assert!(!is_network_or_file_url_input(OsStr::new("/tmp/notes.md")));
+    }
+
+    #[test]
+    fn recursive_empty_directory_reports_no_convertible_files() {
+        let dir = unique_temp("empty-recursive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = run(args(&[
+            dir.to_str().unwrap(),
+            "--recursive",
+            "-t",
+            "markdown",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("no convertible") || error.contains("directory"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_multi_input_with_single_output_path() {
+        let error = run(args(&["a.md", "b.md", "-t", "html", "-o", "out.html"])).unwrap_err();
+        assert!(
+            error.contains("output-dir") || error.contains("multiple inputs"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_requires_value_for_value_taking_flags() {
+        let missing_to = parse_convert_args(&args(&["file.md", "-t"])).unwrap_err();
+        assert!(missing_to.contains("--to"), "{missing_to}");
+
+        let missing_module = parse_convert_args(&args(&["file.md", "--module"])).unwrap_err();
+        assert!(missing_module.contains("--module"), "{missing_module}");
+
+        let missing_start = parse_convert_args(&args(&["clip.mp4", "--start"])).unwrap_err();
+        assert!(missing_start.contains("--start"), "{missing_start}");
+    }
 }

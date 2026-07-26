@@ -968,4 +968,339 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert!(!loaded[0].archived);
     }
+
+    #[test]
+    fn url_source_round_trips_and_redacts_credentials() {
+        let conn = open_history(":memory:").unwrap();
+        let entry = StoredHistoryEntry {
+            id: 10,
+            source: StoredSource::Url("https://user:s3cret@example.com/article?q=1".to_owned()),
+            name: "article".to_owned(),
+            detail: "from url".to_owned(),
+            extension_label: "MD".to_owned(),
+            badge_color: 1,
+            badge_text_color: 2,
+            output_format: "markdown".to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "defuddle".to_owned(),
+                file_name: "article.md".to_owned(),
+                format: "markdown".to_owned(),
+                bytes: b"# hi".to_vec(),
+            },
+            archived: false,
+        };
+        add_history_entry(&conn, &entry, DEFAULT_HISTORY_LIMIT).unwrap();
+
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].source {
+            StoredSource::Url(url) => {
+                assert!(
+                    !url.contains("s3cret") && !url.contains("user:"),
+                    "credentials must be redacted on store: {url}"
+                );
+                assert!(url.contains("example.com/article"));
+                assert!(url.starts_with("https://"));
+            }
+            other => panic!("expected Url source, got {other:?}"),
+        }
+        // Plain URLs without credentials round-trip unchanged.
+        let plain = StoredHistoryEntry {
+            id: 11,
+            source: StoredSource::Url("https://example.com/clean".to_owned()),
+            name: "clean".to_owned(),
+            detail: "from url".to_owned(),
+            extension_label: "MD".to_owned(),
+            badge_color: 1,
+            badge_text_color: 2,
+            output_format: "markdown".to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "defuddle".to_owned(),
+                file_name: "clean.md".to_owned(),
+                format: "markdown".to_owned(),
+                bytes: b"# clean".to_vec(),
+            },
+            archived: false,
+        };
+        add_history_entry(&conn, &plain, DEFAULT_HISTORY_LIMIT).unwrap();
+        let all = history_entries(&conn, true).unwrap();
+        let clean = all.iter().find(|e| e.id == 11).unwrap();
+        assert_eq!(
+            clean.source,
+            StoredSource::Url("https://example.com/clean".to_owned())
+        );
+    }
+
+    #[test]
+    fn ready_large_and_failed_outcomes_persist_without_artifact_bytes() {
+        let conn = open_history(":memory:").unwrap();
+        let large = StoredHistoryEntry {
+            id: 1,
+            source: StoredSource::File(PathBuf::from("/tmp/big.bin")),
+            name: "big".to_owned(),
+            detail: "large".to_owned(),
+            extension_label: "BIN".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "binary".to_owned(),
+            outcome: StoredOutcome::ReadyLarge {
+                module_id: "ffmpeg".to_owned(),
+                byte_len: MAX_HISTORY_ARTIFACT_BYTES + 1,
+            },
+            archived: false,
+        };
+        let failed = StoredHistoryEntry {
+            id: 2,
+            source: StoredSource::File(PathBuf::from("/tmp/bad.docx")),
+            name: "bad".to_owned(),
+            detail: "err".to_owned(),
+            extension_label: "DOCX".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "markdown".to_owned(),
+            outcome: StoredOutcome::Failed("converter exploded".to_owned()),
+            archived: false,
+        };
+        add_history_entry(&conn, &large, DEFAULT_HISTORY_LIMIT).unwrap();
+        add_history_entry(&conn, &failed, DEFAULT_HISTORY_LIMIT).unwrap();
+
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let large_row = loaded.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            large_row.outcome,
+            StoredOutcome::ReadyLarge {
+                module_id: "ffmpeg".to_owned(),
+                byte_len: MAX_HISTORY_ARTIFACT_BYTES + 1,
+            }
+        );
+        // ReadyLarge must not store artifact payload.
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT artifact_bytes FROM history WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(blob.is_none() || blob.as_ref().is_some_and(|b| b.is_empty()));
+
+        let failed_row = loaded.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(
+            failed_row.outcome,
+            StoredOutcome::Failed("converter exploded".to_owned())
+        );
+        let err: Option<String> = conn
+            .query_row(
+                "SELECT error_message FROM history WHERE id = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(err.as_deref(), Some("converter exploded"));
+    }
+
+    #[test]
+    fn ready_at_max_artifact_bytes_still_stores_payload() {
+        // write_entry_row does not auto-promote Ready → ReadyLarge; callers decide.
+        // Verify a Ready payload at the documented size bound round-trips intact.
+        let conn = open_history(":memory:").unwrap();
+        let bytes = vec![0xABu8; MAX_HISTORY_ARTIFACT_BYTES];
+        let entry = StoredHistoryEntry {
+            id: 1,
+            source: StoredSource::File(PathBuf::from("/tmp/at-limit.bin")),
+            name: "at-limit".to_owned(),
+            detail: "boundary".to_owned(),
+            extension_label: "BIN".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "binary".to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "ffmpeg".to_owned(),
+                file_name: "at-limit.bin".to_owned(),
+                format: "binary".to_owned(),
+                bytes: bytes.clone(),
+            },
+            archived: false,
+        };
+        add_history_entry(&conn, &entry, DEFAULT_HISTORY_LIMIT).unwrap();
+        let loaded = history_entries(&conn, true).unwrap();
+        match &loaded[0].outcome {
+            StoredOutcome::Ready {
+                bytes: stored,
+                module_id,
+                ..
+            } => {
+                assert_eq!(module_id, "ffmpeg");
+                assert_eq!(stored.len(), MAX_HISTORY_ARTIFACT_BYTES);
+                assert_eq!(stored, &bytes);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_and_delete_return_false_for_unknown_ids() {
+        let conn = open_history(":memory:").unwrap();
+        add_history_entry(&conn, &sample_entry(1, "one", false), DEFAULT_HISTORY_LIMIT).unwrap();
+
+        assert!(!archive_history(&conn, 999).unwrap());
+        assert!(!delete_history(&conn, 999).unwrap());
+        // Existing row still present and unarchived.
+        let all = history_entries(&conn, true).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(!all[0].archived);
+    }
+
+    #[test]
+    fn clear_history_store_empties_on_disk_database() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-history-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+
+        let db_path = history_db_path().expect("override sets support dir");
+        let conn = open_history(&db_path).unwrap();
+        add_history_entry(&conn, &sample_entry(1, "one", false), DEFAULT_HISTORY_LIMIT).unwrap();
+        add_history_entry(&conn, &sample_entry(2, "two", false), DEFAULT_HISTORY_LIMIT).unwrap();
+        drop(conn);
+        assert!(db_path.is_file());
+        assert_eq!(load_history().entries.len(), 2);
+
+        clear_history_store().unwrap();
+        assert!(!db_path.exists());
+        assert!(load_history().entries.is_empty());
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn encode_decode_round_trips_mixed_sources_and_outcomes() {
+        let entries = vec![
+            StoredHistoryEntry {
+                id: 1,
+                source: StoredSource::File(PathBuf::from("/tmp/a.txt")),
+                name: "ready".to_owned(),
+                detail: "d".to_owned(),
+                extension_label: "TXT".to_owned(),
+                badge_color: 1,
+                badge_text_color: 2,
+                output_format: "markdown".to_owned(),
+                outcome: StoredOutcome::Ready {
+                    module_id: "pandoc".to_owned(),
+                    file_name: "a.md".to_owned(),
+                    format: "markdown".to_owned(),
+                    bytes: b"body".to_vec(),
+                },
+                archived: false,
+            },
+            StoredHistoryEntry {
+                id: 2,
+                source: StoredSource::Url("https://example.com/x".to_owned()),
+                name: "large".to_owned(),
+                detail: "d".to_owned(),
+                extension_label: "BIN".to_owned(),
+                badge_color: 0,
+                badge_text_color: 0,
+                output_format: "binary".to_owned(),
+                outcome: StoredOutcome::ReadyLarge {
+                    module_id: "ffmpeg".to_owned(),
+                    byte_len: 9_000_000,
+                },
+                archived: false,
+            },
+            StoredHistoryEntry {
+                id: 3,
+                source: StoredSource::File(PathBuf::from("/tmp/fail.pdf")),
+                name: "failed".to_owned(),
+                detail: "d".to_owned(),
+                extension_label: "PDF".to_owned(),
+                badge_color: 0,
+                badge_text_color: 0,
+                output_format: "markdown".to_owned(),
+                outcome: StoredOutcome::Failed("boom".to_owned()),
+                archived: true, // binary format does not persist archived; see assert below
+            },
+        ];
+        let encoded = encode_history(&entries, 42);
+        let loaded = decode_history(&encoded).unwrap();
+        assert_eq!(loaded.next_id, 42);
+        assert_eq!(loaded.entries.len(), 3);
+
+        assert_eq!(loaded.entries[0].source, entries[0].source);
+        assert_eq!(loaded.entries[0].outcome, entries[0].outcome);
+        assert_eq!(loaded.entries[1].source, entries[1].source);
+        assert_eq!(loaded.entries[1].outcome, entries[1].outcome);
+        assert_eq!(loaded.entries[2].outcome, entries[2].outcome);
+        // Legacy binary codec always reloads archived as false.
+        assert!(!loaded.entries[2].archived);
+    }
+
+    #[test]
+    fn decode_history_rejects_garbage_and_wrong_magic() {
+        assert!(decode_history(b"").is_err());
+        assert!(decode_history(b"not-a-history-blob").is_err());
+        assert!(decode_history(b"SHIFT_HISTORY_V0\n").is_err());
+        // Correct magic but truncated payload.
+        let mut truncated = MAGIC.to_vec();
+        truncated.extend_from_slice(&1u64.to_le_bytes());
+        // Missing count / entries.
+        assert!(decode_history(&truncated).is_err());
+    }
+
+    #[test]
+    fn intern_module_id_maps_known_and_unknown() {
+        assert_eq!(intern_module_id("markitdown"), "markitdown");
+        assert_eq!(intern_module_id("pandoc"), "pandoc");
+        assert_eq!(intern_module_id("defuddle"), "defuddle");
+        assert_eq!(intern_module_id("docling"), "docling");
+        assert_eq!(intern_module_id("ffmpeg"), "ffmpeg");
+        // Unknown ids collapse to the stable "unknown" static.
+        assert_eq!(intern_module_id("custom-engine"), "unknown");
+        assert_eq!(intern_module_id(""), "unknown");
+        // Stable pointer identity for known modules.
+        let a: *const str = intern_module_id("pandoc");
+        let b: *const str = intern_module_id("pandoc");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn store_source_path_keeps_relative_and_empty_paths() {
+        let relative = PathBuf::from("relative/file.txt");
+        assert_eq!(
+            store_source_path(&relative),
+            relative.to_string_lossy().into_owned()
+        );
+        assert_eq!(restore_source_path("relative/file.txt"), relative);
+
+        let empty = PathBuf::from("");
+        assert_eq!(store_source_path(&empty), "");
+        // restore trims; empty raw yields empty path.
+        assert_eq!(restore_source_path(""), PathBuf::from(""));
+        assert_eq!(restore_source_path("   "), PathBuf::from(""));
+    }
+
+    #[test]
+    fn archived_flag_persists_through_sqlite() {
+        let conn = open_history(":memory:").unwrap();
+        let entry = sample_entry(1, "archived-row", true);
+        insert_entry(&conn, &entry).unwrap();
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].archived);
+        assert!(history_entries(&conn, false).unwrap().is_empty());
+    }
 }

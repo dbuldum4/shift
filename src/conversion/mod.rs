@@ -2190,6 +2190,338 @@ mod tests {
         assert!(!parts.iter().any(|p| p == "s3cret"));
     }
 
+    #[test]
+    fn format_argv_display_quotes_spaces_empty_and_metacharacters() {
+        assert_eq!(
+            format_argv_display(&["ffmpeg", "-i", "in.mp4"]),
+            "ffmpeg -i in.mp4"
+        );
+        assert_eq!(
+            format_argv_display(&["ffmpeg", "-i", "my file.mp4"]),
+            "ffmpeg -i 'my file.mp4'"
+        );
+        assert_eq!(format_argv_display(&["tool", ""]), "tool ''");
+        assert_eq!(format_argv_display(&["echo", "a'b"]), "echo 'a'\"'\"'b'");
+        assert_eq!(
+            format_argv_display(&["sh", "-c", "echo $HOME; true"]),
+            "sh -c 'echo $HOME; true'"
+        );
+        assert_eq!(
+            format_argv_display(&["cmd", "x*y", "a|b", "c&d"]),
+            "cmd 'x*y' 'a|b' 'c&d'"
+        );
+    }
+
+    #[test]
+    fn redact_flag_value_handles_missing_last_arg_equals_and_multiples() {
+        // Flag present but no following value: leave argv unchanged.
+        let mut trailing = vec!["tool".into(), "--pdf-password".into()];
+        redact_flag_value(&mut trailing, "--pdf-password", "••••");
+        assert_eq!(trailing, vec!["tool", "--pdf-password"]);
+
+        // Flag not present at all.
+        let mut missing = vec!["tool".into(), "--other".into(), "x".into()];
+        redact_flag_value(&mut missing, "--pdf-password", "••••");
+        assert_eq!(missing, vec!["tool", "--other", "x"]);
+
+        // `--flag=value` form.
+        let mut equals = vec![
+            "docling".into(),
+            "--pdf-password=s3cret".into(),
+            "--ocr".into(),
+        ];
+        redact_flag_value(&mut equals, "--pdf-password", "••••");
+        assert_eq!(equals[1], "--pdf-password=••••");
+        assert!(!equals.iter().any(|p| p.contains("s3cret")));
+
+        // Multiple occurrences of both forms.
+        let mut multi = vec![
+            "a".into(),
+            "--secret".into(),
+            "one".into(),
+            "--secret=two".into(),
+            "--secret".into(),
+            "three".into(),
+        ];
+        redact_flag_value(&mut multi, "--secret", "REDACTED");
+        assert_eq!(
+            multi,
+            vec![
+                "a",
+                "--secret",
+                "REDACTED",
+                "--secret=REDACTED",
+                "--secret",
+                "REDACTED"
+            ]
+        );
+    }
+
+    #[test]
+    fn text_preview_and_artifact_text_cover_utf8_binary_empty_and_truncation() {
+        // Valid short UTF-8 text.
+        let short = ConversionArtifact {
+            file_name: "note.md".into(),
+            media_type: "text/markdown",
+            bytes: b"# Hi\n\nbody".to_vec(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        };
+        assert_eq!(short.text(), Some("# Hi\n\nbody"));
+        assert_eq!(short.preview_summary(), "# Hi\n\nbody");
+
+        // Empty document message.
+        let empty = ConversionArtifact {
+            file_name: "empty.md".into(),
+            media_type: "text/markdown",
+            bytes: b"   \n".to_vec(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        };
+        let empty_preview = empty.preview_summary();
+        assert!(empty_preview.contains("empty document"), "{empty_preview}");
+
+        // Invalid UTF-8 on a text-previewable format.
+        let bad_utf8 = ConversionArtifact {
+            file_name: "weird.md".into(),
+            media_type: "text/markdown",
+            bytes: vec![0xff, 0xfe, 0x00],
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        };
+        assert!(bad_utf8.text().is_none());
+        let bad_preview = bad_utf8.preview_summary();
+        assert!(bad_preview.contains("not valid UTF-8"), "{bad_preview}");
+        assert!(bad_preview.contains("3 bytes"), "{bad_preview}");
+
+        // Long text is truncated with a character count.
+        let long_body = "x".repeat(TEXT_PREVIEW_CHAR_LIMIT + 50);
+        let long = ConversionArtifact {
+            file_name: "long.md".into(),
+            media_type: "text/markdown",
+            bytes: long_body.into_bytes(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        };
+        let long_preview = long.preview_summary();
+        assert!(long_preview.contains("preview truncated"), "{long_preview}");
+        assert!(
+            long_preview.contains(&format!(
+                "{} characters total",
+                TEXT_PREVIEW_CHAR_LIMIT + 50
+            )),
+            "{long_preview}"
+        );
+
+        // Binary format still reports non-text summary even with UTF-8 bytes.
+        let binary = ConversionArtifact {
+            file_name: "clip.mp4".into(),
+            media_type: "video/mp4",
+            bytes: b"not really video".to_vec(),
+            format: OutputFormat::MP4,
+            module_id: "ffmpeg",
+            pipeline: vec!["ffmpeg"],
+            invocations: Vec::new(),
+        };
+        assert_eq!(binary.text(), Some("not really video"));
+        let bin_preview = binary.preview_summary();
+        assert!(bin_preview.contains("Not shown inline"), "{bin_preview}");
+        assert!(
+            bin_preview.contains("Video") || bin_preview.contains("MP4"),
+            "{bin_preview}"
+        );
+    }
+
+    #[test]
+    fn normalize_path_collapses_dot_and_dotdot_components() {
+        let with_dots = normalize_path(Path::new("/tmp/a/./b/../c/file.md"));
+        assert_eq!(with_dots, Path::new("/tmp/a/c/file.md"));
+
+        // Relative paths become absolute against cwd, then collapse.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = normalize_path(Path::new("foo/./bar/../baz.txt"));
+        assert_eq!(relative, cwd.join("foo/baz.txt"));
+
+        // Extra parent segments pop roots carefully (lexically).
+        let up_from_tmp = normalize_path(Path::new("/tmp/x/../../etc/passwd"));
+        assert_eq!(up_from_tmp, Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn default_output_path_handles_unicode_stem_and_missing_stem() {
+        assert_eq!(
+            default_output_path(Path::new("notes/rapor-ç.md"), OutputFormat::HTML),
+            Path::new("notes/rapor-ç.html")
+        );
+        // Same extension with unicode stem still gets the uniquifying suffix.
+        assert_eq!(
+            default_output_path(Path::new("notes/文档.html"), OutputFormat::HTML),
+            Path::new("notes/文档.converted.html")
+        );
+        // No stem (e.g. ".gitignore"-style or bare extension name): use "converted".
+        // `file_stem` of ".md" is often empty or the whole name depending on platform
+        // conventions; assert the result never equals the input for same-extension.
+        let bare = default_output_path(Path::new(".md"), OutputFormat::MARKDOWN);
+        assert_ne!(bare, Path::new(".md"));
+        assert!(
+            bare.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".md")),
+            "unexpected bare path: {}",
+            bare.display()
+        );
+    }
+
+    #[test]
+    fn output_format_from_str_and_metadata_cover_common_ids() {
+        assert_eq!(
+            "markdown".parse::<OutputFormat>().unwrap(),
+            OutputFormat::MARKDOWN
+        );
+        assert_eq!("HTML".parse::<OutputFormat>().unwrap(), OutputFormat::HTML);
+        assert_eq!(
+            "md".parse::<OutputFormat>().unwrap(),
+            OutputFormat::MARKDOWN
+        );
+        assert_eq!("jpeg".parse::<OutputFormat>().unwrap().id(), "jpg");
+        assert_eq!(
+            "png-zip".parse::<OutputFormat>().unwrap(),
+            OutputFormat::PNG_SEQUENCE_ZIP
+        );
+        assert_eq!("mp3".parse::<OutputFormat>().unwrap(), OutputFormat::MP3);
+
+        let unknown = "not-a-real-format".parse::<OutputFormat>().unwrap_err();
+        assert!(
+            unknown.to_string().contains("unknown output format"),
+            "{unknown}"
+        );
+
+        assert_eq!(OutputFormat::MARKDOWN.extension(), "md");
+        assert_eq!(OutputFormat::MARKDOWN.media_type(), "text/markdown");
+        assert!(OutputFormat::MARKDOWN.is_text_previewable());
+
+        assert_eq!(OutputFormat::HTML.extension(), "html");
+        assert_eq!(OutputFormat::HTML.media_type(), "text/html");
+        assert!(OutputFormat::HTML.is_text_previewable());
+
+        assert_eq!(OutputFormat::MP3.extension(), "mp3");
+        assert_eq!(OutputFormat::MP3.media_type(), "audio/mpeg");
+        assert!(!OutputFormat::MP3.is_text_previewable());
+
+        assert_eq!(OutputFormat::PDF.extension(), "pdf");
+        assert_eq!(OutputFormat::PDF.media_type(), "application/pdf");
+        assert!(!OutputFormat::PDF.is_text_previewable());
+
+        assert_eq!(OutputFormat("srt").extension(), "srt");
+        assert!(OutputFormat("srt").is_text_previewable());
+        assert_eq!(OutputFormat("vtt").media_type(), "text/vtt");
+        assert!(OutputFormat("vtt").is_text_previewable());
+    }
+
+    #[test]
+    fn conversion_error_cancelled_and_not_found_helpers() {
+        let cancelled = ConversionError::cancelled();
+        assert!(cancelled.is_cancelled());
+        assert!(!cancelled.is_executable_not_found());
+        assert_eq!(cancelled.to_string(), "conversion cancelled");
+
+        let missing = ConversionError::new("executable not found: /tmp/missing-bin");
+        assert!(missing.is_executable_not_found());
+        assert!(!missing.is_cancelled());
+
+        let other = ConversionError::new("something else failed");
+        assert!(!other.is_cancelled());
+        assert!(!other.is_executable_not_found());
+    }
+
+    #[test]
+    fn write_bytes_atomically_fails_when_parent_is_a_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-atomic-parent-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent_as_file = dir.join("not-a-dir");
+        std::fs::write(&parent_as_file, b"file").unwrap();
+        let impossible = parent_as_file.join("child.md");
+
+        let error = write_bytes_atomically(&impossible, b"data").unwrap_err();
+        assert!(
+            error.to_string().contains("could not write")
+                || error.to_string().contains("could not finalize"),
+            "error: {error}"
+        );
+        assert!(!impossible.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn available_url_outputs_is_non_empty_for_default_registry() {
+        let outputs = ConversionRegistry::default().available_url_outputs();
+        assert!(!outputs.is_empty());
+        assert!(outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(outputs.contains(&OutputFormat::HTML));
+    }
+
+    #[test]
+    fn pdf_input_options_slice_preprocessing_and_default() {
+        let default = PdfInputOptions::default();
+        assert!(default.is_default());
+        assert!(!default.needs_slice());
+        assert!(!default.needs_preprocessing());
+
+        // page_from == 1 with no page_to is full-document (no slice).
+        let from_one = PdfInputOptions {
+            page_from: Some(1),
+            ..Default::default()
+        };
+        assert!(!from_one.needs_slice());
+        assert!(!from_one.needs_preprocessing());
+        assert!(!from_one.is_default());
+
+        let from_later = PdfInputOptions {
+            page_from: Some(2),
+            ..Default::default()
+        };
+        assert!(from_later.needs_slice());
+        assert!(from_later.needs_preprocessing());
+
+        let with_to = PdfInputOptions {
+            page_to: Some(5),
+            ..Default::default()
+        };
+        assert!(with_to.needs_slice());
+        assert!(with_to.needs_preprocessing());
+
+        let password_only = PdfInputOptions {
+            password: Some("s3cret".into()),
+            ..Default::default()
+        };
+        assert!(!password_only.needs_slice());
+        assert!(password_only.needs_preprocessing());
+        assert!(!password_only.is_default());
+
+        let range = PdfInputOptions {
+            page_from: Some(2),
+            page_to: Some(5),
+            password: Some("x".into()),
+        };
+        assert!(range.needs_slice());
+        assert!(range.needs_preprocessing());
+    }
+
     /// UI hot paths: format chips, previews, and destination naming on selection change.
     ///
     /// Budgets are deliberately loose for unoptimized debug test builds; they

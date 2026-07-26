@@ -487,7 +487,7 @@ printf '%s' "$body" > "$output/$stem.$ext"
         write_fake_docling(&executable);
         fs::write(&input, b"%PDF-1.4 fake").unwrap();
 
-        let options = ConversionOptions {
+        let mut options = ConversionOptions {
             docling: DoclingOptions {
                 image_export_mode: DoclingImageExportMode::Embedded,
                 ocr: false,
@@ -497,6 +497,7 @@ printf '%s' "$body" > "$output/$stem.$ext"
             },
             ..ConversionOptions::default()
         };
+        options.pdf.password = Some("s3cret".into());
         let artifact = DoclingModule::with_executable(&executable)
             .convert(&input, OutputFormat::MARKDOWN, &options)
             .unwrap();
@@ -612,5 +613,192 @@ printf '%s' "$body" > "$output/$stem.$ext"
         let result = DoclingModule::discover_output(&work, &expected);
         assert_eq!(result, Some(work.join("report.md")));
         let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn image_export_mode_from_str_id_label_round_trips() {
+        let cases = [
+            (
+                DoclingImageExportMode::Placeholder,
+                "placeholder",
+                "Placeholder",
+                &["placeholder"][..],
+            ),
+            (
+                DoclingImageExportMode::Embedded,
+                "embedded",
+                "Embedded",
+                &["embedded", "embed"],
+            ),
+            (
+                DoclingImageExportMode::Referenced,
+                "referenced",
+                "Referenced",
+                &["referenced", "reference", "refs"],
+            ),
+        ];
+        assert_eq!(DoclingImageExportMode::all().len(), cases.len());
+        for (mode, id, label, aliases) in cases {
+            assert_eq!(mode.id(), id);
+            assert_eq!(mode.label(), label);
+            for alias in aliases {
+                assert_eq!(
+                    alias.parse::<DoclingImageExportMode>().unwrap(),
+                    mode,
+                    "alias {alias}"
+                );
+                assert_eq!(
+                    alias
+                        .to_ascii_uppercase()
+                        .parse::<DoclingImageExportMode>()
+                        .unwrap(),
+                    mode,
+                    "uppercase alias {alias}"
+                );
+            }
+        }
+        let err = "nope".parse::<DoclingImageExportMode>().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown Docling image export mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn table_mode_from_str_id_label_round_trips() {
+        let cases = [
+            (DoclingTableMode::Fast, "fast", "Fast", &["fast"][..]),
+            (
+                DoclingTableMode::Accurate,
+                "accurate",
+                "Accurate",
+                &["accurate", "hq", "high"],
+            ),
+        ];
+        assert_eq!(DoclingTableMode::all().len(), cases.len());
+        for (mode, id, label, aliases) in cases {
+            assert_eq!(mode.id(), id);
+            assert_eq!(mode.label(), label);
+            for alias in aliases {
+                assert_eq!(
+                    alias.parse::<DoclingTableMode>().unwrap(),
+                    mode,
+                    "alias {alias}"
+                );
+                assert_eq!(
+                    alias
+                        .to_ascii_uppercase()
+                        .parse::<DoclingTableMode>()
+                        .unwrap(),
+                    mode,
+                    "uppercase alias {alias}"
+                );
+            }
+        }
+        let err = "slow".parse::<DoclingTableMode>().unwrap_err();
+        assert!(
+            err.to_string().contains("unknown Docling table mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn to_arg_maps_markdown_html_plain() {
+        assert_eq!(DoclingModule::to_arg(OutputFormat::MARKDOWN), Some("md"));
+        assert_eq!(DoclingModule::to_arg(OutputFormat::HTML), Some("html"));
+        assert_eq!(DoclingModule::to_arg(OutputFormat("plain")), Some("text"));
+        assert_eq!(DoclingModule::to_arg(OutputFormat::PDF), None);
+        assert_eq!(DoclingModule::to_arg(OutputFormat::DOCX), None);
+    }
+
+    #[test]
+    fn pdf_password_does_not_appear_on_docling_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = format!(
+            "{}-{}-pw",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let secret = "p@ssw0rd-never-on-argv";
+        let mut options = ConversionOptions::default();
+        options.pdf.password = Some(secret.into());
+        DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap();
+
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(
+            !args.contains("--pdf-password"),
+            "docling must not receive --pdf-password, args: {args}"
+        );
+        assert!(
+            !args.contains(secret),
+            "password must not appear on docling argv, args: {args}"
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn reports_capability_lists() {
+        let module = DoclingModule::with_executable("docling");
+        let inputs = module.input_extensions();
+        assert!(
+            inputs.contains(&"pdf"),
+            "input_extensions should include pdf: {inputs:?}"
+        );
+        let outputs = module.output_formats();
+        assert!(outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(outputs.contains(&OutputFormat::HTML));
+        assert!(outputs.contains(&OutputFormat("plain")));
+        assert_eq!(module.chainable_output_formats(), outputs);
+    }
+
+    #[test]
+    fn missing_executable_fails_cleanly() {
+        let missing = std::env::temp_dir().join(format!(
+            "shift-docling-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let input = std::env::temp_dir().join(format!(
+            "shift-docling-missing-input-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let err = DoclingModule::with_executable(&missing)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Docling is not installed")
+                || message.contains("executable not found"),
+            "{message}"
+        );
+
+        let _ = fs::remove_file(&input);
     }
 }

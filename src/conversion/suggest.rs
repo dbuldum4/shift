@@ -122,4 +122,140 @@ mod tests {
             OutputFormat::MARKDOWN
         );
     }
+
+    #[test]
+    fn table_driven_video_demux_extensions_suggest_mp4() {
+        // Covers both the parse-time demux aliases and the outer match arm.
+        let cases = [
+            "m2ts", "mts", "vob", "wmv", "flv", "rm", "rmvb", "asf", "divx", "mxf", "mpg", "mpg2",
+        ];
+        for ext in cases {
+            let path = format!("clip.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::MP4,
+                "video demux extension .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_driven_audio_special_extensions_suggest_mp3() {
+        let cases = [
+            "amr", "ape", "dts", "eac3", "mpc", "oga", "spx", "aif", "aiff",
+        ];
+        for ext in cases {
+            let path = format!("track.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::MP3,
+                "audio special extension .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_driven_still_extensions_suggest_png() {
+        let cases = ["bmp", "tif", "tiff", "webp", "jpeg"];
+        for ext in cases {
+            let path = format!("photo.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::PNG,
+                "still extension .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_driven_document_extensions_suggest_markdown() {
+        let cases = [
+            "pdf", "docx", "pptx", "xlsx", "xls", "odt", "ods", "odp", "epub", "html", "htm",
+            "xhtml", "rtf", "md", "markdown", "txt", "csv", "json", "xml",
+        ];
+        for ext in cases {
+            let path = format!("doc.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::MARKDOWN,
+                "document extension .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_driven_known_format_ids() {
+        // Video OutputFormat ids demux to MP4.
+        for ext in ["mkv", "webm", "mp4", "mov", "avi"] {
+            assert_eq!(
+                suggested_output_for_path(format!("clip.{ext}")),
+                OutputFormat::MP4,
+                "known video id .{ext}"
+            );
+        }
+        // GIF is catalogued as a video writer id, so it demuxes to MP4.
+        assert_eq!(suggested_output_for_path("anim.gif"), OutputFormat::MP4);
+
+        // Audio OutputFormat ids → MP3.
+        for ext in ["flac", "aac", "mp3", "wav", "ogg", "opus", "m4a"] {
+            assert_eq!(
+                suggested_output_for_path(format!("track.{ext}")),
+                OutputFormat::MP3,
+                "known audio id .{ext}"
+            );
+        }
+
+        // Still OutputFormat ids → PNG.
+        for ext in ["png", "jpg"] {
+            assert_eq!(
+                suggested_output_for_path(format!("photo.{ext}")),
+                OutputFormat::PNG,
+                "known still id .{ext}"
+            );
+        }
+
+        // Subtitle OutputFormat ids → SRT. Unknown subtitle-like extensions
+        // (e.g. ass) fall through to the default Markdown arm.
+        for ext in ["srt", "vtt"] {
+            assert_eq!(
+                suggested_output_for_path(format!("subs.{ext}")),
+                OutputFormat::SRT,
+                "known subtitle id .{ext}"
+            );
+        }
+        assert_eq!(
+            suggested_output_for_path("subs.ass"),
+            OutputFormat::MARKDOWN
+        );
+    }
+
+    #[test]
+    fn table_driven_case_insensitive_samples() {
+        let cases = [
+            ("Tape.MXF", OutputFormat::MP4),
+            ("Clip.M2TS", OutputFormat::MP4),
+            ("Track.AMR", OutputFormat::MP3),
+            ("Sound.AIFF", OutputFormat::MP3),
+            ("Photo.JPEG", OutputFormat::PNG),
+            ("Image.WEBP", OutputFormat::PNG),
+            ("Scan.PDF", OutputFormat::MARKDOWN),
+            ("Page.HTML", OutputFormat::MARKDOWN),
+            ("Subs.SRT", OutputFormat::SRT),
+            ("Clip.MKV", OutputFormat::MP4),
+            ("Track.FLAC", OutputFormat::MP3),
+            ("Photo.PNG", OutputFormat::PNG),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                suggested_output_for_path(path),
+                expected,
+                "case-insensitive sample {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn suggested_output_for_url_is_markdown() {
+        assert_eq!(suggested_output_for_url(), OutputFormat::MARKDOWN);
+    }
 }

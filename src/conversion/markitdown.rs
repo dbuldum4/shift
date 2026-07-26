@@ -257,4 +257,193 @@ mod tests {
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_file(&input);
     }
+
+    #[test]
+    fn rejects_non_markdown_output() {
+        let err = MarkItDownModule::with_executable("/bin/cat")
+            .convert(
+                Path::new("notes.pdf"),
+                OutputFormat::PDF,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("MarkItDown only produces Markdown"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reports_capability_lists() {
+        let module = MarkItDownModule::with_executable("/bin/cat");
+        let inputs = module.input_extensions();
+        assert!(!inputs.is_empty());
+        for required in ["pdf", "docx", "html"] {
+            assert!(
+                inputs.contains(&required),
+                "input_extensions missing {required}: {inputs:?}"
+            );
+        }
+        assert_eq!(module.output_formats(), &[OutputFormat::MARKDOWN]);
+        assert_eq!(module.chainable_output_formats(), module.output_formats());
+        assert_eq!(module.chainable_output_formats(), &[OutputFormat::MARKDOWN]);
+    }
+
+    #[test]
+    fn empty_stdout_still_yields_named_markdown_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let executable = directory.join(format!("shift-markitdown-empty-{suffix}"));
+        let input = directory.join(format!("shift-markitdown-empty-input-{suffix}.txt"));
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "source").unwrap();
+
+        let artifact = MarkItDownModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            artifact.file_name,
+            format!("{}.md", input.file_stem().unwrap().to_string_lossy())
+        );
+        assert_eq!(artifact.bytes, b"");
+        assert_eq!(artifact.media_type, "text/markdown");
+        assert_eq!(artifact.format, OutputFormat::MARKDOWN);
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[test]
+    fn successful_convert_records_markitdown_provenance() {
+        let input = std::env::temp_dir().join(format!(
+            "shift-markitdown-prov-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&input, "# Converted\n").unwrap();
+
+        let artifact = MarkItDownModule::with_executable("/bin/cat")
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(artifact.module_id, "markitdown");
+        assert_eq!(artifact.pipeline, vec!["markitdown"]);
+        assert_eq!(artifact.format, OutputFormat::MARKDOWN);
+        assert_eq!(artifact.invocations.len(), 1);
+        assert_eq!(artifact.invocations[0].module_id, "markitdown");
+        assert!(
+            !artifact.invocations[0].argv_display.is_empty(),
+            "argv_display should be recorded"
+        );
+
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[test]
+    fn missing_executable_fails_cleanly() {
+        let missing = std::env::temp_dir().join(format!(
+            "shift-markitdown-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let input = std::env::temp_dir().join(format!(
+            "shift-markitdown-missing-input-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&input, "source").unwrap();
+
+        let err = MarkItDownModule::with_executable(&missing)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("MarkItDown is not installed")
+                || message.contains("executable not found"),
+            "{message}"
+        );
+
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[test]
+    fn keep_data_uris_false_does_not_pass_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let executable = directory.join(format!("shift-markitdown-no-keep-{suffix}"));
+        let input = directory.join(format!("shift-markitdown-no-keep-input-{suffix}.txt"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '# ok\\n'",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "source").unwrap();
+
+        let options = ConversionOptions {
+            markitdown: MarkItDownOptions {
+                keep_data_uris: false,
+            },
+            ..ConversionOptions::default()
+        };
+        MarkItDownModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap();
+
+        let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(
+            !args.contains("--keep-data-uris"),
+            "keep_data_uris=false must not pass the flag, args: {args}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        let _ = std::fs::remove_file(&input);
+    }
 }
