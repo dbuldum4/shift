@@ -14,6 +14,7 @@ mkdir -p "$contents/MacOS" "$resources/bin" "$runtime/bin" "$runtime/python" "$r
 
 cp target/release/shift "$contents/MacOS/shift"
 cp target/release/shift-cli "$resources/bin/shift-cli"
+cp LICENSE "$resources/LICENSE"
 
 cat > "$contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

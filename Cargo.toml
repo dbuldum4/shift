@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 default-run = "shift"
+license = "MIT"
 
 [lib]
 name = "shift_core"
