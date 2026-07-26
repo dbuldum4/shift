@@ -1121,8 +1121,10 @@ mod tests {
         let home = std::env::temp_dir().join(format!("shift-home-nvm-{}", std::process::id()));
         let node_bin = home.join("versions/node/v22.23.1/bin");
         std::fs::create_dir_all(&node_bin).unwrap();
-        let node = node_bin.join("node");
-        write_script(&node, "#!/bin/sh\necho ok\n");
+        // Unique name: runners often already have /opt/homebrew/bin/node, so a
+        // bare "node" probe would not prove nvm dirs are searched.
+        let probe = node_bin.join("shift_nvm_probe_tool");
+        write_script(&probe, "#!/bin/sh\necho ok\n");
 
         let previous_home = std::env::var_os("HOME");
         let previous_nvm = std::env::var_os("NVM_DIR");
@@ -1140,7 +1142,10 @@ mod tests {
             dirs.iter().any(|dir| dir == &node_bin),
             "expected nvm bin dir in {dirs:?}"
         );
-        assert_eq!(find_executable("node").as_deref(), Some(node.as_path()));
+        assert_eq!(
+            find_executable("shift_nvm_probe_tool").as_deref(),
+            Some(probe.as_path())
+        );
 
         unsafe {
             match previous_home {
