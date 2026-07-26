@@ -15,7 +15,9 @@ jobs:
           toolchain: 1.97.0
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # objc 0.2 expands a historical `cargo-clippy` cfg in its macros. Keep
+      # all project warnings fatal while allowing that upstream compatibility cfg.
+      - run: cargo clippy --all-targets --all-features -- -D warnings -A unexpected-cfgs
       - run: cargo test --all-targets
 
   landing-page:
@@ -29,5 +31,5 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
-      - run: VITE_BASE_PATH=/shift/ bun run build:pages
+      - run: VITE_BASE_PATH=/shift/ bun run build
       - run: bun run test:sites
