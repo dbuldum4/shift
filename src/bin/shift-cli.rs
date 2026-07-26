@@ -1904,4 +1904,235 @@ mod tests {
         let missing_start = parse_convert_args(&args(&["clip.mp4", "--start"])).unwrap_err();
         assert!(missing_start.contains("--start"), "{missing_start}");
     }
+
+    #[test]
+    fn cli_accepted_format_ids_match_output_format_catalog() {
+        // Every OutputFormat::ALL id must parse via the same FromStr used by -t/--to.
+        for format in OutputFormat::ALL {
+            let id = format.id();
+            let parsed = parse_convert_args(&args(&["file.bin", "-t", id]))
+                .unwrap_or_else(|e| panic!("CLI rejected catalog id {id}: {e}"));
+            assert_eq!(parsed.target.id(), id);
+
+            // Extension aliases that uniquely map should also work when they equal the id.
+            let ext = format.extension();
+            if ext != id && ext.parse::<OutputFormat>().map(|f| f.id()) == Ok(id) {
+                let parsed = parse_convert_args(&args(&["file.bin", "-t", ext])).unwrap();
+                assert_eq!(parsed.target.extension(), ext);
+            }
+        }
+
+        // Documented aliases accepted by FromStr.
+        for (alias, expected) in [
+            ("md", "markdown"),
+            ("jpeg", "jpg"),
+            ("png-zip", "png-sequence-zip"),
+            ("mpg", "mpeg"),
+        ] {
+            let parsed = parse_convert_args(&args(&["file.bin", "-t", alias])).unwrap();
+            assert_eq!(parsed.target.id(), expected, "alias {alias}");
+        }
+
+        // Reject anything outside the catalog.
+        for bad in ["not-a-format", "docx-plus", "audio", "video", ""] {
+            // Empty -t value is a missing-value error; others are unknown format.
+            if bad.is_empty() {
+                continue;
+            }
+            let err = parse_convert_args(&args(&["file.bin", "-t", bad])).unwrap_err();
+            assert!(
+                err.contains("unknown output format") || err.contains(bad),
+                "bad={bad:?} err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_module_ids_match_default_registry() {
+        let registry = ConversionRegistry::default();
+        let module_ids: Vec<_> = registry.modules().map(|m| m.id()).collect();
+        assert_eq!(
+            module_ids,
+            vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
+        );
+
+        for id in &module_ids {
+            let built = build_registry(Some(id)).unwrap();
+            // Preferred module is sorted first.
+            assert_eq!(built.modules().next().unwrap().id(), *id);
+            assert!(built.has_module(id));
+        }
+
+        let err = match build_registry(Some("not-a-module")) {
+            Ok(_) => panic!("expected unknown module error"),
+            Err(message) => message,
+        };
+        assert!(err.contains("unknown module"));
+        for id in &module_ids {
+            assert!(
+                err.contains(id),
+                "error should list known module {id}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_to_flag_long_and_short_forms() {
+        let gfm: OutputFormat = "gfm".parse().unwrap();
+        let plain: OutputFormat = "plain".parse().unwrap();
+        for (args_list, expected) in [
+            (args(&["a.md", "-t", "html"]), OutputFormat::HTML),
+            (args(&["a.md", "--to", "pdf"]), OutputFormat::PDF),
+            (args(&["a.md", "-t", "mp3"]), OutputFormat::MP3),
+            (
+                args(&["a.md", "--to", "png-sequence-zip"]),
+                OutputFormat::PNG_SEQUENCE_ZIP,
+            ),
+            (args(&["a.md", "-t", "gfm"]), gfm),
+            (args(&["a.md", "-t", "plain"]), plain),
+        ] {
+            let parsed = parse_convert_args(&args_list).unwrap();
+            assert_eq!(parsed.target, expected);
+        }
+    }
+
+    #[test]
+    fn parse_defuddle_and_markitdown_flags() {
+        let parsed = parse_convert_args(&args(&[
+            "https://example.com",
+            "--frontmatter",
+            "--lang",
+            "de",
+            "--keep-data-uris",
+            "-t",
+            "markdown",
+            "--yes",
+        ]))
+        .unwrap();
+        assert!(parsed.defuddle.frontmatter);
+        assert_eq!(parsed.defuddle.lang.as_deref(), Some("de"));
+        assert!(parsed.markitdown.keep_data_uris);
+        assert!(parsed.yes);
+    }
+
+    #[test]
+    fn parse_batch_subcommand_shape() {
+        // `batch` as first token is treated as an input path unless it is a subcommand.
+        // The CLI uses multi-input detection; ensure batch keyword still parses convert flags.
+        let parsed = parse_convert_args(&args(&[
+            "batch", "a.md", "b.md", "-t", "html", "-O", "/tmp/out", "--force",
+        ]))
+        .unwrap();
+        assert!(parsed.force);
+        assert_eq!(parsed.output_dir.as_deref(), Some(Path::new("/tmp/out")));
+        assert!(parsed.inputs.len() >= 2);
+        assert_eq!(parsed.target, OutputFormat::HTML);
+    }
+
+    #[test]
+    fn parse_all_boolean_media_flags() {
+        let parsed = parse_convert_args(&args(&[
+            "clip.mp4",
+            "--mute",
+            "--normalize-audio",
+            "--burn-subtitles",
+            "--mono",
+            "-t",
+            "mp4",
+        ]))
+        .unwrap();
+        assert!(parsed.ffmpeg.mute);
+        assert!(parsed.ffmpeg.normalize_audio);
+        assert!(parsed.ffmpeg.burn_subtitles);
+        assert!(parsed.ffmpeg.mono);
+    }
+
+    #[test]
+    fn parse_docling_ocr_and_table_mode_flags() {
+        let parsed = parse_convert_args(&args(&[
+            "scan.pdf",
+            "--docling-ocr",
+            "--docling-table-mode",
+            "accurate",
+            "--ocr-lang",
+            "eng",
+            "-t",
+            "markdown",
+        ]))
+        .unwrap();
+        assert!(parsed.docling.ocr);
+        assert_eq!(parsed.docling.ocr_lang.as_deref(), Some("eng"));
+        assert_eq!(parsed.target, OutputFormat::MARKDOWN);
+
+        let parsed =
+            parse_convert_args(&args(&["scan.pdf", "--no-docling-ocr", "-t", "html"])).unwrap();
+        assert!(!parsed.docling.ocr);
+    }
+
+    #[test]
+    fn formats_command_lists_every_registry_module() {
+        // `formats` prints module lines; ensure it exits successfully and modules exist.
+        assert!(run(args(&["formats"])).is_ok());
+        let registry = ConversionRegistry::default();
+        for module in registry.modules() {
+            assert!(
+                build_registry(Some(module.id())).is_ok(),
+                "module {} from formats surface must be selectable",
+                module.id()
+            );
+        }
+    }
+
+    #[test]
+    fn version_and_help_flags() {
+        assert!(run(args(&["--version"])).is_ok());
+        assert!(run(args(&["version"])).is_ok());
+        assert!(run(args(&["--help"])).is_ok());
+        assert!(run(args(&["help"])).is_ok());
+        assert!(run(args(&["-h"])).is_ok());
+    }
+
+    #[test]
+    fn reject_unknown_format_across_aliases() {
+        for bad in [
+            "docx2",
+            "markdownn",
+            "mp33",
+            "text",
+            "application/pdf",
+            "image/png",
+        ] {
+            let err = run(args(&["file.md", "-t", bad])).unwrap_err();
+            assert!(
+                err.contains("unknown output format") || err.contains(bad),
+                "bad={bad} err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_subtitle_stream_and_frame_interval() {
+        let parsed = parse_convert_args(&args(&[
+            "clip.mkv",
+            "--subtitle-stream",
+            "2",
+            "--frame-interval",
+            "1.25",
+            "-t",
+            "srt",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.ffmpeg.subtitle_stream, Some(2));
+        assert_eq!(parsed.ffmpeg.frame_interval_secs, Some(1.25));
+        assert_eq!(parsed.target, OutputFormat::SRT);
+    }
+
+    #[test]
+    fn network_confirm_skips_file_only_batches() {
+        let sources = [
+            BatchSource::File(PathBuf::from("a.pdf")),
+            BatchSource::File(PathBuf::from("b.pdf")),
+        ];
+        assert!(confirm_network_sources(&sources, false).is_ok());
+    }
 }

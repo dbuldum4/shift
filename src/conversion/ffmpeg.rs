@@ -1933,4 +1933,594 @@ esac
         let _ = fs::remove_file(format!("{}.args", executable.display()));
         let _ = fs::remove_file(&input);
     }
+
+    #[test]
+    fn validate_options_every_error_branch() {
+        assert!(validate_options(&FfmpegOptions::default()).is_ok());
+
+        // start_secs
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, -100.0] {
+            let o = FfmpegOptions {
+                start_secs: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("start"), "start={bad}: {err}");
+        }
+        assert!(
+            validate_options(&FfmpegOptions {
+                start_secs: Some(0.0),
+                ..FfmpegOptions::default()
+            })
+            .is_ok()
+        );
+
+        // frame_secs
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let o = FfmpegOptions {
+                frame_secs: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("frame"), "frame={bad}: {err}");
+        }
+
+        // duration_secs
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -5.0] {
+            let o = FfmpegOptions {
+                duration_secs: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("duration"), "duration={bad}: {err}");
+        }
+        assert!(
+            validate_options(&FfmpegOptions {
+                duration_secs: Some(0.001),
+                ..FfmpegOptions::default()
+            })
+            .is_ok()
+        );
+
+        // frame_interval_secs
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let o = FfmpegOptions {
+                frame_interval_secs: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("frame interval"), "interval={bad}: {err}");
+        }
+
+        // fps
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0, 240.1, 1000.0] {
+            let o = FfmpegOptions {
+                fps: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("fps"), "fps={bad}: {err}");
+        }
+        assert!(
+            validate_options(&FfmpegOptions {
+                fps: Some(240.0),
+                ..FfmpegOptions::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_options(&FfmpegOptions {
+                fps: Some(0.1),
+                ..FfmpegOptions::default()
+            })
+            .is_ok()
+        );
+
+        // sample_rate_hz
+        for bad in [0, 1, 7999, 192_001, u32::MAX] {
+            let o = FfmpegOptions {
+                sample_rate_hz: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("sample rate"), "rate={bad}: {err}");
+        }
+        for ok in [8000, 44100, 48000, 192_000] {
+            assert!(
+                validate_options(&FfmpegOptions {
+                    sample_rate_hz: Some(ok),
+                    ..FfmpegOptions::default()
+                })
+                .is_ok()
+            );
+        }
+
+        // scale_width
+        for bad in [0, 1, 15, 7681, u32::MAX] {
+            let o = FfmpegOptions {
+                scale_width: Some(bad),
+                ..FfmpegOptions::default()
+            };
+            let err = validate_options(&o).unwrap_err().to_string();
+            assert!(err.contains("scale width"), "width={bad}: {err}");
+        }
+        for ok in [16, 640, 1920, 7680] {
+            assert!(
+                validate_options(&FfmpegOptions {
+                    scale_width: Some(ok),
+                    ..FfmpegOptions::default()
+                })
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn stream_copy_conflict_matrix() {
+        let conflicts = [
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                mono: true,
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                sample_rate_hz: Some(44100),
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                scale_width: Some(640),
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                fps: Some(24.0),
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                mute: true,
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                normalize_audio: true,
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                burn_subtitles: true,
+                ..FfmpegOptions::default()
+            },
+            FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                frame_interval_secs: Some(1.0),
+                ..FfmpegOptions::default()
+            },
+        ];
+        let module = FfmpegModule::with_executable("ffmpeg");
+        for (i, options) in conflicts.into_iter().enumerate() {
+            let err = module
+                .convert(Path::new("clip.mp4"), OutputFormat::MP4, &opts(options))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("stream copy"),
+                "conflict case {i}: {err}"
+            );
+        }
+
+        // Still-image output with PreferCopy also fails (cannot copy to a single frame).
+        let err = module
+            .convert(
+                Path::new("clip.mp4"),
+                OutputFormat::PNG,
+                &opts(FfmpegOptions {
+                    encode_mode: FfmpegEncodeMode::PreferCopy,
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("stream copy"), "{err}");
+    }
+
+    #[test]
+    fn every_media_output_format_classifier() {
+        for format in OutputFormat::MEDIA {
+            assert!(
+                is_ffmpeg_output(*format),
+                "{} should be ffmpeg output",
+                format.id()
+            );
+            let audio = is_audio_output(*format);
+            let video = is_video_output(*format);
+            let image = is_image_output(*format);
+            let sub = is_subtitle_output(*format);
+            let seq = *format == OutputFormat::PNG_SEQUENCE_ZIP;
+            let kinds = [audio, video, image, sub, seq]
+                .into_iter()
+                .filter(|x| *x)
+                .count();
+            assert_eq!(
+                kinds,
+                1,
+                "{} must be exactly one of audio/video/image/subtitle/seq (a={audio} v={video} i={image} s={sub} z={seq})",
+                format.id()
+            );
+        }
+
+        // Explicit id matrix.
+        for id in [
+            "mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "ac3", "wma", "caf", "aiff",
+        ] {
+            let f: OutputFormat = id.parse().unwrap();
+            assert!(is_audio_output(f), "{id}");
+            assert!(!is_video_output(f) && !is_image_output(f) && !is_subtitle_output(f));
+        }
+        for id in [
+            "mp4", "webm", "mkv", "mov", "avi", "gif", "m4v", "mpeg", "ts", "3gp",
+        ] {
+            let f: OutputFormat = id.parse().unwrap();
+            assert!(is_video_output(f), "{id}");
+        }
+        for id in ["png", "jpg", "webp"] {
+            let f: OutputFormat = id.parse().unwrap();
+            assert!(is_image_output(f), "{id}");
+        }
+        for id in ["srt", "vtt"] {
+            let f: OutputFormat = id.parse().unwrap();
+            assert!(is_subtitle_output(f), "{id}");
+        }
+        assert!(!is_ffmpeg_output(OutputFormat::MARKDOWN));
+        assert!(!is_ffmpeg_output(OutputFormat::PDF));
+        assert!(!is_ffmpeg_output(OutputFormat::DOCX));
+        assert!(!is_ffmpeg_output(OutputFormat::HTML));
+    }
+
+    #[test]
+    fn input_looks_like_media_covers_ffmpeg_input_list() {
+        // Representative sample of every INPUTS family.
+        let media = [
+            "a.mp3",
+            "a.wav",
+            "a.flac",
+            "a.aac",
+            "a.m4a",
+            "a.ogg",
+            "a.opus",
+            "a.ac3",
+            "a.wma",
+            "a.caf",
+            "a.aiff",
+            "a.aif",
+            "a.mp4",
+            "a.mkv",
+            "a.mov",
+            "a.webm",
+            "a.avi",
+            "a.gif",
+            "a.m4v",
+            "a.mpeg",
+            "a.mpg",
+            "a.ts",
+            "a.3gp",
+            "a.wmv",
+            "a.flv",
+            "a.m2ts",
+            "a.mts",
+            "a.vob",
+            "a.asf",
+            "a.divx",
+            "a.mxf",
+            "a.png",
+            "a.jpg",
+            "a.jpeg",
+            "a.webp",
+            "a.bmp",
+            "a.tif",
+            "a.tiff",
+            "A.MP4",
+            "Track.WAV",
+        ];
+        for name in media {
+            assert!(
+                input_looks_like_media(Path::new(name)),
+                "expected media: {name}"
+            );
+        }
+        for name in ["a.docx", "a.pdf", "a.html", "a.md", "a.txt", "a", "a.xyz"] {
+            assert!(
+                !input_looks_like_media(Path::new(name)),
+                "expected non-media: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_command_argv_for_format_pairs_matrix() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let pairs = [
+            (OutputFormat::MP3, "out.mp3", &["-vn"][..]),
+            (OutputFormat::WAV, "out.wav", &["-vn"][..]),
+            (OutputFormat::FLAC, "out.flac", &["-vn"][..]),
+            (OutputFormat::AAC, "out.aac", &["-vn"][..]),
+            (OutputFormat::M4A, "out.m4a", &["-vn"][..]),
+            (OutputFormat::OGG, "out.ogg", &["-vn"][..]),
+            (OutputFormat::OPUS, "out.opus", &["-vn"][..]),
+            (OutputFormat::AC3, "out.ac3", &["-vn"][..]),
+            (OutputFormat::WMA, "out.wma", &["-vn"][..]),
+            (OutputFormat::AIFF, "out.aiff", &["-vn"][..]),
+            (OutputFormat::MP4, "out.mp4", &[][..]),
+            (OutputFormat::WEBM, "out.webm", &["libvpx-vp9"][..]),
+            (OutputFormat::MKV, "out.mkv", &[][..]),
+            (OutputFormat::MOV, "out.mov", &[][..]),
+            (OutputFormat::AVI, "out.avi", &[][..]),
+            (OutputFormat::GIF, "out.gif", &["palette"][..]),
+            (OutputFormat::M4V, "out.m4v", &[][..]),
+            (OutputFormat::TS, "out.ts", &[][..]),
+            (OutputFormat::PNG, "out.png", &["-frames:v"][..]),
+            (OutputFormat::JPG, "out.jpg", &["-frames:v"][..]),
+            (OutputFormat::WEBP, "out.webp", &["-frames:v"][..]),
+            (OutputFormat::SRT, "out.srt", &["0:s:0"][..]),
+            (OutputFormat::VTT, "out.vtt", &["0:s:0"][..]),
+        ];
+        for (format, out_name, expected_fragments) in pairs {
+            let command = module
+                .build_command(
+                    Path::new("in.mp4"),
+                    Path::new(out_name),
+                    format,
+                    &FfmpegOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("build {} failed: {e}", format.id()));
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let joined = args.join(" ");
+            assert!(
+                args.iter().any(|a| a == "-i"),
+                "{} missing -i: {joined}",
+                format.id()
+            );
+            assert!(
+                args.iter().any(|a| a == out_name),
+                "{} missing output path: {joined}",
+                format.id()
+            );
+            for frag in expected_fragments {
+                assert!(
+                    joined.contains(frag),
+                    "{} expected fragment {frag:?} in {joined}",
+                    format.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_mode_and_quality_parse_matrix() {
+        let mode_cases = [
+            ("auto", FfmpegEncodeMode::Auto),
+            ("copy", FfmpegEncodeMode::PreferCopy),
+            ("stream-copy", FfmpegEncodeMode::PreferCopy),
+            ("stream_copy", FfmpegEncodeMode::PreferCopy),
+            ("reencode", FfmpegEncodeMode::Reencode),
+            ("re-encode", FfmpegEncodeMode::Reencode),
+            ("encode", FfmpegEncodeMode::Reencode),
+            ("AUTO", FfmpegEncodeMode::Auto),
+        ];
+        for (input, expected) in mode_cases {
+            assert_eq!(input.parse::<FfmpegEncodeMode>().unwrap(), expected);
+        }
+        for bad in ["", "turbo", "fast", "copy-ish"] {
+            assert!(bad.parse::<FfmpegEncodeMode>().is_err(), "{bad}");
+        }
+        for mode in FfmpegEncodeMode::all() {
+            assert_eq!(mode.id().parse::<FfmpegEncodeMode>().unwrap(), *mode);
+            assert!(!mode.label().is_empty());
+        }
+
+        let quality_cases = [
+            ("balanced", FfmpegQuality::Balanced),
+            ("default", FfmpegQuality::Balanced),
+            ("medium", FfmpegQuality::Balanced),
+            ("high", FfmpegQuality::High),
+            ("hq", FfmpegQuality::High),
+            ("small", FfmpegQuality::Small),
+            ("low", FfmpegQuality::Small),
+            ("compact", FfmpegQuality::Small),
+            ("HIGH", FfmpegQuality::High),
+        ];
+        for (input, expected) in quality_cases {
+            assert_eq!(input.parse::<FfmpegQuality>().unwrap(), expected);
+        }
+        for bad in ["", "max", "lossless", "tiny"] {
+            assert!(bad.parse::<FfmpegQuality>().is_err(), "{bad}");
+        }
+        for q in FfmpegQuality::all() {
+            assert_eq!(q.id().parse::<FfmpegQuality>().unwrap(), *q);
+            assert!(!q.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn audio_quality_bitrate_presets_matrix() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        for (quality, needle) in [
+            (FfmpegQuality::High, "320k"),
+            (FfmpegQuality::Balanced, "192k"),
+            (FfmpegQuality::Small, "96k"),
+        ] {
+            let command = module
+                .build_command(
+                    Path::new("in.wav"),
+                    Path::new("out.mp3"),
+                    OutputFormat::MP3,
+                    &FfmpegOptions {
+                        quality,
+                        ..FfmpegOptions::default()
+                    },
+                )
+                .unwrap();
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.windows(2).any(|w| w == ["-b:a", needle]),
+                "quality {:?} expected -b:a {needle}, got {args:?}",
+                quality
+            );
+            assert!(args.windows(2).any(|w| w == ["-c:a", "libmp3lame"]));
+        }
+    }
+
+    #[test]
+    fn trim_start_on_image_uses_output_side_ss() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.png"),
+                OutputFormat::PNG,
+                &FfmpegOptions {
+                    start_secs: Some(2.5),
+                    ..FfmpegOptions::default()
+                },
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // -ss should appear after -i for stills (output-side seek).
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        let ss_positions: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, a)| (a == "-ss").then_some(idx))
+            .collect();
+        assert!(
+            ss_positions.iter().any(|p| *p > i_pos),
+            "expected output-side -ss after -i: {args:?}"
+        );
+    }
+
+    #[test]
+    fn module_metadata_and_outputs_match_media_catalog() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        assert_eq!(module.id(), "ffmpeg");
+        assert!(!module.label().is_empty());
+        assert_eq!(module.output_formats(), OutputFormat::MEDIA);
+        for format in OutputFormat::MEDIA {
+            assert!(module.supports(Path::new("clip.mp4"), *format));
+        }
+        assert!(!module.supports(Path::new("doc.docx"), OutputFormat::MP3));
+        assert!(!module.supports_url(OutputFormat::MP3));
+    }
+
+    #[test]
+    fn format_timestamp_matrix() {
+        let cases = [
+            (0.0, "0"),
+            (1.0, "1"),
+            (1.5, "1.500"),
+            (12.3456, "12.346"),
+            (12.3444, "12.344"),
+            (100.0000000001, "100"),
+        ];
+        for (secs, expected) in cases {
+            assert_eq!(format_timestamp(secs), expected, "secs={secs}");
+        }
+    }
+
+    #[test]
+    fn converts_more_format_pairs_with_fake_executable() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-pairs", std::process::id());
+        let executable = directory.join(format!("shift-ffmpeg-pairs-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-pairs-{suffix}.mp4"));
+        write_fake_ffmpeg(&executable);
+        fs::write(&input, b"fake").unwrap();
+        let module = FfmpegModule::with_executable(&executable);
+
+        let formats = [
+            OutputFormat::WAV,
+            OutputFormat::FLAC,
+            OutputFormat::AAC,
+            OutputFormat::OGG,
+            OutputFormat::OPUS,
+            OutputFormat::MP4,
+            OutputFormat::WEBM,
+            OutputFormat::MKV,
+            OutputFormat::GIF,
+            OutputFormat::JPG,
+            OutputFormat::WEBP,
+            OutputFormat::VTT,
+            OutputFormat::AIFF,
+            OutputFormat::M4A,
+        ];
+        for format in formats {
+            let artifact = module
+                .convert(&input, format, &ConversionOptions::default())
+                .unwrap_or_else(|e| panic!("convert to {} failed: {e}", format.id()));
+            assert_eq!(artifact.format, format);
+            assert_eq!(artifact.module_id, "ffmpeg");
+            assert!(
+                !artifact.bytes.is_empty(),
+                "empty bytes for {}",
+                format.id()
+            );
+            assert!(
+                artifact
+                    .file_name
+                    .ends_with(&format!(".{}", format.extension())),
+                "file_name {} for {}",
+                artifact.file_name,
+                format.id()
+            );
+        }
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn reencode_with_all_filters_builds_without_error() {
+        let module = FfmpegModule::with_executable("ffmpeg");
+        let options = FfmpegOptions {
+            start_secs: Some(1.0),
+            duration_secs: Some(5.0),
+            encode_mode: FfmpegEncodeMode::Reencode,
+            quality: FfmpegQuality::High,
+            mono: true,
+            sample_rate_hz: Some(44100),
+            scale_width: Some(640),
+            fps: Some(24.0),
+            normalize_audio: true,
+            ..FfmpegOptions::default()
+        };
+        let command = module
+            .build_command(
+                Path::new("in.mp4"),
+                Path::new("out.mp4"),
+                OutputFormat::MP4,
+                &options,
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(joined.contains("-ss"));
+        assert!(joined.contains("-t"));
+        assert!(joined.contains("scale=640:-2"));
+        assert!(joined.contains("fps=24"));
+        assert!(joined.contains("loudnorm"));
+        assert!(joined.contains("-ac"));
+        assert!(joined.contains("-ar"));
+    }
 }

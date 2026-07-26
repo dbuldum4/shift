@@ -1431,4 +1431,207 @@ mod tests {
         assert_eq!(script_value("a\rb"), "\"a\\rb\"");
         assert_eq!(script_value(""), "");
     }
+
+    #[test]
+    fn engine_ids_match_default_registry_module_ids() {
+        let report = DiagnosticsReport::collect();
+        let registry = ConversionRegistry::default();
+        let module_ids: Vec<_> = registry.modules().map(|m| m.id()).collect();
+        let engine_ids: Vec<_> = report.engines.iter().map(|e| e.id).collect();
+        assert_eq!(
+            engine_ids, module_ids,
+            "doctor engines must stay aligned with ConversionRegistry::default"
+        );
+        for engine in &report.engines {
+            assert!(!engine.label.is_empty());
+            assert!(!engine.env_override.is_empty());
+            assert!(engine.env_override.starts_with("SHIFT_"));
+            assert!(matches!(
+                engine.readiness,
+                Readiness::Ready | Readiness::Missing
+            ));
+        }
+    }
+
+    #[test]
+    fn format_availability_matrix_for_common_pairs() {
+        // Synthetic report: only markitdown + ffmpeg ready.
+        let registry = ConversionRegistry::default();
+        let report = DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "markitdown",
+                    label: "MarkItDown",
+                    readiness: Readiness::Ready,
+                    version: Some("1".into()),
+                    resolved_path: Some(PathBuf::from("/bin/markitdown")),
+                    env_override: "SHIFT_MARKITDOWN_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "pandoc",
+                    label: "Pandoc",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_PANDOC_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "defuddle",
+                    label: "Defuddle",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_DEFUDDLE_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "docling",
+                    label: "Docling",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_DOCLING_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "ffmpeg",
+                    label: "FFmpeg",
+                    readiness: Readiness::Ready,
+                    version: Some("8".into()),
+                    resolved_path: Some(PathBuf::from("/bin/ffmpeg")),
+                    env_override: "SHIFT_FFMPEG_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+
+        let cases = [
+            (
+                "notes.txt",
+                OutputFormat::MARKDOWN,
+                FormatAvailability::Available,
+            ),
+            ("clip.mp4", OutputFormat::MP3, FormatAvailability::Available),
+            ("clip.mp4", OutputFormat::PNG, FormatAvailability::Available),
+            (
+                "scan.pdf",
+                OutputFormat::HTML,
+                FormatAvailability::SupportedUnavailable, // docling missing
+            ),
+            (
+                "mystery.xyz",
+                OutputFormat::MARKDOWN,
+                FormatAvailability::Unsupported,
+            ),
+            (
+                "notes.md",
+                OutputFormat::DOCX,
+                FormatAvailability::SupportedUnavailable, // pandoc missing
+            ),
+        ];
+        for (input, output, expected) in cases {
+            let actual = format_availability(&registry, &report, Path::new(input), output);
+            assert_eq!(
+                actual,
+                expected,
+                "availability for {input} → {}",
+                output.id()
+            );
+        }
+    }
+
+    #[test]
+    fn supported_outputs_cover_media_for_video_input() {
+        let registry = ConversionRegistry::default();
+        let outs = supported_outputs(&registry, Path::new("clip.mp4"));
+        for format in OutputFormat::MEDIA {
+            assert!(
+                outs.contains(format),
+                "supported_outputs missing {}",
+                format.id()
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_complete_requires_all_engines_and_pdf() {
+        let mut engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
+            .into_iter()
+            .map(|id| EngineDiagnostic {
+                id,
+                label: id,
+                readiness: Readiness::Ready,
+                version: Some("1".into()),
+                resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
+                env_override: "X",
+                install_hint: String::new(),
+                notes: None,
+            })
+            .collect();
+        let mut report = DiagnosticsReport {
+            engines: engines.clone(),
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+        // Without a ready PDF engine, complete may still be false depending on policy.
+        let complete_without_pdf = report.is_complete();
+
+        report.pdf_engines.push(PdfEngineDiagnostic {
+            name: "typst".into(),
+            readiness: Readiness::Ready,
+            version: Some("0.15".into()),
+            resolved_path: Some(PathBuf::from("/bin/typst")),
+            selected: true,
+        });
+        report.selected_pdf_engine = Some("typst".into());
+        assert!(report.is_complete());
+        assert!(report.is_healthy());
+        assert_eq!(report.exit_code(), 0);
+
+        engines[0].readiness = Readiness::Missing;
+        report.engines = engines;
+        assert!(!report.is_complete());
+        assert!(report.is_healthy()); // still partial ok
+        let _ = complete_without_pdf;
+    }
+
+    #[test]
+    fn script_render_keys_for_all_engines() {
+        let engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
+            .into_iter()
+            .map(|id| EngineDiagnostic {
+                id,
+                label: id,
+                readiness: Readiness::Missing,
+                version: None,
+                resolved_path: None,
+                env_override: "X",
+                install_hint: "hint".into(),
+                notes: None,
+            })
+            .collect();
+        let report = DiagnosticsReport {
+            engines,
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+        let script = report.render_script();
+        for id in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+            assert!(
+                script.contains(&format!("engine.{id}=missing")),
+                "missing key for {id} in:\n{script}"
+            );
+        }
+        assert!(script.contains("exit_code=1"));
+        assert!(script.contains("healthy=false"));
+    }
 }

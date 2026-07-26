@@ -258,4 +258,71 @@ mod tests {
     fn suggested_output_for_url_is_markdown() {
         assert_eq!(suggested_output_for_url(), OutputFormat::MARKDOWN);
     }
+
+    #[test]
+    fn ffmpeg_input_list_extensions_have_suggestions() {
+        // Mirror FFmpeg INPUTS families so suggested_output stays complete as demux surface grows.
+        let video = [
+            // Note: extensions present only on the FFmpeg demux list but without a
+            // dedicated suggest arm (e.g. mk3d) fall through to Markdown and are
+            // intentionally omitted here.
+            "3gp", "asf", "avi", "divx", "flv", "gif", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg",
+            "mpg", "mts", "mxf", "rm", "rmvb", "ts", "vob", "webm", "wmv",
+        ];
+        // Catalog audio ids + the special demux arms in `suggested_output_for_path`.
+        // FFmpeg-only demux extensions without a suggest arm (m4b, m4p, mka, weba, …)
+        // still fall through to Markdown and are omitted here.
+        let audio = [
+            "aac", "ac3", "aif", "aiff", "amr", "ape", "caf", "dts", "eac3", "flac", "m4a", "mp3",
+            "mpc", "oga", "ogg", "opus", "spx", "wav", "wma",
+        ];
+        let stills = ["bmp", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
+
+        for ext in video {
+            let path = format!("clip.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::MP4,
+                "video demux .{ext}"
+            );
+        }
+        for ext in audio {
+            let path = format!("track.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::MP3,
+                "audio demux .{ext}"
+            );
+        }
+        for ext in stills {
+            let path = format!("photo.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::PNG,
+                "still demux .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn remaining_media_catalog_ids_as_inputs() {
+        for format in OutputFormat::MEDIA {
+            let ext = format.extension();
+            // png-sequence-zip is an output-only package; input as .zip is not media demux.
+            if format.id() == "png-sequence-zip" {
+                continue;
+            }
+            let path = format!("sample.{ext}");
+            let suggested = suggested_output_for_path(&path);
+            if is_video_output(*format) {
+                assert_eq!(suggested, OutputFormat::MP4, "video id {}", format.id());
+            } else if is_audio_output(*format) {
+                assert_eq!(suggested, OutputFormat::MP3, "audio id {}", format.id());
+            } else if is_image_output(*format) {
+                assert_eq!(suggested, OutputFormat::PNG, "image id {}", format.id());
+            } else if is_subtitle_output(*format) {
+                assert_eq!(suggested, OutputFormat::SRT, "subtitle id {}", format.id());
+            }
+        }
+    }
 }

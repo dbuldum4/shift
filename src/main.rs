@@ -5400,3 +5400,1994 @@ mod ui_perf {
         );
     }
 }
+
+#[cfg(test)]
+mod pure_ui_helpers {
+    //! Exhaustive correctness tests for pure UI helpers in `main.rs`.
+    //!
+    //! Complements `ui_perf` (wall-clock budgets) with dense table-driven
+    //! assertions over clamps, formatters, parsers, history helpers, and
+    //! preview builders.
+
+    use super::*;
+    use crate::app::*;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    // ── sample builders (mirror ui_perf) ─────────────────────────────────
+
+    fn sample_artifact(id: u64, bytes: Vec<u8>) -> ConversionArtifact {
+        ConversionArtifact {
+            file_name: format!("file{id}.md"),
+            media_type: "text/markdown",
+            bytes,
+            format: OutputFormat::MARKDOWN,
+            module_id: "pandoc",
+            pipeline: vec!["pandoc"],
+            invocations: Vec::new(),
+        }
+    }
+
+    fn sample_artifact_with(
+        id: u64,
+        format: OutputFormat,
+        module_id: &'static str,
+        bytes: Vec<u8>,
+    ) -> ConversionArtifact {
+        ConversionArtifact {
+            file_name: format!("file{id}.{} ", format.extension()).replace(" ", ""),
+            media_type: format.media_type(),
+            bytes,
+            format,
+            module_id,
+            pipeline: vec![module_id],
+            invocations: Vec::new(),
+        }
+    }
+
+    fn sample_history_entry(id: u64, outcome: HistoryOutcome) -> ConversionHistoryEntry {
+        ConversionHistoryEntry {
+            id,
+            source: HistorySource::File(PathBuf::from(format!(
+                "/Users/me/Documents/report{id}.docx"
+            ))),
+            name: format!("report{id}.docx").into(),
+            detail: "DOCX → Markdown  ·  via Pandoc".into(),
+            extension_label: "DOCX".into(),
+            badge_color: BADGE_FILL,
+            badge_text_color: BADGE_TEXT,
+            output_format: OutputFormat::MARKDOWN,
+            outcome,
+            archived: false,
+        }
+    }
+
+    fn sample_history_entry_custom(
+        id: u64,
+        source: HistorySource,
+        name: &str,
+        detail: &str,
+        extension_label: &str,
+        output_format: OutputFormat,
+        outcome: HistoryOutcome,
+    ) -> ConversionHistoryEntry {
+        ConversionHistoryEntry {
+            id,
+            source,
+            name: name.to_owned().into(),
+            detail: detail.to_owned().into(),
+            extension_label: extension_label.to_owned().into(),
+            badge_color: BADGE_FILL,
+            badge_text_color: BADGE_TEXT,
+            output_format,
+            outcome,
+            archived: false,
+        }
+    }
+
+    fn sample_batch_item(id: u64, state: BatchItemState) -> BatchItem {
+        BatchItem {
+            id: BatchItemId(id),
+            source: BatchSource::File(PathBuf::from(format!("/tmp/input{id}.pdf"))),
+            output_format: OutputFormat::MARKDOWN,
+            format_selection: BatchFormatSelection::Inherit,
+            options: ConversionOptions::default(),
+            destination: PathBuf::from(format!("/tmp/out{id}.md")),
+            force: false,
+            state,
+            attempts: 0,
+        }
+    }
+
+    fn expected_history_clamp(width: f32, window_width: f32, output_panel_width: f32) -> f32 {
+        let reserved = output_panel_width + CENTER_PANEL_MIN + PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+        let max_by_window = (window_width - reserved).max(HISTORY_SIDEBAR_MIN);
+        width.clamp(HISTORY_SIDEBAR_MIN, HISTORY_SIDEBAR_MAX.min(max_by_window))
+    }
+
+    fn expected_output_clamp(width: f32, window_width: f32, history_sidebar_width: f32) -> f32 {
+        let reserved = history_sidebar_width + CENTER_PANEL_MIN + PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+        let max_by_window = (window_width - reserved).max(OUTPUT_PANEL_MIN);
+        width.clamp(OUTPUT_PANEL_MIN, OUTPUT_PANEL_MAX.min(max_by_window))
+    }
+
+    fn expected_format_file_size(bytes: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+        let size = bytes as f64;
+        if size < KB {
+            format!("{bytes} B")
+        } else if size < MB {
+            format!("{:.1} KB", size / KB)
+        } else if size < GB {
+            format!("{:.1} MB", size / MB)
+        } else {
+            format!("{:.2} GB", size / GB)
+        }
+    }
+
+    fn expected_badge_label(format: OutputFormat) -> String {
+        let ext = format.extension().to_ascii_uppercase();
+        if ext.is_empty() {
+            "OUT".into()
+        } else if ext.len() <= 4 {
+            ext
+        } else {
+            ext.chars().take(4).collect()
+        }
+    }
+
+    // ── constants ────────────────────────────────────────────────────────
+
+    #[test]
+    fn app_constants_are_stable() {
+        assert_eq!(APP_NAME, "Shift");
+        assert!(!DEFAULT_UI_FONT.is_empty());
+        assert_eq!(FONT_MONO, "Geist Mono");
+        assert_eq!(BADGE_FILL, 0x1a1a1a);
+        assert_eq!(BADGE_TEXT, 0xcccccc);
+        assert_eq!(HISTORY_SIDEBAR_MIN, 220.0);
+        assert_eq!(HISTORY_SIDEBAR_MAX, 360.0);
+        assert_eq!(OUTPUT_PANEL_MIN, 340.0);
+        assert_eq!(OUTPUT_PANEL_MAX, 600.0);
+        assert_eq!(CENTER_PANEL_MIN, 300.0);
+        assert_eq!(PANEL_RESIZE_HANDLE_WIDTH, 5.0);
+        assert_eq!(SETTINGS_SIDEBAR_WIDTH, 220.0);
+        // Window minimum 900: mins + handles must fit.
+        let floor = HISTORY_SIDEBAR_MIN
+            + OUTPUT_PANEL_MIN
+            + CENTER_PANEL_MIN
+            + PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+        assert!(
+            floor <= 900.0,
+            "panel mins must fit 900px window, got {floor}"
+        );
+        const {
+            assert!(HISTORY_SIDEBAR_MIN <= HISTORY_SIDEBAR_MAX);
+            assert!(OUTPUT_PANEL_MIN <= OUTPUT_PANEL_MAX);
+        }
+        assert!(!UI_FONT_CHOICES.is_empty());
+        for (label, family) in UI_FONT_CHOICES {
+            assert!(!label.is_empty());
+            assert!(!family.is_empty());
+        }
+        // Labels unique; family names unique.
+        let labels: HashSet<_> = UI_FONT_CHOICES.iter().map(|(l, _)| *l).collect();
+        let families: HashSet<_> = UI_FONT_CHOICES.iter().map(|(_, f)| *f).collect();
+        assert_eq!(labels.len(), UI_FONT_CHOICES.len());
+        assert_eq!(families.len(), UI_FONT_CHOICES.len());
+    }
+
+    #[test]
+    fn panel_resize_target_eq() {
+        assert_eq!(PanelResizeTarget::History, PanelResizeTarget::History);
+        assert_eq!(PanelResizeTarget::Output, PanelResizeTarget::Output);
+        assert_ne!(PanelResizeTarget::History, PanelResizeTarget::Output);
+    }
+
+    // ── clamp_history_sidebar_width / clamp_output_panel_width ───────────
+
+    #[test]
+    fn clamp_history_sidebar_dense_grid() {
+        let windows: Vec<f32> = (4..=30).map(|i| i as f32 * 100.0).collect(); // 400..3000
+        let peers: Vec<f32> = vec![
+            0.0,
+            -50.0,
+            OUTPUT_PANEL_MIN / 2.0,
+            OUTPUT_PANEL_MIN,
+            400.0,
+            470.0,
+            OUTPUT_PANEL_MAX,
+            OUTPUT_PANEL_MAX + 100.0,
+            9999.0,
+        ];
+        let widths: Vec<f32> = vec![
+            f32::NEG_INFINITY,
+            -1000.0,
+            -1.0,
+            0.0,
+            1.0,
+            HISTORY_SIDEBAR_MIN - 1.0,
+            HISTORY_SIDEBAR_MIN,
+            HISTORY_SIDEBAR_MIN + 1.0,
+            240.0,
+            300.0,
+            HISTORY_SIDEBAR_MAX - 1.0,
+            HISTORY_SIDEBAR_MAX,
+            HISTORY_SIDEBAR_MAX + 1.0,
+            9999.0,
+            f32::INFINITY,
+        ];
+        let mut cases = 0u32;
+        for &window in &windows {
+            for &peer in &peers {
+                for &width in &widths {
+                    let got = clamp_history_sidebar_width(width, window, peer);
+                    let want = expected_history_clamp(width, window, peer);
+                    assert_eq!(
+                        got, want,
+                        "history clamp width={width} window={window} peer={peer}"
+                    );
+                    assert!(got >= HISTORY_SIDEBAR_MIN || got.is_nan());
+                    // Result never exceeds absolute max when window allows it.
+                    if want.is_finite() {
+                        assert!(got <= HISTORY_SIDEBAR_MAX.max(HISTORY_SIDEBAR_MIN));
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 1000, "expected dense grid, got {cases}");
+    }
+
+    #[test]
+    fn clamp_output_panel_dense_grid() {
+        let windows: Vec<f32> = (4..=30).map(|i| i as f32 * 100.0).collect();
+        let peers: Vec<f32> = vec![
+            0.0,
+            -50.0,
+            HISTORY_SIDEBAR_MIN / 2.0,
+            HISTORY_SIDEBAR_MIN,
+            240.0,
+            HISTORY_SIDEBAR_MAX,
+            HISTORY_SIDEBAR_MAX + 50.0,
+            9999.0,
+        ];
+        let widths: Vec<f32> = vec![
+            f32::NEG_INFINITY,
+            -1000.0,
+            -1.0,
+            0.0,
+            1.0,
+            OUTPUT_PANEL_MIN - 1.0,
+            OUTPUT_PANEL_MIN,
+            OUTPUT_PANEL_MIN + 1.0,
+            470.0,
+            500.0,
+            OUTPUT_PANEL_MAX - 1.0,
+            OUTPUT_PANEL_MAX,
+            OUTPUT_PANEL_MAX + 1.0,
+            9999.0,
+            f32::INFINITY,
+        ];
+        let mut cases = 0u32;
+        for &window in &windows {
+            for &peer in &peers {
+                for &width in &widths {
+                    let got = clamp_output_panel_width(width, window, peer);
+                    let want = expected_output_clamp(width, window, peer);
+                    assert_eq!(
+                        got, want,
+                        "output clamp width={width} window={window} peer={peer}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 1000, "expected dense grid, got {cases}");
+    }
+
+    #[test]
+    fn clamp_history_named_edge_cases() {
+        // Identity within range on a roomy window.
+        assert_eq!(clamp_history_sidebar_width(240.0, 1400.0, 470.0), 240.0);
+        assert_eq!(
+            clamp_history_sidebar_width(HISTORY_SIDEBAR_MIN, 1400.0, 470.0),
+            HISTORY_SIDEBAR_MIN
+        );
+        assert_eq!(
+            clamp_history_sidebar_width(HISTORY_SIDEBAR_MAX, 2000.0, OUTPUT_PANEL_MIN),
+            HISTORY_SIDEBAR_MAX
+        );
+
+        // Below min → min.
+        assert_eq!(
+            clamp_history_sidebar_width(0.0, 1400.0, 470.0),
+            HISTORY_SIDEBAR_MIN
+        );
+        assert_eq!(
+            clamp_history_sidebar_width(-100.0, 1400.0, 470.0),
+            HISTORY_SIDEBAR_MIN
+        );
+
+        // Above max with room → absolute max.
+        assert_eq!(
+            clamp_history_sidebar_width(10_000.0, 2000.0, OUTPUT_PANEL_MIN),
+            HISTORY_SIDEBAR_MAX
+        );
+
+        // Tiny window: floor still HISTORY_SIDEBAR_MIN even if center suffers.
+        let tiny = clamp_history_sidebar_width(300.0, 100.0, 50.0);
+        assert_eq!(tiny, HISTORY_SIDEBAR_MIN);
+
+        // Peer output huge: max_by_window collapses to HISTORY_SIDEBAR_MIN.
+        let squeezed = clamp_history_sidebar_width(HISTORY_SIDEBAR_MAX, 900.0, 800.0);
+        assert_eq!(squeezed, HISTORY_SIDEBAR_MIN);
+
+        // Zero window.
+        assert_eq!(
+            clamp_history_sidebar_width(240.0, 0.0, 0.0),
+            HISTORY_SIDEBAR_MIN
+        );
+
+        // Negative window still yields at least min.
+        assert_eq!(
+            clamp_history_sidebar_width(240.0, -500.0, 0.0),
+            HISTORY_SIDEBAR_MIN
+        );
+    }
+
+    #[test]
+    fn clamp_output_named_edge_cases() {
+        assert_eq!(clamp_output_panel_width(470.0, 1400.0, 240.0), 470.0);
+        assert_eq!(
+            clamp_output_panel_width(OUTPUT_PANEL_MIN, 1400.0, 240.0),
+            OUTPUT_PANEL_MIN
+        );
+        assert_eq!(
+            clamp_output_panel_width(OUTPUT_PANEL_MAX, 2000.0, HISTORY_SIDEBAR_MIN),
+            OUTPUT_PANEL_MAX
+        );
+        assert_eq!(
+            clamp_output_panel_width(0.0, 1400.0, 240.0),
+            OUTPUT_PANEL_MIN
+        );
+        assert_eq!(
+            clamp_output_panel_width(-50.0, 1400.0, 240.0),
+            OUTPUT_PANEL_MIN
+        );
+        assert_eq!(
+            clamp_output_panel_width(10_000.0, 2000.0, HISTORY_SIDEBAR_MIN),
+            OUTPUT_PANEL_MAX
+        );
+        let tiny = clamp_output_panel_width(500.0, 100.0, 50.0);
+        assert_eq!(tiny, OUTPUT_PANEL_MIN);
+        let squeezed = clamp_output_panel_width(OUTPUT_PANEL_MAX, 900.0, 700.0);
+        assert_eq!(squeezed, OUTPUT_PANEL_MIN);
+        assert_eq!(clamp_output_panel_width(470.0, 0.0, 0.0), OUTPUT_PANEL_MIN);
+    }
+
+    #[test]
+    fn clamp_pair_leaves_center_room_when_window_allows() {
+        // When the window is large enough for mins + center, clamping each
+        // side against the other's min leaves center ≥ CENTER_PANEL_MIN.
+        for window in [900.0_f32, 1000.0, 1180.0, 1400.0, 1600.0, 1920.0, 2560.0] {
+            let history =
+                clamp_history_sidebar_width(HISTORY_SIDEBAR_MAX, window, OUTPUT_PANEL_MIN);
+            let center = window - history - OUTPUT_PANEL_MIN - PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+            if window
+                >= HISTORY_SIDEBAR_MIN
+                    + OUTPUT_PANEL_MIN
+                    + CENTER_PANEL_MIN
+                    + PANEL_RESIZE_HANDLE_WIDTH * 2.0
+            {
+                assert!(
+                    center + 0.5 >= CENTER_PANEL_MIN,
+                    "window={window} center left={center} after history clamp"
+                );
+            }
+            let output = clamp_output_panel_width(OUTPUT_PANEL_MAX, window, HISTORY_SIDEBAR_MIN);
+            let center2 = window - HISTORY_SIDEBAR_MIN - output - PANEL_RESIZE_HANDLE_WIDTH * 2.0;
+            if window
+                >= HISTORY_SIDEBAR_MIN
+                    + OUTPUT_PANEL_MIN
+                    + CENTER_PANEL_MIN
+                    + PANEL_RESIZE_HANDLE_WIDTH * 2.0
+            {
+                assert!(
+                    center2 + 0.5 >= CENTER_PANEL_MIN,
+                    "window={window} center left={center2} after output clamp"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_stepped_widths_across_windows() {
+        // Dense step over requested range 400..2000 step 100.
+        for window in (400..=2000).step_by(100) {
+            let w = window as f32;
+            for panel in (0..=800).step_by(40) {
+                let p = panel as f32;
+                for peer in (0..=700).step_by(50) {
+                    let peer_f = peer as f32;
+                    let h = clamp_history_sidebar_width(p, w, peer_f);
+                    assert_eq!(h, expected_history_clamp(p, w, peer_f));
+                    let o = clamp_output_panel_width(p, w, peer_f);
+                    assert_eq!(o, expected_output_clamp(p, w, peer_f));
+                }
+            }
+        }
+    }
+
+    // ── format_file_size ─────────────────────────────────────────────────
+
+    #[test]
+    fn format_file_size_bytes_band() {
+        for bytes in [0u64, 1, 2, 10, 100, 512, 999, 1023] {
+            assert_eq!(format_file_size(bytes), format!("{bytes} B"));
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+        }
+    }
+
+    #[test]
+    fn format_file_size_kb_band() {
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(10 * 1024), "10.0 KB");
+        assert_eq!(
+            format_file_size(1024 * 1024 - 1),
+            expected_format_file_size(1024 * 1024 - 1)
+        );
+        // Step through KB range.
+        for k in 1u64..1024 {
+            let bytes = k * 1024;
+            if bytes < 1024 * 1024 {
+                assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+            }
+        }
+        // Mid-KB non-multiples.
+        for bytes in [
+            1025u64, 2048, 4096, 12_345, 50_000, 100_000, 500_000, 999_999,
+        ] {
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+            assert!(format_file_size(bytes).ends_with(" KB"));
+        }
+    }
+
+    #[test]
+    fn format_file_size_mb_band() {
+        assert_eq!(format_file_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_file_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_file_size(50 * 1024 * 1024), "50.0 MB");
+        assert_eq!(
+            format_file_size(1024 * 1024 * 1024 - 1),
+            expected_format_file_size(1024 * 1024 * 1024 - 1)
+        );
+        for m in 1u64..50 {
+            let bytes = m * 1024 * 1024;
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+            assert!(format_file_size(bytes).ends_with(" MB"));
+        }
+        for bytes in [
+            1_500_000u64,
+            12_345_678,
+            100 * 1024 * 1024,
+            512 * 1024 * 1024,
+        ] {
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+        }
+    }
+
+    #[test]
+    fn format_file_size_gb_band() {
+        assert_eq!(format_file_size(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_file_size(5 * 1024 * 1024 * 1024), "5.00 GB");
+        for g in 1u64..=20 {
+            let bytes = g * 1024 * 1024 * 1024;
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+            assert!(format_file_size(bytes).ends_with(" GB"));
+        }
+        // Large values including near u64 edge (f64 precision may coarsen).
+        for &bytes in &[
+            10u64 * 1024 * 1024 * 1024,
+            100 * 1024 * 1024 * 1024,
+            u64::MAX / 4,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+        }
+    }
+
+    #[test]
+    fn format_file_size_exact_boundaries() {
+        let cases: &[(u64, &str)] = &[
+            (0, "0 B"),
+            (1, "1 B"),
+            (1023, "1023 B"),
+            (1024, "1.0 KB"),
+            (1024 * 1024, "1.0 MB"),
+            (1024 * 1024 * 1024, "1.00 GB"),
+        ];
+        for &(bytes, want) in cases {
+            assert_eq!(format_file_size(bytes), want, "bytes={bytes}");
+        }
+        // Near-boundary values computed via the same formula the production code uses.
+        for bytes in [1024 * 1024 - 1, 1024 * 1024 * 1024 - 1] {
+            assert_eq!(
+                format_file_size(bytes),
+                expected_format_file_size(bytes),
+                "bytes={bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_file_size_dense_sweep() {
+        // Sweep powers of two and nearby values.
+        for exp in 0u32..40 {
+            let base = 1u64 << exp.min(63);
+            for delta in [0i64, -1, 1, -10, 10, -100, 100] {
+                let bytes = base.saturating_add_signed(delta);
+                assert_eq!(
+                    format_file_size(bytes),
+                    expected_format_file_size(bytes),
+                    "bytes={bytes}"
+                );
+            }
+        }
+        // Linear sweep in each band.
+        for bytes in (0u64..2048).step_by(17) {
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+        }
+        for bytes in (1024u64..100_000).step_by(4099) {
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+        }
+        for bytes in (1024u64 * 1024..20 * 1024 * 1024).step_by(1_048_583) {
+            assert_eq!(format_file_size(bytes), expected_format_file_size(bytes));
+        }
+    }
+
+    // ── ellipsize_chars ──────────────────────────────────────────────────
+
+    #[test]
+    fn ellipsize_chars_empty_and_zero_max() {
+        assert_eq!(ellipsize_chars("", 0).as_ref(), "…");
+        assert_eq!(ellipsize_chars("", 1).as_ref(), "");
+        assert_eq!(ellipsize_chars("", 10).as_ref(), "");
+        assert_eq!(ellipsize_chars("hello", 0).as_ref(), "…");
+        assert_eq!(ellipsize_chars("a", 0).as_ref(), "…");
+        assert_eq!(ellipsize_chars("🚀", 0).as_ref(), "…");
+    }
+
+    #[test]
+    fn ellipsize_chars_short_and_exact() {
+        assert_eq!(ellipsize_chars("a", 1).as_ref(), "a");
+        assert_eq!(ellipsize_chars("ab", 2).as_ref(), "ab");
+        assert_eq!(ellipsize_chars("PLAN.md", 7).as_ref(), "PLAN.md");
+        assert_eq!(ellipsize_chars("PLAN.md", 42).as_ref(), "PLAN.md");
+        assert_eq!(ellipsize_chars("failed", 6).as_ref(), "failed");
+        assert_eq!(ellipsize_chars("via Pandoc", 10).as_ref(), "via Pandoc");
+        for max in 1..=20 {
+            let s = "x".repeat(max);
+            assert_eq!(ellipsize_chars(&s, max).as_ref(), s);
+            assert_eq!(ellipsize_chars(&s, max + 1).as_ref(), s);
+            assert_eq!(ellipsize_chars(&s, max + 100).as_ref(), s);
+        }
+    }
+
+    #[test]
+    fn ellipsize_chars_truncates_with_ellipsis() {
+        let long = "personal strength week 5 workout.docx";
+        for max in 1..=long.chars().count() {
+            let got = ellipsize_chars(long, max);
+            assert_eq!(got.chars().count(), max, "max={max} got={got:?}");
+            if max < long.chars().count() {
+                assert!(got.as_ref().ends_with('…'), "max={max}");
+                if max >= 2 {
+                    let prefix: String = long.chars().take(max - 1).collect();
+                    assert_eq!(&got.as_ref()[..got.as_ref().len() - '…'.len_utf8()], prefix);
+                }
+            } else {
+                assert_eq!(got.as_ref(), long);
+            }
+        }
+        // max+1 of longer string.
+        let s = "abcdefghij";
+        assert_eq!(ellipsize_chars(s, 3).as_ref(), "ab…");
+        assert_eq!(ellipsize_chars(s, 1).as_ref(), "…");
+        assert_eq!(ellipsize_chars(s, 5).as_ref(), "abcd…");
+        assert_eq!(ellipsize_chars(s, 9).as_ref(), "abcdefgh…");
+        assert_eq!(ellipsize_chars(s, 10).as_ref(), "abcdefghij");
+        assert_eq!(ellipsize_chars(s, 11).as_ref(), "abcdefghij");
+    }
+
+    #[test]
+    fn ellipsize_chars_unicode_grapheme_units_are_chars() {
+        // Implementation counts Unicode scalar values (chars), not grapheme clusters.
+        assert_eq!(ellipsize_chars("你好世界", 4).as_ref(), "你好世界");
+        assert_eq!(ellipsize_chars("你好世界", 2).as_ref(), "你…");
+        assert_eq!(ellipsize_chars("你好世界", 3).as_ref(), "你好…");
+        assert_eq!(ellipsize_chars("你好世界", 1).as_ref(), "…");
+        assert_eq!(ellipsize_chars("🚀🌟✨", 3).as_ref(), "🚀🌟✨");
+        assert_eq!(ellipsize_chars("🚀🌟✨", 2).as_ref(), "🚀…");
+        assert_eq!(ellipsize_chars("🚀🌟✨", 1).as_ref(), "…");
+        // Combining mark is a separate char (café via e + combining acute).
+        let cafe = {
+            let mut s = String::from("caf");
+            s.push('e');
+            s.push('\u{0301}');
+            s
+        };
+        assert_eq!(cafe.chars().count(), 5); // c a f e combining
+        let clipped = ellipsize_chars(&cafe, 4);
+        assert_eq!(clipped.chars().count(), 4);
+        assert!(clipped.as_ref().ends_with('…'));
+
+        // Mixed ASCII + CJK.
+        assert_eq!(
+            ellipsize_chars("file-報告書.pdf", 20).as_ref(),
+            "file-報告書.pdf"
+        );
+        let m = ellipsize_chars("file-報告書.pdf", 8);
+        assert_eq!(m.chars().count(), 8);
+        assert!(m.as_ref().ends_with('…'));
+
+        // Long emoji string.
+        let emojis: String = (0..20).map(|_| '🔥').collect();
+        assert_eq!(ellipsize_chars(&emojis, 20).as_ref(), emojis);
+        assert_eq!(ellipsize_chars(&emojis, 5).chars().count(), 5);
+        assert!(ellipsize_chars(&emojis, 5).as_ref().ends_with('…'));
+    }
+
+    #[test]
+    fn ellipsize_chars_table_driven() {
+        let cases: &[(&str, usize, &str)] = &[
+            ("", 0, "…"),
+            ("", 5, ""),
+            ("x", 0, "…"),
+            ("x", 1, "x"),
+            ("xy", 1, "…"),
+            ("xyz", 2, "x…"),
+            ("abcd", 3, "ab…"),
+            ("abcd", 4, "abcd"),
+            ("abcd", 5, "abcd"),
+            ("hello world", 5, "hell…"),
+            ("hello world", 11, "hello world"),
+            ("日本語", 2, "日…"),
+            ("日本語", 3, "日本語"),
+            ("🎉party", 1, "…"),
+            ("🎉party", 2, "🎉…"),
+            ("🎉party", 6, "🎉party"),
+            ("🎉party", 7, "🎉party"),
+        ];
+        for &(input, max, want) in cases {
+            assert_eq!(
+                ellipsize_chars(input, max).as_ref(),
+                want,
+                "input={input:?} max={max}"
+            );
+        }
+    }
+
+    // ── extension_badge ──────────────────────────────────────────────────
+
+    #[test]
+    fn extension_badge_images() {
+        for name in [
+            "a.png",
+            "b.PNG",
+            "c.jpg",
+            "d.JPEG",
+            "e.gif",
+            "f.webp",
+            "g.heic",
+            "h.svg",
+            "i.bmp",
+            "j.tiff",
+            "photo.Jpg",
+        ] {
+            let (label, fill, text) = extension_badge(Path::new(name));
+            assert_eq!(label, "IMG", "name={name}");
+            assert_eq!(fill, BADGE_FILL);
+            assert_eq!(text, BADGE_TEXT);
+        }
+    }
+
+    #[test]
+    fn extension_badge_video() {
+        for name in ["a.mp4", "b.MOV", "c.mkv", "d.avi", "e.webm", "clip.Mp4"] {
+            let (label, fill, text) = extension_badge(Path::new(name));
+            assert_eq!(label, "VID", "name={name}");
+            assert_eq!(fill, BADGE_FILL);
+            assert_eq!(text, BADGE_TEXT);
+        }
+    }
+
+    #[test]
+    fn extension_badge_audio() {
+        for name in [
+            "a.mp3",
+            "b.wav",
+            "c.aac",
+            "d.flac",
+            "e.m4a",
+            "f.ogg",
+            "track.FLAC",
+        ] {
+            let (label, _, _) = extension_badge(Path::new(name));
+            assert_eq!(label, "AUD", "name={name}");
+        }
+    }
+
+    #[test]
+    fn extension_badge_pdf_zip_and_passthrough() {
+        assert_eq!(extension_badge(Path::new("x.pdf")).0, "PDF");
+        assert_eq!(extension_badge(Path::new("X.PDF")).0, "PDF");
+        for name in ["a.zip", "b.tar", "c.gz", "d.tgz", "e.7z", "f.rar"] {
+            assert_eq!(extension_badge(Path::new(name)).0, "ZIP", "name={name}");
+        }
+        // Code/docs passthrough (uppercase of original ext).
+        let passthrough = [
+            ("main.rs", "RS"),
+            ("app.ts", "TS"),
+            ("App.tsx", "TSX"),
+            ("index.js", "JS"),
+            ("Comp.jsx", "JSX"),
+            ("script.py", "PY"),
+            ("main.go", "GO"),
+            ("App.swift", "SWIFT"),
+            ("Main.kt", "KT"),
+            ("Main.java", "JAVA"),
+            ("file.c", "C"),
+            ("file.cpp", "CPP"),
+            ("file.h", "H"),
+            ("Program.cs", "CS"),
+            ("app.rb", "RB"),
+            ("index.php", "PHP"),
+            ("README.md", "MD"),
+            ("notes.txt", "TXT"),
+            ("doc.rtf", "RTF"),
+            ("old.doc", "DOC"),
+            ("new.docx", "DOCX"),
+            ("book.pages", "PAGES"),
+            ("data.json", "JSON"),
+            ("cfg.yaml", "YAML"),
+            ("cfg.yml", "YML"),
+            ("Cargo.toml", "TOML"),
+            ("data.xml", "XML"),
+            ("sheet.csv", "CSV"),
+        ];
+        for (name, want) in passthrough {
+            assert_eq!(extension_badge(Path::new(name)).0, want, "name={name}");
+        }
+    }
+
+    #[test]
+    fn extension_badge_unknown_empty_long_multidot() {
+        // No extension.
+        assert_eq!(extension_badge(Path::new("README")).0, "FILE");
+        assert_eq!(extension_badge(Path::new("Makefile")).0, "FILE");
+        assert_eq!(extension_badge(Path::new("/tmp/noext")).0, "FILE");
+        assert_eq!(extension_badge(Path::new("")).0, "FILE");
+
+        // Short unknown (≤4) keeps the uppercase ext.
+        assert_eq!(extension_badge(Path::new("a.srt")).0, "SRT");
+        assert_eq!(extension_badge(Path::new("a.vtt")).0, "VTT");
+        assert_eq!(extension_badge(Path::new("a.pptx")).0, "PPTX");
+        assert_eq!(extension_badge(Path::new("a.epub")).0, "EPUB");
+        assert_eq!(extension_badge(Path::new("a.xyz")).0, "XYZ");
+        assert_eq!(extension_badge(Path::new("a.abc")).0, "ABC");
+
+        // Long unknown → FILE.
+        assert_eq!(extension_badge(Path::new("long.extensionname")).0, "FILE");
+        assert_eq!(extension_badge(Path::new("a.toolong")).0, "FILE");
+        assert_eq!(extension_badge(Path::new("a.12345")).0, "FILE");
+
+        // Multi-dot: extension is the last component.
+        assert_eq!(extension_badge(Path::new("archive.tar.gz")).0, "ZIP"); // gz → ZIP
+        assert_eq!(extension_badge(Path::new("my.file.name.md")).0, "MD");
+        assert_eq!(extension_badge(Path::new("photo.final.JPG")).0, "IMG");
+        assert_eq!(extension_badge(Path::new("a.b.c.mp4")).0, "VID");
+
+        // Path with directories.
+        assert_eq!(
+            extension_badge(Path::new("/Users/me/docs/report.PDF")).0,
+            "PDF"
+        );
+        assert_eq!(
+            extension_badge(Path::new("/Users/me/docs/report")).0,
+            "FILE"
+        );
+    }
+
+    #[test]
+    fn extension_badge_always_monochrome_colors() {
+        let names = [
+            "x.png",
+            "x.mp4",
+            "x.mp3",
+            "x.pdf",
+            "x.zip",
+            "x.rs",
+            "x.md",
+            "noext",
+            "x.toolongext",
+            "x.srt",
+        ];
+        for name in names {
+            let (_, fill, text) = extension_badge(Path::new(name));
+            assert_eq!(fill, BADGE_FILL, "name={name}");
+            assert_eq!(text, BADGE_TEXT, "name={name}");
+        }
+    }
+
+    // ── output_format_badge_label ────────────────────────────────────────
+
+    #[test]
+    fn output_format_badge_label_covers_all_formats() {
+        assert!(!OutputFormat::ALL.is_empty());
+        for &format in OutputFormat::ALL {
+            let got = output_format_badge_label(format);
+            let want = expected_badge_label(format);
+            assert_eq!(got, want, "format={}", format.id());
+            // Badge is never empty and at most 4 chars (or "OUT").
+            assert!(!got.is_empty());
+            assert!(
+                got.chars().count() <= 4,
+                "badge too long: {got} for {}",
+                format.id()
+            );
+            // Uppercase A-Z / digits / punctuation from extension.
+            assert_eq!(got, got.to_ascii_uppercase());
+        }
+    }
+
+    #[test]
+    fn output_format_badge_label_known_examples() {
+        assert_eq!(output_format_badge_label(OutputFormat::MARKDOWN), "MD");
+        assert_eq!(output_format_badge_label(OutputFormat::HTML), "HTML");
+        assert_eq!(output_format_badge_label(OutputFormat::PDF), "PDF");
+        assert_eq!(output_format_badge_label(OutputFormat::DOCX), "DOCX");
+        assert_eq!(output_format_badge_label(OutputFormat::PPTX), "PPTX");
+        assert_eq!(output_format_badge_label(OutputFormat::EPUB), "EPUB");
+        assert_eq!(output_format_badge_label(OutputFormat::MP3), "MP3");
+        assert_eq!(output_format_badge_label(OutputFormat::MP4), "MP4");
+        assert_eq!(output_format_badge_label(OutputFormat::PNG), "PNG");
+        assert_eq!(output_format_badge_label(OutputFormat::JPG), "JPG");
+        assert_eq!(output_format_badge_label(OutputFormat::SRT), "SRT");
+        assert_eq!(
+            output_format_badge_label(OutputFormat::PNG_SEQUENCE_ZIP),
+            "ZIP"
+        );
+        // Long extensions truncate to 4 (parse public API — tuple ctor is private outside lib).
+        let biblatex: OutputFormat = "biblatex".parse().unwrap();
+        let mediawiki: OutputFormat = "mediawiki".parse().unwrap();
+        let commonmark: OutputFormat = "commonmark".parse().unwrap();
+        assert_eq!(output_format_badge_label(biblatex), "BIBL");
+        assert_eq!(output_format_badge_label(mediawiki), "MEDI");
+        assert_eq!(output_format_badge_label(commonmark), "MD");
+        // Empty extension edge (if any synthetic).
+        // Real catalog entries all have non-empty extensions; still assert property:
+        for &format in OutputFormat::ALL {
+            if format.extension().is_empty() {
+                assert_eq!(output_format_badge_label(format), "OUT");
+            }
+        }
+    }
+
+    #[test]
+    fn output_format_badge_label_truncation_property() {
+        for &format in OutputFormat::ALL {
+            let ext = format.extension().to_ascii_uppercase();
+            let badge = output_format_badge_label(format);
+            if ext.is_empty() {
+                assert_eq!(badge, "OUT");
+            } else if ext.len() <= 4 {
+                assert_eq!(badge, ext);
+            } else {
+                assert_eq!(badge, ext.chars().take(4).collect::<String>());
+            }
+        }
+    }
+
+    // ── history_matches_search ───────────────────────────────────────────
+
+    #[test]
+    fn history_matches_search_empty_query_matches_all() {
+        // Rust str::contains("") is true for every haystack; query is not lowercased here.
+        let ready = sample_history_entry(
+            1,
+            HistoryOutcome::Ready(Arc::new(sample_artifact(1, b"# hi".to_vec()))),
+        );
+        let failed = sample_history_entry(2, HistoryOutcome::Failed("boom".into()));
+        let large = sample_history_entry(
+            3,
+            HistoryOutcome::ReadyLarge {
+                module_id: "ffmpeg".into(),
+                byte_len: 1_000_000,
+            },
+        );
+        for entry in [&ready, &failed, &large] {
+            assert!(history_matches_search(entry, ""));
+        }
+    }
+
+    #[test]
+    fn history_matches_search_by_name_detail_extension() {
+        let entry = sample_history_entry_custom(
+            1,
+            HistorySource::File(PathBuf::from("/Users/me/Documents/Q3-Report.docx")),
+            "Q3-Report.docx",
+            "DOCX → Markdown  ·  via Pandoc",
+            "DOCX",
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::Failed("missing".into()),
+        );
+        // Name (entry fields lowercased; query used as-is).
+        assert!(history_matches_search(&entry, "q3-report"));
+        assert!(history_matches_search(&entry, "report"));
+        assert!(history_matches_search(&entry, ".docx"));
+        assert!(!history_matches_search(&entry, "Q3-REPORT")); // query not lowercased
+        assert!(!history_matches_search(&entry, "xyzzy"));
+
+        // Detail.
+        assert!(history_matches_search(&entry, "pandoc"));
+        assert!(history_matches_search(&entry, "markdown"));
+        assert!(history_matches_search(&entry, "via"));
+
+        // Extension label.
+        assert!(history_matches_search(&entry, "docx"));
+        assert!(!history_matches_search(&entry, "DOCX")); // uppercase query misses
+    }
+
+    #[test]
+    fn history_matches_search_by_output_format_label() {
+        let entry = sample_history_entry_custom(
+            1,
+            HistorySource::File(PathBuf::from("/tmp/a.pdf")),
+            "a.pdf",
+            "detail-no-match-zzz",
+            "PDF",
+            OutputFormat::HTML,
+            HistoryOutcome::Failed("x".into()),
+        );
+        // Failed uses entry.output_format → HTML label "html".
+        assert!(history_matches_search(&entry, "html"));
+        // Ready prefers artifact format.
+        let ready = sample_history_entry_custom(
+            2,
+            HistorySource::File(PathBuf::from("/tmp/a.pdf")),
+            "a.pdf",
+            "zzz",
+            "PDF",
+            OutputFormat::HTML,
+            HistoryOutcome::Ready(Arc::new(sample_artifact_with(
+                2,
+                OutputFormat::DOCX,
+                "pandoc",
+                b"bytes".to_vec(),
+            ))),
+        );
+        // Artifact is DOCX → label "word (docx)".
+        assert!(history_matches_search(&ready, "word"));
+        assert!(history_matches_search(&ready, "docx"));
+        // HTML is entry.output_format but Ready ignores it for search label.
+        // (html may still match path/name? no — so should not match "html" alone
+        // unless somewhere else; name is a.pdf, detail zzz, ext PDF)
+        assert!(!history_matches_search(&ready, "html"));
+    }
+
+    #[test]
+    fn history_matches_search_by_file_path_and_url() {
+        let file = sample_history_entry_custom(
+            1,
+            HistorySource::File(PathBuf::from("/Volumes/Exports/secret-project/final.mov")),
+            "final.mov",
+            "vid detail",
+            "VID",
+            OutputFormat::MP4,
+            HistoryOutcome::Failed("x".into()),
+        );
+        assert!(history_matches_search(&file, "secret-project"));
+        assert!(history_matches_search(&file, "/volumes/exports"));
+        assert!(history_matches_search(&file, "final.mov"));
+        assert!(!history_matches_search(&file, "Secret-Project")); // case of query
+
+        let url = sample_history_entry_custom(
+            2,
+            HistorySource::Url("https://News.Example.com/articles/42?q=1".into()),
+            "article",
+            "web detail",
+            "WEB",
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::Failed("x".into()),
+        );
+        assert!(history_matches_search(&url, "news.example.com"));
+        assert!(history_matches_search(&url, "articles/42"));
+        assert!(history_matches_search(&url, "https://"));
+        assert!(!history_matches_search(&url, "NEWS.EXAMPLE"));
+    }
+
+    #[test]
+    fn history_matches_search_partial_and_no_match() {
+        let entry = sample_history_entry(
+            9,
+            HistoryOutcome::Ready(Arc::new(sample_artifact(9, b"x".to_vec()))),
+        );
+        assert!(history_matches_search(&entry, "report"));
+        assert!(history_matches_search(&entry, "port9"));
+        assert!(history_matches_search(&entry, "documents"));
+        assert!(!history_matches_search(&entry, "no-such-token-zzz"));
+        assert!(!history_matches_search(&entry, "REPORT9.DOCX"));
+    }
+
+    // ── history_output_format / history_entry_detail / stored_detail ─────
+
+    #[test]
+    fn history_output_format_prefers_artifact_when_ready() {
+        let ready = sample_history_entry_custom(
+            1,
+            HistorySource::File(PathBuf::from("/tmp/a.docx")),
+            "a.docx",
+            "d",
+            "DOCX",
+            OutputFormat::HTML, // entry field differs from artifact
+            HistoryOutcome::Ready(Arc::new(sample_artifact_with(
+                1,
+                OutputFormat::PDF,
+                "pandoc",
+                b"%PDF".to_vec(),
+            ))),
+        );
+        assert_eq!(history_output_format(&ready), OutputFormat::PDF);
+
+        let large = sample_history_entry_custom(
+            2,
+            HistorySource::File(PathBuf::from("/tmp/a.docx")),
+            "a.docx",
+            "d",
+            "DOCX",
+            OutputFormat::MP4,
+            HistoryOutcome::ReadyLarge {
+                module_id: "ffmpeg".into(),
+                byte_len: 9,
+            },
+        );
+        assert_eq!(history_output_format(&large), OutputFormat::MP4);
+
+        let failed = sample_history_entry_custom(
+            3,
+            HistorySource::File(PathBuf::from("/tmp/a.docx")),
+            "a.docx",
+            "d",
+            "DOCX",
+            OutputFormat::SRT,
+            HistoryOutcome::Failed("e".into()),
+        );
+        assert_eq!(history_output_format(&failed), OutputFormat::SRT);
+    }
+
+    #[test]
+    fn history_entry_detail_all_outcomes_and_modules() {
+        let modules = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "ffmpeg",
+            "custom-mod",
+        ];
+        for (i, module_id) in modules.iter().enumerate() {
+            let ready = sample_history_entry_custom(
+                i as u64,
+                HistorySource::File(PathBuf::from("/tmp/x")),
+                "x",
+                "d",
+                "X",
+                OutputFormat::MARKDOWN,
+                HistoryOutcome::Ready(Arc::new(sample_artifact_with(
+                    i as u64,
+                    OutputFormat::MARKDOWN,
+                    module_id,
+                    b"ok".to_vec(),
+                ))),
+            );
+            let detail = history_entry_detail(&ready);
+            assert_eq!(
+                detail.as_ref(),
+                format!("via {}", module_label(module_id)),
+                "module={module_id}"
+            );
+
+            let large = sample_history_entry_custom(
+                100 + i as u64,
+                HistorySource::File(PathBuf::from("/tmp/x")),
+                "x",
+                "d",
+                "X",
+                OutputFormat::MP4,
+                HistoryOutcome::ReadyLarge {
+                    module_id: (*module_id).into(),
+                    byte_len: 2 * 1024 * 1024,
+                },
+            );
+            let d = history_entry_detail(&large);
+            assert!(d.as_ref().contains(module_label(module_id)), "{d}");
+            assert!(d.as_ref().contains("re-convert to restore"), "{d}");
+            assert!(
+                d.as_ref().contains(&format_file_size(2 * 1024 * 1024)),
+                "{d}"
+            );
+        }
+
+        let failed = sample_history_entry(99, HistoryOutcome::Failed("nope".into()));
+        assert_eq!(history_entry_detail(&failed).as_ref(), "failed");
+    }
+
+    #[test]
+    fn history_entry_stored_detail_all_outcomes() {
+        let ready = sample_history_entry(
+            1,
+            HistoryOutcome::Ready(Arc::new(sample_artifact(1, b"#".to_vec()))),
+        );
+        assert_eq!(
+            history_entry_stored_detail(&ready),
+            "DOCX → Markdown  ·  via Pandoc"
+        );
+
+        let failed = sample_history_entry(2, HistoryOutcome::Failed("boom".into()));
+        assert_eq!(
+            history_entry_stored_detail(&failed),
+            "DOCX → Markdown  ·  failed"
+        );
+
+        let large = sample_history_entry(
+            3,
+            HistoryOutcome::ReadyLarge {
+                module_id: "ffmpeg".into(),
+                byte_len: 3 * 1024,
+            },
+        );
+        let stored = history_entry_stored_detail(&large);
+        assert!(stored.starts_with("DOCX → Markdown  ·  "));
+        assert!(stored.contains("via FFmpeg"));
+        assert!(stored.contains("re-convert to restore"));
+        assert!(stored.contains(&format_file_size(3 * 1024)));
+
+        // Custom extension + output format labels.
+        let custom = sample_history_entry_custom(
+            4,
+            HistorySource::Url("https://ex.com".into()),
+            "ex.com",
+            "d",
+            "WEB",
+            OutputFormat::HTML,
+            HistoryOutcome::Failed("e".into()),
+        );
+        assert_eq!(
+            history_entry_stored_detail(&custom),
+            "WEB → HTML  ·  failed"
+        );
+    }
+
+    #[test]
+    fn history_entry_detail_ready_large_size_variants() {
+        for byte_len in [0usize, 1, 1023, 1024, 1024 * 1024, 5 * 1024 * 1024] {
+            let entry = sample_history_entry(
+                byte_len as u64,
+                HistoryOutcome::ReadyLarge {
+                    module_id: "docling".into(),
+                    byte_len,
+                },
+            );
+            let d = history_entry_detail(&entry);
+            assert!(d.as_ref().contains(&format_file_size(byte_len as u64)));
+            assert!(d.as_ref().contains("via Docling"));
+            let s = history_entry_stored_detail(&entry);
+            assert!(s.contains(&format_file_size(byte_len as u64)));
+            assert!(s.contains("DOCX → Markdown"));
+        }
+    }
+
+    // ── module_label / module_description ────────────────────────────────
+
+    #[test]
+    fn module_label_known_and_unknown() {
+        let known = [
+            ("markitdown", "MarkItDown"),
+            ("pandoc", "Pandoc"),
+            ("defuddle", "Defuddle"),
+            ("docling", "Docling"),
+            ("ffmpeg", "FFmpeg"),
+        ];
+        for (id, label) in known {
+            assert_eq!(module_label(id), label);
+        }
+        // Unknown passthrough.
+        for id in [
+            "",
+            "unknown",
+            "custom-engine",
+            "MarkItDown",
+            "PANDOC",
+            " ffmpeg",
+        ] {
+            assert_eq!(module_label(id), id);
+        }
+    }
+
+    #[test]
+    fn module_description_known_and_unknown() {
+        assert!(module_description("markitdown").contains("Markdown"));
+        assert!(module_description("pandoc").contains("Publishing"));
+        assert!(module_description("defuddle").contains("URL"));
+        assert!(module_description("docling").contains("Layout"));
+        assert!(module_description("ffmpeg").contains("Audio"));
+        // Default fallback.
+        assert_eq!(module_description("nope"), "Conversion module.");
+        assert_eq!(module_description(""), "Conversion module.");
+        assert_eq!(module_description("PANDOC"), "Conversion module.");
+        // Every known description is non-empty and distinct.
+        let ids = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let mut set = HashSet::new();
+        for id in ids {
+            let d = module_description(id);
+            assert!(!d.is_empty());
+            assert!(set.insert(d), "duplicate description for {id}");
+        }
+    }
+
+    // ── ui_font_choice_label ─────────────────────────────────────────────
+
+    #[test]
+    fn ui_font_choice_label_known_and_fallback() {
+        for (label, family) in UI_FONT_CHOICES {
+            assert_eq!(ui_font_choice_label(family).as_ref(), *label);
+        }
+        // Explicit samples from settings UI.
+        assert_eq!(ui_font_choice_label("Geist").as_ref(), "Geist");
+        assert_eq!(ui_font_choice_label("Geist Mono").as_ref(), "Geist Mono");
+        assert_eq!(ui_font_choice_label(".SystemUIFont").as_ref(), "System");
+        assert_eq!(ui_font_choice_label("Menlo").as_ref(), "Menlo");
+        assert_eq!(ui_font_choice_label("SF Mono").as_ref(), "SF Mono");
+        assert_eq!(ui_font_choice_label("Monaco").as_ref(), "Monaco");
+        assert_eq!(ui_font_choice_label("Courier New").as_ref(), "Courier New");
+        assert_eq!(ui_font_choice_label("Andale Mono").as_ref(), "Andale Mono");
+        assert_eq!(
+            ui_font_choice_label("Helvetica Neue").as_ref(),
+            "Helvetica Neue"
+        );
+
+        // Unknown → passthrough family name.
+        assert_eq!(ui_font_choice_label("CustomFace").as_ref(), "CustomFace");
+        assert_eq!(ui_font_choice_label("").as_ref(), "");
+        assert_eq!(ui_font_choice_label("comic sans").as_ref(), "comic sans");
+        // Near-miss does not fuzzy-match.
+        assert_eq!(ui_font_choice_label("menlo").as_ref(), "menlo");
+        assert_eq!(ui_font_choice_label("System").as_ref(), "System"); // label≠family
+    }
+
+    // ── parse_optional_secs ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_optional_secs_empty_and_whitespace() {
+        assert_eq!(parse_optional_secs("").unwrap(), None);
+        assert_eq!(parse_optional_secs("   ").unwrap(), None);
+        assert_eq!(parse_optional_secs("\t\n").unwrap(), None);
+        assert_eq!(parse_optional_secs("  \t  ").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_optional_secs_valid_numbers() {
+        assert_eq!(parse_optional_secs("0").unwrap(), Some(0.0));
+        assert_eq!(parse_optional_secs("0.0").unwrap(), Some(0.0));
+        assert_eq!(parse_optional_secs("1").unwrap(), Some(1.0));
+        assert_eq!(parse_optional_secs("1.5").unwrap(), Some(1.5));
+        assert_eq!(parse_optional_secs("  12  ").unwrap(), Some(12.0));
+        assert_eq!(parse_optional_secs("2.5").unwrap(), Some(2.5));
+        assert_eq!(parse_optional_secs("01").unwrap(), Some(1.0));
+        assert_eq!(parse_optional_secs("1e3").unwrap(), Some(1000.0));
+        assert_eq!(parse_optional_secs("1E3").unwrap(), Some(1000.0));
+        assert_eq!(parse_optional_secs("1e9").unwrap(), Some(1e9));
+        assert_eq!(parse_optional_secs("0.001").unwrap(), Some(0.001));
+        // -0 is non-negative in IEEE sense (>= 0.0).
+        assert_eq!(parse_optional_secs("-0").unwrap(), Some(0.0));
+        assert_eq!(parse_optional_secs("-0.0").unwrap(), Some(0.0));
+        for s in ["3.14159", "60", "3600", "0.5", "999999.25"] {
+            let v = parse_optional_secs(s).unwrap().unwrap();
+            assert!(v >= 0.0 && v.is_finite());
+        }
+    }
+
+    #[test]
+    fn parse_optional_secs_rejects_negative_nan_inf_garbage() {
+        for bad in [
+            "-1",
+            "-0.1",
+            "-1e3",
+            "nan",
+            "NaN",
+            "inf",
+            "INF",
+            "-inf",
+            "-Infinity",
+            "Infinity",
+            "abc",
+            "1.2.3",
+            "seconds",
+            "--1",
+            "+",
+            "1 2",
+            "0x10",
+            "",
+        ] {
+            // empty already Ok(None) — skip
+            if bad.trim().is_empty() {
+                continue;
+            }
+            let result = parse_optional_secs(bad);
+            // Some of these might be "valid" parse but non-finite / negative.
+            match bad {
+                "-1" | "-0.1" | "-1e3" | "nan" | "NaN" | "inf" | "INF" | "-inf" | "-Infinity"
+                | "Infinity" => {
+                    assert!(result.is_err(), "expected err for {bad:?}, got {result:?}");
+                }
+                "abc" | "1.2.3" | "seconds" | "--1" | "+" | "1 2" | "0x10" => {
+                    assert!(result.is_err(), "expected err for {bad:?}, got {result:?}");
+                }
+                _ => {}
+            }
+        }
+        assert!(parse_optional_secs("-1").is_err());
+        assert!(parse_optional_secs("nan").is_err());
+        assert!(parse_optional_secs("inf").is_err());
+        assert!(parse_optional_secs("-inf").is_err());
+        assert!(parse_optional_secs("garbage").is_err());
+        // Error messages mention the problem domain.
+        let err = parse_optional_secs("nope").unwrap_err();
+        assert!(
+            err.contains("expected seconds") || err.contains("nope"),
+            "{err}"
+        );
+        let err2 = parse_optional_secs("-5").unwrap_err();
+        assert!(err2.contains("non-negative"), "{err2}");
+    }
+
+    // ── parse_optional_u32 ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_optional_u32_empty_and_valid() {
+        assert_eq!(parse_optional_u32("").unwrap(), None);
+        assert_eq!(parse_optional_u32("   ").unwrap(), None);
+        assert_eq!(parse_optional_u32("\t").unwrap(), None);
+        assert_eq!(parse_optional_u32("0").unwrap(), Some(0));
+        assert_eq!(parse_optional_u32("1").unwrap(), Some(1));
+        assert_eq!(parse_optional_u32("30").unwrap(), Some(30));
+        assert_eq!(parse_optional_u32("  4 ").unwrap(), Some(4));
+        assert_eq!(parse_optional_u32("12").unwrap(), Some(12));
+        assert_eq!(
+            parse_optional_u32(&u32::MAX.to_string()).unwrap(),
+            Some(u32::MAX)
+        );
+        assert_eq!(parse_optional_u32("4294967295").unwrap(), Some(u32::MAX));
+        for n in [
+            0u32, 1, 2, 7, 15, 16, 31, 32, 63, 64, 100, 255, 256, 1000, 999999,
+        ] {
+            assert_eq!(parse_optional_u32(&n.to_string()).unwrap(), Some(n));
+            assert_eq!(parse_optional_u32(&format!("  {n}  ")).unwrap(), Some(n));
+        }
+    }
+
+    #[test]
+    fn parse_optional_u32_rejects_negative_float_overflow_garbage() {
+        for bad in [
+            "x",
+            "nope",
+            "-3",
+            "-1",
+            "1.5",
+            "1.0",
+            "3.14",
+            "1e3",
+            "99999999999999999999",
+            "4294967296", // u32::MAX+1
+            "+",
+            "--1",
+            "0x10",
+            "one",
+            "1 2",
+            "NaN",
+            "inf",
+        ] {
+            assert!(parse_optional_u32(bad).is_err(), "expected err for {bad:?}");
+        }
+        let err = parse_optional_u32("nope").unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+    }
+
+    // ── build_file_preview / build_file_preview_with_size ────────────────
+
+    #[test]
+    fn build_file_preview_with_size_fields() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("/tmp/folder/notes.md", "notes.md", "MD", "folder"),
+            (
+                "/Users/me/Documents/report.PDF",
+                "report.PDF",
+                "PDF",
+                "Documents",
+            ),
+            ("/var/log/app.log", "app.log", "LOG", "log"),
+            ("clip.mp4", "clip.mp4", "VID", "Disk"), // no parent name
+            ("/notes.md", "notes.md", "MD", "Disk"), // parent is root
+            ("/Users/me/photo.JPEG", "photo.JPEG", "IMG", "me"),
+            ("/tmp/a.b.c.docx", "a.b.c.docx", "DOCX", "tmp"),
+            ("/tmp/archive.tar.gz", "archive.tar.gz", "ZIP", "tmp"),
+            ("/tmp/noext", "noext", "FILE", "tmp"),
+        ];
+        for &(path, name, ext, location_part) in cases {
+            let preview = build_file_preview_with_size(Path::new(path), "1.2 KB".into());
+            assert_eq!(preview.name.as_ref(), name, "path={path}");
+            assert_eq!(preview.extension_label.as_ref(), ext, "path={path}");
+            assert!(
+                preview.subtitle.as_ref().contains(location_part),
+                "path={path} subtitle={} missing {location_part}",
+                preview.subtitle.as_ref()
+            );
+            assert!(preview.subtitle.as_ref().contains("1.2 KB"), "path={path}");
+            assert_eq!(preview.badge_color, BADGE_FILL);
+            assert_eq!(preview.badge_text_color, BADGE_TEXT);
+        }
+    }
+
+    #[test]
+    fn build_file_preview_with_size_size_label_passthrough() {
+        for size in ["0 B", "1.0 KB", "—", "12.5 MB", "custom"] {
+            let p = build_file_preview_with_size(Path::new("/tmp/x.md"), size.into());
+            assert!(
+                p.subtitle.as_ref().starts_with(size),
+                "{}",
+                p.subtitle.as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn build_file_preview_reads_metadata_or_placeholder() {
+        // Non-existent path → size placeholder "—".
+        let missing = PathBuf::from("/tmp/shift-pure-ui-helpers-does-not-exist-xyz.md");
+        let preview = build_file_preview(&missing);
+        assert_eq!(
+            preview.name.as_ref(),
+            "shift-pure-ui-helpers-does-not-exist-xyz.md"
+        );
+        assert!(preview.subtitle.as_ref().contains('—') || preview.subtitle.as_ref().contains("-"));
+        assert_eq!(preview.extension_label.as_ref(), "MD");
+
+        // Existing temp file.
+        let dir = std::env::temp_dir().join("shift_pure_ui_helpers_preview");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("sample.txt");
+        std::fs::write(&file, b"hello-preview").unwrap();
+        let preview = build_file_preview(&file);
+        assert_eq!(preview.name.as_ref(), "sample.txt");
+        assert_eq!(preview.extension_label.as_ref(), "TXT");
+        assert!(
+            preview.subtitle.as_ref().contains("B") || preview.subtitle.as_ref().contains("KB")
+        );
+        assert!(
+            preview
+                .subtitle
+                .as_ref()
+                .contains("shift_pure_ui_helpers_preview")
+                || preview.subtitle.as_ref().contains("Disk")
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ── build_url_preview ────────────────────────────────────────────────
+
+    #[test]
+    fn build_url_preview_hosts_and_schemes() {
+        let cases: &[(&str, &str)] = &[
+            ("https://example.com/path", "example.com"),
+            ("http://example.com/path", "example.com"),
+            ("  HTTPS://Example.COM/path  ", "Example.COM"),
+            ("HTTP://FOO.bar/baz", "FOO.bar"),
+            (
+                "https://news.example.com/articles/1?q=1#top",
+                "news.example.com",
+            ),
+            ("https://example.com", "example.com"),
+            ("https://example.com?q=1", "example.com"),
+            ("https://example.com#frag", "example.com"),
+            (
+                "https://user:pass@host.example/path",
+                "user:pass@host.example",
+            ),
+            ("  https://spaced.example/  ", "spaced.example"),
+            ("not-a-url", "not-a-url"),
+            ("ftp://files.example.com/a", "ftp:"), // only strips http(s)
+        ];
+        for &(url, host_part) in cases {
+            let p = build_url_preview(url);
+            assert_eq!(p.name.as_ref(), url.trim(), "url={url}");
+            assert_eq!(p.extension_label.as_ref(), "WEB");
+            assert_eq!(p.badge_color, BADGE_FILL);
+            assert_eq!(p.badge_text_color, BADGE_TEXT);
+            assert!(
+                p.subtitle.as_ref().contains(host_part),
+                "url={url} subtitle={} expected host {host_part}",
+                p.subtitle.as_ref()
+            );
+            assert!(p.subtitle.as_ref().starts_with("URL  ·  "));
+        }
+    }
+
+    #[test]
+    fn build_url_preview_trims_and_preserves_name() {
+        let p = build_url_preview("  https://a.com/x  ");
+        assert_eq!(p.name.as_ref(), "https://a.com/x");
+        assert!(p.subtitle.as_ref().contains("a.com"));
+    }
+
+    // ── artifact_preview ─────────────────────────────────────────────────
+
+    #[test]
+    fn artifact_preview_text_and_binary() {
+        let text = sample_artifact(1, b"# Heading\n\nbody".to_vec());
+        let preview = artifact_preview(&text);
+        assert!(!preview.is_empty());
+        // Text-previewable markdown should surface content.
+        assert!(
+            preview.as_ref().contains("Heading")
+                || preview.as_ref().contains("body")
+                || !preview.is_empty()
+        );
+
+        let binary = ConversionArtifact {
+            file_name: "clip.mp4".into(),
+            media_type: "video/mp4",
+            bytes: vec![0u8; 1024],
+            format: OutputFormat::MP4,
+            module_id: "ffmpeg",
+            pipeline: vec!["ffmpeg"],
+            invocations: Vec::new(),
+        };
+        let bp = artifact_preview(&binary);
+        assert!(!bp.is_empty());
+
+        let empty_text = sample_artifact(2, Vec::new());
+        let _ = artifact_preview(&empty_text); // must not panic
+
+        // Several formats.
+        for format in [
+            OutputFormat::MARKDOWN,
+            OutputFormat::HTML,
+            OutputFormat::PDF,
+            OutputFormat::MP3,
+            OutputFormat::PNG,
+            OutputFormat::SRT,
+        ] {
+            let a = sample_artifact_with(3, format, "pandoc", b"payload".to_vec());
+            let _ = artifact_preview(&a); // must not panic
+        }
+    }
+
+    // ── batch_item_status_label ──────────────────────────────────────────
+
+    #[test]
+    fn batch_item_status_label_all_variants() {
+        assert_eq!(
+            batch_item_status_label(&sample_batch_item(1, BatchItemState::Queued)).as_ref(),
+            "queued"
+        );
+        assert_eq!(
+            batch_item_status_label(&sample_batch_item(2, BatchItemState::Running)).as_ref(),
+            "running…"
+        );
+        assert_eq!(
+            batch_item_status_label(&sample_batch_item(3, BatchItemState::Cancelled)).as_ref(),
+            "cancelled"
+        );
+
+        let ok = sample_batch_item(
+            4,
+            BatchItemState::Succeeded {
+                written_path: PathBuf::from("/tmp/exports/out.md"),
+                module_id: "pandoc".into(),
+                byte_len: 99,
+            },
+        );
+        let label = batch_item_status_label(&ok);
+        assert!(label.as_ref().starts_with("✓ saved · "));
+        assert!(label.as_ref().contains("/tmp/exports/out.md"));
+
+        let fail = sample_batch_item(
+            5,
+            BatchItemState::Failed {
+                error: "engine missing".into(),
+            },
+        );
+        assert_eq!(batch_item_status_label(&fail).as_ref(), "✗ engine missing");
+
+        // Empty error still prefixes.
+        let fail_empty = sample_batch_item(6, BatchItemState::Failed { error: "".into() });
+        assert_eq!(batch_item_status_label(&fail_empty).as_ref(), "✗ ");
+
+        // Full path never hidden.
+        let deep = sample_batch_item(
+            7,
+            BatchItemState::Succeeded {
+                written_path: PathBuf::from("/Volumes/Exports/deep/nested/file.mp4"),
+                module_id: "ffmpeg".into(),
+                byte_len: 1,
+            },
+        );
+        assert!(
+            batch_item_status_label(&deep)
+                .as_ref()
+                .contains("/Volumes/Exports/deep/nested/file.mp4")
+        );
+    }
+
+    // ── SettingsSection ──────────────────────────────────────────────────
+
+    #[test]
+    fn settings_section_labels_and_descriptions() {
+        let sections = [
+            (SettingsSection::Converters, "Converters"),
+            (SettingsSection::General, "General"),
+            (SettingsSection::Theme, "Theme"),
+            (SettingsSection::Options, "Options"),
+            (SettingsSection::Paths, "Paths"),
+            (SettingsSection::Diagnostics, "Diagnostics"),
+            (SettingsSection::About, "About"),
+        ];
+        let mut labels = HashSet::new();
+        let mut descriptions = HashSet::new();
+        for (section, want_label) in sections {
+            assert_eq!(section.label(), want_label);
+            let d = section.description();
+            assert!(!d.is_empty(), "empty description for {want_label}");
+            assert!(labels.insert(section.label()));
+            assert!(descriptions.insert(d));
+        }
+        // Spot-check description content.
+        assert!(SettingsSection::Converters.description().contains("engine"));
+        assert!(SettingsSection::General.description().contains("history"));
+        assert!(SettingsSection::Theme.description().contains("font"));
+        assert!(SettingsSection::Options.description().contains("FFmpeg"));
+        assert!(SettingsSection::Paths.description().contains("tools"));
+        assert!(
+            SettingsSection::Diagnostics
+                .description()
+                .contains("engines")
+        );
+        assert!(SettingsSection::About.description().contains("Version"));
+    }
+
+    #[test]
+    fn settings_section_equality() {
+        assert_eq!(SettingsSection::Theme, SettingsSection::Theme);
+        assert_ne!(SettingsSection::Theme, SettingsSection::About);
+        // Exhaustive match stability: every variant has a label.
+        for section in [
+            SettingsSection::Converters,
+            SettingsSection::General,
+            SettingsSection::Theme,
+            SettingsSection::Options,
+            SettingsSection::Paths,
+            SettingsSection::Diagnostics,
+            SettingsSection::About,
+        ] {
+            assert!(!section.label().is_empty());
+            assert!(!section.description().is_empty());
+        }
+    }
+
+    // ── output_format_filter_choices ─────────────────────────────────────
+
+    #[test]
+    fn output_format_filter_choices_covers_catalog() {
+        let choices = output_format_filter_choices();
+        assert!(!choices.is_empty());
+        assert_eq!(choices.len(), OutputFormat::ALL.len());
+
+        let mut formats = HashSet::new();
+        for (format, label_lc, id_lc) in choices {
+            assert!(formats.insert(*format), "duplicate format {}", format.id());
+            assert_eq!(label_lc, &format.label().to_ascii_lowercase());
+            assert_eq!(id_lc, &format.id().to_ascii_lowercase());
+            assert_eq!(label_lc, &label_lc.to_ascii_lowercase());
+            assert_eq!(id_lc, &id_lc.to_ascii_lowercase());
+        }
+
+        // Important formats present.
+        for important in [
+            OutputFormat::MARKDOWN,
+            OutputFormat::HTML,
+            OutputFormat::PDF,
+            OutputFormat::DOCX,
+            OutputFormat::MP3,
+            OutputFormat::MP4,
+            OutputFormat::PNG,
+            OutputFormat::SRT,
+            OutputFormat::PNG_SEQUENCE_ZIP,
+        ] {
+            assert!(formats.contains(&important), "missing {}", important.id());
+        }
+
+        // Idempotent static init.
+        let again = output_format_filter_choices();
+        assert_eq!(again.len(), choices.len());
+        assert!(std::ptr::eq(again, choices));
+    }
+
+    // ── cross-helper integration-ish pure checks ─────────────────────────
+
+    #[test]
+    fn history_search_and_detail_agree_on_module_names() {
+        for module_id in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+            let entry = sample_history_entry_custom(
+                1,
+                HistorySource::File(PathBuf::from("/tmp/a.docx")),
+                "a.docx",
+                "ignored-detail-zzz",
+                "DOCX",
+                OutputFormat::MARKDOWN,
+                HistoryOutcome::Ready(Arc::new(sample_artifact_with(
+                    1,
+                    OutputFormat::MARKDOWN,
+                    module_id,
+                    b"x".to_vec(),
+                ))),
+            );
+            let detail = history_entry_detail(&entry);
+            let label = module_label(module_id).to_lowercase();
+            // Search looks at stored detail field, not live history_entry_detail.
+            // Live detail still names the module.
+            assert!(detail.as_ref().to_lowercase().contains(&label), "{detail}");
+        }
+    }
+
+    #[test]
+    fn badge_helpers_consistent_for_path_extensions() {
+        // When path ext maps to a short code-like badge, file preview uses it.
+        for (path, ext_badge) in [
+            ("/tmp/a.md", "MD"),
+            ("/tmp/a.pdf", "PDF"),
+            ("/tmp/a.docx", "DOCX"),
+            ("/tmp/a.mp4", "VID"),
+            ("/tmp/a.mp3", "AUD"),
+            ("/tmp/a.png", "IMG"),
+        ] {
+            let (badge, _, _) = extension_badge(Path::new(path));
+            assert_eq!(badge, ext_badge);
+            let preview = build_file_preview_with_size(Path::new(path), "1 B".into());
+            assert_eq!(preview.extension_label.as_ref(), ext_badge);
+        }
+    }
+
+    #[test]
+    fn format_file_size_used_in_ready_large_detail() {
+        for &byte_len in &[512usize, 2048, 2 * 1024 * 1024] {
+            let entry = sample_history_entry(
+                1,
+                HistoryOutcome::ReadyLarge {
+                    module_id: "pandoc".into(),
+                    byte_len,
+                },
+            );
+            let size = format_file_size(byte_len as u64);
+            assert!(history_entry_detail(&entry).as_ref().contains(&size));
+            assert!(history_entry_stored_detail(&entry).contains(&size));
+        }
+    }
+
+    // ── additional dense tables ──────────────────────────────────────────
+
+    #[test]
+    fn parse_optional_secs_table() {
+        let ok: &[(&str, Option<f64>)] = &[
+            ("", None),
+            (" ", None),
+            ("0", Some(0.0)),
+            ("0.0", Some(0.0)),
+            ("1.5", Some(1.5)),
+            (" 2.25 ", Some(2.25)),
+            ("1e2", Some(100.0)),
+        ];
+        for &(s, want) in ok {
+            let got = parse_optional_secs(s).unwrap();
+            match (got, want) {
+                (None, None) => {}
+                (Some(a), Some(b)) => assert!((a - b).abs() < 1e-9, "{s}: {a} vs {b}"),
+                other => panic!("mismatch for {s:?}: {other:?}"),
+            }
+        }
+        for s in ["-1", "nan", "inf", "-inf", "xx", "1.2.3"] {
+            assert!(parse_optional_secs(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn parse_optional_u32_table() {
+        let ok: &[(&str, Option<u32>)] = &[
+            ("", None),
+            ("  ", None),
+            ("0", Some(0)),
+            ("1", Some(1)),
+            ("42", Some(42)),
+            (" 99 ", Some(99)),
+        ];
+        for &(s, want) in ok {
+            assert_eq!(parse_optional_u32(s).unwrap(), want, "{s}");
+        }
+        for s in ["-1", "1.5", "x", "1e3", "4294967296"] {
+            assert!(parse_optional_u32(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn extension_badge_exhaustive_image_video_audio_lists() {
+        let img = [
+            "png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "bmp", "tiff",
+        ];
+        let vid = ["mp4", "mov", "mkv", "avi", "webm"];
+        let aud = ["mp3", "wav", "aac", "flac", "m4a", "ogg"];
+        let zip = ["zip", "tar", "gz", "tgz", "7z", "rar"];
+        for ext in img {
+            assert_eq!(extension_badge(Path::new(&format!("f.{ext}"))).0, "IMG");
+            assert_eq!(
+                extension_badge(Path::new(&format!("f.{}", ext.to_ascii_uppercase()))).0,
+                "IMG"
+            );
+        }
+        for ext in vid {
+            assert_eq!(extension_badge(Path::new(&format!("f.{ext}"))).0, "VID");
+            assert_eq!(
+                extension_badge(Path::new(&format!("f.{}", ext.to_ascii_uppercase()))).0,
+                "VID"
+            );
+        }
+        for ext in aud {
+            assert_eq!(extension_badge(Path::new(&format!("f.{ext}"))).0, "AUD");
+            assert_eq!(
+                extension_badge(Path::new(&format!("f.{}", ext.to_ascii_uppercase()))).0,
+                "AUD"
+            );
+        }
+        for ext in zip {
+            assert_eq!(extension_badge(Path::new(&format!("f.{ext}"))).0, "ZIP");
+            assert_eq!(
+                extension_badge(Path::new(&format!("f.{}", ext.to_ascii_uppercase()))).0,
+                "ZIP"
+            );
+        }
+    }
+
+    #[test]
+    fn ellipsize_chars_max_from_0_to_len() {
+        let samples = [
+            "a",
+            "ab",
+            "hello",
+            "PLAN.md",
+            "personal strength week 5 workout.docx",
+            "你好",
+            "🚀✨",
+            "",
+        ];
+        for s in samples {
+            let n = s.chars().count();
+            for max in 0..=n + 3 {
+                let got = ellipsize_chars(s, max);
+                if max == 0 {
+                    assert_eq!(got.as_ref(), "…");
+                } else if n <= max {
+                    assert_eq!(got.as_ref(), s);
+                } else {
+                    assert_eq!(got.chars().count(), max);
+                    assert!(got.as_ref().ends_with('…'));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_history_matches_formula_for_randomish_values() {
+        // Deterministic pseudo-grid without RNG dependency.
+        for i in 0..200 {
+            let width = (i as f32) * 3.5 - 50.0;
+            let window = 400.0 + (i as f32) * 12.0;
+            let peer = (i as f32) * 2.0;
+            assert_eq!(
+                clamp_history_sidebar_width(width, window, peer),
+                expected_history_clamp(width, window, peer)
+            );
+            assert_eq!(
+                clamp_output_panel_width(width, window, peer),
+                expected_output_clamp(width, window, peer)
+            );
+        }
+    }
+
+    #[test]
+    fn output_format_badge_label_never_empty_for_catalog() {
+        for &format in OutputFormat::ALL {
+            let badge = output_format_badge_label(format);
+            assert!(!badge.is_empty());
+            assert!(badge.chars().count() <= 4);
+        }
+    }
+
+    #[test]
+    fn history_matches_search_url_vs_file_isolation() {
+        let file = sample_history_entry_custom(
+            1,
+            HistorySource::File(PathBuf::from("/tmp/only-file-token/x.md")),
+            "x.md",
+            "file-detail-aaa",
+            "MD",
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::Failed("e".into()),
+        );
+        let url = sample_history_entry_custom(
+            2,
+            HistorySource::Url("https://only-url-token.example/y".into()),
+            "y",
+            "url-detail-bbb",
+            "WEB",
+            OutputFormat::HTML,
+            HistoryOutcome::Failed("e".into()),
+        );
+        assert!(history_matches_search(&file, "only-file-token"));
+        assert!(!history_matches_search(&file, "only-url-token"));
+        assert!(history_matches_search(&url, "only-url-token"));
+        assert!(!history_matches_search(&url, "only-file-token"));
+        assert!(history_matches_search(&file, "file-detail-aaa"));
+        assert!(history_matches_search(&url, "url-detail-bbb"));
+    }
+
+    #[test]
+    fn module_label_description_table() {
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "markitdown",
+                "MarkItDown",
+                "Broad document, image, audio, and archive → Markdown.",
+            ),
+            (
+                "pandoc",
+                "Pandoc",
+                "Publishing formats (DOCX, PDF, HTML, wiki, and more).",
+            ),
+            (
+                "defuddle",
+                "Defuddle",
+                "Clean article extraction from URLs and local HTML.",
+            ),
+            (
+                "docling",
+                "Docling",
+                "Layout-aware PDF and office documents → Markdown/HTML/text.",
+            ),
+            (
+                "ffmpeg",
+                "FFmpeg",
+                "Audio, video, stills, and subtitle conversion.",
+            ),
+        ];
+        for &(id, label, desc) in rows {
+            assert_eq!(module_label(id), label);
+            assert_eq!(module_description(id), desc);
+        }
+    }
+}

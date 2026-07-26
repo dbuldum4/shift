@@ -2231,4 +2231,493 @@ mod tests {
         assert_ne!(old, new, "IDs must not be recycled after clear");
         assert!(queue.get(old).is_none(), "old ID must not resolve");
     }
+
+    #[test]
+    fn empty_queue_run_batch_is_noop() {
+        let mut queue = BatchQueue::new();
+        let registry = ConversionRegistry::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut events = Vec::new();
+        let summary = run_batch(&mut queue, &registry, &cancel, |event| {
+            events.push(event);
+        });
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.cancelled, 0);
+        assert_eq!(summary.exit_code(), 0);
+        assert!(queue.is_empty());
+        assert!(
+            events.is_empty()
+                || events.iter().all(|e| {
+                    // Some implementations may emit a batch-level event; none should mark items.
+                    !matches!(
+                        e,
+                        BatchEvent::ItemSucceeded { .. }
+                            | BatchEvent::ItemFailed { .. }
+                            | BatchEvent::ItemStarted { .. }
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn run_batch_all_failed() {
+        let dir = unique_dir("all-failed");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        struct AlwaysFail;
+        impl ConversionModule for AlwaysFail {
+            fn id(&self) -> &'static str {
+                "always-fail"
+            }
+            fn label(&self) -> &'static str {
+                "always-fail"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                _output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Err(ConversionError::new("forced failure"))
+            }
+        }
+
+        let registry = ConversionRegistry::new().with_module(AlwaysFail);
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            queue.enqueue(BatchSource::File(path), &opts);
+        }
+
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.failed, 3);
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.cancelled, 0);
+        assert_eq!(summary.exit_code(), 1);
+        assert!(
+            queue
+                .items()
+                .iter()
+                .all(|item| { matches!(item.state, BatchItemState::Failed { .. }) })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mixed_destinations_uniquify_on_collision() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(PathBuf::from("/exports")),
+            force: false,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        // Same stem from different folders → same planned destination.
+        for folder in ["a", "b", "c", "d"] {
+            queue.enqueue(
+                BatchSource::File(PathBuf::from(format!("/{folder}/report.pdf"))),
+                &opts,
+            );
+        }
+        assert!(
+            queue
+                .items()
+                .iter()
+                .all(|item| item.destination.as_path() == Path::new("/exports/report.md"))
+        );
+        queue.uniquify_planned_destinations();
+        let dests: Vec<_> = queue
+            .items()
+            .iter()
+            .map(|item| item.destination.clone())
+            .collect();
+        let unique: std::collections::HashSet<_> = dests.iter().cloned().collect();
+        assert_eq!(unique.len(), 4, "destinations must be unique: {dests:?}");
+        assert!(
+            dests
+                .iter()
+                .any(|d| d.as_path() == Path::new("/exports/report.md"))
+        );
+        assert!(
+            dests
+                .iter()
+                .any(|d| d.as_path() == Path::new("/exports/report-1.md"))
+        );
+        assert!(
+            dests
+                .iter()
+                .any(|d| d.as_path() == Path::new("/exports/report-2.md"))
+        );
+        assert!(
+            dests
+                .iter()
+                .any(|d| d.as_path() == Path::new("/exports/report-3.md"))
+        );
+    }
+
+    #[test]
+    fn cancel_flag_mid_run_cancels_remaining() {
+        let dir = unique_dir("cancel-mid");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "slowish",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN],
+            payload: b"x",
+            fail_once: None,
+            delay_ms: 120,
+            in_flight: None,
+            peak: None,
+        });
+
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            queue.enqueue(BatchSource::File(path), &opts);
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let mut started = 0usize;
+        let summary = run_batch(&mut queue, &registry, &cancel, |event| {
+            if matches!(event, BatchEvent::ItemStarted { .. }) {
+                started += 1;
+                if started >= 1 {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+
+        assert!(
+            summary.cancelled >= 1,
+            "expected cancellations, summary={summary:?} states={:?}",
+            queue
+                .items()
+                .iter()
+                .map(|i| i.state.label())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(summary.succeeded + summary.failed + summary.cancelled, 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inherit_vs_override_format_applied_per_item_on_run() {
+        let dir = unique_dir("inherit-override");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Module that echoes the requested output format into the payload.
+        struct FormatEcho;
+        impl ConversionModule for FormatEcho {
+            fn id(&self) -> &'static str {
+                "format-echo"
+            }
+            fn label(&self) -> &'static str {
+                "format-echo"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[
+                    OutputFormat::MARKDOWN,
+                    OutputFormat::HTML,
+                    OutputFormat("plain"),
+                ]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Ok(ConversionArtifact {
+                    file_name: format!("out.{}", output.extension()),
+                    media_type: output.media_type(),
+                    bytes: output.id().as_bytes().to_vec(),
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+
+        let registry = ConversionRegistry::new().with_module(FormatEcho);
+        let mut queue = BatchQueue::new();
+        let session = OutputFormat::MARKDOWN;
+        let opts = BatchEnqueueOptions {
+            output_format: session,
+            output_dir: Some(out.clone()),
+            force: true,
+            ..BatchEnqueueOptions::new(session)
+        };
+
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        std::fs::write(&c, b"c").unwrap();
+
+        let id_a = queue.enqueue(BatchSource::File(a), &opts);
+        let id_b = queue.enqueue(BatchSource::File(b), &opts);
+        let id_c = queue.enqueue(BatchSource::File(c), &opts);
+
+        // a inherits session markdown; b overrides HTML; c overrides plain.
+        assert_eq!(
+            queue.get(id_a).unwrap().format_selection,
+            BatchFormatSelection::Inherit
+        );
+        assert!(queue.set_item_format_selection(
+            id_b,
+            BatchFormatSelection::Override(OutputFormat::HTML),
+            session,
+            Some(out.as_path()),
+        ));
+        assert!(queue.set_item_format_selection(
+            id_c,
+            BatchFormatSelection::Override(OutputFormat("plain")),
+            session,
+            Some(out.as_path()),
+        ));
+
+        // Session changes should only move inherited items.
+        queue.refresh_inherited_formats(OutputFormat::MARKDOWN, Some(out.as_path()));
+        assert_eq!(
+            queue.get(id_a).unwrap().output_format,
+            OutputFormat::MARKDOWN
+        );
+        assert_eq!(queue.get(id_b).unwrap().output_format, OutputFormat::HTML);
+        assert_eq!(
+            queue.get(id_c).unwrap().output_format,
+            OutputFormat("plain")
+        );
+
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.succeeded, 3, "summary={summary:?}");
+
+        // Read written files and verify format ids.
+        let read_payload = |id: BatchItemId| -> String {
+            match &queue.get(id).unwrap().state {
+                BatchItemState::Succeeded { written_path, .. } => {
+                    String::from_utf8(std::fs::read(written_path).unwrap()).unwrap()
+                }
+                other => panic!("expected success for {id:?}, got {other:?}"),
+            }
+        };
+        assert_eq!(read_payload(id_a), "markdown");
+        assert_eq!(read_payload(id_b), "html");
+        assert_eq!(read_payload(id_c), "plain");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn enqueue_many_and_progress_mixed_states() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::HTML);
+        let sources: Vec<_> = (0..10)
+            .map(|i| BatchSource::File(PathBuf::from(format!("/tmp/f{i}.pdf"))))
+            .collect();
+        queue.enqueue_many(sources, &opts);
+        assert_eq!(queue.len(), 10);
+        assert_eq!(queue.progress().queued, 10);
+
+        // Force mixed terminal states without running converters.
+        for (i, item) in queue.items_mut().iter_mut().enumerate() {
+            item.state = match i % 4 {
+                0 => BatchItemState::Succeeded {
+                    written_path: PathBuf::from(format!("/tmp/o{i}.html")),
+                    module_id: "x".into(),
+                    byte_len: 10,
+                },
+                1 => BatchItemState::Failed {
+                    error: "nope".into(),
+                },
+                2 => BatchItemState::Cancelled,
+                _ => BatchItemState::Queued,
+            };
+        }
+        let progress = queue.progress();
+        assert_eq!(progress.total, 10);
+        assert_eq!(progress.succeeded, 3);
+        assert_eq!(progress.failed, 3);
+        assert_eq!(progress.cancelled, 2);
+        assert_eq!(progress.queued, 2);
+        assert!(!progress.is_idle());
+    }
+
+    #[test]
+    fn url_and_file_sources_resolve_distinct_destinations() {
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(PathBuf::from("/out")),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        let mut queue = BatchQueue::new();
+        queue.enqueue(BatchSource::File(PathBuf::from("/docs/page.pdf")), &opts);
+        queue.enqueue(BatchSource::Url("https://example.com/page".into()), &opts);
+        queue.uniquify_planned_destinations();
+        let dests: Vec<_> = queue
+            .items()
+            .iter()
+            .map(|i| i.destination.clone())
+            .collect();
+        let unique: std::collections::HashSet<_> = dests.iter().cloned().collect();
+        assert_eq!(unique.len(), dests.len(), "dests={dests:?}");
+    }
+
+    #[test]
+    fn retry_failed_only_requeues_failures() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let id_ok = queue.enqueue(BatchSource::File(PathBuf::from("/ok.pdf")), &opts);
+        let id_fail = queue.enqueue(BatchSource::File(PathBuf::from("/fail.pdf")), &opts);
+        let id_cancel = queue.enqueue(BatchSource::File(PathBuf::from("/c.pdf")), &opts);
+        queue.get_mut(id_ok).unwrap().state = BatchItemState::Succeeded {
+            written_path: PathBuf::from("/ok.md"),
+            module_id: "m".into(),
+            byte_len: 1,
+        };
+        queue.get_mut(id_fail).unwrap().state = BatchItemState::Failed { error: "x".into() };
+        queue.get_mut(id_cancel).unwrap().state = BatchItemState::Cancelled;
+
+        // `retry_failed` requeues every retryable state (Failed *and* Cancelled).
+        assert_eq!(queue.retry_failed(), 2);
+        assert!(matches!(
+            queue.get(id_fail).unwrap().state,
+            BatchItemState::Queued
+        ));
+        assert!(matches!(
+            queue.get(id_cancel).unwrap().state,
+            BatchItemState::Queued
+        ));
+        // Succeeded items are not retryable.
+        assert!(!queue.retry(id_ok));
+        assert!(matches!(
+            queue.get(id_ok).unwrap().state,
+            BatchItemState::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn force_true_overwrites_existing_destination() {
+        let dir = unique_dir("force-overwrite");
+        let input = dir.join("doc.txt");
+        std::fs::write(&input, b"x").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let dest = out.join("doc.md");
+        std::fs::write(&dest, b"prior").unwrap();
+
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "fake",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN],
+            payload: b"new\n",
+            fail_once: None,
+            delay_ms: 0,
+            in_flight: None,
+            peak: None,
+        });
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        queue.enqueue(BatchSource::File(input), &opts);
+        queue.items_mut()[0].destination = dest.clone();
+
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unsupported_input_fails_item_without_panic() {
+        let dir = unique_dir("unsupported");
+        let input = dir.join("doc.xyz");
+        std::fs::write(&input, b"x").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "fake",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN],
+            payload: b"x",
+            fail_once: None,
+            delay_ms: 0,
+            in_flight: None,
+            peak: None,
+        });
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        queue.enqueue(BatchSource::File(input), &opts);
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.succeeded, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

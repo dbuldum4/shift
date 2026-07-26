@@ -2738,4 +2738,838 @@ mod tests {
         let _ = std::fs::remove_file(&fake_qpdf);
         let _ = std::fs::remove_file(&input);
     }
+
+    // -------------------------------------------------------------------------
+    // OutputFormat catalog matrix — every entry in OutputFormat::ALL
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn output_format_all_id_parse_round_trip() {
+        for format in OutputFormat::ALL {
+            let id = format.id();
+            assert!(!id.is_empty(), "empty id in catalog");
+            let parsed: OutputFormat = id
+                .parse()
+                .unwrap_or_else(|e| panic!("id {id:?} failed to parse: {e}"));
+            assert_eq!(
+                parsed.id(),
+                id,
+                "round-trip id mismatch for catalog entry {id}"
+            );
+            // Case-insensitive parse of the canonical id.
+            let upper = id.to_ascii_uppercase();
+            let parsed_upper: OutputFormat = upper
+                .parse()
+                .unwrap_or_else(|e| panic!("uppercase id {upper:?} failed to parse for {id}: {e}"));
+            assert_eq!(parsed_upper.id(), id);
+        }
+    }
+
+    #[test]
+    fn output_format_all_extension_media_type_label_non_empty() {
+        for format in OutputFormat::ALL {
+            let id = format.id();
+            let ext = format.extension();
+            // Catalog extensions are non-empty for every writer we ship.
+            assert!(!ext.is_empty(), "extension empty for format id {id}");
+            let media = format.media_type();
+            assert!(!media.is_empty(), "media_type empty for format id {id}");
+            assert!(
+                media.contains('/'),
+                "media_type should look like type/subtype for {id}: {media}"
+            );
+            let label = format.label();
+            assert!(!label.is_empty(), "label empty for format id {id}");
+            // Lowercase helpers must be consistent and non-empty.
+            assert!(!format.label_lowercase().is_empty());
+            assert!(!format.id_lowercase().is_empty());
+            assert_eq!(
+                format.id_lowercase(),
+                id.to_ascii_lowercase(),
+                "id_lowercase drift for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_format_text_previewable_consistent_with_media_types() {
+        for format in OutputFormat::ALL {
+            let media = format.media_type();
+            let previewable = format.is_text_previewable();
+            // Explicit text/* media types in the catalog should be previewable.
+            if matches!(
+                media,
+                "text/markdown" | "text/html" | "text/plain" | "text/vtt"
+            ) {
+                assert!(
+                    previewable,
+                    "{} has media_type {media} but is_text_previewable=false",
+                    format.id()
+                );
+            }
+            // Structured text-like application types used by pandoc writers.
+            if matches!(
+                media,
+                "application/json" | "application/xml" | "application/x-subrip"
+            ) {
+                assert!(
+                    previewable,
+                    "{} has media_type {media} but is_text_previewable=false",
+                    format.id()
+                );
+            }
+            // Binary media families must not claim text preview.
+            if media.starts_with("audio/")
+                || media.starts_with("video/")
+                || media.starts_with("image/")
+                || media == "application/pdf"
+                || media == "application/epub+zip"
+                || media == "application/zip"
+                || media.starts_with("application/vnd.")
+            {
+                assert!(
+                    !previewable,
+                    "{} has binary media_type {media} but is_text_previewable=true",
+                    format.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_format_partitions_pandoc_media_cover_all_without_overlap() {
+        use std::collections::HashSet;
+
+        let all_ids: HashSet<&str> = OutputFormat::ALL.iter().map(|f| f.id()).collect();
+        let pandoc_ids: HashSet<&str> = OutputFormat::PANDOC.iter().map(|f| f.id()).collect();
+        let media_ids: HashSet<&str> = OutputFormat::MEDIA.iter().map(|f| f.id()).collect();
+
+        assert_eq!(
+            OutputFormat::ALL.len(),
+            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len()
+        );
+        assert_eq!(
+            all_ids.len(),
+            OutputFormat::ALL.len(),
+            "duplicate ids in ALL"
+        );
+        assert_eq!(
+            pandoc_ids.len(),
+            OutputFormat::PANDOC.len(),
+            "duplicate ids in PANDOC"
+        );
+        assert_eq!(
+            media_ids.len(),
+            OutputFormat::MEDIA.len(),
+            "duplicate ids in MEDIA"
+        );
+
+        let overlap: Vec<_> = pandoc_ids.intersection(&media_ids).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "ids appear in both PANDOC and MEDIA: {overlap:?}"
+        );
+
+        let union: HashSet<&str> = pandoc_ids.union(&media_ids).copied().collect();
+        assert_eq!(union, all_ids, "PANDOC ∪ MEDIA must equal ALL");
+
+        // Every ALL entry is in exactly one partition.
+        for format in OutputFormat::ALL {
+            let in_pandoc = OutputFormat::PANDOC.contains(format);
+            let in_media = OutputFormat::MEDIA.contains(format);
+            assert!(
+                in_pandoc ^ in_media,
+                "{} must appear in exactly one of PANDOC/MEDIA (pandoc={in_pandoc}, media={in_media})",
+                format.id()
+            );
+        }
+
+        // MEDIA partition members are exactly the FFmpeg writers.
+        for format in OutputFormat::MEDIA {
+            assert!(
+                is_ffmpeg_output(*format),
+                "MEDIA entry {} should be an FFmpeg output",
+                format.id()
+            );
+        }
+        for format in OutputFormat::PANDOC {
+            assert!(
+                !is_ffmpeg_output(*format),
+                "PANDOC entry {} must not be classified as FFmpeg output",
+                format.id()
+            );
+        }
+    }
+
+    #[test]
+    fn output_format_parse_aliases_and_unknowns_matrix() {
+        let aliases = [
+            ("md", "markdown"),
+            ("jpeg", "jpg"),
+            ("mpg", "mpeg"),
+            ("mpg2", "mpeg"),
+            ("aif", "aiff"),
+            ("png-zip", "png-sequence-zip"),
+            ("png_sequence", "png-sequence-zip"),
+            ("frames-zip", "png-sequence-zip"),
+            ("PNG-SEQUENCE-ZIP", "png-sequence-zip"),
+            ("  markdown  ", "markdown"),
+            ("HTML", "html"),
+            ("Mp3", "mp3"),
+            ("3gp", "3gp"),
+        ];
+        for (input, expected_id) in aliases {
+            let parsed: OutputFormat = input
+                .parse()
+                .unwrap_or_else(|e| panic!("alias {input:?} failed: {e}"));
+            assert_eq!(
+                parsed.id(),
+                expected_id,
+                "alias {input:?} should resolve to {expected_id}"
+            );
+        }
+
+        for bad in [
+            "",
+            "   ",
+            "not-a-real-format",
+            "docx-plus",
+            "audio/mpeg",
+            "mark down",
+            "png-sequence",
+        ] {
+            let err = bad.parse::<OutputFormat>().unwrap_err();
+            assert!(
+                err.to_string().contains("unknown output format"),
+                "expected unknown for {bad:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_format_extension_round_trip_via_parse_where_unique() {
+        // For formats whose extension uniquely maps back to the same id (or a
+        // sibling that shares the extension), parsing the extension must succeed.
+        for format in OutputFormat::ALL {
+            let ext = format.extension();
+            let parsed = ext.parse::<OutputFormat>();
+            assert!(
+                parsed.is_ok(),
+                "extension {ext:?} of {} must parse as some OutputFormat",
+                format.id()
+            );
+            let parsed = parsed.unwrap();
+            // The parsed format's extension must match (aliases like md→markdown).
+            assert_eq!(
+                parsed.extension(),
+                ext,
+                "parsed extension for {} via {ext}",
+                format.id()
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Default registry route matrix
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn default_registry_route_matrix_representative_pairs() {
+        let registry = ConversionRegistry::default();
+
+        // (input path, output, expected direct module id or None for unsupported direct)
+        // Two-step-only routes assert module_for is None while route_module_ids is Some.
+        struct Case {
+            input: &'static str,
+            output: OutputFormat,
+            direct_module: Option<&'static str>,
+            route_head: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                input: "REPORT.DOCX",
+                output: OutputFormat::MARKDOWN,
+                direct_module: Some("markitdown"),
+                route_head: Some("markitdown"),
+            },
+            Case {
+                input: "scan.pdf",
+                output: OutputFormat::MARKDOWN,
+                direct_module: Some("markitdown"),
+                route_head: Some("markitdown"),
+            },
+            Case {
+                input: "scan.pdf",
+                output: OutputFormat::HTML,
+                direct_module: Some("docling"),
+                route_head: Some("docling"),
+            },
+            Case {
+                input: "scan.pdf",
+                output: OutputFormat("plain"),
+                direct_module: Some("docling"),
+                route_head: Some("docling"),
+            },
+            Case {
+                input: "clip.mp4",
+                output: OutputFormat::MP3,
+                direct_module: Some("ffmpeg"),
+                route_head: Some("ffmpeg"),
+            },
+            Case {
+                input: "page.html",
+                output: OutputFormat::MARKDOWN,
+                direct_module: Some("markitdown"),
+                route_head: Some("markitdown"),
+            },
+            Case {
+                input: "page.HTM",
+                output: OutputFormat::HTML,
+                // Pandoc is registered before Defuddle and handles HTML→HTML.
+                direct_module: Some("pandoc"),
+                route_head: Some("pandoc"),
+            },
+            Case {
+                input: "track.wav",
+                output: OutputFormat::FLAC,
+                direct_module: Some("ffmpeg"),
+                route_head: Some("ffmpeg"),
+            },
+            Case {
+                input: "clip.mkv",
+                output: OutputFormat::SRT,
+                direct_module: Some("ffmpeg"),
+                route_head: Some("ffmpeg"),
+            },
+            Case {
+                input: "photo.png",
+                output: OutputFormat::JPG,
+                direct_module: Some("ffmpeg"),
+                route_head: Some("ffmpeg"),
+            },
+            Case {
+                input: "notes.md",
+                output: OutputFormat::DOCX,
+                direct_module: Some("pandoc"),
+                route_head: Some("pandoc"),
+            },
+            Case {
+                input: "notes.md",
+                output: OutputFormat::PDF,
+                direct_module: Some("pandoc"),
+                route_head: Some("pandoc"),
+            },
+            Case {
+                input: "deck.pptx",
+                output: OutputFormat::MARKDOWN,
+                direct_module: Some("markitdown"),
+                route_head: Some("markitdown"),
+            },
+            // Unsupported direct pairs
+            Case {
+                input: "clip.mp4",
+                output: OutputFormat::DOCX,
+                direct_module: None,
+                route_head: None, // may be two-step or unsupported
+            },
+            Case {
+                input: "report.docx",
+                output: OutputFormat::MP3,
+                direct_module: None,
+                route_head: None,
+            },
+            Case {
+                input: "mystery.xyz",
+                output: OutputFormat::MARKDOWN,
+                direct_module: None,
+                route_head: None,
+            },
+        ];
+
+        for case in cases {
+            let path = Path::new(case.input);
+            let direct = registry.module_for(path, case.output).map(|m| m.id());
+            assert_eq!(
+                direct,
+                case.direct_module,
+                "module_for({}, {})",
+                case.input,
+                case.output.id()
+            );
+
+            let route = registry.route_module_ids(path, case.output);
+            match case.route_head {
+                Some(head) => {
+                    let ids = route.unwrap_or_else(|| {
+                        panic!("expected route for {} → {}", case.input, case.output.id())
+                    });
+                    assert_eq!(
+                        ids.first().copied(),
+                        Some(head),
+                        "route head for {} → {}: {ids:?}",
+                        case.input,
+                        case.output.id()
+                    );
+                }
+                None => {
+                    // For explicitly unsupported samples, either no route or no direct module.
+                    if case.direct_module.is_none()
+                        && matches!(case.input, "mystery.xyz" | "report.docx")
+                        && case.output == OutputFormat::MP3
+                    {
+                        assert!(
+                            route.is_none(),
+                            "unexpected route for {} → {}: {:?}",
+                            case.input,
+                            case.output.id(),
+                            route
+                        );
+                    }
+                    if case.input == "mystery.xyz" {
+                        assert!(route.is_none(), "mystery.xyz must not route: {:?}", route);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_registry_url_routes_and_unsupported() {
+        let registry = ConversionRegistry::default();
+
+        assert_eq!(
+            registry
+                .module_for_url(OutputFormat::MARKDOWN)
+                .map(|m| m.id()),
+            Some("defuddle")
+        );
+        assert_eq!(
+            registry.module_for_url(OutputFormat::HTML).map(|m| m.id()),
+            Some("defuddle")
+        );
+        // Defuddle does not produce PDF directly; URL→PDF is two-step via pandoc.
+        assert!(registry.module_for_url(OutputFormat::PDF).is_none());
+        let pdf_route = registry.url_route_module_ids(OutputFormat::PDF);
+        assert!(
+            pdf_route
+                .as_ref()
+                .is_some_and(|ids| ids.first() == Some(&"defuddle")),
+            "URL→PDF should chain from defuddle: {pdf_route:?}"
+        );
+
+        assert!(registry.module_for_url(OutputFormat::MP3).is_none());
+        assert!(
+            registry.url_route_module_ids(OutputFormat::MP3).is_none(),
+            "URL→mp3 must be unsupported"
+        );
+
+        let url_outputs = registry.available_url_outputs();
+        assert!(url_outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(url_outputs.contains(&OutputFormat::HTML));
+        assert!(!url_outputs.contains(&OutputFormat::MP3));
+    }
+
+    #[test]
+    fn priority_reordering_markitdown_pandoc_docling_on_pdf_markdown() {
+        let default = ConversionRegistry::default();
+        assert_eq!(
+            default
+                .module_for(Path::new("scan.pdf"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "markitdown"
+        );
+
+        let pandoc_first =
+            ConversionRegistry::default().with_priority(&["pandoc", "markitdown", "docling"]);
+        // Pandoc also accepts pdf→md? Check — if not, markitdown stays.
+        let chosen = pandoc_first
+            .module_for(Path::new("scan.pdf"), OutputFormat::MARKDOWN)
+            .unwrap()
+            .id();
+        // Pandoc may or may not support pdf input; assert stability of docling promote.
+        let _ = chosen;
+
+        let docling_first =
+            ConversionRegistry::default().with_priority(&["docling", "markitdown", "pandoc"]);
+        assert_eq!(
+            docling_first
+                .module_for(Path::new("scan.pdf"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "docling"
+        );
+
+        let markitdown_first =
+            ConversionRegistry::default().with_priority(&["markitdown", "docling", "pandoc"]);
+        assert_eq!(
+            markitdown_first
+                .module_for(Path::new("scan.pdf"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "markitdown"
+        );
+
+        // DOCX markdown priority between markitdown and pandoc.
+        let pandoc_docx = ConversionRegistry::default().with_priority(&["pandoc", "markitdown"]);
+        assert_eq!(
+            pandoc_docx
+                .module_for(Path::new("report.docx"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "pandoc"
+        );
+        let markitdown_docx =
+            ConversionRegistry::default().with_priority(&["markitdown", "pandoc"]);
+        assert_eq!(
+            markitdown_docx
+                .module_for(Path::new("report.docx"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id(),
+            "markitdown"
+        );
+    }
+
+    #[test]
+    fn default_registry_module_ids_are_stable() {
+        let registry = ConversionRegistry::default();
+        let ids: Vec<_> = registry.modules().map(|m| m.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
+        );
+        for id in &ids {
+            assert!(registry.has_module(id));
+        }
+        assert!(!registry.has_module("libreoffice"));
+        assert!(!registry.has_module(""));
+    }
+
+    #[test]
+    fn unsupported_pairs_have_no_route_matrix() {
+        let registry = ConversionRegistry::default();
+        let unsupported = [
+            ("report.docx", OutputFormat::MP3),
+            ("report.docx", OutputFormat::MP4),
+            ("report.docx", OutputFormat::PNG),
+            ("report.docx", OutputFormat::SRT),
+            ("notes.md", OutputFormat::MP3),
+            ("notes.md", OutputFormat::WEBM),
+            ("mystery.xyz", OutputFormat::MARKDOWN),
+            ("mystery.xyz", OutputFormat::HTML),
+            ("mystery.xyz", OutputFormat::MP3),
+            ("data.csv", OutputFormat::MP4),
+        ];
+        for (input, output) in unsupported {
+            let path = Path::new(input);
+            assert!(
+                registry.module_for(path, output).is_none(),
+                "unexpected direct module for {input} → {}",
+                output.id()
+            );
+            // Two-step may still exist for some document pairs via chain; only
+            // assert hard-unsupported when neither direct nor chain is found.
+            if input.starts_with("mystery")
+                || (input.ends_with(".docx") && is_ffmpeg_output(output))
+            {
+                assert!(
+                    registry.route_module_ids(path, output).is_none(),
+                    "unexpected route for {input} → {}: {:?}",
+                    output.id(),
+                    registry.route_module_ids(path, output)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_input_available_outputs_include_media_catalog() {
+        let registry = ConversionRegistry::default();
+        let video_outputs = registry.available_outputs(Path::new("clip.mp4"));
+        for format in OutputFormat::MEDIA {
+            assert!(
+                video_outputs.contains(format),
+                "mp4 should list media output {}",
+                format.id()
+            );
+        }
+        // Document-only formats are not direct FFmpeg outputs.
+        assert!(
+            !video_outputs.contains(&OutputFormat::DOCX) || {
+                // DOCX might appear via a chain; if present it must not be direct ffmpeg.
+                registry
+                    .module_for(Path::new("clip.mp4"), OutputFormat::DOCX)
+                    .is_none()
+            }
+        );
+    }
+
+    #[test]
+    fn default_output_path_matrix_for_catalog_sample() {
+        let samples = [
+            (
+                Path::new("a/b/note.md"),
+                OutputFormat::HTML,
+                "a/b/note.html",
+            ),
+            (
+                Path::new("a/b/note.md"),
+                OutputFormat::MARKDOWN,
+                "a/b/note.converted.md",
+            ),
+            (Path::new("clip.mp4"), OutputFormat::MP3, "clip.mp3"),
+            (
+                Path::new("clip.mp3"),
+                OutputFormat::MP3,
+                "clip.converted.mp3",
+            ),
+            (
+                Path::new("scan.pdf"),
+                OutputFormat::PNG_SEQUENCE_ZIP,
+                "scan.zip",
+            ),
+            (Path::new("x.3gp"), OutputFormat::THREEGP, "x.converted.3gp"),
+            (Path::new("subs.srt"), OutputFormat::VTT, "subs.vtt"),
+        ];
+        for (input, format, expected) in samples {
+            assert_eq!(
+                default_output_path(input, format),
+                Path::new(expected),
+                "{} → {}",
+                input.display(),
+                format.id()
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_artifact_write_to_and_preview_matrix() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-artifact-matrix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases: &[(OutputFormat, &[u8], bool)] = &[
+            (OutputFormat::MARKDOWN, b"# hi\n", true),
+            (OutputFormat::HTML, b"<p>x</p>", true),
+            (OutputFormat("plain"), b"plain text", true),
+            (OutputFormat::MP3, b"ID3fake", false),
+            (OutputFormat::PDF, b"%PDF-1.4", false),
+            (OutputFormat::PNG, b"\x89PNG", false),
+            (
+                OutputFormat::SRT,
+                b"1\n00:00:00,000 --> 00:00:01,000\nHi\n",
+                true,
+            ),
+            (OutputFormat::VTT, b"WEBVTT\n\nHi\n", true),
+        ];
+
+        for (format, bytes, text_preview) in cases {
+            let artifact = ConversionArtifact {
+                file_name: format!("out.{}", format.extension()),
+                media_type: format.media_type(),
+                bytes: bytes.to_vec(),
+                format: *format,
+                module_id: "test",
+                pipeline: vec!["test"],
+                invocations: Vec::new(),
+            };
+            let path = dir.join(&artifact.file_name);
+            artifact.write_to(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), *bytes);
+
+            let preview = artifact.preview_summary();
+            if *text_preview {
+                assert!(
+                    !preview.contains("Not shown inline"),
+                    "expected text preview for {}: {preview}",
+                    format.id()
+                );
+            } else {
+                assert!(
+                    preview.contains("Not shown inline"),
+                    "expected binary preview for {}: {preview}",
+                    format.id()
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_step_url_and_file_route_ids_cover_common_chains() {
+        let registry = ConversionRegistry::default();
+
+        // Video → Markdown is two-step (ffmpeg → markitdown).
+        let ids = registry
+            .route_module_ids(Path::new("clip.mp4"), OutputFormat::MARKDOWN)
+            .expect("video→md chain");
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], "ffmpeg");
+        assert!(
+            ids[1] == "markitdown" || ids[1] == "pandoc",
+            "second hop unexpected: {ids:?}"
+        );
+
+        // Local HTML → DOCX: defuddle/markitdown chain or pandoc direct.
+        let html_docx = registry.route_module_ids(Path::new("page.html"), OutputFormat::DOCX);
+        assert!(html_docx.is_some(), "html→docx should route");
+
+        // URL → DOCX chains through defuddle.
+        let url_docx = registry
+            .url_route_module_ids(OutputFormat::DOCX)
+            .expect("url→docx");
+        assert_eq!(url_docx[0], "defuddle");
+    }
+
+    #[test]
+    fn format_byte_size_edges() {
+        assert_eq!(format_byte_size(0), "0 B");
+        assert_eq!(format_byte_size(1), "1 B");
+        assert_eq!(format_byte_size(1023), "1023 B");
+        assert_eq!(format_byte_size(1024), "1.0 KB");
+        assert_eq!(format_byte_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn pdf_input_options_matrix_combinations() {
+        let matrix = [
+            (None, None, None, false, false, true),
+            (Some(1), None, None, false, false, false),
+            (Some(2), None, None, true, true, false),
+            (None, Some(3), None, true, true, false),
+            (Some(1), Some(3), None, true, true, false),
+            (Some(2), Some(5), Some("pw"), true, true, false),
+            (None, None, Some("pw"), false, true, false),
+            (Some(1), None, Some("pw"), false, true, false),
+        ];
+        for (from, to, password, needs_slice, needs_pre, is_default) in matrix {
+            let opts = PdfInputOptions {
+                page_from: from,
+                page_to: to,
+                password: password.map(str::to_owned),
+            };
+            assert_eq!(
+                opts.needs_slice(),
+                needs_slice,
+                "slice from={from:?} to={to:?}"
+            );
+            assert_eq!(
+                opts.needs_preprocessing(),
+                needs_pre,
+                "pre from={from:?} to={to:?} pw={password:?}"
+            );
+            assert_eq!(
+                opts.is_default(),
+                is_default,
+                "default from={from:?} to={to:?} pw={password:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_options_default_nests_are_default() {
+        let opts = ConversionOptions::default();
+        assert!(opts.ffmpeg.is_default());
+        assert!(opts.pdf.is_default());
+        assert!(opts.cancel.is_none());
+        assert!(opts.progress.is_none());
+    }
+
+    #[test]
+    fn paths_refer_to_same_file_edge_cases() {
+        assert!(paths_refer_to_same_file(Path::new("a/b"), Path::new("a/b")));
+        assert!(!paths_refer_to_same_file(
+            Path::new("a/b"),
+            Path::new("a/c")
+        ));
+        // Relative vs absolute with same cwd resolution is best-effort.
+        let cwd_file = std::env::current_dir().unwrap().join("Cargo.toml");
+        if cwd_file.is_file() {
+            assert!(paths_refer_to_same_file(Path::new("Cargo.toml"), &cwd_file));
+        }
+    }
+
+    #[test]
+    fn redact_and_format_argv_matrix() {
+        let cases = [
+            (vec!["a"], "a"),
+            (vec!["a", "b c"], "a 'b c'"),
+            (vec!["tool", "--x=y"], "tool --x=y"),
+        ];
+        for (parts, expected) in cases {
+            assert_eq!(format_argv_display(&parts), expected);
+        }
+
+        let mut parts = vec!["docling".into(), "--pdf-password".into(), "hunter2".into()];
+        redact_flag_value(&mut parts, "--pdf-password", "••••");
+        assert_eq!(parts[2], "••••");
+    }
+
+    #[test]
+    fn every_media_format_extension_matches_id_or_known_alias() {
+        for format in OutputFormat::MEDIA {
+            let id = format.id();
+            let ext = format.extension();
+            if id == "png-sequence-zip" {
+                assert_eq!(ext, "zip");
+            } else if id == "jpg" {
+                assert_eq!(ext, "jpg");
+            } else {
+                assert_eq!(ext, id, "media format id should equal extension for {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn route_module_ids_for_all_media_outputs_from_mp4() {
+        let registry = ConversionRegistry::default();
+        let input = Path::new("clip.mp4");
+        for format in OutputFormat::MEDIA {
+            let ids = registry
+                .route_module_ids(input, *format)
+                .unwrap_or_else(|| panic!("no route clip.mp4 → {}", format.id()));
+            assert_eq!(ids, vec!["ffmpeg"], "route for {}", format.id());
+        }
+    }
+
+    #[test]
+    fn available_outputs_non_empty_for_common_inputs() {
+        let registry = ConversionRegistry::default();
+        for sample in [
+            "a.docx", "b.pdf", "c.html", "d.md", "e.mp4", "f.wav", "g.png", "h.pptx", "i.epub",
+            "j.jpg", "k.mkv",
+        ] {
+            let outs = registry.available_outputs(Path::new(sample));
+            assert!(!outs.is_empty(), "available_outputs empty for {sample}");
+        }
+    }
+
+    #[test]
+    fn conversion_error_display_and_helpers_matrix() {
+        let cases = [
+            ("conversion cancelled", true, false),
+            ("executable not found: /tmp/x", false, true),
+            ("executable not found: missing", false, true),
+            ("Executable not found on PATH", false, false),
+            ("boom", false, false),
+        ];
+        for (msg, cancelled, missing) in cases {
+            let err = if msg == "conversion cancelled" {
+                ConversionError::cancelled()
+            } else {
+                ConversionError::new(msg)
+            };
+            assert_eq!(err.is_cancelled(), cancelled, "{msg}");
+            assert_eq!(err.is_executable_not_found(), missing, "{msg}");
+            assert!(!err.to_string().is_empty());
+        }
+    }
 }

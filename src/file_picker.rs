@@ -608,6 +608,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
+    /// Serialize env + static LAST_DIRECTORY / DIALOG_OPEN mutations.
     static LOCK: Mutex<()> = Mutex::new(());
 
     struct HomeGuard {
@@ -653,6 +654,13 @@ mod tests {
         ))
     }
 
+    fn last_dir() -> Option<PathBuf> {
+        LAST_DIRECTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     #[test]
     fn default_start_directory_prefers_documents() {
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -666,10 +674,14 @@ mod tests {
     }
 
     #[test]
-    fn default_start_directory_falls_back_to_home() {
+    fn default_start_directory_falls_back_to_home_when_documents_missing() {
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = unique_temp("home");
+        let home = unique_temp("home-no-docs");
         std::fs::create_dir_all(&home).unwrap();
+        // Explicitly ensure Documents is absent
+        let docs = home.join("Documents");
+        let _ = std::fs::remove_dir_all(&docs);
+        assert!(!docs.exists());
         let _home_guard = HomeGuard::set(&home);
         reset();
 
@@ -678,15 +690,90 @@ mod tests {
     }
 
     #[test]
+    fn default_start_directory_falls_back_to_home_when_documents_is_file() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("docs-is-file");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("Documents"), b"not a dir").unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(default_start_directory(), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_start_directory_returns_home_path_even_if_missing() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let missing = unique_temp("missing-home");
+        // Do not create `missing`; HOME points at a nonexistent path.
+        let _ = std::fs::remove_dir_all(&missing);
+        let _home_guard = HomeGuard::set(&missing);
+        reset();
+
+        // Documents filter fails; `or_else(home_dir)` returns HOME without an
+        // is_dir check (callers / NSOpenPanel tolerate a missing start URL).
+        assert_eq!(default_start_directory(), Some(missing));
+    }
+
+    #[test]
+    fn home_dir_reads_env_override() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("home-env");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(home_dir(), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn resolve_start_dir_prefers_provided_directory() {
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("provided");
         let provided = home.join("provided");
+        let last = home.join("last");
         std::fs::create_dir_all(&provided).unwrap();
+        std::fs::create_dir_all(&last).unwrap();
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
         let _home_guard = HomeGuard::set(&home);
         reset();
 
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(last);
+        // Priority: provided > last > default Documents
         assert_eq!(resolve_start_dir(Some(provided.clone())), Some(provided));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_ignores_provided_file_and_uses_last() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("provided-file");
+        let last = home.join("last");
+        std::fs::create_dir_all(&last).unwrap();
+        let file = home.join("not-a-dir.txt");
+        std::fs::write(&file, b"").unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(last.clone());
+        assert_eq!(resolve_start_dir(Some(file)), Some(last));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_ignores_provided_missing_path() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("provided-missing");
+        let last = home.join("last");
+        std::fs::create_dir_all(&last).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(last.clone());
+        let missing = home.join("does-not-exist");
+        assert_eq!(resolve_start_dir(Some(missing)), Some(last));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -705,6 +792,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_start_dir_ignores_non_dir_last_directory() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("last-file");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let file = home.join("was-a-dir-now-file");
+        std::fs::write(&file, b"x").unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+        // Non-dir last is filtered out → default Documents
+        assert_eq!(resolve_start_dir(None), Some(home.join("Documents")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_ignores_missing_last_directory() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("last-missing");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        let gone = home.join("gone");
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(gone);
+        // No Documents → home
+        assert_eq!(resolve_start_dir(None), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn resolve_start_dir_falls_back_to_default() {
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = unique_temp("default");
@@ -713,6 +831,41 @@ mod tests {
         reset();
 
         assert_eq!(resolve_start_dir(None), Some(home.join("Documents")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_priority_provided_over_last_over_default() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("priority");
+        let provided = home.join("provided");
+        let last = home.join("last");
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&provided).unwrap();
+        std::fs::create_dir_all(&last).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(last.clone());
+
+        assert_eq!(
+            resolve_start_dir(Some(provided.clone())),
+            Some(provided),
+            "provided wins"
+        );
+        assert_eq!(
+            resolve_start_dir(None),
+            Some(last),
+            "last wins over default"
+        );
+
+        *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        assert_eq!(
+            resolve_start_dir(None),
+            Some(docs),
+            "default Documents when no last"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -727,16 +880,105 @@ mod tests {
         reset();
 
         remember_directory(&file);
-        assert_eq!(
-            *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()),
-            Some(parent.clone())
-        );
+        assert_eq!(last_dir(), Some(parent.clone()));
 
         remember_directory(&parent);
-        assert_eq!(
-            *LAST_DIRECTORY.lock().unwrap_or_else(|e| e.into_inner()),
-            Some(parent)
-        );
+        assert_eq!(last_dir(), Some(parent));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_nested_file_uses_immediate_parent() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-nested");
+        let nested = home.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("deep.txt");
+        std::fs::write(&file, b"x").unwrap();
+        reset();
+
+        remember_directory(&file);
+        assert_eq!(last_dir(), Some(nested));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_nested_dir_stores_that_dir() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-nested-dir");
+        let nested = home.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        reset();
+
+        remember_directory(&nested);
+        assert_eq!(last_dir(), Some(nested));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_missing_file_with_existing_parent_stores_parent() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-missing-parent-ok");
+        std::fs::create_dir_all(&home).unwrap();
+        reset();
+
+        // Non-existent file under an existing parent → remember parent (drag-drop style).
+        let missing_file = home.join("gone.txt");
+        remember_directory(&missing_file);
+        assert_eq!(last_dir(), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_ignores_path_when_resolved_dir_missing() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-missing-deep");
+        std::fs::create_dir_all(&home).unwrap();
+        reset();
+
+        // Parent chain does not exist → filter(|p| p.is_dir()) drops it.
+        let missing_file = home.join("nope").join("file.txt");
+        remember_directory(&missing_file);
+        assert_eq!(last_dir(), None, "missing parent must not set last dir");
+
+        // Missing directory whose parent exists → stores parent, not the missing dir.
+        let missing_dir = home.join("nope-dir");
+        remember_directory(&missing_dir);
+        assert_eq!(last_dir(), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_overwrites_previous_value() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-overwrite");
+        let d1 = home.join("one");
+        let d2 = home.join("two");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        reset();
+
+        remember_directory(&d1);
+        assert_eq!(last_dir(), Some(d1));
+        remember_directory(&d2);
+        assert_eq!(last_dir(), Some(d2));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remember_directory_does_not_clear_on_unresolvable_path() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-keep");
+        let good = home.join("good");
+        std::fs::create_dir_all(&good).unwrap();
+        reset();
+
+        remember_directory(&good);
+        assert_eq!(last_dir(), Some(good.clone()));
+
+        // Parent of this path does not exist → remember is a no-op, keeps prior.
+        remember_directory(&home.join("missing-parent").join("file.txt"));
+        assert_eq!(last_dir(), Some(good));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -749,9 +991,65 @@ mod tests {
         assert!(begin_dialog());
         assert!(is_busy());
         assert!(!begin_dialog());
+        assert!(!begin_dialog(), "third begin also fails while busy");
+        assert!(is_busy());
+
+        // Simulate dialog completion clearing the flag (end_dialog path).
+        DIALOG_OPEN.store(false, Ordering::Release);
+        assert!(!is_busy());
+        assert!(begin_dialog(), "can begin again after clear");
+        assert!(is_busy());
 
         DIALOG_OPEN.store(false, Ordering::SeqCst);
         assert!(!is_busy());
+    }
+
+    #[test]
+    fn concurrent_begin_dialog_false_when_busy() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
+        assert!(begin_dialog());
+        // Second "concurrent" attempt sees busy and fails without opening.
+        assert!(!begin_dialog());
+        assert!(is_busy());
+
+        // is_busy mirrors DIALOG_OPEN
+        DIALOG_OPEN.store(true, Ordering::SeqCst);
+        assert!(is_busy());
+        assert!(!begin_dialog());
+
+        DIALOG_OPEN.store(false, Ordering::SeqCst);
+        assert!(!is_busy());
+        assert!(begin_dialog());
+        DIALOG_OPEN.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn is_busy_false_after_reset() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert!(!is_busy());
+        assert!(begin_dialog());
+        reset();
+        assert!(!is_busy());
+        assert!(last_dir().is_none());
+    }
+
+    #[test]
+    fn resolve_start_dir_with_none_and_empty_state_uses_home_env() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("env-resolve");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        assert_eq!(resolve_start_dir(None), Some(home.join("Documents")));
+
+        // Remove Documents mid-test → falls back to home
+        std::fs::remove_dir_all(home.join("Documents")).unwrap();
+        assert_eq!(resolve_start_dir(None), Some(home.clone()));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -771,6 +1069,50 @@ mod tests {
         // These are no-ops on non-Apple platforms; just ensure they don't panic.
         reveal_in_finder(Path::new("/tmp"));
         open_path(Path::new("/tmp"));
+        prewarm();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stub_pickers_clear_busy_and_accept_starting_directory() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
+        // Even if busy was set, stubs force-clear DIALOG_OPEN.
+        DIALOG_OPEN.store(true, Ordering::SeqCst);
+        assert_eq!(
+            pick_file(Some(PathBuf::from("/tmp"))).try_recv(),
+            Ok(Some(None))
+        );
+        assert!(!is_busy());
+
+        DIALOG_OPEN.store(true, Ordering::SeqCst);
+        assert_eq!(
+            pick_files(Some(PathBuf::from("/tmp"))).try_recv(),
+            Ok(Some(Vec::new()))
+        );
+        assert!(!is_busy());
+
+        DIALOG_OPEN.store(true, Ordering::SeqCst);
+        assert_eq!(
+            pick_directory(Some(PathBuf::from("/tmp"))).try_recv(),
+            Ok(Some(None))
+        );
+        assert!(!is_busy());
+
+        DIALOG_OPEN.store(true, Ordering::SeqCst);
+        assert_eq!(
+            pick_save_file("x.pdf", Some(PathBuf::from("/tmp"))).try_recv(),
+            Ok(Some(None))
+        );
+        assert!(!is_busy());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stub_prewarm_is_noop() {
+        // prewarm() is empty on non-macOS; call repeatedly.
+        prewarm();
         prewarm();
     }
 }

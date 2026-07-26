@@ -692,4 +692,431 @@ mod tests {
         let _ = std::fs::remove_file(&executable);
         let _ = std::fs::remove_file(format!("{}.args", executable.display()));
     }
+
+    #[test]
+    fn supports_url_for_markdown_and_html_only() {
+        let module = DefuddleModule::with_executable("defuddle");
+        assert!(module.supports_url(OutputFormat::MARKDOWN));
+        assert!(module.supports_url(OutputFormat::HTML));
+        assert!(!module.supports_url(OutputFormat::PDF));
+        assert!(!module.supports_url(OutputFormat::DOCX));
+        assert!(!module.supports_url(OutputFormat::MP3));
+        assert!(!module.supports_url(OutputFormat("plain")));
+        assert!(!module.supports_url(OutputFormat::PNG));
+        assert!(!module.supports_url(OutputFormat::SRT));
+    }
+
+    #[test]
+    fn looks_like_url_edge_matrix() {
+        let yes = [
+            "https://example.com",
+            "http://example.com/",
+            "https://example.com:8443/path?q=1#frag",
+            "http://user:pass@example.com/x",
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://[2001:db8::1]/path",
+            "HTTPS://EXAMPLE.COM/A",
+            "  https://example.com  ",
+        ];
+        for url in yes {
+            assert!(looks_like_url(url), "expected url: {url}");
+        }
+
+        let no = [
+            "",
+            "   ",
+            "example.com",
+            "www.example.com",
+            "ftp://example.com",
+            "file:///tmp/x.html",
+            "mailto:user@example.com",
+            "not a url",
+            "report.docx",
+            "https://",
+            "http://",
+            "//example.com",
+            "javascript:alert(1)",
+        ];
+        for url in no {
+            assert!(!looks_like_url(url), "expected non-url: {url}");
+        }
+        // `https:///path` is accepted by the URL parser with an empty authority in
+        // some versions; only assert the helper does not panic on it.
+        let _ = looks_like_url("https:///path");
+    }
+
+    #[test]
+    fn non_public_host_edge_matrix() {
+        let private = [
+            "http://localhost/",
+            "http://localhost:3000/x",
+            "http://app.localhost/x",
+            "http://foo.local/",
+            "http://bar.local:8080/",
+            "http://127.0.0.1/",
+            "http://127.0.0.1:9/",
+            "http://10.0.0.1/",
+            "http://10.255.255.255/",
+            "http://172.16.0.1/",
+            "http://172.31.255.1/",
+            "http://192.168.0.1/",
+            "http://192.168.255.255/",
+            "http://169.254.1.1/",
+            "http://0.0.0.0/",
+            "http://255.255.255.255/",
+            "http://224.0.0.1/",
+            "http://100.64.0.1/",
+            "http://100.127.1.1/",
+            "http://198.18.0.1/",
+            "http://192.0.0.1/",
+            "http://240.0.0.1/",
+            "http://[::1]/",
+            "http://[fe80::1]/",
+            "http://[fc00::1]/",
+            "http://[fd12:3456:789a::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:10.0.0.2]/",
+            "http://[::ffff:192.168.1.1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://metadata/",
+            "http://metadata.google.internal/",
+            "http://x.metadata.google.internal/",
+            "http://svc.internal/",
+            "http://0.0.0.0:80/",
+        ];
+        for url in private {
+            assert!(
+                url_targets_non_public_host(url),
+                "expected non-public: {url}"
+            );
+        }
+
+        let public = [
+            "https://example.com/",
+            "https://example.com:443/path",
+            "http://8.8.8.8/",
+            "http://1.1.1.1/dns",
+            "https://93.184.216.34/",
+            "http://[2001:4860:4860::8888]/",
+            // Invalid URLs are not non-public (literal check returns false).
+            "not-a-url",
+            "",
+        ];
+        for url in public {
+            assert!(
+                !url_targets_non_public_host(url),
+                "expected public/non-match: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_display_host_and_redact_edge_matrix() {
+        let host_cases = [
+            ("https://example.com/path", "example.com"),
+            ("http://localhost:3000/x", "localhost"),
+            (
+                "https://user:pass@cdn.example.org:8443/a",
+                "cdn.example.org",
+            ),
+            ("http://127.0.0.1/x", "127.0.0.1"),
+            ("http://[::1]/x", "[::1]"),
+            ("not-a-url", "url"),
+            ("", "url"),
+        ];
+        for (url, expected) in host_cases {
+            assert_eq!(url_display_host(url), expected, "host for {url}");
+        }
+
+        let redact_cases = [
+            (
+                "https://user:s3cret@example.com/private?q=1",
+                "https://example.com/private?q=1",
+            ),
+            ("http://onlyuser@example.com/", "http://example.com/"),
+            (
+                "https://example.com/no-creds",
+                "https://example.com/no-creds",
+            ),
+            ("not-a-url", "not-a-url"),
+        ];
+        for (input, expected) in redact_cases {
+            let redacted = redact_url_credentials(input);
+            assert_eq!(redacted, expected, "redact {input}");
+            assert!(!redacted.contains("s3cret"));
+            assert!(!redacted.contains("user:"));
+        }
+    }
+
+    #[test]
+    fn url_file_stem_edge_matrix() {
+        let cases = [
+            ("https://example.com/blog/my-post?ref=1", "my-post"),
+            ("https://example.com/", "example.com"),
+            ("https://example.com", "example.com"),
+            ("https://example.com/page.html", "page"),
+            ("https://example.com/a/b/c.d.e.md", "c.d.e"),
+            ("https://example.com/%20", "20"),
+            ("https://example.com/hello%20world", "hello-20world"),
+            ("https://example.com/!!!", "page"),
+            ("https://example.com/ok_file-name.2", "ok_file-name"),
+            ("https://sub.example.co.uk/x", "x"),
+            ("http://127.0.0.1/", "127.0.0.1"),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(url_file_stem(url), expected, "stem for {url}");
+        }
+    }
+
+    #[test]
+    fn block_private_urls_env_matrix() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized behind ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        assert!(block_private_urls());
+
+        for truthy in ["1", "true", "TRUE", "yes", "YES"] {
+            unsafe {
+                std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", truthy);
+            }
+            assert!(
+                !block_private_urls(),
+                "ALLOW={truthy} should disable blocking"
+            );
+            unsafe {
+                std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            }
+        }
+
+        for falsey in ["0", "false", "FALSE", "no", "NO"] {
+            unsafe {
+                std::env::set_var("SHIFT_BLOCK_PRIVATE_URLS", falsey);
+            }
+            assert!(
+                !block_private_urls(),
+                "BLOCK={falsey} should disable blocking"
+            );
+            unsafe {
+                std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+            }
+        }
+
+        // ALLOW takes precedence over BLOCK=1.
+        unsafe {
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+            std::env::set_var("SHIFT_BLOCK_PRIVATE_URLS", "1");
+        }
+        assert!(!block_private_urls());
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        assert!(block_private_urls());
+    }
+
+    #[test]
+    fn ensure_public_url_fetch_allowed_private_hosts_matrix() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+
+        for url in [
+            "http://127.0.0.1/secret",
+            "http://localhost/x",
+            "http://192.168.1.10/a",
+            "http://10.1.2.3/",
+            "http://[::1]/",
+            "http://metadata.google.internal/",
+        ] {
+            let err = ensure_public_url_fetch_allowed(url).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("non-public") || msg.contains("public internet"),
+                "url {url}: {msg}"
+            );
+            // Credentials must never appear in the error.
+            assert!(!msg.contains("s3cret"));
+        }
+
+        // Credentialed private URL still redacts userinfo in the error.
+        let err = ensure_public_url_fetch_allowed("http://user:s3cret@127.0.0.1/x").unwrap_err();
+        assert!(!err.to_string().contains("s3cret"));
+        assert!(!err.to_string().contains("user:"));
+
+        // Public literal IP allowed without DNS.
+        assert!(ensure_public_url_fetch_allowed("https://8.8.8.8/").is_ok());
+
+        // Opt-out allows private hosts.
+        unsafe {
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
+        assert!(ensure_public_url_fetch_allowed("http://127.0.0.1/x").is_ok());
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_url_rejects_unsupported_format_and_invalid_url() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-reject", std::process::id());
+        let executable = directory.join(format!("shift-defuddle-reject-{suffix}"));
+        std::fs::write(&executable, "#!/bin/sh\nprintf '# should not run\\n'").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let module = DefuddleModule::with_executable(&executable);
+        let opts = ConversionOptions::default();
+
+        let err = module
+            .convert_url("https://example.com/a", OutputFormat::PDF, &opts)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not produce") || err.to_string().contains("PDF"),
+            "{err}"
+        );
+
+        let err = module
+            .convert_url("not-a-url", OutputFormat::MARKDOWN, &opts)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid") || err.to_string().contains("URL"),
+            "{err}"
+        );
+
+        // Private host rejected before the fake binary runs.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        let err = module
+            .convert_url("http://127.0.0.1/x", OutputFormat::MARKDOWN, &opts)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-public") || err.to_string().contains("public internet"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_url_html_output_and_failure_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-html-url", std::process::id());
+        let executable = directory.join(format!("shift-defuddle-html-url-{suffix}"));
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '<article>ok</article>'",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let artifact = DefuddleModule::with_executable(&executable)
+            .convert_url(
+                "https://example.com/story",
+                OutputFormat::HTML,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bytes, b"<article>ok</article>");
+        assert_eq!(artifact.format, OutputFormat::HTML);
+        assert_eq!(artifact.module_id, "defuddle");
+        let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("parse"));
+        assert!(
+            !args.contains("--markdown"),
+            "html output must omit --markdown"
+        );
+
+        // Failing process.
+        let fail = directory.join(format!("shift-defuddle-fail-{suffix}"));
+        std::fs::write(&fail, "#!/bin/sh\necho boom >&2\nexit 2\n").unwrap();
+        let mut permissions = std::fs::metadata(&fail).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fail, permissions).unwrap();
+        let err = DefuddleModule::with_executable(&fail)
+            .convert_url(
+                "https://example.com/x",
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("boom") || err.to_string().contains("Defuddle"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        let _ = std::fs::remove_file(&fail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_local_html_rejects_unsupported_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-local-bad", std::process::id());
+        let executable = directory.join(format!("shift-defuddle-local-bad-{suffix}"));
+        let input = directory.join(format!("shift-defuddle-input-{suffix}.html"));
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'x'\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(&input, "<p>x</p>").unwrap();
+
+        let err = DefuddleModule::with_executable(&executable)
+            .convert(&input, OutputFormat::PDF, &ConversionOptions::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Markdown")
+                || err.to_string().contains("HTML")
+                || err.to_string().contains("PDF"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[test]
+    fn module_metadata_and_extensions() {
+        let module = DefuddleModule::with_executable("defuddle");
+        assert_eq!(module.id(), "defuddle");
+        assert_eq!(module.label(), "Defuddle");
+        assert!(module.input_extensions().contains(&"html"));
+        assert!(module.input_extensions().contains(&"htm"));
+        assert!(module.output_formats().contains(&OutputFormat::MARKDOWN));
+        assert!(module.output_formats().contains(&OutputFormat::HTML));
+        assert!(
+            module
+                .chainable_output_formats()
+                .contains(&OutputFormat::MARKDOWN)
+        );
+    }
+
+    #[test]
+    fn defuddle_options_default() {
+        let opts = DefuddleOptions::default();
+        assert!(!opts.frontmatter);
+        assert!(opts.lang.is_none());
+    }
 }

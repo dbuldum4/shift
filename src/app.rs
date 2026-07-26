@@ -3330,3 +3330,811 @@ pub(crate) fn main() {
         cx.activate(true);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pure unit tests for conversion/history helpers at the top of `app.rs`.
+    //!
+    //! These cover `ConversionState`, store round-trips, and `history_from_store`
+    //! without GPUI, disk I/O, or external converters.
+
+    use super::*;
+    use shift_core::conversion::{ConversionArtifact, OutputFormat};
+    use shift_core::history::{
+        LoadedHistory, StoredHistoryEntry, StoredOutcome, StoredSource, intern_module_id,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn artifact(
+        file_name: &str,
+        format: OutputFormat,
+        module_id: &'static str,
+        bytes: Vec<u8>,
+    ) -> ConversionArtifact {
+        ConversionArtifact {
+            file_name: file_name.to_owned(),
+            media_type: format.media_type(),
+            bytes,
+            format,
+            module_id,
+            pipeline: vec![module_id],
+            invocations: Vec::new(),
+        }
+    }
+
+    fn history_entry(
+        id: u64,
+        source: HistorySource,
+        output_format: OutputFormat,
+        outcome: HistoryOutcome,
+        archived: bool,
+    ) -> ConversionHistoryEntry {
+        let name = match &source {
+            HistorySource::File(path) => path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".into()),
+            HistorySource::Url(url) => url.clone(),
+        };
+        ConversionHistoryEntry {
+            id,
+            source,
+            name: name.into(),
+            detail: "detail".into(),
+            extension_label: "EXT".into(),
+            badge_color: 0x1a1a1a,
+            badge_text_color: 0xcccccc,
+            output_format,
+            outcome,
+            archived,
+        }
+    }
+
+    fn assert_ready_outcome_eq(left: &HistoryOutcome, right: &HistoryOutcome) {
+        // HistoryOutcome does not derive Eq; compare Ready paths via stored form.
+        let left_entry = history_entry(
+            0,
+            HistorySource::File(PathBuf::from("/tmp/a")),
+            OutputFormat::MARKDOWN,
+            left.clone(),
+            false,
+        );
+        let right_entry = history_entry(
+            0,
+            HistorySource::File(PathBuf::from("/tmp/a")),
+            OutputFormat::MARKDOWN,
+            right.clone(),
+            false,
+        );
+        assert_eq!(
+            to_stored_entry(&left_entry).outcome,
+            to_stored_entry(&right_entry).outcome
+        );
+    }
+
+    // --- ConversionState ---
+
+    #[test]
+    fn ready_artifact_some_only_for_ready() {
+        let art = Arc::new(artifact(
+            "out.md",
+            OutputFormat::MARKDOWN,
+            "pandoc",
+            b"# hi".to_vec(),
+        ));
+
+        assert!(ConversionState::Empty.ready_artifact().is_none());
+        assert!(ConversionState::Converting.ready_artifact().is_none());
+        assert!(
+            ConversionState::Failed("boom".into())
+                .ready_artifact()
+                .is_none()
+        );
+
+        let ready = ConversionState::Ready(Arc::clone(&art));
+        let got = ready.ready_artifact().expect("Ready yields artifact");
+        assert!(Arc::ptr_eq(&got, &art));
+        assert_eq!(got.file_name, "out.md");
+        assert_eq!(got.bytes, b"# hi");
+    }
+
+    #[test]
+    fn conversion_state_ready_clone_shares_arc() {
+        let art = Arc::new(artifact(
+            "large.bin",
+            OutputFormat::PDF,
+            "docling",
+            vec![0u8; 64 * 1024],
+        ));
+        let state = ConversionState::Ready(Arc::clone(&art));
+        let cloned = state.clone();
+
+        match (&state, &cloned) {
+            (ConversionState::Ready(a), ConversionState::Ready(b)) => {
+                assert!(Arc::ptr_eq(a, b));
+                // Original local + state + clone = 3 strong refs.
+                assert_eq!(Arc::strong_count(a), 3);
+            }
+            _ => panic!("expected Ready/Ready"),
+        }
+
+        // ready_artifact also returns a clone of the same Arc.
+        let via_method = state.ready_artifact().unwrap();
+        assert!(Arc::ptr_eq(&via_method, &art));
+        assert_eq!(Arc::strong_count(&art), 4);
+    }
+
+    // --- HistorySource equality ---
+
+    #[test]
+    fn history_source_equality() {
+        let path_a = PathBuf::from("/tmp/doc.pdf");
+        let path_b = PathBuf::from("/tmp/other.pdf");
+        assert_eq!(
+            HistorySource::File(path_a.clone()),
+            HistorySource::File(path_a.clone())
+        );
+        assert_ne!(
+            HistorySource::File(path_a.clone()),
+            HistorySource::File(path_b)
+        );
+        assert_eq!(
+            HistorySource::Url("https://example.com/a".into()),
+            HistorySource::Url("https://example.com/a".into())
+        );
+        assert_ne!(
+            HistorySource::Url("https://example.com/a".into()),
+            HistorySource::Url("https://example.com/b".into())
+        );
+        assert_ne!(
+            HistorySource::File(path_a),
+            HistorySource::Url("https://example.com/a".into())
+        );
+    }
+
+    // --- to_stored_entry / from_stored_entry round-trips ---
+
+    #[test]
+    fn store_round_trip_file_ready_markdown() {
+        let entry = history_entry(
+            7,
+            HistorySource::File(PathBuf::from("/Users/me/Notes/report.docx")),
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::Ready(Arc::new(artifact(
+                "report.md",
+                OutputFormat::MARKDOWN,
+                "pandoc",
+                b"# Report\n".to_vec(),
+            ))),
+            false,
+        );
+        let stored = to_stored_entry(&entry);
+        assert_eq!(stored.id, 7);
+        assert_eq!(
+            stored.source,
+            StoredSource::File(PathBuf::from("/Users/me/Notes/report.docx"))
+        );
+        assert_eq!(stored.output_format, "markdown");
+        assert!(!stored.archived);
+        match &stored.outcome {
+            StoredOutcome::Ready {
+                module_id,
+                file_name,
+                format,
+                bytes,
+            } => {
+                assert_eq!(module_id, "pandoc");
+                assert_eq!(file_name, "report.md");
+                assert_eq!(format, "markdown");
+                assert_eq!(bytes, b"# Report\n");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+
+        let back = from_stored_entry(stored).expect("valid entry");
+        assert_eq!(back.id, entry.id);
+        assert_eq!(back.source, entry.source);
+        assert_eq!(back.name.as_ref(), entry.name.as_ref());
+        assert_eq!(back.detail.as_ref(), entry.detail.as_ref());
+        assert_eq!(
+            back.extension_label.as_ref(),
+            entry.extension_label.as_ref()
+        );
+        assert_eq!(back.badge_color, entry.badge_color);
+        assert_eq!(back.badge_text_color, entry.badge_text_color);
+        assert_eq!(back.output_format, entry.output_format);
+        assert_eq!(back.archived, entry.archived);
+        assert_ready_outcome_eq(&back.outcome, &entry.outcome);
+
+        if let HistoryOutcome::Ready(restored) = &back.outcome {
+            // Pipeline/invocations are not persisted; restore clears them.
+            assert!(restored.pipeline.is_empty());
+            assert!(restored.invocations.is_empty());
+            assert_eq!(restored.module_id, "pandoc");
+            assert_eq!(restored.media_type, OutputFormat::MARKDOWN.media_type());
+        } else {
+            panic!("expected Ready outcome");
+        }
+    }
+
+    #[test]
+    fn store_round_trip_file_ready_pdf() {
+        let bytes = vec![0x25, 0x50, 0x44, 0x46]; // %PDF
+        let entry = history_entry(
+            2,
+            HistorySource::File(PathBuf::from("/tmp/slides.md")),
+            OutputFormat::PDF,
+            HistoryOutcome::Ready(Arc::new(artifact(
+                "slides.pdf",
+                OutputFormat::PDF,
+                "pandoc",
+                bytes.clone(),
+            ))),
+            false,
+        );
+        let back = from_stored_entry(to_stored_entry(&entry)).expect("round trip");
+        assert_eq!(back.output_format, OutputFormat::PDF);
+        match back.outcome {
+            HistoryOutcome::Ready(a) => {
+                assert_eq!(a.format, OutputFormat::PDF);
+                assert_eq!(a.bytes, bytes);
+                assert_eq!(a.media_type, "application/pdf");
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn store_round_trip_file_ready_media_formats() {
+        for (format, module_id, file_name, payload) in [
+            (
+                OutputFormat::MP3,
+                "ffmpeg",
+                "clip.mp3",
+                b"ID3fake".as_slice(),
+            ),
+            (OutputFormat::WAV, "ffmpeg", "clip.wav", b"RIFFfake"),
+            (OutputFormat::MP4, "ffmpeg", "clip.mp4", b"ftyp"),
+            (
+                OutputFormat::SRT,
+                "ffmpeg",
+                "clip.srt",
+                b"1\n00:00:00,000 --> 00:00:01,000\nhi\n",
+            ),
+            (OutputFormat::PNG, "ffmpeg", "frame.png", b"\x89PNG"),
+        ] {
+            let entry = history_entry(
+                11,
+                HistorySource::File(PathBuf::from("/tmp/clip.mkv")),
+                format,
+                HistoryOutcome::Ready(Arc::new(artifact(
+                    file_name,
+                    format,
+                    module_id,
+                    payload.to_vec(),
+                ))),
+                false,
+            );
+            let stored = to_stored_entry(&entry);
+            assert_eq!(stored.output_format, format.id());
+            let back = from_stored_entry(stored).expect("media round trip");
+            assert_eq!(back.output_format, format);
+            match back.outcome {
+                HistoryOutcome::Ready(a) => {
+                    assert_eq!(a.format, format);
+                    assert_eq!(a.file_name, file_name);
+                    assert_eq!(a.bytes, payload);
+                    assert_eq!(a.module_id, module_id);
+                    assert_eq!(a.media_type, format.media_type());
+                }
+                _ => panic!("expected Ready for {}", format.id()),
+            }
+        }
+    }
+
+    #[test]
+    fn store_url_source_redacts_credentials() {
+        let secret_url = "https://user:pass@host.example/path?q=1".to_owned();
+        let entry = history_entry(
+            3,
+            HistorySource::Url(secret_url.clone()),
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::Ready(Arc::new(artifact(
+                "article.md",
+                OutputFormat::MARKDOWN,
+                "defuddle",
+                b"# Article".to_vec(),
+            ))),
+            false,
+        );
+
+        let stored = to_stored_entry(&entry);
+        match &stored.source {
+            StoredSource::Url(url) => {
+                assert!(!url.contains("pass"), "password must not be stored: {url}");
+                assert!(!url.contains("user:"), "userinfo must not be stored: {url}");
+                assert!(url.contains("host.example"));
+                assert!(url.contains("/path"));
+                // Matches defuddle redaction: https://host.example/path?q=1
+                assert_eq!(url, "https://host.example/path?q=1");
+            }
+            other => panic!("expected Url source, got {other:?}"),
+        }
+
+        // In-memory entry still holds the original; only the stored form is redacted.
+        assert_eq!(entry.source, HistorySource::Url(secret_url));
+
+        let back = from_stored_entry(stored).expect("round trip");
+        assert_eq!(
+            back.source,
+            HistorySource::Url("https://host.example/path?q=1".into())
+        );
+    }
+
+    #[test]
+    fn store_round_trip_ready_large() {
+        let entry = history_entry(
+            9,
+            HistorySource::File(PathBuf::from("/tmp/movie.mp4")),
+            OutputFormat::MP3,
+            HistoryOutcome::ReadyLarge {
+                module_id: "ffmpeg".into(),
+                byte_len: 8_000_000,
+            },
+            false,
+        );
+        let stored = to_stored_entry(&entry);
+        match &stored.outcome {
+            StoredOutcome::ReadyLarge {
+                module_id,
+                byte_len,
+            } => {
+                assert_eq!(module_id, "ffmpeg");
+                assert_eq!(*byte_len, 8_000_000);
+            }
+            other => panic!("expected ReadyLarge, got {other:?}"),
+        }
+        let back = from_stored_entry(stored).expect("round trip");
+        match back.outcome {
+            HistoryOutcome::ReadyLarge {
+                module_id,
+                byte_len,
+            } => {
+                assert_eq!(module_id.as_ref(), "ffmpeg");
+                assert_eq!(byte_len, 8_000_000);
+            }
+            _ => panic!("expected ReadyLarge"),
+        }
+        assert_eq!(back.output_format, OutputFormat::MP3);
+    }
+
+    #[test]
+    fn store_round_trip_failed() {
+        let entry = history_entry(
+            4,
+            HistorySource::File(PathBuf::from("/tmp/bad.pdf")),
+            OutputFormat::HTML,
+            HistoryOutcome::Failed("engine missing: docling".into()),
+            false,
+        );
+        let stored = to_stored_entry(&entry);
+        assert_eq!(
+            stored.outcome,
+            StoredOutcome::Failed("engine missing: docling".into())
+        );
+        let back = from_stored_entry(stored).expect("round trip");
+        match back.outcome {
+            HistoryOutcome::Failed(msg) => assert_eq!(msg.as_ref(), "engine missing: docling"),
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn store_round_trip_archived_flags() {
+        for archived in [false, true] {
+            let entry = history_entry(
+                5,
+                HistorySource::File(PathBuf::from("/tmp/a.md")),
+                OutputFormat::MARKDOWN,
+                HistoryOutcome::Failed("x".into()),
+                archived,
+            );
+            let stored = to_stored_entry(&entry);
+            assert_eq!(stored.archived, archived);
+            let back = from_stored_entry(stored).expect("round trip");
+            assert_eq!(back.archived, archived);
+        }
+    }
+
+    #[test]
+    fn from_stored_entry_none_for_invalid_output_format() {
+        let entry = StoredHistoryEntry {
+            id: 1,
+            source: StoredSource::File(PathBuf::from("/tmp/x.bin")),
+            name: "x.bin".into(),
+            detail: "d".into(),
+            extension_label: "BIN".into(),
+            badge_color: 1,
+            badge_text_color: 2,
+            output_format: "not-a-real-format".into(),
+            outcome: StoredOutcome::Failed("nope".into()),
+            archived: false,
+        };
+        assert!(from_stored_entry(entry).is_none());
+    }
+
+    #[test]
+    fn from_stored_entry_ready_unparsable_artifact_format_falls_back_to_output_format() {
+        // When the nested Ready.format string is unknown, restore uses entry.output_format.
+        let entry = StoredHistoryEntry {
+            id: 42,
+            source: StoredSource::File(PathBuf::from("/tmp/doc.docx")),
+            name: "doc.docx".into(),
+            detail: "d".into(),
+            extension_label: "DOCX".into(),
+            badge_color: 1,
+            badge_text_color: 2,
+            output_format: "markdown".into(),
+            outcome: StoredOutcome::Ready {
+                module_id: "pandoc".into(),
+                file_name: "doc.md".into(),
+                format: "totally-unknown-format-xyz".into(),
+                bytes: b"# body".to_vec(),
+            },
+            archived: false,
+        };
+        let back = from_stored_entry(entry).expect("output_format is valid");
+        assert_eq!(back.output_format, OutputFormat::MARKDOWN);
+        match back.outcome {
+            HistoryOutcome::Ready(a) => {
+                assert_eq!(
+                    a.format,
+                    OutputFormat::MARKDOWN,
+                    "unparsable artifact format must fall back to entry output_format"
+                );
+                assert_eq!(a.media_type, OutputFormat::MARKDOWN.media_type());
+                assert_eq!(a.bytes, b"# body");
+                assert_eq!(a.file_name, "doc.md");
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn from_stored_entry_ready_parsable_artifact_format_kept_even_if_differs_from_entry() {
+        // Fallback only applies when parse fails; a valid nested format is preserved.
+        let entry = StoredHistoryEntry {
+            id: 43,
+            source: StoredSource::File(PathBuf::from("/tmp/doc.md")),
+            name: "doc.md".into(),
+            detail: "d".into(),
+            extension_label: "MD".into(),
+            badge_color: 1,
+            badge_text_color: 2,
+            output_format: "markdown".into(),
+            outcome: StoredOutcome::Ready {
+                module_id: "pandoc".into(),
+                file_name: "doc.html".into(),
+                format: "html".into(),
+                bytes: b"<p>hi</p>".to_vec(),
+            },
+            archived: false,
+        };
+        let back = from_stored_entry(entry).expect("valid");
+        assert_eq!(back.output_format, OutputFormat::MARKDOWN);
+        match back.outcome {
+            HistoryOutcome::Ready(a) => {
+                assert_eq!(a.format, OutputFormat::HTML);
+                assert_eq!(a.media_type, OutputFormat::HTML.media_type());
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn from_stored_entry_interns_known_module_ids() {
+        for module in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+            let entry = StoredHistoryEntry {
+                id: 1,
+                source: StoredSource::File(PathBuf::from("/tmp/in")),
+                name: "in".into(),
+                detail: "d".into(),
+                extension_label: "X".into(),
+                badge_color: 0,
+                badge_text_color: 0,
+                output_format: "markdown".into(),
+                outcome: StoredOutcome::Ready {
+                    module_id: module.to_owned(),
+                    file_name: "out.md".into(),
+                    format: "markdown".into(),
+                    bytes: vec![],
+                },
+                archived: false,
+            };
+            let back = from_stored_entry(entry).expect("valid");
+            match back.outcome {
+                HistoryOutcome::Ready(a) => {
+                    assert_eq!(a.module_id, module);
+                    // Must be the same static as intern_module_id returns.
+                    assert!(std::ptr::eq(a.module_id, intern_module_id(module)));
+                }
+                _ => panic!("expected Ready"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_stored_entry_unknown_module_id_becomes_unknown() {
+        let entry = StoredHistoryEntry {
+            id: 1,
+            source: StoredSource::File(PathBuf::from("/tmp/in")),
+            name: "in".into(),
+            detail: "d".into(),
+            extension_label: "X".into(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "markdown".into(),
+            outcome: StoredOutcome::Ready {
+                module_id: "custom-plugin-v2".into(),
+                file_name: "out.md".into(),
+                format: "markdown".into(),
+                bytes: vec![],
+            },
+            archived: false,
+        };
+        let back = from_stored_entry(entry).expect("valid");
+        match back.outcome {
+            HistoryOutcome::Ready(a) => {
+                assert_eq!(a.module_id, "unknown");
+                assert!(std::ptr::eq(
+                    a.module_id,
+                    intern_module_id("custom-plugin-v2")
+                ));
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    // --- history_from_store ---
+
+    #[test]
+    fn history_from_store_empty_defaults_next_id_to_one() {
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: Vec::new(),
+            next_id: 0,
+        });
+        assert!(entries.is_empty());
+        assert_eq!(next_id, 1, "next_id must be at least 1");
+
+        let (entries, next_id) = history_from_store(LoadedHistory::default());
+        assert!(entries.is_empty());
+        assert_eq!(next_id, 1);
+    }
+
+    #[test]
+    fn history_from_store_next_id_is_max_of_loaded_and_max_entry_plus_one() {
+        let make = |id: u64| StoredHistoryEntry {
+            id,
+            source: StoredSource::File(PathBuf::from(format!("/tmp/{id}.md"))),
+            name: format!("{id}.md"),
+            detail: "d".into(),
+            extension_label: "MD".into(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "markdown".into(),
+            outcome: StoredOutcome::Failed("x".into()),
+            archived: false,
+        };
+
+        // loaded.next_id already ahead of max entry id.
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: vec![make(1), make(3), make(2)],
+            next_id: 10,
+        });
+        assert_eq!(entries.len(), 3);
+        assert_eq!(next_id, 10);
+
+        // max entry id forces next_id up (loaded.next_id is stale/low).
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: vec![make(1), make(5), make(2)],
+            next_id: 2,
+        });
+        assert_eq!(entries.len(), 3);
+        assert_eq!(next_id, 6); // max_id(5) + 1
+
+        // Equal case: loaded.next_id == max_id + 1.
+        let (_, next_id) = history_from_store(LoadedHistory {
+            entries: vec![make(4)],
+            next_id: 5,
+        });
+        assert_eq!(next_id, 5);
+    }
+
+    #[test]
+    fn history_from_store_skips_unparsable_entries_keeps_valid() {
+        let valid = |id: u64| StoredHistoryEntry {
+            id,
+            source: StoredSource::File(PathBuf::from(format!("/tmp/{id}.md"))),
+            name: format!("{id}.md"),
+            detail: "ok".into(),
+            extension_label: "MD".into(),
+            badge_color: 1,
+            badge_text_color: 2,
+            output_format: "markdown".into(),
+            outcome: StoredOutcome::Failed(format!("fail-{id}")),
+            archived: id % 2 == 0,
+        };
+        let invalid = |id: u64| StoredHistoryEntry {
+            id,
+            source: StoredSource::Url(format!("https://example.com/{id}")),
+            name: format!("{id}"),
+            detail: "bad".into(),
+            extension_label: "?".into(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "not-a-format".into(),
+            outcome: StoredOutcome::Failed("ignored".into()),
+            archived: false,
+        };
+
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: vec![valid(1), invalid(2), valid(3), invalid(99), valid(4)],
+            next_id: 1,
+        });
+        // Invalid formats skipped; max_id still considers their ids (99).
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(next_id, 100); // max(1, 99+1)
+
+        match &entries[0].outcome {
+            HistoryOutcome::Failed(msg) => assert_eq!(msg.as_ref(), "fail-1"),
+            _ => panic!("expected Failed"),
+        }
+        assert!(!entries[1].archived);
+        assert!(entries[2].archived);
+    }
+
+    #[test]
+    fn history_from_store_next_id_at_least_one_with_only_invalid_entries() {
+        // All entries unparsable: entries empty, but max_id still advances next_id.
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: vec![StoredHistoryEntry {
+                id: 0,
+                source: StoredSource::File(PathBuf::from("/tmp/x")),
+                name: "x".into(),
+                detail: "d".into(),
+                extension_label: "X".into(),
+                badge_color: 0,
+                badge_text_color: 0,
+                output_format: "nope".into(),
+                outcome: StoredOutcome::Failed("x".into()),
+                archived: false,
+            }],
+            next_id: 0,
+        });
+        assert!(entries.is_empty());
+        // max_id = 0 → saturating_add(1) = 1; max(loaded 0, 1).max(1) = 1
+        assert_eq!(next_id, 1);
+    }
+
+    #[test]
+    fn history_from_store_preserves_mixed_outcomes_and_sources() {
+        let stored = vec![
+            to_stored_entry(&history_entry(
+                1,
+                HistorySource::File(PathBuf::from("/tmp/a.docx")),
+                OutputFormat::MARKDOWN,
+                HistoryOutcome::Ready(Arc::new(artifact(
+                    "a.md",
+                    OutputFormat::MARKDOWN,
+                    "markitdown",
+                    b"a".to_vec(),
+                ))),
+                false,
+            )),
+            to_stored_entry(&history_entry(
+                2,
+                HistorySource::Url("https://user:secret@news.example/story".into()),
+                OutputFormat::HTML,
+                HistoryOutcome::ReadyLarge {
+                    module_id: "defuddle".into(),
+                    byte_len: 1_000_000,
+                },
+                true,
+            )),
+            to_stored_entry(&history_entry(
+                3,
+                HistorySource::File(PathBuf::from("/tmp/b.mp4")),
+                OutputFormat::MP3,
+                HistoryOutcome::Failed("ffmpeg missing".into()),
+                false,
+            )),
+        ];
+        // Confirm credentials were redacted before load.
+        match &stored[1].source {
+            StoredSource::Url(u) => assert!(!u.contains("secret")),
+            _ => panic!("url"),
+        }
+
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: stored,
+            next_id: 0,
+        });
+        assert_eq!(entries.len(), 3);
+        assert_eq!(next_id, 4);
+        assert!(matches!(entries[0].outcome, HistoryOutcome::Ready(_)));
+        assert!(matches!(
+            entries[1].outcome,
+            HistoryOutcome::ReadyLarge { .. }
+        ));
+        assert!(matches!(entries[2].outcome, HistoryOutcome::Failed(_)));
+        assert_eq!(
+            entries[1].source,
+            HistorySource::Url("https://news.example/story".into())
+        );
+        assert!(entries[1].archived);
+    }
+
+    #[test]
+    fn ready_outcomes_equal_via_stored_form() {
+        let a = HistoryOutcome::Ready(Arc::new(artifact(
+            "x.md",
+            OutputFormat::MARKDOWN,
+            "pandoc",
+            b"same".to_vec(),
+        )));
+        let b = HistoryOutcome::Ready(Arc::new(artifact(
+            "x.md",
+            OutputFormat::MARKDOWN,
+            "pandoc",
+            b"same".to_vec(),
+        )));
+        let c = HistoryOutcome::Ready(Arc::new(artifact(
+            "x.md",
+            OutputFormat::MARKDOWN,
+            "pandoc",
+            b"different".to_vec(),
+        )));
+        assert_ready_outcome_eq(&a, &b);
+        let a_stored = to_stored_entry(&history_entry(
+            1,
+            HistorySource::File(PathBuf::from("/t")),
+            OutputFormat::MARKDOWN,
+            a,
+            false,
+        ));
+        let c_stored = to_stored_entry(&history_entry(
+            1,
+            HistorySource::File(PathBuf::from("/t")),
+            OutputFormat::MARKDOWN,
+            c,
+            false,
+        ));
+        assert_ne!(a_stored.outcome, c_stored.outcome);
+    }
+
+    #[test]
+    fn double_round_trip_is_stable_for_file_ready() {
+        let entry = history_entry(
+            100,
+            HistorySource::File(PathBuf::from("/data/input.rst")),
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::Ready(Arc::new(artifact(
+                "input.md",
+                OutputFormat::MARKDOWN,
+                "pandoc",
+                b"stable".to_vec(),
+            ))),
+            true,
+        );
+        let once = from_stored_entry(to_stored_entry(&entry)).unwrap();
+        let twice = from_stored_entry(to_stored_entry(&once)).unwrap();
+        assert_eq!(to_stored_entry(&once), to_stored_entry(&twice));
+        assert_eq!(once.id, twice.id);
+        assert!(once.archived);
+    }
+}
