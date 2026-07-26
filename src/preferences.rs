@@ -309,4 +309,104 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn save_fails_without_home_or_app_support() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        env_guard.apply_with_app_support(None, None, None);
+
+        assert!(preferences_path().is_none());
+        let err = save_module_priority(&["pandoc".to_owned()]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("home") || err.to_string().contains("directory"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn normalize_empty_list_yields_defaults() {
+        assert_eq!(normalize(std::iter::empty()), default_module_priority());
+        assert_eq!(normalize([""]), default_module_priority());
+        assert_eq!(normalize([" ", "\t"]), default_module_priority());
+        assert_eq!(normalize(["", "unknown", ""]), default_module_priority());
+    }
+
+    #[test]
+    fn single_module_env_var_permutations() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        let defaults = default_module_priority();
+
+        for module in DEFAULT_MODULES {
+            env_guard.apply_with_app_support(None, None, Some(module));
+            let priority = load_module_priority();
+            assert_eq!(
+                priority.first().map(String::as_str),
+                Some(*module),
+                "single-module env should put {module} first"
+            );
+            assert_eq!(priority.len(), defaults.len());
+            for expected in &defaults {
+                assert!(
+                    priority.contains(expected),
+                    "missing {expected} when env is {module}: {priority:?}"
+                );
+            }
+        }
+
+        // Reverse order of all modules.
+        let reversed: Vec<&str> = DEFAULT_MODULES.iter().copied().rev().collect();
+        env_guard.apply_with_app_support(None, None, Some(&reversed.join(",")));
+        assert_eq!(
+            load_module_priority(),
+            reversed.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_string_app_support_dir_still_resolves_path() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env_guard = EnvGuard::new();
+        // Empty override is still Some("") from the env API after set_var.
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", "");
+            std::env::remove_var("SHIFT_MODULE_PRIORITY");
+        }
+        let path = preferences_path();
+        assert_eq!(
+            path,
+            Some(PathBuf::from("").join("module-priority")),
+            "empty SHIFT_APP_SUPPORT_DIR should still produce a path"
+        );
+        // Drop guard restores prior env values.
+        drop(env_guard);
+    }
+
+    #[test]
+    fn concurrent_env_lock_stress_small() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let env_guard = EnvGuard::new();
+                let module = DEFAULT_MODULES[i % DEFAULT_MODULES.len()];
+                env_guard.apply_with_app_support(None, None, Some(module));
+                let priority = load_module_priority();
+                assert_eq!(priority.first().map(String::as_str), Some(module));
+                // Hold the lock briefly so others queue.
+                thread::sleep(std::time::Duration::from_millis(5));
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker panicked");
+        }
+    }
 }

@@ -1634,4 +1634,280 @@ mod tests {
         assert!(script.contains("exit_code=1"));
         assert!(script.contains("healthy=false"));
     }
+
+    #[test]
+    fn parse_version_remaining_pure_edges() {
+        // Blank lines before content.
+        assert_eq!(
+            parse_version_text("\n\n  \npandoc 3.1\n").as_deref(),
+            Some("3.1")
+        );
+        // CRLF.
+        assert_eq!(
+            parse_version_text("ffmpeg version 7.0.1 Copyright\r\n").as_deref(),
+            Some("7.0.1")
+        );
+        // Empty Docling version suffix: prefix match rejects empty rest, then
+        // second-token fallback yields the leftover label token (not a panic).
+        assert_eq!(
+            parse_version_text("Docling version: ").as_deref(),
+            Some("version:")
+        );
+        assert_eq!(
+            parse_version_text("Docling version:\n").as_deref(),
+            Some("version:")
+        );
+
+        // Parenthesized commit still yields the version token.
+        assert_eq!(
+            parse_version_text("typst 0.11.0 (abc1234)\n").as_deref(),
+            Some("0.11.0")
+        );
+        // Version-like second token is preferred even when it still carries a
+        // trailing comma (looks_like_version matches before trim fallback).
+        assert_eq!(
+            parse_version_text("tool 1.0-beta,").as_deref(),
+            Some("1.0-beta,")
+        );
+        // Non-version second token still uses the comma/semicolon trim path.
+        assert_eq!(parse_version_text("tool beta,").as_deref(), Some("beta"));
+        // Bare multipartite version.
+        assert_eq!(parse_version_text("10.20.30").as_deref(), Some("10.20.30"));
+        // Non-version first token, version second.
+        assert_eq!(
+            parse_version_text("release 4.5.6-rc1\n").as_deref(),
+            Some("4.5.6-rc1")
+        );
+        // looks_like_version additional edges.
+        assert!(looks_like_version("0.0.1"));
+        assert!(looks_like_version("2."));
+        assert!(!looks_like_version(""));
+        assert!(!looks_like_version("v"));
+        assert!(!looks_like_version("v2.0"));
+        assert!(!looks_like_version("abc"));
+        assert!(!looks_like_version("12"));
+        assert!(!looks_like_version(".2.3"));
+    }
+
+    #[test]
+    fn readiness_is_ready_and_labels_cover_both_variants() {
+        assert!(Readiness::Ready.is_ready());
+        assert!(!Readiness::Missing.is_ready());
+        assert_eq!(Readiness::Ready.label(), "ready");
+        assert_eq!(Readiness::Missing.label(), "missing");
+        assert_eq!(format!("{}", Readiness::Ready), "ready");
+        assert_eq!(format!("{}", Readiness::Missing), "missing");
+        assert_eq!(FormatAvailability::Available.label(), "available");
+        assert_eq!(
+            FormatAvailability::SupportedUnavailable.label(),
+            "supported (engine missing)"
+        );
+        assert_eq!(FormatAvailability::Unsupported.label(), "unsupported");
+    }
+
+    #[test]
+    fn format_availability_for_every_output_format_all() {
+        let registry = ConversionRegistry::default();
+        // Synthetic report: all engines ready, PDF engine ready.
+        let engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
+            .into_iter()
+            .map(|id| EngineDiagnostic {
+                id,
+                label: id,
+                readiness: Readiness::Ready,
+                version: Some("1".into()),
+                resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
+                env_override: "X",
+                install_hint: String::new(),
+                notes: None,
+            })
+            .collect();
+        let report = DiagnosticsReport {
+            engines,
+            pdf_engines: vec![PdfEngineDiagnostic {
+                name: "typst".into(),
+                readiness: Readiness::Ready,
+                version: Some("0.15".into()),
+                resolved_path: Some(PathBuf::from("/bin/typst")),
+                selected: true,
+            }],
+            selected_pdf_engine: Some("typst".into()),
+        };
+
+        let md = Path::new("notes.md");
+        let mut available = 0usize;
+        let mut supported_unavailable = 0usize;
+        let mut unsupported = 0usize;
+        for format in OutputFormat::ALL {
+            let avail = format_availability(&registry, &report, md, *format);
+            match avail {
+                FormatAvailability::Available => available += 1,
+                FormatAvailability::SupportedUnavailable => supported_unavailable += 1,
+                FormatAvailability::Unsupported => unsupported += 1,
+            }
+            // Must not panic and must be one of the three variants (exhaustive match).
+            assert!(
+                matches!(
+                    avail,
+                    FormatAvailability::Available
+                        | FormatAvailability::SupportedUnavailable
+                        | FormatAvailability::Unsupported
+                ),
+                "unexpected availability for {}",
+                format.id()
+            );
+        }
+        // Markdown input should support many Pandoc writers when engines are ready.
+        assert!(
+            available > 0,
+            "expected some Available formats for notes.md, got available={available} unsupported={unsupported}"
+        );
+        let _ = supported_unavailable;
+
+        // Unknown extension is unsupported for every catalog format.
+        let mystery = Path::new("file.xyzzy");
+        for format in OutputFormat::ALL {
+            assert_eq!(
+                format_availability(&registry, &report, mystery, *format),
+                FormatAvailability::Unsupported,
+                "mystery.xyzzy → {}",
+                format.id()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_version_output_in_text_and_script() {
+        let report = DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "ffmpeg",
+                    label: "FFmpeg",
+                    readiness: Readiness::Ready,
+                    version: None,
+                    resolved_path: Some(PathBuf::from("/bin/ffmpeg")),
+                    env_override: "SHIFT_FFMPEG_BIN",
+                    install_hint: String::new(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "pandoc",
+                    label: "Pandoc",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_PANDOC_BIN",
+                    install_hint: "brew install pandoc".into(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![PdfEngineDiagnostic {
+                name: "typst".into(),
+                readiness: Readiness::Ready,
+                version: None,
+                resolved_path: Some(PathBuf::from("/bin/typst")),
+                selected: true,
+            }],
+            selected_pdf_engine: Some("typst".into()),
+        };
+
+        let text = report.render_text();
+        assert!(
+            text.contains("unknown version"),
+            "ready engine without version should show 'unknown version':\n{text}"
+        );
+        assert!(
+            text.contains("—") || text.contains("missing"),
+            "missing engine should not invent a version:\n{text}"
+        );
+        // PDF ready without version uses "unknown".
+        assert!(
+            text.contains("unknown"),
+            "ready PDF engine without version should mention unknown:\n{text}"
+        );
+
+        let script = report.render_script();
+        assert!(script.contains("engine.ffmpeg=ready"), "script:\n{script}");
+        // Empty version renders as version= (empty value).
+        assert!(
+            script.contains("engine.ffmpeg=ready version="),
+            "missing version should be empty value:\n{script}"
+        );
+        assert!(script.contains("engine.pandoc=missing"));
+        assert!(script.contains("pdf.engine.typst=ready"));
+    }
+
+    #[test]
+    fn script_key_matrix_mixed_readiness() {
+        let ids = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let readiness = [
+            Readiness::Ready,
+            Readiness::Missing,
+            Readiness::Ready,
+            Readiness::Missing,
+            Readiness::Ready,
+        ];
+        let engines: Vec<_> = ids
+            .iter()
+            .zip(readiness.iter())
+            .map(|(id, readiness)| EngineDiagnostic {
+                id,
+                label: id,
+                readiness: *readiness,
+                version: if readiness.is_ready() {
+                    Some("1.0".into())
+                } else {
+                    None
+                },
+                resolved_path: if readiness.is_ready() {
+                    Some(PathBuf::from(format!("/bin/{id}")))
+                } else {
+                    None
+                },
+                env_override: "X",
+                install_hint: "hint".into(),
+                notes: None,
+            })
+            .collect();
+        let report = DiagnosticsReport {
+            engines,
+            pdf_engines: vec![
+                PdfEngineDiagnostic {
+                    name: "typst".into(),
+                    readiness: Readiness::Ready,
+                    version: Some("0.15".into()),
+                    resolved_path: Some(PathBuf::from("/bin/typst")),
+                    selected: true,
+                },
+                PdfEngineDiagnostic {
+                    name: "pdflatex".into(),
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    selected: false,
+                },
+            ],
+            selected_pdf_engine: Some("typst".into()),
+        };
+
+        let script = report.render_script();
+        for (id, readiness) in ids.iter().zip(readiness.iter()) {
+            let expected = format!("engine.{id}={}", readiness.label());
+            assert!(
+                script.contains(&expected),
+                "expected {expected} in:\n{script}"
+            );
+        }
+        assert!(script.contains("pdf.engine.typst=ready"));
+        assert!(script.contains("pdf.engine.pdflatex=missing"));
+        assert!(script.contains("pdf.selected=typst"));
+        assert!(script.contains("pdf.ready=true"));
+        assert!(script.contains("healthy=true"));
+        assert!(script.contains("complete=false")); // missing engines
+        assert!(script.contains("exit_code=0"));
+        // Paths with no spaces stay unquoted.
+        assert!(
+            script.contains("path=/bin/markitdown") || script.contains("path=\"/bin/markitdown\"")
+        );
+    }
 }

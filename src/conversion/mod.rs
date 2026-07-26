@@ -13,6 +13,9 @@ mod process;
 mod sources;
 mod suggest;
 
+#[cfg(test)]
+mod registry_parity;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;

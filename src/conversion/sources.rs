@@ -471,4 +471,256 @@ mod tests {
         assert_eq!(found, vec![pdf]);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn expansion_follows_symlink_to_directory_recursively() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_dir("symlink-dir");
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        let target_file = real.join("nested").join("doc.pdf");
+        std::fs::write(&target_file, b"%PDF").unwrap();
+        let link = root.join("alias");
+        symlink(&real, &link).unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found = expand_input_paths_with_extensions(&[link.as_path()], true, &exts).unwrap();
+        assert_eq!(found, vec![link.join("nested").join("doc.pdf")]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn max_files_boundary_exact() {
+        let dir = unique_dir("exact-max");
+        let mut files = Vec::new();
+        for i in 0..MAX_EXPAND_FILES {
+            let path = dir.join(format!("doc{i:04}.txt"));
+            std::fs::write(&path, b"x").unwrap();
+            files.push(path);
+        }
+
+        let mut exts = HashSet::new();
+        exts.insert("txt".into());
+        let found = expand_input_paths_with_extensions(&files, false, &exts).unwrap();
+        assert_eq!(found.len(), MAX_EXPAND_FILES);
+
+        // One more file tips over the hard cap.
+        let extra = dir.join("extra.txt");
+        std::fs::write(&extra, b"x").unwrap();
+        files.push(extra);
+        let err = expand_input_paths_with_extensions(&files, false, &exts).unwrap_err();
+        assert!(err.to_string().contains("too many input files"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn max_depth_exact_boundary() {
+        // Directories at depth 0..MAX_EXPAND_DEPTH-1 expand; a directory at
+        // depth MAX_EXPAND_DEPTH errors. Place a file at the deepest allowed level.
+        let root = unique_dir("depth-exact");
+        let mut dir = root.clone();
+        for _ in 0..(MAX_EXPAND_DEPTH - 1) {
+            dir = dir.join("sub");
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        let deep_file = dir.join("leaf.txt");
+        std::fs::write(&deep_file, b"ok").unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("txt".into());
+        let found = expand_input_paths_with_extensions(&[root.as_path()], true, &exts).unwrap();
+        assert_eq!(found, vec![deep_file]);
+
+        // One more directory level under the deep path should exceed the cap.
+        let too_deep_dir = dir.join("extra");
+        std::fs::create_dir_all(&too_deep_dir).unwrap();
+        std::fs::write(too_deep_dir.join("past.txt"), b"x").unwrap();
+        let err = expand_input_paths_with_extensions(&[root.as_path()], true, &exts).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_files_and_directories() {
+        let root = unique_dir("mixed");
+        let top = root.join("top.pdf");
+        std::fs::write(&top, b"%PDF").unwrap();
+        let nested_dir = root.join("folder");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join("nested.pdf");
+        std::fs::write(&nested, b"%PDF").unwrap();
+        let ignored = root.join("skip.bin");
+        std::fs::write(&ignored, b"x").unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        // Mix a file path and a directory path in one call.
+        let found =
+            expand_input_paths_with_extensions(&[top.as_path(), nested_dir.as_path()], true, &exts)
+                .unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&top));
+        assert!(found.contains(&nested));
+        assert!(!found.contains(&ignored));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extension_matching_is_case_insensitive() {
+        let dir = unique_dir("case");
+        let upper = dir.join("A.PDF");
+        let mixed = dir.join("B.PdF");
+        let lower = dir.join("c.pdf");
+        std::fs::write(&upper, b"%PDF").unwrap();
+        std::fs::write(&mixed, b"%PDF").unwrap();
+        std::fs::write(&lower, b"%PDF").unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found = expand_input_paths_with_extensions(
+            &[upper.as_path(), mixed.as_path(), lower.as_path()],
+            false,
+            &exts,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 3);
+        assert!(found.contains(&upper));
+        assert!(found.contains(&mixed));
+        assert!(found.contains(&lower));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_directory_recursive_returns_empty() {
+        let dir = unique_dir("empty-rec");
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
+        assert!(found.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_components_are_handled() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // macOS/APFS rejects non-UTF-8 path components at create time (EILSEQ).
+        // Still verify expand logic does not panic on a non-UTF-8 PathBuf: tilde
+        // expansion is skipped (to_str fails) and the missing path surfaces as an error.
+        let weird = PathBuf::from(OsStr::from_bytes(b"/tmp/shift-non-utf8-\x80\x81.pdf"));
+        assert!(weird.to_str().is_none());
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let result = expand_input_paths_with_extensions(&[weird.as_path()], false, &exts);
+        assert!(
+            result.is_err(),
+            "missing non-utf8 path should error, not panic"
+        );
+        assert!(result.unwrap_err().to_string().contains("could not read"));
+
+        // If the host FS allows non-UTF-8 names, exercise the happy path too.
+        let dir = unique_dir("non-utf8");
+        let weird_name = OsStr::from_bytes(b"file-\x80\x81");
+        let weird_dir = dir.join(weird_name);
+        match std::fs::create_dir_all(&weird_dir) {
+            Ok(()) => {
+                let pdf = weird_dir.join("ok.pdf");
+                std::fs::write(&pdf, b"%PDF").unwrap();
+                let found =
+                    expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
+                assert_eq!(found, vec![pdf]);
+            }
+            Err(error) => {
+                // Expected on macOS: Illegal byte sequence.
+                assert!(
+                    error.raw_os_error() == Some(92)
+                        || error.to_string().contains("Illegal byte sequence")
+                        || error.kind() == std::io::ErrorKind::InvalidInput,
+                    "unexpected create_dir error: {error}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supported_input_extensions_from_custom_registry() {
+        use crate::conversion::{
+            ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
+        };
+        use std::path::Path;
+
+        struct OnlyFooModule;
+
+        impl ConversionModule for OnlyFooModule {
+            fn id(&self) -> &'static str {
+                "only-foo"
+            }
+            fn label(&self) -> &'static str {
+                "Only Foo"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["FOO", "Bar"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                _output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Err(ConversionError::new("unused"))
+            }
+        }
+
+        let registry = ConversionRegistry::new().with_module(OnlyFooModule);
+        let exts = supported_input_extensions(&registry);
+        // Registry extensions are lowercased when collected.
+        assert_eq!(exts.len(), 2);
+        assert!(exts.contains("foo"));
+        assert!(exts.contains("bar"));
+        assert!(!exts.contains("FOO"));
+        assert!(!exts.contains("pdf"));
+    }
+
+    #[test]
+    fn tilde_expansion_in_expand_paths() {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let Some(home) = home else {
+            return;
+        };
+        let dir = home.join(format!(
+            ".shift-expand-tilde-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("txt".into());
+        let tilde_path = PathBuf::from(format!(
+            "~/{}/note.txt",
+            dir.strip_prefix(&home).unwrap().to_string_lossy()
+        ));
+        let found =
+            expand_input_paths_with_extensions(&[tilde_path.as_path()], false, &exts).unwrap();
+        assert_eq!(found, vec![file]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

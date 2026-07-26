@@ -1164,4 +1164,882 @@ mod tests {
         clear_tool_discovery_cache();
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    fn unique_suffix(tag: &str) -> String {
+        format!(
+            "{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn unique_temp_dir_creates_distinct_directories_with_prefix() {
+        let prefix = format!("shift-utd-{}", std::process::id());
+        let a = unique_temp_dir(&prefix).unwrap();
+        let b = unique_temp_dir(&prefix).unwrap();
+        assert!(a.is_dir(), "expected directory: {}", a.display());
+        assert!(b.is_dir(), "expected directory: {}", b.display());
+        assert_ne!(a, b, "unique_temp_dir must not collide");
+        let a_name = a.file_name().and_then(|n| n.to_str()).unwrap();
+        let b_name = b.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(
+            a_name.starts_with(&prefix),
+            "dir name should start with prefix: {a_name}"
+        );
+        assert!(
+            b_name.starts_with(&prefix),
+            "dir name should start with prefix: {b_name}"
+        );
+        assert!(
+            a_name.contains(&std::process::id().to_string()),
+            "dir name should include pid: {a_name}"
+        );
+        // Parallel creations stay unique under load.
+        let more: Vec<PathBuf> = (0..8).map(|_| unique_temp_dir(&prefix).unwrap()).collect();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(a.clone());
+        seen.insert(b.clone());
+        for path in &more {
+            assert!(
+                seen.insert(path.clone()),
+                "duplicate temp dir: {}",
+                path.display()
+            );
+        }
+        for path in more.into_iter().chain([a, b]) {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn clear_tool_discovery_cache_invalidates_memoized_paths() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("cache-clear");
+        let bin_dir = std::env::temp_dir().join(format!("shift-process-cache-{suffix}"));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let tool_name = format!("shift_cache_tool_{}", std::process::id());
+        let tool = bin_dir.join(&tool_name);
+        write_script(&tool, "#!/bin/sh\necho cached\n");
+
+        let previous_path = std::env::var_os("PATH");
+        let new_path = match &previous_path {
+            Some(old) => format!("{}:{}", bin_dir.display(), old.to_string_lossy()),
+            None => bin_dir.display().to_string(),
+        };
+        unsafe { std::env::set_var("PATH", &new_path) };
+        clear_tool_discovery_cache();
+
+        assert_eq!(find_executable(&tool_name).as_deref(), Some(tool.as_path()));
+
+        // Remove the binary; memoized result still returns the old path.
+        std::fs::remove_file(&tool).unwrap();
+        assert_eq!(
+            find_executable(&tool_name).as_deref(),
+            Some(tool.as_path()),
+            "cache should still report the previously resolved path"
+        );
+
+        clear_tool_discovery_cache();
+        assert!(
+            find_executable(&tool_name).is_none(),
+            "after clear, missing tool must not resolve"
+        );
+
+        // Re-create and ensure rediscovery works after clear.
+        write_script(&tool, "#!/bin/sh\necho again\n");
+        clear_tool_discovery_cache();
+        assert_eq!(find_executable(&tool_name).as_deref(), Some(tool.as_path()));
+
+        unsafe {
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_dir(&bin_dir);
+    }
+
+    #[test]
+    fn clear_tool_discovery_cache_also_clears_resolve_tool_path_cache() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("resolve-cache");
+        let temp = std::env::temp_dir().join(format!("shift-process-resolve-cache-{suffix}"));
+        std::fs::create_dir_all(&temp).unwrap();
+        let local = temp.join("local_cached");
+        write_script(&local, "#!/bin/sh\necho local\n");
+
+        let env_key = "SHIFT_PROCESS_RESOLVE_CACHE_TEST";
+        let previous = std::env::var_os(env_key);
+        unsafe { std::env::remove_var(env_key) };
+        clear_tool_discovery_cache();
+
+        assert_eq!(
+            resolve_tool_path(env_key, "missing_default_xyz", std::slice::from_ref(&local)),
+            Some(local.clone())
+        );
+
+        // Remove local candidate; cache still returns the old path until clear.
+        std::fs::remove_file(&local).unwrap();
+        assert_eq!(
+            resolve_tool_path(env_key, "missing_default_xyz", std::slice::from_ref(&local)),
+            Some(local.clone())
+        );
+
+        clear_tool_discovery_cache();
+        assert!(
+            resolve_tool_path(env_key, "missing_default_xyz", std::slice::from_ref(&local))
+                .is_none()
+        );
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_dir(&temp);
+    }
+
+    #[test]
+    fn bundled_runtime_tool_returns_none_or_path_under_resources() {
+        // Test binary is not inside a .app bundle, so ancestors typically lack
+        // Resources/Contents. The function must still return a well-formed Option.
+        let result = bundled_runtime_tool("pandoc");
+        if let Some(path) = result {
+            let rendered = path.to_string_lossy();
+            assert!(
+                rendered.contains("runtime/bin") || rendered.contains("pandoc"),
+                "unexpected bundled path: {rendered}"
+            );
+            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("pandoc"));
+        }
+        // Empty tool name still builds a path when a Resources ancestor exists.
+        let empty = bundled_runtime_tool("");
+        if let Some(path) = empty {
+            assert!(
+                path.to_string_lossy().contains("runtime/bin"),
+                "empty name should still sit under runtime/bin: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn version_label_parts_handles_empty_non_numeric_and_prerelease() {
+        assert!(version_label_parts("").is_empty());
+        assert!(version_label_parts("v").is_empty());
+        assert!(version_label_parts("alpha").is_empty());
+        assert!(version_label_parts("---").is_empty());
+        assert_eq!(version_label_parts("22"), vec![22]);
+        assert_eq!(version_label_parts("v22"), vec![22]);
+        assert_eq!(version_label_parts("v22.23.1"), vec![22, 23, 1]);
+        assert_eq!(version_label_parts("22.23.1"), vec![22, 23, 1]);
+        // Multi-dot / trailing junk still extracts leading numeric segments.
+        assert_eq!(version_label_parts("v22.23.1.extra"), vec![22, 23, 1]);
+        assert_eq!(version_label_parts("22.23.1-rc.1"), vec![22, 23, 1, 1]);
+        assert_eq!(version_label_parts("v18.20.0-pre"), vec![18, 20, 0]);
+        assert_eq!(version_label_parts("node-v20.11.0"), vec![20, 11, 0]);
+        // Non-ascii separators between digits still split.
+        assert_eq!(version_label_parts("1_2_3"), vec![1, 2, 3]);
+        assert_eq!(version_label_parts("10.0.0+build.5"), vec![10, 0, 0, 5]);
+        // Leading zeros parse as numbers.
+        assert_eq!(version_label_parts("v01.02.003"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn version_label_cmp_edge_cases_empty_equal_and_prerelease() {
+        use std::cmp::Ordering;
+        assert_eq!(version_label_cmp("", ""), Ordering::Equal);
+        assert_eq!(version_label_cmp("alpha", "beta"), Ordering::Equal);
+        assert_eq!(version_label_cmp("v1", "1"), Ordering::Equal);
+        assert_eq!(version_label_cmp("v10.0.0", "v9.9.9"), Ordering::Greater);
+        assert_eq!(version_label_cmp("v9.9.9", "v10.0.0"), Ordering::Less);
+        assert_eq!(version_label_cmp("22.1.0", "22.1"), Ordering::Greater);
+        assert_eq!(version_label_cmp("22.1", "22.1.0"), Ordering::Less);
+        // Shared prefix then extra segment wins as longer.
+        assert_eq!(
+            version_label_cmp("1.2.3-rc.2", "1.2.3-rc.1"),
+            Ordering::Greater
+        );
+        assert_eq!(version_label_cmp("v0.0.0", "v0"), Ordering::Greater);
+        // Equal numeric tuples from different string shapes.
+        assert_eq!(version_label_cmp("v22.23.1", "22.23.1"), Ordering::Equal);
+        // Completely non-numeric labels compare equal (both empty parts).
+        assert_eq!(version_label_cmp("latest", "stable"), Ordering::Equal);
+        // Mixed: numeric vs non-numeric — numeric parts win as non-empty vs empty.
+        assert_eq!(version_label_cmp("v1", "latest"), Ordering::Greater);
+        assert_eq!(version_label_cmp("latest", "v1"), Ordering::Less);
+    }
+
+    #[test]
+    fn common_bin_dirs_includes_home_local_cargo_volta_asdf_mise() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("home-layout");
+        let home = std::env::temp_dir().join(format!("shift-home-layout-{suffix}"));
+        let expected_relative = [
+            ".local/bin",
+            ".cargo/bin",
+            ".volta/bin",
+            ".asdf/shims",
+            ".local/share/mise/shims",
+            ".mise/shims",
+        ];
+        for rel in expected_relative {
+            std::fs::create_dir_all(home.join(rel)).unwrap();
+        }
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_nvm = std::env::var_os("NVM_DIR");
+        let previous_fnm = std::env::var_os("FNM_DIR");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("NVM_DIR");
+            std::env::remove_var("FNM_DIR");
+        }
+
+        let dirs = common_bin_dirs();
+        for rel in expected_relative {
+            let want = home.join(rel);
+            assert!(
+                dirs.iter().any(|dir| dir == &want),
+                "expected {want:?} in common_bin_dirs, got {dirs:?}"
+            );
+        }
+        // Fixed system locations always present.
+        assert!(dirs.iter().any(|d| d == Path::new("/opt/homebrew/bin")));
+        assert!(dirs.iter().any(|d| d == Path::new("/usr/local/bin")));
+        assert!(dirs.iter().any(|d| d == Path::new("/Library/TeX/texbin")));
+        // Default nvm layout under HOME when NVM_DIR unset (create a version so it appears).
+        let default_nvm_bin = home.join(".nvm/versions/node/v21.0.0/bin");
+        std::fs::create_dir_all(&default_nvm_bin).unwrap();
+        let dirs_with_nvm = common_bin_dirs();
+        assert!(
+            dirs_with_nvm.iter().any(|d| d == &default_nvm_bin),
+            "default nvm bin under HOME should be present; dirs={dirs_with_nvm:?}"
+        );
+
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match previous_nvm {
+                Some(value) => std::env::set_var("NVM_DIR", value),
+                None => std::env::remove_var("NVM_DIR"),
+            }
+            match previous_fnm {
+                Some(value) => std::env::set_var("FNM_DIR", value),
+                None => std::env::remove_var("FNM_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn common_bin_dirs_orders_nvm_versions_newest_first() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("nvm-order");
+        let home = std::env::temp_dir().join(format!("shift-home-nvm-order-{suffix}"));
+        let nvm_root = home.join(".nvm");
+        let old_bin = nvm_root.join("versions/node/v18.0.0/bin");
+        let mid_bin = nvm_root.join("versions/node/v20.11.0/bin");
+        let new_bin = nvm_root.join("versions/node/v22.23.1/bin");
+        for bin in [&old_bin, &mid_bin, &new_bin] {
+            std::fs::create_dir_all(bin).unwrap();
+        }
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_nvm = std::env::var_os("NVM_DIR");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("NVM_DIR", &nvm_root);
+        }
+
+        let dirs = common_bin_dirs();
+        let positions: Vec<_> = [&new_bin, &mid_bin, &old_bin]
+            .iter()
+            .map(|want| {
+                dirs.iter()
+                    .position(|d| d == *want)
+                    .unwrap_or_else(|| panic!("missing {want:?} in {dirs:?}"))
+            })
+            .collect();
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "expected newest nvm first: positions={positions:?}, dirs={dirs:?}"
+        );
+
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match previous_nvm {
+                Some(value) => std::env::set_var("NVM_DIR", value),
+                None => std::env::remove_var("NVM_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn common_bin_dirs_includes_fnm_layout_under_home_and_fnm_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("fnm-layout");
+        let home = std::env::temp_dir().join(format!("shift-home-fnm-{suffix}"));
+        let fnm_custom = home.join("custom-fnm");
+        let custom_bin = fnm_custom.join("node-versions/v22.1.0/installation/bin");
+        let home_fnm_bin = home.join(".fnm/node-versions/v20.0.0/installation/bin");
+        let share_fnm_bin = home.join(".local/share/fnm/node-versions/v18.0.0/installation/bin");
+        for bin in [&custom_bin, &home_fnm_bin, &share_fnm_bin] {
+            std::fs::create_dir_all(bin).unwrap();
+        }
+        let probe = custom_bin.join("shift_fnm_probe_tool");
+        write_script(&probe, "#!/bin/sh\necho fnm\n");
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_fnm = std::env::var_os("FNM_DIR");
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FNM_DIR", &fnm_custom);
+            std::env::set_var("PATH", "/usr/bin:/bin");
+        }
+        clear_tool_discovery_cache();
+
+        let dirs = common_bin_dirs();
+        for want in [&custom_bin, &home_fnm_bin, &share_fnm_bin] {
+            assert!(
+                dirs.iter().any(|d| d == want),
+                "expected fnm bin {want:?} in {dirs:?}"
+            );
+        }
+        assert_eq!(
+            find_executable("shift_fnm_probe_tool").as_deref(),
+            Some(probe.as_path())
+        );
+
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match previous_fnm {
+                Some(value) => std::env::set_var("FNM_DIR", value),
+                None => std::env::remove_var("FNM_DIR"),
+            }
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn is_runnable_accepts_executable_symlink_and_rejects_non_exec_symlink() {
+        let suffix = unique_suffix("symlink");
+        let target = std::env::temp_dir().join(format!("shift-process-symlink-target-{suffix}"));
+        let link = std::env::temp_dir().join(format!("shift-process-symlink-link-{suffix}"));
+        let non_exec_target =
+            std::env::temp_dir().join(format!("shift-process-symlink-nonexec-{suffix}"));
+        let non_exec_link =
+            std::env::temp_dir().join(format!("shift-process-symlink-nonexec-link-{suffix}"));
+
+        write_script(&target, "#!/bin/sh\necho ok\n");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            is_runnable(&link),
+            "symlink to executable should be runnable"
+        );
+
+        std::fs::write(&non_exec_target, b"not exec").unwrap();
+        let _ = std::fs::remove_file(&non_exec_link);
+        std::os::unix::fs::symlink(&non_exec_target, &non_exec_link).unwrap();
+        assert!(
+            !is_runnable(&non_exec_link),
+            "symlink to non-executable must not be runnable"
+        );
+
+        // Broken symlink is not a regular file.
+        let dangling =
+            std::env::temp_dir().join(format!("shift-process-symlink-dangling-{suffix}"));
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(
+            std::env::temp_dir().join(format!("shift-process-does-not-exist-{suffix}")),
+            &dangling,
+        )
+        .unwrap();
+        assert!(!is_runnable(&dangling));
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&non_exec_link);
+        let _ = std::fs::remove_file(&non_exec_target);
+        let _ = std::fs::remove_file(&dangling);
+    }
+
+    #[test]
+    fn is_runnable_rejects_directory_with_execute_bit() {
+        let suffix = unique_suffix("dir-exec");
+        let dir = std::env::temp_dir().join(format!("shift-process-dir-exec-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        assert!(
+            !is_runnable(&dir),
+            "directories must never be runnable tools"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn resolve_tool_path_empty_env_override_falls_through() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("empty-override");
+        let temp = std::env::temp_dir().join(format!("shift-resolve-empty-{suffix}"));
+        std::fs::create_dir_all(&temp).unwrap();
+        let local = temp.join("local_only");
+        write_script(&local, "#!/bin/sh\necho local\n");
+
+        let env_key = "SHIFT_PROCESS_EMPTY_OVERRIDE";
+        let previous = std::env::var_os(env_key);
+        unsafe { std::env::set_var(env_key, "") };
+        clear_tool_discovery_cache();
+
+        assert_eq!(
+            resolve_tool_path(env_key, "nope", std::slice::from_ref(&local)),
+            Some(local.clone()),
+            "empty override should fall through to local candidates"
+        );
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_file(&local);
+        let _ = std::fs::remove_dir(&temp);
+    }
+
+    #[test]
+    fn resolve_tool_path_absolute_missing_override_is_still_surfaced() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("abs-missing");
+        let missing = std::env::temp_dir().join(format!("shift-resolve-abs-missing-{suffix}"));
+        let _ = std::fs::remove_file(&missing);
+
+        let env_key = "SHIFT_PROCESS_ABS_MISSING";
+        let previous = std::env::var_os(env_key);
+        unsafe { std::env::set_var(env_key, &missing) };
+        clear_tool_discovery_cache();
+
+        assert_eq!(
+            resolve_tool_path(env_key, "default_unused", &[]),
+            Some(missing.clone()),
+            "configured absolute path must surface even when missing"
+        );
+
+        // resolve_tool_executable returns the same configured path.
+        assert_eq!(
+            resolve_tool_executable(env_key, "default_unused", &[]),
+            missing.into_os_string()
+        );
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+        }
+        clear_tool_discovery_cache();
+    }
+
+    #[test]
+    fn resolve_tool_path_relative_multi_component_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("rel-multi");
+        let work = std::env::temp_dir().join(format!("shift-resolve-rel-{suffix}"));
+        std::fs::create_dir_all(work.join("nested")).unwrap();
+        let tool = work.join("nested/tool.sh");
+        write_script(&tool, "#!/bin/sh\necho rel\n");
+
+        // Relative multi-component path is used as-is (not PATH search).
+        let previous_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&work).unwrap();
+
+        let env_key = "SHIFT_PROCESS_REL_MULTI";
+        let previous = std::env::var_os(env_key);
+        unsafe { std::env::set_var(env_key, "nested/tool.sh") };
+        clear_tool_discovery_cache();
+
+        let resolved = resolve_tool_path(env_key, "unused", &[]);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(Path::new("nested/tool.sh")),
+            "relative multi-component override should be returned as-is"
+        );
+        assert!(is_runnable(Path::new("nested/tool.sh")));
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+        }
+        clear_tool_discovery_cache();
+        std::env::set_current_dir(previous_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn resolve_tool_path_skips_non_runnable_local_candidates() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("local-skip");
+        let temp = std::env::temp_dir().join(format!("shift-resolve-local-skip-{suffix}"));
+        std::fs::create_dir_all(&temp).unwrap();
+        let non_exec = temp.join("not_exec");
+        let good = temp.join("good_tool");
+        std::fs::write(&non_exec, b"nope").unwrap();
+        write_script(&good, "#!/bin/sh\necho good\n");
+
+        let env_key = "SHIFT_PROCESS_LOCAL_SKIP";
+        let previous = std::env::var_os(env_key);
+        unsafe { std::env::remove_var(env_key) };
+        clear_tool_discovery_cache();
+
+        assert_eq!(
+            resolve_tool_path(env_key, "unused", &[non_exec.clone(), good.clone()]),
+            Some(good.clone())
+        );
+        // Only non-runnable candidates -> fall through to default (missing).
+        assert!(resolve_tool_path(env_key, "definitely_missing_xyz", &[non_exec]).is_none());
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn resolve_tool_executable_returns_resolved_absolute_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("exec-abs");
+        let temp = std::env::temp_dir().join(format!("shift-resolve-exec-abs-{suffix}"));
+        std::fs::create_dir_all(&temp).unwrap();
+        let tool = temp.join("abs_tool");
+        write_script(&tool, "#!/bin/sh\necho abs\n");
+
+        let env_key = "SHIFT_PROCESS_EXEC_ABS";
+        let previous = std::env::var_os(env_key);
+        unsafe { std::env::set_var(env_key, &tool) };
+        clear_tool_discovery_cache();
+
+        assert_eq!(
+            resolve_tool_executable(env_key, "default", &[]),
+            tool.clone().into_os_string()
+        );
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_dir(&temp);
+    }
+
+    #[test]
+    fn find_executable_accepts_absolute_runnable_path() {
+        let suffix = unique_suffix("find-abs");
+        let tool = std::env::temp_dir().join(format!("shift-find-abs-{suffix}"));
+        write_script(&tool, "#!/bin/sh\necho abs\n");
+        clear_tool_discovery_cache();
+        assert_eq!(find_executable(&tool).as_deref(), Some(tool.as_path()));
+        // Non-runnable absolute path returns None.
+        let non_exec = std::env::temp_dir().join(format!("shift-find-abs-nonexec-{suffix}"));
+        std::fs::write(&non_exec, b"nope").unwrap();
+        clear_tool_discovery_cache();
+        assert!(find_executable(&non_exec).is_none());
+        let _ = std::fs::remove_file(&tool);
+        let _ = std::fs::remove_file(&non_exec);
+        clear_tool_discovery_cache();
+    }
+
+    #[test]
+    fn find_executable_skips_empty_path_components() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let suffix = unique_suffix("empty-path");
+        let cwd_tool = format!("shift_cwd_tool_{suffix}");
+        // Place a same-named file in cwd; empty PATH component must not find it.
+        let previous_cwd = std::env::current_dir().unwrap();
+        let work = std::env::temp_dir().join(format!("shift-empty-path-{suffix}"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::env::set_current_dir(&work).unwrap();
+        write_script(Path::new(&cwd_tool), "#!/bin/sh\necho cwd\n");
+
+        let previous_path = std::env::var_os("PATH");
+        // Leading empty component + only system bins — must not resolve via cwd.
+        unsafe { std::env::set_var("PATH", ":/usr/bin:/bin") };
+        clear_tool_discovery_cache();
+        assert!(
+            find_executable(&cwd_tool).is_none(),
+            "empty PATH component must not resolve tools from cwd"
+        );
+
+        unsafe {
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_file(&cwd_tool);
+        std::env::set_current_dir(previous_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn read_limited_zero_max_bytes_truncates_any_input() {
+        let result = read_limited(b"hello".as_slice(), 0).unwrap();
+        assert!(result.bytes.is_empty());
+        assert!(result.truncated);
+
+        let result = read_limited(std::io::empty(), 0).unwrap();
+        assert!(result.bytes.is_empty());
+        assert!(!result.truncated, "empty reader is not truncated");
+    }
+
+    #[test]
+    fn read_file_limited_zero_max_rejects_nonempty_file() {
+        let path =
+            std::env::temp_dir().join(format!("shift-process-zero-max-{}", unique_suffix("read")));
+        std::fs::write(&path, b"x").unwrap();
+        let error = read_file_limited(&path, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        // Empty file with zero max is ok (metadata len == 0).
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(read_file_limited(&path, 0).unwrap(), b"");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_file_limited_missing_path_errors() {
+        let missing = std::env::temp_dir().join(format!(
+            "shift-process-missing-file-{}",
+            unique_suffix("read")
+        ));
+        let error = read_file_limited(&missing, 100).unwrap_err();
+        assert!(
+            error.to_string().contains("could not read"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_stdout_command_succeeds_with_empty_buffers() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-empty-stdout-{}",
+            unique_suffix("empty")
+        ));
+        write_script(&path, "#!/bin/sh\nexit 0\n");
+        let output = run_command(shell_command(&path), Duration::from_secs(5), 1024).unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_stdout_nonzero_exit_still_captures_status() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-empty-fail-{}",
+            unique_suffix("empty-fail")
+        ));
+        write_script(&path, "#!/bin/sh\nexit 7\n");
+        let output = run_command(shell_command(&path), Duration::from_secs(5), 1024).unwrap();
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(7));
+        assert!(output.stdout.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_command_zero_max_bytes_rejects_any_stdout() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-zero-stdout-{}",
+            unique_suffix("zero")
+        ));
+        write_script(&path, "#!/bin/sh\nprintf 'x'\n");
+        let error = run_command(shell_command(&path), Duration::from_secs(5), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_command_zero_max_bytes_allows_silent_success() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-zero-silent-{}",
+            unique_suffix("zero-silent")
+        ));
+        write_script(&path, "#!/bin/sh\nexit 0\n");
+        let output = run_command(shell_command(&path), Duration::from_secs(5), 0).unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn process_timeout_ignores_zero_and_invalid_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("SHIFT_CONVERSION_TIMEOUT_SECS").ok();
+        unsafe { std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", "0") };
+        assert_eq!(process_timeout(), DEFAULT_PROCESS_TIMEOUT);
+        unsafe { std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", "not-a-number") };
+        assert_eq!(process_timeout(), DEFAULT_PROCESS_TIMEOUT);
+        unsafe { std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", "") };
+        assert_eq!(process_timeout(), DEFAULT_PROCESS_TIMEOUT);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("SHIFT_CONVERSION_TIMEOUT_SECS", value),
+                None => std::env::remove_var("SHIFT_CONVERSION_TIMEOUT_SECS"),
+            }
+        }
+    }
+
+    #[test]
+    fn max_output_bytes_ignores_zero_and_invalid_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES").ok();
+        unsafe { std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", "0") };
+        assert_eq!(max_output_bytes(), DEFAULT_MAX_OUTPUT_BYTES);
+        unsafe { std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", "abc") };
+        assert_eq!(max_output_bytes(), DEFAULT_MAX_OUTPUT_BYTES);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES", value),
+                None => std::env::remove_var("SHIFT_CONVERSION_MAX_OUTPUT_BYTES"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_none_behaves_like_run_command() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-cancel-none-{}",
+            unique_suffix("cancel-none")
+        ));
+        write_script(&path, "#!/bin/sh\nprintf 'ok'\n");
+        let output =
+            run_command_cancellable(shell_command(&path), Duration::from_secs(5), 1024, None)
+                .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversized_stderr_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-big-stderr-{}",
+            unique_suffix("stderr")
+        ));
+        write_script(
+            &path,
+            // Write zeros to the process stderr (not dd's diagnostic stream).
+            "#!/bin/sh\nhead -c 200 /dev/zero >&2\n",
+        );
+        let error = run_command(shell_command(&path), Duration::from_secs(5), 64).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exact_max_output_bytes_boundary_is_allowed() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-exact-max-{}",
+            unique_suffix("exact")
+        ));
+        // 16 bytes of output with max 16 must succeed.
+        write_script(&path, "#!/bin/sh\nprintf '0123456789abcdef'\n");
+        let output = run_command(shell_command(&path), Duration::from_secs(5), 16).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 16);
+        // One more byte must fail.
+        write_script(&path, "#!/bin/sh\nprintf '0123456789abcdefX'\n");
+        let error = run_command(shell_command(&path), Duration::from_secs(5), 16).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_limited_large_chunk_boundary() {
+        // Larger than the 8 KiB internal chunk to exercise multi-read path.
+        let data = vec![b'a'; 20_000];
+        let result = read_limited(data.as_slice(), 20_000).unwrap();
+        assert_eq!(result.bytes.len(), 20_000);
+        assert!(!result.truncated);
+
+        let result = read_limited(data.as_slice(), 19_999).unwrap();
+        assert_eq!(result.bytes.len(), 19_999);
+        assert!(result.truncated);
+
+        let result = read_limited(data.as_slice(), 8_192).unwrap();
+        assert_eq!(result.bytes.len(), 8_192);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn append_versioned_bin_dirs_ignores_missing_and_files() {
+        let suffix = unique_suffix("versioned");
+        let root = std::env::temp_dir().join(format!("shift-versioned-{suffix}"));
+        // Missing root: no panic, dirs unchanged.
+        let mut dirs = vec![PathBuf::from("/sentinel")];
+        append_versioned_bin_dirs(&mut dirs, &root.join("missing"), "bin");
+        assert_eq!(dirs, vec![PathBuf::from("/sentinel")]);
+
+        // Root with a file entry (not a dir) is ignored; only version dirs count.
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("not-a-dir"), b"x").unwrap();
+        let ver = root.join("v1.2.3");
+        std::fs::create_dir_all(&ver).unwrap();
+        append_versioned_bin_dirs(&mut dirs, &root, "bin");
+        assert!(
+            dirs.iter().any(|d| d == &ver.join("bin")),
+            "expected version bin, got {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

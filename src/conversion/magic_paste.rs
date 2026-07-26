@@ -1371,4 +1371,329 @@ exit 0
         let _ = fs::remove_dir_all(&staging);
         let _ = fs::remove_dir_all(&fake_dir);
     }
+
+    #[test]
+    fn parse_quotes_multiline_and_windows_like_paths() {
+        // Single-quoted path with spaces.
+        let paste = parse_magic_paste("'/Users/me/My Docs/file.pdf'");
+        assert_eq!(
+            paste,
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
+                "/Users/me/My Docs/file.pdf"
+            )))
+        );
+
+        // Nested-looking quotes: outer double, inner single kept as content.
+        let paste = parse_magic_paste(r#""/tmp/outer 'inner' still.pdf""#);
+        assert_eq!(
+            paste,
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
+                "/tmp/outer 'inner' still.pdf"
+            )))
+        );
+
+        // Single outer with double inside.
+        let paste = parse_magic_paste(r#"'"quoted name".pdf'"#);
+        assert_eq!(
+            paste,
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(r#""quoted name".pdf"#)))
+        );
+
+        // Multiline whitespace separation.
+        let paste = parse_magic_paste("/tmp/a.pdf\n/tmp/b.pdf\r\nhttps://example.com/c");
+        match paste {
+            MagicPaste::Multiple(tokens) => {
+                assert_eq!(tokens.len(), 3);
+                assert!(matches!(&tokens[0], PasteToken::LocalPath(_)));
+                assert!(matches!(&tokens[1], PasteToken::LocalPath(_)));
+                assert!(matches!(&tokens[2], PasteToken::PageUrl(_)));
+            }
+            other => panic!("expected multiple, got {other:?}"),
+        }
+
+        // Windows-like path with backslashes is a local path token.
+        let paste = parse_magic_paste(r"C:\Users\me\report.pdf");
+        assert_eq!(
+            paste,
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
+                r"C:\Users\me\report.pdf"
+            )))
+        );
+
+        // Mixed tabs and multiple spaces.
+        let paste = parse_magic_paste("  /tmp/a.pdf\t\t/tmp/b.md  ");
+        assert!(matches!(paste, MagicPaste::Multiple(ref t) if t.len() == 2));
+
+        // Unclosed quote still yields the buffered content as a token.
+        let tokens = tokenize_paste("\"/tmp/unclosed.pdf");
+        assert_eq!(tokens, vec!["/tmp/unclosed.pdf"]);
+    }
+
+    #[test]
+    fn materialize_cancel_mid_multi_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-mid-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let p1 = dir.join("first.md");
+        let p2 = dir.join("second.md");
+        fs::write(&p1, b"1").unwrap();
+        fs::write(&p2, b"2").unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        // First token succeeds while cancel is clear.
+        let first =
+            materialize_paste_token(&PasteToken::LocalPath(p1.clone()), Some(cancel.clone()))
+                .unwrap();
+        assert_eq!(first, BatchSource::File(p1));
+
+        // Flip cancel before the next token — mid-multi abort.
+        cancel.store(true, Ordering::SeqCst);
+        let err =
+            materialize_paste_token(&PasteToken::LocalPath(p2), Some(cancel.clone())).unwrap_err();
+        assert!(err.is_cancelled());
+
+        // materialize_magic_paste also aborts on the first cancelled token.
+        let paste = MagicPaste::Multiple(vec![
+            PasteToken::LocalPath(dir.join("first.md")),
+            PasteToken::LocalPath(dir.join("second.md")),
+        ]);
+        let err = materialize_magic_paste(&paste, Some(cancel)).unwrap_err();
+        assert!(err.is_cancelled());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_file_extension_detection_matrix() {
+        // Convertible remote files.
+        for url in [
+            "https://cdn.example.com/a.pdf",
+            "https://cdn.example.com/a.PDF",
+            "https://cdn.example.com/path/doc.docx",
+            "https://cdn.example.com/v.mp4",
+            "https://cdn.example.com/a.wav?token=1",
+            "http://cdn.example.com/sub/file.md",
+            "https://cdn.example.com/x.epub",
+        ] {
+            assert!(
+                url_looks_like_remote_file(url),
+                "expected remote file: {url}"
+            );
+            assert!(
+                matches!(
+                    parse_magic_paste(url),
+                    MagicPaste::Single(PasteToken::RemoteFileUrl(_))
+                ),
+                "parse should classify remote file: {url}"
+            );
+        }
+
+        // Pages / non-files.
+        for url in [
+            "https://example.com/post",
+            "https://example.com/index.html",
+            "https://example.com/page.htm",
+            "https://example.com/app.php",
+            "https://example.com/",
+            "https://example.com/dir/",
+            "ftp://cdn.example.com/a.pdf",
+            "file:///tmp/a.pdf",
+        ] {
+            assert!(
+                !url_looks_like_remote_file(url),
+                "expected not remote file: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_pasted_image_various_extensions() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-img-ext-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        fs::create_dir_all(&dir).unwrap();
+
+        // Leading-dot and mixed-case extensions normalize.
+        let png = stage_pasted_image(b"\x89PNG", ".PNG").unwrap();
+        assert_eq!(png.extension().and_then(|e| e.to_str()), Some("png"));
+        assert_eq!(fs::read(&png).unwrap(), b"\x89PNG");
+
+        let jpg = stage_pasted_image(b"\xff\xd8", "JPG").unwrap();
+        assert_eq!(jpg.extension().and_then(|e| e.to_str()), Some("jpg"));
+
+        // Empty bytes rejected (already covered lightly; keep with matrix).
+        let err = stage_pasted_image(&[], "png").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+
+        // Whitespace-only extension after trim → no format.
+        let err = stage_pasted_image(b"x", "   ").unwrap_err();
+        assert!(err.to_string().contains("no format"));
+
+        // Dot-only after trim_start_matches.
+        let err = stage_pasted_image(b"x", ".").unwrap_err();
+        assert!(err.to_string().contains("no format"));
+
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_url_with_and_without_host() {
+        // Standard absolute file URL (no host).
+        match parse_magic_paste("file:///Users/me/doc.pdf") {
+            MagicPaste::Single(PasteToken::LocalPath(path)) => {
+                assert_eq!(path, PathBuf::from("/Users/me/doc.pdf"));
+            }
+            other => panic!("expected local path, got {other:?}"),
+        }
+
+        // Empty / bare file URL must not become a page or remote-file token.
+        let paste = parse_magic_paste("file://");
+        assert!(
+            matches!(
+                paste,
+                MagicPaste::Empty | MagicPaste::Single(PasteToken::LocalPath(_))
+            ),
+            "file:// alone should not become a page/remote url: {paste:?}"
+        );
+
+        // Non-local host cannot convert to a path on Unix.
+        assert_eq!(parse_magic_paste("file://hostname/only"), MagicPaste::Empty);
+
+        // `localhost` is accepted by url::Url::to_file_path on Unix.
+        match parse_magic_paste("file://localhost/tmp/x.pdf") {
+            MagicPaste::Single(PasteToken::LocalPath(path)) => {
+                assert_eq!(path, PathBuf::from("/tmp/x.pdf"));
+            }
+            MagicPaste::Empty => {
+                // Some platforms may still reject host-form file URLs.
+            }
+            other => panic!("unexpected classification for localhost file URL: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tilde_expansion_edge_cases() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "shift-magic-tilde-edge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(home.join("Docs")).unwrap();
+        let file = home.join("Docs").join("note.md");
+        fs::write(&file, b"# hi").unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_profile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("USERPROFILE");
+        }
+
+        assert_eq!(expand_user_path(Path::new("~")), home);
+        assert_eq!(
+            expand_user_path(Path::new("~/Docs/note.md")),
+            home.join("Docs/note.md")
+        );
+        // Bare ~ is classified as a path token.
+        assert_eq!(
+            parse_magic_paste("~"),
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("~")))
+        );
+        assert_eq!(
+            parse_magic_paste("~/Docs/note.md"),
+            MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("~/Docs/note.md")))
+        );
+
+        // Materialize expands ~ before existence checks.
+        let source = materialize_paste_token(
+            &PasteToken::LocalPath(PathBuf::from("~/Docs/note.md")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(source, BatchSource::File(file));
+
+        // ~user (no slash) is not home expansion.
+        assert_eq!(
+            expand_user_path(Path::new("~user/file")),
+            PathBuf::from("~user/file")
+        );
+
+        // Without HOME/USERPROFILE, tilde is left unchanged.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+        }
+        assert_eq!(expand_user_path(Path::new("~")), PathBuf::from("~"));
+        assert_eq!(expand_user_path(Path::new("~/x")), PathBuf::from("~/x"));
+
+        if let Some(old) = old_home {
+            unsafe {
+                std::env::set_var("HOME", old);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        if let Some(old) = old_profile {
+            unsafe {
+                std::env::set_var("USERPROFILE", old);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn is_page_extension_and_path_extension_helpers() {
+        assert!(is_page_extension("html"));
+        assert!(is_page_extension("htm"));
+        assert!(is_page_extension("php"));
+        assert!(!is_page_extension("pdf"));
+        assert!(!is_page_extension("md"));
+
+        assert_eq!(
+            path_extension_from_url_path("/docs/report.pdf"),
+            Some("pdf".into())
+        );
+        assert_eq!(
+            path_extension_from_url_path("/docs/REPORT.PDF"),
+            Some("pdf".into())
+        );
+        assert_eq!(path_extension_from_url_path("/docs/"), None);
+        assert_eq!(path_extension_from_url_path("/docs/file"), None);
+    }
+
+    #[test]
+    fn materialize_remote_file_cancel_before_start() {
+        // materialize_paste_token checks cancel before download so Cancelled kind is preserved
+        // (download_remote_file itself re-wraps errors via ConversionError::new).
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = materialize_paste_token(
+            &PasteToken::RemoteFileUrl("https://cdn.example.com/docs/report.pdf".into()),
+            Some(cancel),
+        )
+        .unwrap_err();
+        assert!(err.is_cancelled());
+        assert!(err.to_string().contains("cancel"));
+    }
 }

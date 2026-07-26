@@ -883,4 +883,219 @@ mod tests {
         assert_eq!(conversion.pdf.page_from, Some(5));
         assert_eq!(conversion.pdf.page_to, Some(9));
     }
+
+    #[test]
+    fn invalid_nested_enum_strings_fall_back_to_defaults_on_load() {
+        let dir = unique_dir("bad-enums");
+        let path = dir.join("session-settings.json");
+
+        let mut settings = SessionSettings::default();
+        settings.options.ffmpeg.encode_mode = "not-a-mode".into();
+        settings.options.ffmpeg.quality = "ultra".into();
+        settings.options.docling.image_export_mode = "bogus-export".into();
+        settings.options.docling.table_mode = "turbo".into();
+
+        // Persist the invalid strings as-is (serde does not validate).
+        save_session_settings(&path, &settings).unwrap();
+        let loaded = load_session_settings(&path);
+        assert_eq!(loaded.options.ffmpeg.encode_mode, "not-a-mode");
+        assert_eq!(loaded.options.ffmpeg.quality, "ultra");
+        assert_eq!(loaded.options.docling.image_export_mode, "bogus-export");
+        assert_eq!(loaded.options.docling.table_mode, "turbo");
+
+        // Conversion mapping falls back to defaults for unknown enum ids.
+        let conversion = loaded.to_conversion_options();
+        assert_eq!(
+            conversion.ffmpeg.encode_mode,
+            FfmpegEncodeMode::default(),
+            "invalid encode_mode should fall back"
+        );
+        assert_eq!(
+            conversion.ffmpeg.quality,
+            FfmpegQuality::default(),
+            "invalid quality should fall back"
+        );
+        assert_eq!(
+            conversion.docling.image_export_mode,
+            DoclingImageExportMode::default(),
+            "invalid image_export_mode should fall back"
+        );
+        assert_eq!(
+            conversion.docling.table_mode,
+            DoclingTableMode::default(),
+            "invalid table_mode should fall back"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_default_fails_without_home_or_app_support() {
+        let _lock = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new();
+        guard.apply(None, None);
+
+        assert!(application_support_dir().is_none());
+        assert!(default_session_settings_path().is_none());
+        let err = save_default_session_settings(&SessionSettings::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("session settings"), "error: {err}");
+    }
+
+    #[test]
+    fn load_default_without_path_returns_defaults() {
+        let _lock = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new();
+        guard.apply(None, None);
+
+        assert!(default_session_settings_path().is_none());
+        let loaded = load_default_session_settings();
+        assert_eq!(loaded, SessionSettings::default());
+    }
+
+    #[test]
+    fn round_trips_every_ffmpeg_encode_mode_and_quality_string() {
+        let encode_aliases = [
+            ("auto", FfmpegEncodeMode::Auto),
+            ("copy", FfmpegEncodeMode::PreferCopy),
+            ("stream-copy", FfmpegEncodeMode::PreferCopy),
+            ("stream_copy", FfmpegEncodeMode::PreferCopy),
+            ("reencode", FfmpegEncodeMode::Reencode),
+            ("re-encode", FfmpegEncodeMode::Reencode),
+            ("encode", FfmpegEncodeMode::Reencode),
+            ("  AUTO  ", FfmpegEncodeMode::Auto),
+            ("Copy", FfmpegEncodeMode::PreferCopy),
+        ];
+        for (raw, expected) in encode_aliases {
+            let settings = SessionSettings {
+                options: SessionConversionOptions {
+                    ffmpeg: SessionFfmpegOptions {
+                        encode_mode: raw.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                settings.to_conversion_options().ffmpeg.encode_mode,
+                expected,
+                "encode_mode raw={raw:?}"
+            );
+        }
+
+        let quality_aliases = [
+            ("balanced", FfmpegQuality::Balanced),
+            ("default", FfmpegQuality::Balanced),
+            ("medium", FfmpegQuality::Balanced),
+            ("high", FfmpegQuality::High),
+            ("hq", FfmpegQuality::High),
+            ("small", FfmpegQuality::Small),
+            ("low", FfmpegQuality::Small),
+            ("compact", FfmpegQuality::Small),
+            ("  HIGH  ", FfmpegQuality::High),
+            ("Small", FfmpegQuality::Small),
+        ];
+        for (raw, expected) in quality_aliases {
+            let settings = SessionSettings {
+                options: SessionConversionOptions {
+                    ffmpeg: SessionFfmpegOptions {
+                        quality: raw.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                settings.to_conversion_options().ffmpeg.quality,
+                expected,
+                "quality raw={raw:?}"
+            );
+        }
+
+        // Canonical ids from the enums also round-trip through save/load.
+        let dir = unique_dir("ffmpeg-enums-file");
+        let path = dir.join("session-settings.json");
+        for mode in FfmpegEncodeMode::all() {
+            for quality in FfmpegQuality::all() {
+                let mut settings = SessionSettings::default();
+                settings.options.ffmpeg.encode_mode = mode.id().into();
+                settings.options.ffmpeg.quality = quality.id().into();
+                save_session_settings(&path, &settings).unwrap();
+                let loaded = load_session_settings(&path);
+                let conversion = loaded.to_conversion_options();
+                assert_eq!(conversion.ffmpeg.encode_mode, *mode);
+                assert_eq!(conversion.ffmpeg.quality, *quality);
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn show_archived_false_and_true_round_trip() {
+        let dir = unique_dir("show-archived");
+        let path = dir.join("session-settings.json");
+
+        for value in [false, true] {
+            let settings = SessionSettings {
+                show_archived: value,
+                ..Default::default()
+            };
+            save_session_settings(&path, &settings).unwrap();
+            let loaded = load_session_settings(&path);
+            assert_eq!(loaded.show_archived, value, "show_archived={value}");
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_output_dir_none_vs_unicode_path() {
+        let dir = unique_dir("batch-dir");
+        let path = dir.join("session-settings.json");
+
+        let none = SessionSettings {
+            batch_output_dir: None,
+            ..Default::default()
+        };
+        save_session_settings(&path, &none).unwrap();
+        assert_eq!(load_session_settings(&path).batch_output_dir, None);
+
+        let unicode = PathBuf::from("/tmp/çıkış-klasörü/シフト");
+        let some = SessionSettings {
+            batch_output_dir: Some(unicode.clone()),
+            ..Default::default()
+        };
+        save_session_settings(&path, &some).unwrap();
+        assert_eq!(load_session_settings(&path).batch_output_dir, Some(unicode));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_future_still_loads_when_deserializable() {
+        let dir = unique_dir("version-future");
+        let path = dir.join("session-settings.json");
+
+        let future = SessionSettings {
+            version: 2,
+            show_archived: true,
+            history_limit: 11,
+            ..Default::default()
+        };
+        // Write raw JSON so save_session_settings does not rewrite version to 1.
+        fs::write(&path, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+
+        let loaded = load_session_settings(&path);
+        assert_eq!(
+            loaded.version, 2,
+            "future version should be preserved on load"
+        );
+        assert!(loaded.show_archived);
+        assert_eq!(loaded.history_limit, 11);
+        assert_eq!(loaded.output_format(), OutputFormat::MARKDOWN);
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }

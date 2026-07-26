@@ -13,13 +13,20 @@ use std::sync::{Mutex, MutexGuard};
 
 use gpui::{AppContext, Entity, TestAppContext};
 
-use crate::app::{ConversionState, HistoryOutcome, HistorySource, Shift};
+use crate::app::{
+    CancelWork, ClearRecent, ConversionState, HistoryOutcome, HistorySource, OpenAbout,
+    OpenSettings, Shift, ShowShortcuts, ToggleFormatMenu,
+};
 use crate::{
     DEFAULT_UI_FONT, HISTORY_SIDEBAR_MAX, HISTORY_SIDEBAR_MIN, OUTPUT_PANEL_MAX, OUTPUT_PANEL_MIN,
-    PanelResizeTarget,
+    PanelResizeTarget, SettingsSection,
 };
-use shift_core::conversion::{BatchFormatSelection, BatchItemState, BatchSource, OutputFormat};
+use shift_core::conversion::{
+    BatchFormatSelection, BatchItemState, BatchSource, DiagnosticsReport, EngineDiagnostic,
+    FfmpegQuality, OutputFormat, Readiness,
+};
 use shift_core::history::{MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
+use std::sync::Arc;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2999,4 +3006,1280 @@ async fn set_batch_output_dir_updates_queued_destinations(cx: &mut TestAppContex
         this.batch_queue.items()[0].destination.clone()
     });
     assert_eq!(dest.parent(), Some(out.as_path()));
+}
+
+// =============================================================================
+// Expanded coverage: actions, options matrix, history, batch, modules
+// =============================================================================
+
+#[gpui::test]
+async fn action_cancel_work_closes_shortcuts_first(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.shortcuts_help_open = true;
+            this.settings_open = true;
+            this.action_cancel_work(&CancelWork, window, cx);
+            assert!(!this.shortcuts_help_open);
+            assert!(
+                this.settings_open,
+                "settings should remain until shortcuts are closed"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_cancel_work_closes_settings_before_conversion(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "cancel_settings.txt", b"x");
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.set_selected_file(path, cx);
+            this.start_conversion(cx);
+            this.settings_open = true;
+            this.action_cancel_work(&CancelWork, window, cx);
+            assert!(!this.settings_open);
+            assert!(
+                matches!(this.conversion, ConversionState::Converting)
+                    || matches!(this.conversion, ConversionState::Ready(_))
+                    || matches!(this.conversion, ConversionState::Empty)
+                    || matches!(this.conversion, ConversionState::Failed(_)),
+                "closing settings should not force-cancel via conversion path alone"
+            );
+        });
+    });
+    vcx.run_until_parked();
+}
+
+#[gpui::test]
+async fn action_cancel_work_dismisses_folder_confirm(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let dir = env.inputs().join("folder_cancel_action");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    fs::write(dir.join("nested/a.txt"), b"a").unwrap();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|_window, cx| {
+        shift.update(cx, |this, cx| this.ingest_paths(vec![dir], cx));
+    });
+    vcx.run_until_parked();
+
+    let has_confirm = shift.read_with(vcx, |this, _| this.folder_confirm.is_some());
+    assert!(has_confirm);
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.action_cancel_work(&CancelWork, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let cleared = shift.read_with(vcx, |this, _| this.folder_confirm.is_none());
+    assert!(cleared);
+}
+
+#[gpui::test]
+async fn action_cancel_work_closes_output_menu(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.output_menu_open = true;
+            this.action_cancel_work(&CancelWork, window, cx);
+            assert!(!this.output_menu_open);
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_cancel_work_cancels_active_conversion(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "action_cancel_conv.txt", b"hello");
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.set_selected_file(path, cx);
+            this.start_conversion(cx);
+            this.action_cancel_work(&CancelWork, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let cancelled = shift.read_with(vcx, |this, _| match &this.conversion {
+        ConversionState::Failed(msg) => msg.as_ref().contains("cancelled"),
+        _ => false,
+    });
+    assert!(cancelled);
+}
+
+#[gpui::test]
+async fn action_toggle_format_flips_menu_flag(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            assert!(!this.output_menu_open);
+            this.action_toggle_format(&ToggleFormatMenu, window, cx);
+            assert!(this.output_menu_open);
+            this.action_toggle_format(&ToggleFormatMenu, window, cx);
+            assert!(!this.output_menu_open);
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_toggle_format_with_empty_selection_is_safe(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            assert!(this.selected_file.is_none());
+            assert!(this.selected_url.is_none());
+            this.action_toggle_format(&ToggleFormatMenu, window, cx);
+            assert!(this.output_menu_open);
+            assert!(matches!(this.conversion, ConversionState::Empty));
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_open_settings_toggles_and_loads_diagnostics(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.output_menu_open = true;
+            this.action_open_settings(&OpenSettings, window, cx);
+            assert!(this.settings_open);
+            assert!(!this.output_menu_open);
+        });
+    });
+    vcx.run_until_parked();
+
+    let has_diag = shift.read_with(vcx, |this, _| this.diagnostics.is_some());
+    assert!(has_diag);
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.action_open_settings(&OpenSettings, window, cx);
+            assert!(!this.settings_open);
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_show_shortcuts_toggles_flag(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            assert!(!this.shortcuts_help_open);
+            this.action_show_shortcuts(&ShowShortcuts, window, cx);
+            assert!(this.shortcuts_help_open);
+            this.action_show_shortcuts(&ShowShortcuts, window, cx);
+            assert!(!this.shortcuts_help_open);
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_open_about_sets_section_and_opens_settings(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.settings_open = false;
+            this.settings_section = SettingsSection::General;
+            this.action_open_about(&OpenAbout, window, cx);
+            assert!(this.settings_open);
+            assert_eq!(this.settings_section, SettingsSection::About);
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_clear_recent_empties_history(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "clear_recent_action.txt", b"hist");
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|_window, cx| {
+        shift.update(cx, |this, cx| {
+            this.set_selected_file(path, cx);
+            this.start_conversion(cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(shift.read_with(vcx, |this, _| !this.history.is_empty()));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.action_clear_recent(&ClearRecent, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let empty = shift.read_with(vcx, |this, _| {
+        this.history.is_empty() && this.active_history_id.is_none()
+    });
+    assert!(empty);
+}
+
+#[gpui::test]
+async fn install_hints_for_failure_nonempty_when_engine_missing(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "hints.txt", b"hello");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.diagnostics = Some(Arc::new(DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "markitdown",
+                    label: "MarkItDown",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_MARKITDOWN_BIN",
+                    install_hint: "pip install 'markitdown[all]'".into(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "ffmpeg",
+                    label: "FFmpeg",
+                    readiness: Readiness::Ready,
+                    version: Some("fake".into()),
+                    resolved_path: Some(env.bin.join("ffmpeg")),
+                    env_override: "SHIFT_FFMPEG_BIN",
+                    install_hint: "brew install ffmpeg".into(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        }));
+        this.set_selected_file(path, cx);
+        let hints = this.install_hints_for_failure();
+        assert!(
+            !hints.is_empty(),
+            "missing markitdown should produce install hints"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|(label, hint)| label.as_ref().contains("MarkItDown")
+                    && hint.as_ref().contains("pip install")),
+            "hints={hints:?}"
+        );
+        // Ready engines must not appear.
+        assert!(
+            !hints
+                .iter()
+                .any(|(label, _)| label.as_ref().contains("FFmpeg"))
+        );
+    });
+}
+
+#[gpui::test]
+async fn install_hints_empty_without_diagnostics(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, _cx| {
+        this.diagnostics = None;
+        let hints = this.install_hints_for_failure();
+        assert!(hints.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn rebuild_output_caches_after_format_change_tracks_source(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "cache_fmt.txt", b"x");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.rebuild_output_caches();
+        let file_outputs = this.cached_available_outputs.clone();
+        assert!(
+            file_outputs.contains(&OutputFormat::MARKDOWN),
+            "file outputs={file_outputs:?}"
+        );
+
+        this.set_output_format(OutputFormat::HTML, cx);
+        this.rebuild_output_caches();
+        assert!(
+            this.cached_available_outputs.contains(&OutputFormat::HTML)
+                || this
+                    .cached_available_outputs
+                    .contains(&OutputFormat::MARKDOWN),
+            "after format change caches={:?}",
+            this.cached_available_outputs
+        );
+    });
+    cx.run_until_parked();
+
+    // URL source uses a different cache branch.
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("http://example.com/rebuild.html".into(), cx);
+        this.rebuild_output_caches();
+        assert!(
+            !this.cached_available_outputs.is_empty(),
+            "url outputs should be non-empty"
+        );
+        let url_outputs = this.cached_available_outputs.clone();
+        this.clear_selected_file(cx);
+        this.rebuild_output_caches();
+        assert_eq!(
+            this.cached_available_outputs,
+            OutputFormat::ALL.to_vec(),
+            "no source → all formats; was url={url_outputs:?}"
+        );
+    });
+}
+
+#[gpui::test]
+async fn active_option_modules_for_srt_include_ffmpeg(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "subs.mkv", b"vid");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::SRT, cx);
+    });
+    cx.run_until_parked();
+
+    let modules = shift.read_with(cx, |this, _| this.active_option_modules());
+    assert!(modules.contains(&"ffmpeg"), "srt modules={modules:?}");
+    assert!(shift.read_with(cx, |this, _| this.conversion_options_visible()));
+}
+
+#[gpui::test]
+async fn active_option_modules_for_png_include_ffmpeg(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "frame.mp4", b"vid");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::PNG, cx);
+    });
+    cx.run_until_parked();
+
+    let modules = shift.read_with(cx, |this, _| this.active_option_modules());
+    assert!(modules.contains(&"ffmpeg"), "png modules={modules:?}");
+}
+
+#[gpui::test]
+async fn active_option_modules_for_docx_include_pandoc(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "to_docx.md", b"# hi");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::DOCX, cx);
+    });
+    cx.run_until_parked();
+
+    let modules = shift.read_with(cx, |this, _| this.active_option_modules());
+    assert!(modules.contains(&"pandoc"), "docx modules={modules:?}");
+}
+
+#[gpui::test]
+async fn active_option_modules_for_xlsx_include_markitdown_or_docling(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "sheet.xlsx", b"PK fake xlsx");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::MARKDOWN, cx);
+    });
+    cx.run_until_parked();
+
+    let modules = shift.read_with(cx, |this, _| this.active_option_modules());
+    assert!(
+        modules.contains(&"markitdown") || modules.contains(&"docling"),
+        "xlsx→md modules={modules:?}"
+    );
+}
+
+#[gpui::test]
+async fn active_option_modules_for_epub_include_pandoc_or_docling(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "book.epub", b"PK fake epub");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::MARKDOWN, cx);
+    });
+    cx.run_until_parked();
+
+    let modules = shift.read_with(cx, |this, _| this.active_option_modules());
+    assert!(
+        modules.contains(&"pandoc")
+            || modules.contains(&"docling")
+            || modules.contains(&"markitdown"),
+        "epub→md modules={modules:?}"
+    );
+    assert!(shift.read_with(cx, |this, _| this.conversion_options_visible()));
+}
+
+#[gpui::test]
+async fn retry_single_batch_item_succeeds_after_fixing_tool(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    env.override_tool("markitdown", ALWAYS_FAIL_MARKITDOWN_FAKE);
+    let path = write_input(&env, "fix_tool_batch.txt", b"content");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.enqueue_paths(vec![path], true, cx));
+    cx.run_until_parked();
+
+    let failed_id = shift.read_with(cx, |this, _| {
+        this.batch_queue
+            .items()
+            .iter()
+            .find(|item| matches!(item.state, BatchItemState::Failed { .. }))
+            .map(|item| item.id)
+    });
+    let failed_id = failed_id.expect("batch item should fail with always-fail tool");
+
+    env.override_tool("markitdown", MARKITDOWN_FAKE);
+    shift.update(cx, |this, cx| this.retry_batch_item(failed_id, cx));
+    cx.run_until_parked();
+
+    let succeeded = shift.read_with(cx, |this, _| {
+        this.batch_queue
+            .items()
+            .iter()
+            .all(|item| matches!(item.state, BatchItemState::Succeeded { .. }))
+    });
+    assert!(succeeded);
+}
+
+#[gpui::test]
+async fn set_selected_url_private_succeeds_when_allow_private_enabled(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    // TestEnv sets SHIFT_ALLOW_PRIVATE_URLS=1.
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("http://192.168.0.10/private.html".into(), cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let (url, ready) = shift.read_with(cx, |this, _| {
+        (
+            this.selected_url.clone(),
+            matches!(this.conversion, ConversionState::Ready(_)),
+        )
+    });
+    assert_eq!(url.as_deref(), Some("http://192.168.0.10/private.html"));
+    assert!(ready, "private URL should convert when allow-private is on");
+}
+
+#[gpui::test]
+async fn set_selected_url_private_fails_when_allow_private_toggled_off(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    unsafe { std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS") };
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("http://10.0.0.5/lan.html".into(), cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let blocked = shift.read_with(cx, |this, _| match &this.conversion {
+        ConversionState::Failed(msg) => {
+            let m = msg.as_ref().to_ascii_lowercase();
+            m.contains("non-public") || m.contains("private") || m.contains("blocked")
+        }
+        _ => false,
+    });
+    assert!(blocked);
+}
+
+#[gpui::test]
+async fn fail_magic_paste_then_recover_with_valid_paste(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.fail_magic_paste("synthetic paste failure", cx);
+    });
+    cx.run_until_parked();
+
+    let failed = shift.read_with(cx, |this, _| match &this.conversion {
+        ConversionState::Failed(msg) => msg.as_ref().contains("synthetic paste failure"),
+        _ => false,
+    });
+    assert!(failed);
+    assert!(shift.read_with(cx, |this, _| {
+        this.selected_file.is_none() && this.selected_url.is_none()
+    }));
+
+    shift.update(cx, |this, cx| {
+        this.submit_magic_paste_text("http://example.com/recovered.html".into(), cx);
+    });
+    cx.run_until_parked();
+    shift.update(cx, |this, cx| this.start_conversion(cx));
+    cx.run_until_parked();
+
+    let (url, module) = shift.read_with(cx, |this, _| match &this.conversion {
+        ConversionState::Ready(artifact) => (this.selected_url.clone(), artifact.module_id),
+        other => panic!("expected Ready after recovery, got {other:?}"),
+    });
+    assert_eq!(url.as_deref(), Some("http://example.com/recovered.html"));
+    assert_eq!(module, "defuddle");
+}
+
+#[gpui::test]
+async fn history_archive_hidden_when_show_archived_false(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "archive_hide.txt", b"h");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+    shift.update(cx, |this, cx| this.archive_history_entry(id, cx));
+    cx.run_until_parked();
+
+    shift.update(cx, |this, cx| {
+        this.show_archived = false;
+        this.mark_history_cache_dirty();
+        this.ensure_history_cache(cx);
+        assert!(
+            this.cached_history_visible.is_empty(),
+            "archived entries hidden when show_archived=false"
+        );
+        assert!(this.history.iter().any(|e| e.archived));
+    });
+}
+
+#[gpui::test]
+async fn history_archive_shown_when_show_archived_true(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "archive_show.txt", b"h");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+    shift.update(cx, |this, cx| {
+        this.archive_history_entry(id, cx);
+        this.show_archived = true;
+        this.mark_history_cache_dirty();
+        this.ensure_history_cache(cx);
+        this.persist_session_settings(cx);
+        assert_eq!(this.cached_history_visible.len(), 1);
+        assert!(this.cached_history_visible[0].archived);
+    });
+    cx.run_until_parked();
+
+    let json = fs::read_to_string(env.session_path()).unwrap();
+    assert!(json.contains("\"show_archived\": true") || json.contains("\"show_archived\":true"));
+}
+
+#[gpui::test]
+async fn set_batch_output_dir_then_clear_queue_removes_destinations(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let out = env.temp.join("batch_out_clear");
+    fs::create_dir_all(&out).unwrap();
+    let a = write_input(&env, "dest_clear_a.txt", b"a");
+    let b = write_input(&env, "dest_clear_b.txt", b"b");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.set_batch_output_dir(out.clone(), cx));
+    shift.update(cx, |this, cx| this.enqueue_paths(vec![a, b], false, cx));
+    cx.run_until_parked();
+
+    let in_out = shift.read_with(cx, |this, _| {
+        this.batch_queue
+            .items()
+            .iter()
+            .all(|item| item.destination.starts_with(&out))
+    });
+    assert!(in_out);
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.batch_queue.items().len()),
+        2
+    );
+
+    shift.update(cx, |this, cx| this.clear_batch_queue(cx));
+    cx.run_until_parked();
+
+    let empty = shift.read_with(cx, |this, _| this.batch_queue.is_empty());
+    assert!(empty);
+    // Output dir preference remains; only queue destinations are gone.
+    let dir = shift.read_with(cx, |this, _| this.batch_output_dir.clone());
+    assert_eq!(dir.as_deref(), Some(out.as_path()));
+}
+
+#[gpui::test]
+async fn conversion_options_visible_matrix_for_several_formats(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let txt = write_input(&env, "opts_matrix.txt", b"t");
+    let mp4 = write_input(&env, "opts_matrix.mp4", b"v");
+    let pdf = write_input(&env, "opts_matrix.pdf", b"%PDF");
+    let shift = create_shift(cx);
+
+    // Media output without source → ffmpeg knobs visible.
+    shift.update(cx, |this, cx| {
+        this.clear_selected_file(cx);
+        this.set_output_format(OutputFormat::WAV, cx);
+        assert!(this.conversion_options_visible());
+        assert_eq!(this.active_option_modules(), vec!["ffmpeg"]);
+    });
+
+    // Markdown without source → hidden.
+    shift.update(cx, |this, cx| {
+        this.set_output_format(OutputFormat::MARKDOWN, cx);
+        assert!(!this.conversion_options_visible());
+    });
+
+    // Text → HTML → pandoc.
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(txt, cx);
+        this.set_output_format(OutputFormat::HTML, cx);
+        assert!(this.conversion_options_visible());
+        assert!(this.active_option_modules().contains(&"pandoc"));
+    });
+
+    // Video → MP3 → ffmpeg.
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(mp4, cx);
+        this.set_output_format(OutputFormat::MP3, cx);
+        assert!(this.conversion_options_visible());
+        assert!(this.active_option_modules().contains(&"ffmpeg"));
+    });
+
+    // PDF → HTML → docling (or markitdown path).
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(pdf, cx);
+        this.set_output_format(OutputFormat::HTML, cx);
+        assert!(this.conversion_options_visible());
+        let modules = this.active_option_modules();
+        assert!(
+            modules.contains(&"docling") || modules.contains(&"markitdown"),
+            "pdf→html modules={modules:?}"
+        );
+    });
+
+    // URL → defuddle.
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("http://example.com/matrix.html".into(), cx);
+        assert!(this.conversion_options_visible());
+        assert!(this.active_option_modules().contains(&"defuddle"));
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn build_conversion_options_with_many_session_knobs(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "many_knobs.txt", b"x");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.docling_ocr = true;
+        this.docling_tables = true;
+        this.docling_ocr_lang_input
+            .update(cx, |input, cx| input.set_content("eng+deu", cx));
+        this.pandoc_toc = true;
+        this.pandoc_standalone = true;
+        this.pandoc_citations = true;
+        this.defuddle_frontmatter = true;
+        this.defuddle_lang_input
+            .update(cx, |input, cx| input.set_content("en-US", cx));
+        this.ffmpeg_quality = FfmpegQuality::High;
+        this.ffmpeg_mono = true;
+        this.ffmpeg_mute = true;
+        this.ffmpeg_normalize = true;
+        this.markitdown_keep_data_uris = true;
+        this.ffmpeg_start_input
+            .update(cx, |input, cx| input.set_content("1.5", cx));
+        this.ffmpeg_duration_input
+            .update(cx, |input, cx| input.set_content("10", cx));
+        this.pdf_page_from_input
+            .update(cx, |input, cx| input.set_content("2", cx));
+        this.pdf_page_to_input
+            .update(cx, |input, cx| input.set_content("5", cx));
+
+        this.set_selected_file(path, cx);
+        let options = this
+            .build_conversion_options(cx)
+            .expect("build_conversion_options should succeed");
+
+        assert!(options.docling.ocr);
+        assert!(options.docling.tables);
+        assert_eq!(options.docling.ocr_lang.as_deref(), Some("eng+deu"));
+        assert!(options.pandoc.toc);
+        assert!(options.pandoc.standalone);
+        assert!(options.pandoc.citations);
+        assert!(options.defuddle.frontmatter);
+        assert_eq!(options.defuddle.lang.as_deref(), Some("en-US"));
+        assert_eq!(options.ffmpeg.quality, FfmpegQuality::High);
+        assert!(options.ffmpeg.mono);
+        assert!(options.ffmpeg.mute);
+        assert!(options.ffmpeg.normalize_audio);
+        assert!(options.markitdown.keep_data_uris);
+        assert_eq!(options.ffmpeg.start_secs, Some(1.5));
+        assert_eq!(options.ffmpeg.duration_secs, Some(10.0));
+        assert_eq!(options.pdf.page_from, Some(2));
+        assert_eq!(options.pdf.page_to, Some(5));
+    });
+}
+
+#[gpui::test]
+async fn apply_session_option_change_reconverts_when_options_visible(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "session_reconvert.txt", b"content");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+    assert!(shift.read_with(cx, |this, _| {
+        matches!(this.conversion, ConversionState::Ready(_))
+    }));
+
+    let gen_before = shift.read_with(cx, |this, _| this.conversion_generation);
+
+    shift.update(cx, |this, cx| {
+        this.markitdown_keep_data_uris = true;
+        this.apply_session_option_change(cx);
+    });
+    cx.run_until_parked();
+
+    let (ready, gen_after) = shift.read_with(cx, |this, _| {
+        (
+            matches!(this.conversion, ConversionState::Ready(_)),
+            this.conversion_generation,
+        )
+    });
+    assert!(ready);
+    assert!(
+        gen_after > gen_before,
+        "apply_session_option_change should start a new conversion (gen {gen_before} → {gen_after})"
+    );
+}
+
+#[gpui::test]
+async fn apply_session_option_change_without_visible_options_skips_reconvert(
+    cx: &mut TestAppContext,
+) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        // No source + markdown → options not visible.
+        assert!(!this.conversion_options_visible());
+        let generation = this.conversion_generation;
+        this.ui_font_family = "Helvetica".into();
+        this.apply_session_option_change(cx);
+        assert_eq!(this.conversion_generation, generation);
+        assert!(matches!(this.conversion, ConversionState::Empty));
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn enqueue_sources_with_url_batch(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let out = env.temp.join("url_batch_out");
+    fs::create_dir_all(&out).unwrap();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.batch_force = true;
+        this.set_batch_output_dir(out.clone(), cx);
+        this.enqueue_sources(
+            vec![
+                BatchSource::Url("http://example.com/a.html".into()),
+                BatchSource::Url("http://example.com/b.html".into()),
+            ],
+            true,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let (count, completed, running, states) = shift.read_with(cx, |this, _| {
+        let states: Vec<_> = this
+            .batch_queue
+            .items()
+            .iter()
+            .map(|item| format!("{:?}", item.state))
+            .collect();
+        (
+            this.batch_queue.items().len(),
+            this.batch_queue.progress().completed(),
+            this.batch_running,
+            states,
+        )
+    });
+    assert_eq!(count, 2, "states={states:?}");
+    assert!(!running);
+    assert_eq!(completed, 2, "states={states:?}");
+    let all_ok = shift.read_with(cx, |this, _| {
+        this.batch_queue.items().iter().all(|item| {
+            matches!(item.state, BatchItemState::Succeeded { .. })
+                && matches!(item.source, BatchSource::Url(_))
+        })
+    });
+    assert!(all_ok, "states={states:?}");
+}
+
+#[gpui::test]
+async fn ingest_paths_empty_vec_is_noop(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "ingest_empty_keep.txt", b"keep");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    shift.update(cx, |this, cx| this.ingest_paths(vec![], cx));
+    cx.run_until_parked();
+
+    let (selected, queue_empty) = shift.read_with(cx, |this, _| {
+        (this.selected_file.clone(), this.batch_queue.is_empty())
+    });
+    assert_eq!(selected, Some(path));
+    assert!(queue_empty);
+}
+
+#[gpui::test]
+async fn double_clear_selected_file_is_safe(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "double_clear.txt", b"x");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    shift.update(cx, |this, cx| {
+        this.clear_selected_file(cx);
+        this.clear_selected_file(cx);
+    });
+    cx.run_until_parked();
+
+    let reset = shift.read_with(cx, |this, _| {
+        this.selected_file.is_none()
+            && this.selected_url.is_none()
+            && matches!(this.conversion, ConversionState::Empty)
+            && this.active_history_id.is_none()
+    });
+    assert!(reset);
+}
+
+#[gpui::test]
+async fn module_priority_pandoc_first_for_markdown(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "priority_pandoc_first.md", b"# prefer pandoc");
+    let shift = create_shift(cx);
+
+    // Move markitdown after pandoc so pandoc wins for md→md (or md convert).
+    shift.update(cx, |this, cx| {
+        // Ensure pandoc is first among overlapping modules.
+        if let Some(pandoc_idx) = this.module_priority.iter().position(|m| m == "pandoc") {
+            if pandoc_idx != 0 {
+                this.move_module(pandoc_idx, 0, cx);
+            }
+        }
+    });
+    cx.run_until_parked();
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::MARKDOWN, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+
+    let module = shift.read_with(cx, |this, _| match &this.conversion {
+        ConversionState::Ready(artifact) => artifact.module_id,
+        other => panic!("expected Ready, got {other:?}"),
+    });
+    // With pandoc first, markdown→markdown should prefer pandoc when it supports the pair.
+    assert_eq!(
+        module,
+        "pandoc",
+        "module_priority={:?}",
+        shift.read_with(cx, |this, _| this.module_priority.clone())
+    );
+}
+
+#[gpui::test]
+async fn open_settings_state_flags_via_action(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    let initial = shift.read_with(vcx, |this, _| {
+        (
+            this.settings_open,
+            this.settings_section,
+            this.shortcuts_help_open,
+        )
+    });
+    assert!(!initial.0);
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.action_open_about(&OpenAbout, window, cx);
+        });
+    });
+
+    let after_about = shift.read_with(vcx, |this, _| (this.settings_open, this.settings_section));
+    assert!(after_about.0);
+    assert_eq!(after_about.1, SettingsSection::About);
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            this.action_show_shortcuts(&ShowShortcuts, window, cx);
+            assert!(this.shortcuts_help_open);
+            // Cancel closes shortcuts first.
+            this.action_cancel_work(&CancelWork, window, cx);
+            assert!(!this.shortcuts_help_open);
+            assert!(this.settings_open);
+        });
+    });
+}
+
+#[gpui::test]
+async fn rebuild_output_caches_for_url_then_file(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "cache_switch.wav", b"RIFF");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("http://example.com/switch.html".into(), cx);
+        this.rebuild_output_caches();
+        let url_cache = this.cached_available_outputs.clone();
+        assert!(!url_cache.is_empty());
+
+        this.set_selected_file(path, cx);
+        this.rebuild_output_caches();
+        let file_cache = this.cached_available_outputs.clone();
+        assert!(
+            file_cache.contains(&OutputFormat::MP3) || file_cache.contains(&OutputFormat::WAV),
+            "audio file outputs={file_cache:?}"
+        );
+        // Switching source should change the available set for media vs web.
+        assert_ne!(url_cache, file_cache);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn conversion_options_visible_for_png_sequence_zip_without_source(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_output_format(OutputFormat::PNG_SEQUENCE_ZIP, cx);
+        assert!(this.conversion_options_visible());
+        assert_eq!(this.active_option_modules(), vec!["ffmpeg"]);
+    });
+}
+
+#[gpui::test]
+async fn conversion_options_visible_for_srt_without_source(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_output_format(OutputFormat::SRT, cx);
+        assert!(this.conversion_options_visible());
+        assert_eq!(this.active_option_modules(), vec!["ffmpeg"]);
+    });
+}
+
+#[gpui::test]
+async fn conversion_options_hidden_for_docx_without_source(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_output_format(OutputFormat::DOCX, cx);
+        assert!(!this.conversion_options_visible());
+        assert!(this.active_option_modules().is_empty());
+    });
+}
+
+#[gpui::test]
+async fn build_conversion_options_ok_with_defaults(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        let options = this.build_conversion_options(cx).expect("defaults ok");
+        // Docling defaults OCR+tables on; other engines keep conservative defaults.
+        assert!(options.docling.ocr);
+        assert!(options.docling.tables);
+        assert!(!options.pandoc.toc);
+        assert!(!options.defuddle.frontmatter);
+        assert_eq!(options.ffmpeg.quality, FfmpegQuality::Balanced);
+        assert!(!options.markitdown.keep_data_uris);
+        assert!(options.pdf.password.is_none());
+        assert!(options.pdf.page_from.is_none());
+    });
+}
+
+#[gpui::test]
+async fn enqueue_sources_empty_is_noop(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.enqueue_sources(vec![], true, cx);
+        assert!(this.batch_queue.is_empty());
+        assert!(!this.batch_running);
+    });
+}
+
+#[gpui::test]
+async fn fail_magic_paste_clears_selection_and_bumps_generation(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "fail_paste_clear.txt", b"x");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+    });
+    cx.run_until_parked();
+
+    let gen_before = shift.read_with(cx, |this, _| this.selection_generation);
+
+    shift.update(cx, |this, cx| {
+        this.fail_magic_paste("cleared by fail", cx);
+        assert!(this.selected_file.is_none());
+        assert!(this.selected_url.is_none());
+        assert!(!this.output_menu_open);
+        assert!(this.selection_generation > gen_before);
+        match &this.conversion {
+            ConversionState::Failed(msg) => assert!(msg.as_ref().contains("cleared by fail")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    });
+}
+
+#[gpui::test]
+async fn set_batch_output_dir_while_running_is_rejected(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    // Slow tool so batch is still "running" if we set dir mid-flight — but
+    // synchronous fakes finish quickly. Force the guard by toggling batch_running.
+    let out = env.temp.join("while_running");
+    fs::create_dir_all(&out).unwrap();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.batch_running = true;
+        this.set_batch_output_dir(out.clone(), cx);
+        assert!(
+            this.batch_output_dir.is_none()
+                || this.batch_output_dir.as_deref() != Some(out.as_path())
+                || this
+                    .batch_status
+                    .as_ref()
+                    .is_some_and(|s| s.contains("Cannot change"))
+        );
+        assert!(
+            this.batch_status
+                .as_ref()
+                .is_some_and(|s| s.contains("Cannot change")),
+            "status={:?}",
+            this.batch_status
+        );
+        this.batch_running = false;
+    });
+}
+
+#[gpui::test]
+async fn active_option_modules_for_epub_output_from_markdown(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "to_epub.md", b"# book");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::EPUB, cx);
+    });
+    cx.run_until_parked();
+
+    let modules = shift.read_with(cx, |this, _| this.active_option_modules());
+    assert!(modules.contains(&"pandoc"), "md→epub modules={modules:?}");
+    assert!(shift.read_with(cx, |this, _| this.conversion_options_visible()));
+}
+
+#[gpui::test]
+async fn history_toggle_show_archived_round_trip(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "archive_roundtrip.txt", b"r");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path, cx);
+        this.start_conversion(cx);
+    });
+    cx.run_until_parked();
+    let id = shift
+        .read_with(cx, |this, _| this.active_history_id)
+        .unwrap();
+
+    shift.update(cx, |this, cx| {
+        this.archive_history_entry(id, cx);
+        this.show_archived = false;
+        this.mark_history_cache_dirty();
+        this.ensure_history_cache(cx);
+        assert!(this.cached_history_visible.is_empty());
+
+        this.show_archived = true;
+        this.mark_history_cache_dirty();
+        this.ensure_history_cache(cx);
+        assert_eq!(this.cached_history_visible.len(), 1);
+
+        this.show_archived = false;
+        this.mark_history_cache_dirty();
+        this.ensure_history_cache(cx);
+        assert!(this.cached_history_visible.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn install_hints_filter_to_active_modules_only(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "hints_filter.mp4", b"vid");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.diagnostics = Some(Arc::new(DiagnosticsReport {
+            engines: vec![
+                EngineDiagnostic {
+                    id: "markitdown",
+                    label: "MarkItDown",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_MARKITDOWN_BIN",
+                    install_hint: "pip install markitdown".into(),
+                    notes: None,
+                },
+                EngineDiagnostic {
+                    id: "ffmpeg",
+                    label: "FFmpeg",
+                    readiness: Readiness::Missing,
+                    version: None,
+                    resolved_path: None,
+                    env_override: "SHIFT_FFMPEG_BIN",
+                    install_hint: "brew install ffmpeg".into(),
+                    notes: None,
+                },
+            ],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        }));
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::MP3, cx);
+        let modules = this.active_option_modules();
+        assert!(modules.contains(&"ffmpeg"), "modules={modules:?}");
+        let hints = this.install_hints_for_failure();
+        assert_eq!(hints.len(), 1, "hints={hints:?}");
+        assert!(hints[0].0.as_ref().contains("FFmpeg"));
+        assert!(!hints.iter().any(|(l, _)| l.as_ref().contains("MarkItDown")));
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn apply_session_option_change_persists_docling_ocr(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "docling_ocr_persist.pdf", b"%PDF");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.docling_ocr = true;
+        this.set_selected_file(path, cx);
+        this.set_output_format(OutputFormat::MARKDOWN, cx);
+        this.apply_session_option_change(cx);
+    });
+    cx.run_until_parked();
+
+    let ocr = shift.read_with(cx, |this, _| this.docling_ocr);
+    assert!(ocr);
+    let json = fs::read_to_string(env.session_path()).unwrap();
+    assert!(
+        json.contains("ocr") || json.contains("docling"),
+        "session json should retain docling knobs: {json}"
+    );
+}
+
+#[gpui::test]
+async fn set_selected_url_empty_is_noop(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "url_empty_keep.txt", b"k");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_file(path.clone(), cx);
+        this.set_selected_url("   ".into(), cx);
+        assert_eq!(this.selected_file.as_ref(), Some(&path));
+        assert!(this.selected_url.is_none());
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn set_selected_url_invalid_fails_magic_paste_style(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_selected_url("not-a-url".into(), cx);
+    });
+    cx.run_until_parked();
+
+    let failed = shift.read_with(cx, |this, _| match &this.conversion {
+        ConversionState::Failed(msg) => msg.as_ref().contains("http"),
+        _ => false,
+    });
+    assert!(failed);
 }

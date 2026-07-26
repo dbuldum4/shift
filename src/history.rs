@@ -1303,4 +1303,350 @@ mod tests {
         assert!(loaded[0].archived);
         assert!(history_entries(&conn, false).unwrap().is_empty());
     }
+
+    #[test]
+    fn save_history_delta_to_upserts_and_deletes() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-history-delta-to-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("history.sqlite");
+
+        let e1 = sample_entry(1, "one", false);
+        let e2 = sample_entry(2, "two", false);
+        save_history_delta_to(&db_path, &[e1.clone(), e2.clone()], &[1, 2], &[]).unwrap();
+
+        let conn = open_history(&db_path).unwrap();
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        // Upsert renames id 1; delete id 2; unknown changed id is skipped.
+        let e1_updated = sample_entry(1, "one-renamed", true);
+        save_history_delta_to(&db_path, std::slice::from_ref(&e1_updated), &[1, 999], &[2])
+            .unwrap();
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "one-renamed");
+        assert!(loaded[0].archived);
+
+        // Empty delta is a no-op.
+        save_history_delta_to(&db_path, &[], &[], &[]).unwrap();
+        assert_eq!(history_entries(&conn, true).unwrap().len(), 1);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_history_delta_and_load_history_with_support_dir_override() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-history-delta-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+
+        assert_eq!(support_dir().as_deref(), Some(dir.as_path()));
+        assert_eq!(
+            history_db_path().as_deref(),
+            Some(dir.join("history.sqlite").as_path())
+        );
+
+        // Empty store.
+        let empty = load_history();
+        assert!(empty.entries.is_empty());
+        assert_eq!(empty.next_id, 1);
+
+        let large = StoredHistoryEntry {
+            id: 1,
+            source: StoredSource::File(PathBuf::from("/tmp/big.bin")),
+            name: "big".to_owned(),
+            detail: "large".to_owned(),
+            extension_label: "BIN".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "binary".to_owned(),
+            outcome: StoredOutcome::ReadyLarge {
+                module_id: "ffmpeg".to_owned(),
+                byte_len: 1_048_576,
+            },
+            archived: false,
+        };
+        let failed = StoredHistoryEntry {
+            id: 2,
+            source: StoredSource::Url("https://example.com/x".to_owned()),
+            name: "bad".to_owned(),
+            detail: "err".to_owned(),
+            extension_label: "MD".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "markdown".to_owned(),
+            outcome: StoredOutcome::Failed("nope".to_owned()),
+            archived: false,
+        };
+        save_history_delta(&[large, failed], &[1, 2], &[]).unwrap();
+
+        let populated = load_history();
+        assert_eq!(populated.entries.len(), 2);
+        assert_eq!(populated.next_id, 3);
+        assert!(
+            populated
+                .entries
+                .iter()
+                .any(|e| matches!(e.outcome, StoredOutcome::ReadyLarge { .. }))
+        );
+        assert!(
+            populated
+                .entries
+                .iter()
+                .any(|e| matches!(e.outcome, StoredOutcome::Failed(_)))
+        );
+
+        // Full save_history replaces set: keep only id 1 under a new name.
+        let kept = sample_entry(1, "only", false);
+        save_history(&[kept], 10).unwrap();
+        let after = load_history();
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].name, "only");
+        assert_eq!(after.next_id, 2);
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn archive_then_unarchive_via_upsert() {
+        // No dedicated unarchive API; callers clear the flag via upsert.
+        let conn = open_history(":memory:").unwrap();
+        add_history_entry(&conn, &sample_entry(1, "row", false), DEFAULT_HISTORY_LIMIT).unwrap();
+        assert!(archive_history(&conn, 1).unwrap());
+        assert!(history_entries(&conn, false).unwrap().is_empty());
+        assert!(history_entries(&conn, true).unwrap()[0].archived);
+
+        upsert_history_entry(&conn, &sample_entry(1, "row", false)).unwrap();
+        let active = history_entries(&conn, false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(!active[0].archived);
+        assert_eq!(active[0].name, "row");
+    }
+
+    #[test]
+    fn encode_decode_empty_unicode_and_max_artifact() {
+        let empty_names = StoredHistoryEntry {
+            id: 1,
+            source: StoredSource::File(PathBuf::from("")),
+            name: String::new(),
+            detail: String::new(),
+            extension_label: String::new(),
+            badge_color: 0,
+            badge_text_color: u32::MAX,
+            output_format: String::new(),
+            outcome: StoredOutcome::Ready {
+                module_id: String::new(),
+                file_name: String::new(),
+                format: String::new(),
+                bytes: Vec::new(),
+            },
+            archived: false,
+        };
+        let unicode = StoredHistoryEntry {
+            id: 2,
+            source: StoredSource::File(PathBuf::from("/tmp/文档.pdf")),
+            name: "日本語レポート 🎉".to_owned(),
+            detail: "détail — café".to_owned(),
+            extension_label: "PDF".to_owned(),
+            badge_color: 0xFF00_00FF,
+            badge_text_color: 0,
+            output_format: "markdown".to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "pandoc".to_owned(),
+                file_name: "レポート.md".to_owned(),
+                format: "markdown".to_owned(),
+                bytes: "見出し".as_bytes().to_vec(),
+            },
+            archived: false,
+        };
+        let max_bytes = vec![0x5Au8; MAX_HISTORY_ARTIFACT_BYTES];
+        let at_max = StoredHistoryEntry {
+            id: 3,
+            source: StoredSource::Url("https://example.com/big".to_owned()),
+            name: "at-max".to_owned(),
+            detail: "d".to_owned(),
+            extension_label: "BIN".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "binary".to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "ffmpeg".to_owned(),
+                file_name: "big.bin".to_owned(),
+                format: "binary".to_owned(),
+                bytes: max_bytes.clone(),
+            },
+            archived: false,
+        };
+        let large_meta = StoredHistoryEntry {
+            id: 4,
+            source: StoredSource::File(PathBuf::from("/tmp/huge")),
+            name: "huge".to_owned(),
+            detail: "d".to_owned(),
+            extension_label: "BIN".to_owned(),
+            badge_color: 0,
+            badge_text_color: 0,
+            output_format: "binary".to_owned(),
+            outcome: StoredOutcome::ReadyLarge {
+                module_id: "ffmpeg".to_owned(),
+                byte_len: MAX_HISTORY_ARTIFACT_BYTES * 4,
+            },
+            archived: false,
+        };
+
+        let encoded = encode_history(
+            &[
+                empty_names.clone(),
+                unicode.clone(),
+                at_max.clone(),
+                large_meta.clone(),
+            ],
+            0,
+        );
+        let loaded = decode_history(&encoded).unwrap();
+        // next_id 0 is clamped to 1.
+        assert_eq!(loaded.next_id, 1);
+        assert_eq!(loaded.entries.len(), 4);
+        assert_eq!(loaded.entries[0].name, "");
+        assert_eq!(loaded.entries[0].outcome, empty_names.outcome);
+        assert_eq!(loaded.entries[1].name, unicode.name);
+        assert_eq!(loaded.entries[1].detail, unicode.detail);
+        match &loaded.entries[2].outcome {
+            StoredOutcome::Ready { bytes, .. } => assert_eq!(bytes, &max_bytes),
+            other => panic!("expected Ready at max, got {other:?}"),
+        }
+        assert_eq!(loaded.entries[3].outcome, large_meta.outcome);
+
+        // Oversized next_id survives as-is (aside from the .max(1) floor).
+        let encoded_max_id = encode_history(&[], u64::MAX);
+        assert_eq!(decode_history(&encoded_max_id).unwrap().next_id, u64::MAX);
+    }
+
+    #[test]
+    fn import_legacy_edges_empty_truncated_and_oversized_next_id() {
+        let conn = open_history(":memory:").unwrap();
+
+        // Completely empty / garbage.
+        assert!(import_legacy_history(&conn, b"").is_err());
+        assert!(import_legacy_history(&conn, b"SHIFT_HISTORY_V2\n").is_err());
+
+        // Magic only — truncated before next_id / count.
+        assert!(import_legacy_history(&conn, MAGIC).is_err());
+
+        // Magic + next_id, still missing count.
+        let mut truncated = MAGIC.to_vec();
+        truncated.extend_from_slice(&7u64.to_le_bytes());
+        assert!(import_legacy_history(&conn, &truncated).is_err());
+
+        // Valid empty history blob with oversized next_id.
+        let empty_blob = encode_history(&[], u64::MAX);
+        let count = import_legacy_history(&conn, &empty_blob).unwrap();
+        assert_eq!(count, 0);
+        assert!(history_entries(&conn, true).unwrap().is_empty());
+
+        // Valid blob with one entry imports.
+        let one = encode_history(&[sample_entry(42, "legacy", false)], 100);
+        assert_eq!(import_legacy_history(&conn, &one).unwrap(), 1);
+        let loaded = history_entries(&conn, true).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 42);
+        assert_eq!(loaded[0].name, "legacy");
+    }
+
+    #[test]
+    fn decode_history_caps_entries_at_max_history_entries() {
+        // Encoder writes more entries than the decoder will retain.
+        let many: Vec<_> = (1..=(MAX_HISTORY_ENTRIES as u64 + 5))
+            .map(|id| sample_entry(id, "overflow", false))
+            .collect();
+        let encoded = encode_history(&many, many.len() as u64 + 1);
+        let loaded = decode_history(&encoded).unwrap();
+        assert_eq!(loaded.entries.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(loaded.entries[0].id, 1);
+        assert_eq!(
+            loaded.entries.last().map(|e| e.id),
+            Some(MAX_HISTORY_ENTRIES as u64)
+        );
+    }
+
+    #[test]
+    fn history_limit_constants_are_sane() {
+        const {
+            assert!(MIN_HISTORY_LIMIT >= 1);
+            assert!(DEFAULT_HISTORY_LIMIT >= MIN_HISTORY_LIMIT);
+            assert!(MAX_HISTORY_LIMIT >= DEFAULT_HISTORY_LIMIT);
+            assert!(MAX_HISTORY_ENTRIES == DEFAULT_HISTORY_LIMIT);
+            assert!(MAX_HISTORY_ARTIFACT_BYTES >= 1024);
+        }
+    }
+
+    #[test]
+    fn add_history_entry_zero_limit_skips_trim() {
+        let conn = open_history(":memory:").unwrap();
+        add_history_entry(&conn, &sample_entry(1, "a", false), 0).unwrap();
+        add_history_entry(&conn, &sample_entry(2, "b", false), 0).unwrap();
+        assert_eq!(history_entries(&conn, true).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn load_history_imports_legacy_blob_once() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-history-legacy-load-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+
+        // No sqlite yet; drop a legacy binary blob in place.
+        let legacy_path = dir.join("history");
+        let blob = encode_history(&[sample_entry(7, "from-legacy", false)], 8);
+        std::fs::write(&legacy_path, &blob).unwrap();
+
+        let loaded = load_history();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].id, 7);
+        assert_eq!(loaded.entries[0].name, "from-legacy");
+        assert_eq!(loaded.next_id, 8);
+        assert!(dir.join("history.sqlite").is_file());
+        // Legacy file should be moved aside after successful import.
+        assert!(!legacy_path.exists() || dir.join("history.legacy.bak").exists());
+
+        // Second load uses sqlite only (no re-import of moved blob).
+        let again = load_history();
+        assert_eq!(again.entries.len(), 1);
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

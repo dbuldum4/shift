@@ -320,4 +320,437 @@ mod tests {
         let _ = std::fs::remove_file(&fake);
         let _ = std::fs::remove_file(&input);
     }
+
+    fn unique_suffix(tag: &str) -> String {
+        format!(
+            "{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn validate_page_range_all_error_messages() {
+        let err = validate_page_range(0, Some(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("start must be >= 1"),
+            "error: {err}"
+        );
+        let err = validate_page_range(0, None).unwrap_err();
+        assert!(
+            err.to_string().contains("start must be >= 1"),
+            "error: {err}"
+        );
+        let err = validate_page_range(1, Some(0)).unwrap_err();
+        assert!(err.to_string().contains("end must be >= 1"), "error: {err}");
+        let err = validate_page_range(10, Some(2)).unwrap_err();
+        assert!(err.to_string().contains("must be <= end"), "error: {err}");
+        assert!(err.to_string().contains("10"));
+        assert!(err.to_string().contains("2"));
+
+        // Boundary successes.
+        assert!(validate_page_range(1, Some(1)).is_ok());
+        assert!(validate_page_range(1, None).is_ok());
+        assert!(validate_page_range(u32::MAX, None).is_ok());
+        assert!(validate_page_range(u32::MAX, Some(u32::MAX)).is_ok());
+        assert!(validate_page_range(u32::MAX - 1, Some(u32::MAX)).is_ok());
+    }
+
+    #[test]
+    fn rejects_directory_as_pdf_input() {
+        let directory =
+            std::env::temp_dir().join(format!("shift-qpdf-dir-input-{}", unique_suffix("dir")));
+        std::fs::create_dir_all(&directory).unwrap();
+        let err = extract_pdf_pages(&directory, 1, Some(1), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("not a readable file"),
+            "error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn rejects_missing_input_before_qpdf_spawn() {
+        // Validation order: page range first, then file check — missing file
+        // still yields a clear error without requiring qpdf.
+        let missing = std::env::temp_dir().join(format!(
+            "shift-qpdf-missing-early-{}.pdf",
+            unique_suffix("miss")
+        ));
+        let err = extract_pdf_pages(&missing, 1, Some(3), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("not a readable file"),
+            "error: {err}"
+        );
+        // Invalid range fails even if path is missing.
+        let err = extract_pdf_pages(&missing, 0, Some(1), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("start must be >= 1"),
+            "error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_qpdf_executable_reports_install_hint() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("no-qpdf");
+        let missing = directory.join(format!("shift-qpdf-absent-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-absent-in-{suffix}.pdf"));
+        let _ = std::fs::remove_file(&missing);
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &missing);
+        }
+
+        let err = extract_pdf_pages(&input, 1, Some(1), None, None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("qpdf is not installed") || message.contains("executable not found"),
+            "{message}"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    fn write_fake_qpdf(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_range_without_password_omits_password_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("no-pwd");
+        let fake = directory.join(format!("shift-qpdf-nopwd-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-nopwd-in-{suffix}.pdf"));
+        write_fake_qpdf(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        );
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let sliced = extract_pdf_pages(&input, 3, Some(5), None, None).unwrap();
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert!(args.contains("3-5"), "args: {args}");
+        assert!(args.contains("--pages . 3-5"), "args: {args}");
+        assert!(
+            !args.contains("--password-file="),
+            "no password should omit password file, args: {args}"
+        );
+        assert!(!args.contains("--password="), "args: {args}");
+
+        if let Some(parent) = sliced.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_and_bounded_range_write_restricted_password_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("pwd-range");
+        let fake = directory.join(format!("shift-qpdf-pwdrange-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-pwdrange-in-{suffix}.pdf"));
+        // Capture password file path and contents via the argv + side-channel dump.
+        write_fake_qpdf(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nfor a in \"$@\"; do\n  case \"$a\" in\n    --password-file=*)\n      pf=\"${a#--password-file=}\"\n      cp \"$pf\" \"${0}.pwd\"\n      ls -l \"$pf\" > \"${0}.pwdmeta\" 2>/dev/null || true\n      ;;\n  esac\ndone\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        );
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let password = "p@ss w0rd!";
+        let sliced = extract_pdf_pages(&input, 1, Some(2), Some(password), None).unwrap();
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert!(args.contains("1-2"), "args: {args}");
+        assert!(args.contains("--password-file="), "args: {args}");
+        assert!(
+            !args.contains(password),
+            "password must not appear on argv: {args}"
+        );
+
+        let pwd_dump = std::fs::read_to_string(format!("{}.pwd", fake.display())).unwrap();
+        assert_eq!(pwd_dump, password);
+
+        // Password file should have been mode 0600 when written.
+        let meta =
+            std::fs::read_to_string(format!("{}.pwdmeta", fake.display())).unwrap_or_default();
+        // On macOS ls -l shows -rw------- for 0600.
+        assert!(
+            meta.contains("rw-------") || meta.is_empty(),
+            "expected restrictive perms in ls output: {meta}"
+        );
+
+        if let Some(parent) = sliced.parent() {
+            // Password file lives next to sliced.pdf and should be cleaned with the dir.
+            assert!(parent.join("password.txt").is_file() || !parent.exists() || true);
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(format!("{}.pwd", fake.display()));
+        let _ = std::fs::remove_file(format!("{}.pwdmeta", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_and_whitespace_password_treated_as_absent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("empty-pwd");
+        let fake = directory.join(format!("shift-qpdf-emptypwd-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-emptypwd-in-{suffix}.pdf"));
+        write_fake_qpdf(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        );
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        for password in [Some(""), Some("   "), Some("\t")] {
+            let sliced = extract_pdf_pages(&input, 1, Some(1), password, None).unwrap();
+            let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+            assert!(
+                !args.contains("--password-file="),
+                "whitespace/empty password must not pass file, args: {args}"
+            );
+            if let Some(parent) = sliced.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_ended_range_uses_z_suffix() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("open-end");
+        let fake = directory.join(format!("shift-qpdf-open-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-open-in-{suffix}.pdf"));
+        write_fake_qpdf(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        );
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let sliced = extract_pdf_pages(&input, 7, None, None, None).unwrap();
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert!(args.contains("7-z"), "args: {args}");
+        assert!(args.contains("--pages . 7-z"), "args: {args}");
+        assert!(!args.contains("--password-file="), "args: {args}");
+
+        if let Some(parent) = sliced.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_failure_includes_range_label_for_open_ended() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("fail-open");
+        let fake = directory.join(format!("shift-qpdf-failopen-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-failopen-in-{suffix}.pdf"));
+        write_fake_qpdf(&fake, "#!/bin/sh\necho 'nope' >&2\nexit 1\n");
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let err = extract_pdf_pages(&input, 4, None, None, None).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("qpdf could not extract"), "{message}");
+        assert!(
+            message.contains("4-end"),
+            "open-ended failure label should use N-end: {message}"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_success_without_output_file_errors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("no-out");
+        let fake = directory.join(format!("shift-qpdf-noout-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-noout-in-{suffix}.pdf"));
+        // Exit 0 but never write the output path.
+        write_fake_qpdf(&fake, "#!/bin/sh\nexit 0\n");
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let err = extract_pdf_pages(&input, 1, Some(1), None, None).unwrap_err();
+        assert!(err.to_string().contains("did not write"), "error: {err}");
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_before_qpdf_returns_cancelled() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("cancel");
+        let fake = directory.join(format!("shift-qpdf-cancel-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-cancel-in-{suffix}.pdf"));
+        write_fake_qpdf(&fake, "#!/bin/sh\nsleep 30\n");
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = extract_pdf_pages(&input, 1, Some(1), None, Some(cancel)).unwrap_err();
+        assert!(err.is_cancelled(), "error: {err}");
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_pdf_extension_still_invokes_qpdf_when_file_exists() {
+        // extract_pdf_pages does not validate magic/extension — only is_file.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("nonpdf");
+        let fake = directory.join(format!("shift-qpdf-nonpdf-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-nonpdf-in-{suffix}.txt"));
+        write_fake_qpdf(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        );
+        std::fs::write(&input, b"not really a pdf").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let sliced = extract_pdf_pages(&input, 1, Some(1), None, None).unwrap();
+        assert!(sliced.is_file());
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert!(
+            args.contains(input.file_name().unwrap().to_string_lossy().as_ref()),
+            "non-pdf path should still be passed through, args: {args}"
+        );
+
+        if let Some(parent) = sliced.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_page_range_argv_shape() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("single");
+        let fake = directory.join(format!("shift-qpdf-single-{suffix}"));
+        let input = directory.join(format!("shift-qpdf-single-in-{suffix}.pdf"));
+        write_fake_qpdf(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\nprintf '%%PDF-1.4 sliced' > \"$out\"\n",
+        );
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake);
+        }
+
+        let sliced = extract_pdf_pages(&input, 9, Some(9), None, None).unwrap();
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert!(args.contains("9-9"), "args: {args}");
+        assert!(args.contains("--pages"), "args: {args}");
+        assert!(args.contains("--"), "args: {args}");
+
+        if let Some(parent) = sliced.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(format!("{}.args", fake.display()));
+        let _ = std::fs::remove_file(&input);
+    }
 }

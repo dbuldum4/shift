@@ -2135,4 +2135,202 @@ mod tests {
         ];
         assert!(confirm_network_sources(&sources, false).is_ok());
     }
+
+    #[test]
+    fn doctor_quiet_vs_verbose_acceptance() {
+        // Quiet: exit code only (no panic / argument rejection).
+        let quiet = run(args(&["doctor", "--quiet"])).unwrap();
+        assert!(
+            quiet == ExitCode::SUCCESS || quiet == ExitCode::from(1),
+            "quiet doctor exit"
+        );
+        let quiet_short = run(args(&["doctor", "-q"])).unwrap();
+        assert!(
+            quiet_short == ExitCode::SUCCESS || quiet_short == ExitCode::from(1),
+            "quiet -q doctor exit"
+        );
+
+        // Default (verbose text) doctor is accepted.
+        let verbose = run(args(&["doctor"])).unwrap();
+        assert!(
+            verbose == ExitCode::SUCCESS || verbose == ExitCode::from(1),
+            "default doctor exit"
+        );
+
+        // Script mode without quiet.
+        assert!(run(args(&["doctor", "--script"])).is_ok());
+        assert!(run(args(&["doctor", "-s"])).is_ok());
+
+        // Combinations.
+        assert!(run(args(&["doctor", "--script", "--quiet"])).is_ok());
+        assert!(run(args(&["doctor", "-s", "-q"])).is_ok());
+        assert!(run(args(&["doctor", "--help"])).is_ok());
+        assert!(run(args(&["doctor", "-h"])).is_ok());
+    }
+
+    #[test]
+    fn recursive_multi_dir_expands_convertible_files() {
+        let root = unique_temp("multi-dir");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("one.md"), b"# a\n").unwrap();
+        std::fs::write(b.join("two.html"), b"<p>b</p>").unwrap();
+        // Nested unsupported file should be ignored by expansion.
+        std::fs::write(a.join("skip.xyz"), b"nope").unwrap();
+
+        let expanded =
+            resolve_cli_inputs(args(&[a.to_str().unwrap(), b.to_str().unwrap()]), true).unwrap();
+        let expanded_paths: Vec<PathBuf> = expanded.into_iter().map(PathBuf::from).collect();
+        assert!(
+            expanded_paths.iter().any(|p| p.ends_with("one.md")),
+            "expected one.md in {expanded_paths:?}"
+        );
+        assert!(
+            expanded_paths.iter().any(|p| p.ends_with("two.html")),
+            "expected two.html in {expanded_paths:?}"
+        );
+        assert!(
+            !expanded_paths.iter().any(|p| p.ends_with("skip.xyz")),
+            "unsupported extension should not expand: {expanded_paths:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_with_force_parses_and_prepare_destination_honors_it() {
+        let parsed = parse_convert_args(&args(&[
+            "batch",
+            "a.md",
+            "b.md",
+            "-t",
+            "html",
+            "-O",
+            "/tmp/shift-batch-out",
+            "--force",
+        ]))
+        .unwrap();
+        assert!(parsed.batch_explicit);
+        assert!(parsed.force);
+        assert_eq!(
+            parsed.output_dir.as_deref(),
+            Some(Path::new("/tmp/shift-batch-out"))
+        );
+        assert_eq!(parsed.inputs.len(), 2);
+
+        let dir = unique_temp("batch-force");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("page.md");
+        let dest = dir.join("page.converted.html");
+        std::fs::write(&source, b"# hi\n").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        assert!(prepare_batch_destination(&dest, Some(&source), true).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn allow_private_urls_flag_parses_and_defaults_off() {
+        let off = parse_convert_args(&args(&["https://example.com", "-t", "markdown"])).unwrap();
+        assert!(!off.allow_private_urls);
+
+        let on = parse_convert_args(&args(&[
+            "https://example.com",
+            "--allow-private-urls",
+            "-t",
+            "html",
+            "--yes",
+        ]))
+        .unwrap();
+        assert!(on.allow_private_urls);
+        assert!(on.yes);
+        assert_eq!(on.target, OutputFormat::HTML);
+    }
+
+    #[test]
+    fn convert_with_module_each_known_id() {
+        let registry = ConversionRegistry::default();
+        let module_ids: Vec<_> = registry.modules().map(|m| m.id()).collect();
+        for id in &module_ids {
+            let parsed = parse_convert_args(&args(&["notes.md", "-t", "markdown", "--module", id]))
+                .unwrap_or_else(|e| panic!("module {id}: {e}"));
+            assert_eq!(parsed.preferred_module.as_deref(), Some(*id));
+            let built = build_registry(Some(id)).unwrap();
+            assert_eq!(built.modules().next().unwrap().id(), *id);
+        }
+    }
+
+    #[test]
+    fn meta_commands_do_not_require_inputs_or_stdin() {
+        // These paths never call parse_convert_args / confirm_network_urls.
+        for argv in [
+            args(&["--help"]),
+            args(&["help"]),
+            args(&["-h"]),
+            args(&["--version"]),
+            args(&["version"]),
+            args(&["formats"]),
+            args(&["doctor", "--quiet"]),
+            args(&["doctor", "--help"]),
+        ] {
+            assert!(
+                run(argv.clone()).is_ok(),
+                "meta command should not require inputs: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_help_surfaces_accepted() {
+        assert_eq!(run(args(&["--help"])).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run(args(&["help"])).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run(args(&["doctor", "--help"])).unwrap(), ExitCode::SUCCESS);
+        // Empty args print help but exit failure (documented usage path).
+        assert_eq!(run(args(&[])).unwrap(), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn rejects_empty_to_value() {
+        let err = parse_convert_args(&args(&["file.md", "-t", ""])).unwrap_err();
+        assert!(
+            err.contains("unknown output format")
+                || err.contains("format")
+                || err.contains("empty"),
+            "empty -t should be rejected: {err}"
+        );
+
+        let err = run(args(&["file.md", "--to", ""])).unwrap_err();
+        assert!(
+            err.contains("unknown output format") || err.contains("format"),
+            "empty --to via run: {err}"
+        );
+    }
+
+    #[test]
+    fn pages_with_only_from_or_only_to_are_allowed() {
+        let only_from =
+            parse_convert_args(&args(&["doc.pdf", "--page-from", "3", "-t", "markdown"])).unwrap();
+        assert_eq!(only_from.pdf.page_from, Some(3));
+        assert_eq!(only_from.pdf.page_to, None);
+
+        let only_to =
+            parse_convert_args(&args(&["doc.pdf", "--page-to", "9", "-t", "markdown"])).unwrap();
+        assert_eq!(only_to.pdf.page_from, None);
+        assert_eq!(only_to.pdf.page_to, Some(9));
+
+        // Both still work together.
+        let both = parse_convert_args(&args(&[
+            "doc.pdf",
+            "--page-from",
+            "2",
+            "--page-to",
+            "4",
+            "-t",
+            "html",
+        ]))
+        .unwrap();
+        assert_eq!(both.pdf.page_from, Some(2));
+        assert_eq!(both.pdf.page_to, Some(4));
+    }
 }

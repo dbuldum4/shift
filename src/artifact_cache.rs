@@ -1064,4 +1064,224 @@ mod tests {
         assert!(!missing.exists());
         assert!(!export_matches_bytes(&missing, b"anything"));
     }
+
+    #[test]
+    fn sanitize_cache_name_edge_cases() {
+        assert_eq!(sanitize_cache_name(""), "artifact");
+        assert_eq!(sanitize_cache_name("   "), "___");
+        assert_eq!(sanitize_cache_name("!!!@@@"), "______");
+        assert_eq!(sanitize_cache_name("a/b\\c\0d"), "a_b_c_d");
+        // Control characters become underscores.
+        assert_eq!(sanitize_cache_name("a\nb\tc\rd"), "a_b_c_d");
+        // Unicode non-ASCII letters are replaced (ascii_alphanumeric only).
+        assert_eq!(sanitize_cache_name("café.pdf"), "caf_.pdf");
+        assert_eq!(sanitize_cache_name("日本語.md"), "___.md");
+        assert_eq!(
+            sanitize_cache_name("report-v1_final.PDF"),
+            "report-v1_final.PDF"
+        );
+        // Character-based truncation at 64.
+        let long: String = "a".repeat(100);
+        let truncated = sanitize_cache_name(&long);
+        assert_eq!(truncated.chars().count(), 64);
+        assert!(truncated.chars().all(|c| c == 'a'));
+        let long_unicode: String = "あ".repeat(80);
+        assert_eq!(sanitize_cache_name(&long_unicode).chars().count(), 64);
+        // Path-like names collapse separators but keep the extension shape.
+        assert_eq!(sanitize_cache_name("a/b/c.md"), "a_b_c.md");
+        assert_eq!(sanitize_cache_name(".."), "..");
+        assert_eq!(sanitize_cache_name("."), ".");
+    }
+
+    #[test]
+    fn purge_empty_dir_and_export_only_subdir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let empty = unique_temp_dir("purge-empty");
+        fs::create_dir_all(&empty).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &empty);
+        }
+
+        // Empty real directory: no files to remove.
+        let stats = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.freed_bytes, 0);
+        assert!(empty.is_dir());
+
+        // Only export/ subtree populated — recursive purge still clears it.
+        let export_dir = empty.join(EXPORT_SUBDIR);
+        fs::create_dir_all(&export_dir).unwrap();
+        let staged = export_dir.join("only.md");
+        fs::write(&staged, b"# only export").unwrap();
+        let sidecar = export_dir.join(".only.md.hash");
+        fs::write(&sidecar, "deadbeef").unwrap();
+
+        let stats = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
+        assert!(stats.removed >= 2, "expected export file + sidecar removed");
+        assert!(!staged.exists());
+        assert!(!sidecar.exists());
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    fn cache_artifact_file_missing_source_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("missing-src");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let missing = dir.join("does-not-exist.bin");
+        let err = cache_artifact_file(&missing).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stage_export_strips_path_like_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("pathlike-export");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let path = stage_export_bytes("a/b/c.md", b"# nested name").unwrap();
+        assert_eq!(
+            path.parent().unwrap().file_name().and_then(|n| n.to_str()),
+            Some(EXPORT_SUBDIR)
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("c.md"),
+            "path components must be stripped to the final file name"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"# nested name");
+
+        // On Unix, `\` is not a path separator so Path::file_name keeps the whole
+        // string; export_file_name still neutralizes backslashes to underscores.
+        let win = stage_export_bytes("dir\\sub\\note.txt", b"win").unwrap();
+        let win_name = win.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(!win_name.contains('\\'));
+        assert!(win_name.ends_with("note.txt") || win_name == "dir_sub_note.txt");
+        assert_eq!(fs::read(&win).unwrap(), b"win");
+
+        // Traversal-style names must not escape the export dir.
+        let evil = stage_export_bytes("../../evil.md", b"nope").unwrap();
+        assert!(evil.starts_with(dir.join(EXPORT_SUBDIR)));
+        assert_eq!(evil.file_name().and_then(|n| n.to_str()), Some("evil.md"));
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_constants_are_sane() {
+        const {
+            assert!(DEFAULT_CACHE_TTL.as_secs() == 7 * 24 * 60 * 60);
+            assert!(DEFAULT_CACHE_MAX_BYTES == 512 * 1024 * 1024);
+            assert!(DEFAULT_CACHE_TTL.as_secs() > 0);
+            assert!(DEFAULT_CACHE_MAX_BYTES > 0);
+            // TTL is multi-day; size budget is at least tens of MiB.
+            assert!(DEFAULT_CACHE_TTL.as_secs() >= 24 * 60 * 60);
+            assert!(DEFAULT_CACHE_MAX_BYTES >= 64 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn concurrent_purge_and_write_completes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("concurrent-purge");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        // Seed a few files so purge has work to do.
+        for i in 0..4 {
+            let _ = cache_artifact_bytes(&format!("seed-{i}.bin"), &[i as u8; 64]);
+        }
+
+        // Writers tolerate race errors with purge (no shared lock between purge and write).
+        let writers: Vec<_> = (0..4)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    cache_artifact_bytes(&format!("live-{i}.bin"), &[0xABu8; 32])
+                })
+            })
+            .collect();
+        let purger = std::thread::spawn(|| {
+            purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES)
+        });
+
+        let write_results: Vec<_> = writers
+            .into_iter()
+            .map(|h| h.join().expect("writer thread"))
+            .collect();
+        let purge_result = purger.join().expect("purger thread");
+        assert!(
+            purge_result.is_ok(),
+            "purge should not hard-fail: {purge_result:?}"
+        );
+        // At least some writer attempts completed (Ok or Err — no panics).
+        assert_eq!(write_results.len(), 4);
+
+        // After the race settles, a serial write must succeed.
+        let after = cache_artifact_bytes("after.bin", b"ok").unwrap();
+        assert!(after.is_file());
+        assert_eq!(fs::read(&after).unwrap(), b"ok");
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn purge_missing_or_non_dir_cache_is_noop() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let missing = unique_temp_dir("purge-missing");
+        // Do not create the directory.
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &missing);
+        }
+        let stats = purge_artifact_cache(Duration::from_secs(0), 1).unwrap();
+        assert_eq!(stats, PurgeStats::default());
+
+        // File path (not a real directory) is also a no-op via is_real_dir.
+        let file_path = unique_temp_dir("purge-file-path");
+        fs::write(&file_path, b"not-a-dir").unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &file_path);
+        }
+        let stats = purge_artifact_cache(Duration::from_secs(0), 1).unwrap();
+        assert_eq!(stats, PurgeStats::default());
+        assert!(file_path.is_file());
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir_all(&missing);
+    }
+
+    #[test]
+    fn simple_hash_is_stable_and_sensitive() {
+        assert_eq!(simple_hash(b""), simple_hash(b""));
+        assert_ne!(simple_hash(b"a"), simple_hash(b"b"));
+        assert_eq!(simple_hash(b"payload"), simple_hash(b"payload"));
+        // FNV-1a empty seed.
+        assert_eq!(simple_hash(b""), 0xcbf29ce484222325);
+    }
 }
