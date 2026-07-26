@@ -61,7 +61,7 @@ if [ -z "$python" ]; then
     if command -v "$candidate" >/dev/null 2>&1; then python="$candidate"; break; fi
   done
 fi
-PYTHONPATH="$root/python" exec "$python" -m docling "$@"
+PYTHONPATH="$root/python" exec "$python" -c 'from docling.cli.main import app; app()' "$@"
 EOF
 
 cat > "$runtime/bin/defuddle" <<'EOF'
@@ -78,6 +78,11 @@ exec "$node" "$root/node/node_modules/defuddle/dist/cli.js" "$@"
 EOF
 
 chmod +x "$runtime/bin/"* "$contents/MacOS/shift" "$resources/bin/shift-cli"
+
+# Verify every bundled launcher before publishing a large release artifact.
+SHIFT_PYTHON_BIN="$(command -v python3.11)" "$runtime/bin/markitdown" --help >/dev/null
+SHIFT_PYTHON_BIN="$(command -v python3.11)" "$runtime/bin/docling" --help >/dev/null
+SHIFT_NODE_BIN="$(command -v node)" "$runtime/bin/defuddle" --help >/dev/null
 
 # No Developer ID is available yet. Ad-hoc signing keeps the bundle internally
 # consistent, but the release notes must disclose that Gatekeeper notarization
