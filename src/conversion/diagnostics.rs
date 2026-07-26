@@ -7,7 +7,8 @@
 
 use super::pandoc::{pdf_engine_candidates, resolve_pdf_engine};
 use super::process::{
-    clear_tool_discovery_cache, find_executable, is_runnable, resolve_tool_path, run_command,
+    bundled_runtime_tool, clear_tool_discovery_cache, find_executable, is_runnable,
+    resolve_tool_path, run_command,
 };
 use super::{ConversionRegistry, OutputFormat};
 use std::ffi::OsStr;
@@ -578,19 +579,50 @@ fn probe_pandoc() -> EngineDiagnostic {
 }
 
 fn probe_defuddle() -> EngineDiagnostic {
-    let install_hint = "npm install -g defuddle".into();
     let env_override = "SHIFT_DEFUDDLE_BIN";
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle");
-    let resolved = resolve_tool_path(env_override, "defuddle", &[local]);
-    finish_engine_probe(
+    let mut locals = Vec::new();
+    if let Some(bundled) = bundled_runtime_tool("defuddle") {
+        locals.push(bundled);
+    }
+    locals.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle"));
+
+    let node = find_executable("node");
+    let install_hint = if node.is_none() {
+        "brew install node  # Shift ships Defuddle; Node is required to run it\n# or: export SHIFT_NODE_BIN=/absolute/path/to/node".into()
+    } else {
+        "npm install -g defuddle  # or set SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle".into()
+    };
+    let notes = if node.is_none() {
+        Some(
+            "Packaged Shift embeds Defuddle but needs a system Node binary \
+             (Homebrew, nvm, fnm, volta, asdf, or mise)."
+                .into(),
+        )
+    } else {
+        None
+    };
+
+    let mut diagnostic = finish_engine_probe(
         "defuddle",
         "Defuddle",
-        resolved,
+        resolve_tool_path(env_override, "defuddle", &locals),
         env_override,
         install_hint,
         &["--version"],
-        None,
-    )
+        notes,
+    );
+
+    // A packaged shell launcher can exist and still fail when Node is missing.
+    // Prefer Missing so Settings and failure install hints match runtime reality.
+    if diagnostic.readiness.is_ready() && diagnostic.version.is_none() && node.is_none() {
+        diagnostic.readiness = Readiness::Missing;
+        if diagnostic.notes.is_none() {
+            diagnostic.notes =
+                Some("Defuddle launcher found, but Node.js is not available to run it.".into());
+        }
+    }
+
+    diagnostic
 }
 
 fn probe_docling() -> EngineDiagnostic {

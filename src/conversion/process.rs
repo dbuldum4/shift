@@ -345,6 +345,9 @@ pub fn is_runnable(path: &Path) -> bool {
 }
 
 /// Common absolute bin directories probed when `PATH` is minimal (GUI apps on macOS).
+///
+/// Includes Homebrew, TeX, cargo, and version-manager layouts that ship tools
+/// outside the default GUI `PATH` (nvm, fnm, volta, asdf, mise).
 pub fn common_bin_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/opt/homebrew/bin"),
@@ -355,8 +358,73 @@ pub fn common_bin_dirs() -> Vec<PathBuf> {
         let home = PathBuf::from(home);
         dirs.push(home.join(".local/bin"));
         dirs.push(home.join(".cargo/bin"));
+        dirs.push(home.join(".volta/bin"));
+        dirs.push(home.join(".asdf/shims"));
+        dirs.push(home.join(".local/share/mise/shims"));
+        dirs.push(home.join(".mise/shims"));
+
+        // nvm: ~/.nvm/versions/node/<ver>/bin (newest first)
+        let nvm_root = std::env::var_os("NVM_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".nvm"));
+        append_versioned_bin_dirs(&mut dirs, &nvm_root.join("versions/node"), "bin");
+
+        // fnm: <root>/node-versions/<ver>/installation/bin
+        let mut fnm_roots = Vec::new();
+        if let Some(dir) = std::env::var_os("FNM_DIR") {
+            fnm_roots.push(PathBuf::from(dir));
+        }
+        fnm_roots.push(home.join(".local/share/fnm"));
+        fnm_roots.push(home.join(".fnm"));
+        for root in fnm_roots {
+            append_versioned_bin_dirs(&mut dirs, &root.join("node-versions"), "installation/bin");
+        }
     }
     dirs
+}
+
+/// Append `versions_root/<entry>/<relative_bin>` for each version directory,
+/// newest-looking names first (lexicographic reverse works for `v22.23.1`).
+fn append_versioned_bin_dirs(dirs: &mut Vec<PathBuf>, versions_root: &Path, relative_bin: &str) {
+    let Ok(entries) = std::fs::read_dir(versions_root) else {
+        return;
+    };
+    let mut versions: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    versions.sort_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let right_name = right
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        // Reverse so higher version strings are tried first.
+        version_label_cmp(right_name, left_name)
+    });
+    for version_dir in versions {
+        dirs.push(version_dir.join(relative_bin));
+    }
+}
+
+/// Compare version-ish directory labels (`v22.23.1`, `22.23.1`) for ordering.
+fn version_label_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_parts = version_label_parts(left);
+    let right_parts = version_label_parts(right);
+    left_parts.cmp(&right_parts)
+}
+
+fn version_label_parts(label: &str) -> Vec<u64> {
+    label
+        .trim_start_matches('v')
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
 }
 
 /// Resolve a bare tool name on `PATH` and common install locations.
@@ -1029,5 +1097,66 @@ mod tests {
             std::env::temp_dir().join(format!("shift-process-missing-exe-{}", std::process::id()));
         let error = run_command(Command::new(&missing), Duration::from_secs(1), 1024).unwrap_err();
         assert!(error.is_executable_not_found(), "error: {error}");
+    }
+
+    #[test]
+    fn version_label_cmp_orders_semverish_names() {
+        assert_eq!(
+            version_label_cmp("v22.23.1", "v18.0.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            version_label_cmp("v26.2.0", "v22.23.1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            version_label_cmp("22.1", "22.1.0"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn common_bin_dirs_includes_nvm_layout_under_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("shift-home-nvm-{}", std::process::id()));
+        let node_bin = home.join("versions/node/v22.23.1/bin");
+        std::fs::create_dir_all(&node_bin).unwrap();
+        let node = node_bin.join("node");
+        write_script(&node, "#!/bin/sh\necho ok\n");
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_nvm = std::env::var_os("NVM_DIR");
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("NVM_DIR", &home);
+            // Minimal GUI-like PATH so discovery must use common_bin_dirs.
+            std::env::set_var("PATH", "/usr/bin:/bin");
+        }
+        clear_tool_discovery_cache();
+
+        let dirs = common_bin_dirs();
+        assert!(
+            dirs.iter().any(|dir| dir == &node_bin),
+            "expected nvm bin dir in {dirs:?}"
+        );
+        assert_eq!(find_executable("node").as_deref(), Some(node.as_path()));
+
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match previous_nvm {
+                Some(value) => std::env::set_var("NVM_DIR", value),
+                None => std::env::remove_var("NVM_DIR"),
+            }
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        clear_tool_discovery_cache();
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

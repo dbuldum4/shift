@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use url::Url;
 
+fn looks_like_missing_node(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("node.js not found")
+        || lower.contains("exec: : not found")
+        || lower.contains("shift_node_bin")
+        || (lower.contains("node") && lower.contains("not found") && lower.contains("defuddle"))
+}
+
 const EXTENSIONS: &[&str] = &["htm", "html"];
 const OUTPUTS: &[OutputFormat] = &[OutputFormat::MARKDOWN, OutputFormat::HTML];
 
@@ -60,6 +68,13 @@ impl DefuddleModule {
         options: &ConversionOptions,
     ) -> Result<(LimitedOutput, InvocationRecord), ConversionError> {
         let mut command = Command::new(&self.executable);
+        // Packaged `runtime/bin/defuddle` shells out to Node. GUI apps often
+        // lack nvm/Homebrew on PATH; inject an absolute node when discovered.
+        if std::env::var_os("SHIFT_NODE_BIN").is_none() {
+            if let Some(node) = super::find_executable("node") {
+                command.env("SHIFT_NODE_BIN", node);
+            }
+        }
         command.arg("parse").arg(source);
         if markdown {
             command.arg("--markdown");
@@ -98,8 +113,9 @@ impl DefuddleModule {
         .map_err(|error| {
             map_spawn_error(
                 error,
-                "Defuddle is not installed. Install it with `npm install -g defuddle`, \
-                 or set SHIFT_DEFUDDLE_BIN.",
+                "Defuddle is not available. Packaged Shift includes Defuddle but needs Node.js \
+                 (`brew install node`, or set SHIFT_NODE_BIN). For a standalone CLI install: \
+                 `npm install -g defuddle`, or set SHIFT_DEFUDDLE_BIN.",
             )
         })?;
         Ok((output, invocation))
@@ -120,6 +136,13 @@ impl DefuddleModule {
             } else {
                 detail
             };
+            if looks_like_missing_node(&detail) {
+                return Err(ConversionError::new(format!(
+                    "Defuddle could not convert {source_label}: Node.js not found. \
+                     Install Node (for example: `brew install node`) or set SHIFT_NODE_BIN \
+                     to an absolute path. Detail: {detail}"
+                )));
+            }
             return Err(ConversionError::new(format!(
                 "Defuddle could not convert {source_label}: {detail}"
             )));

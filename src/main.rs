@@ -4080,6 +4080,10 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
         ("SHIFT_MARKITDOWN_BIN", "Path to the markitdown executable"),
         ("SHIFT_PANDOC_BIN", "Path to the pandoc executable"),
         ("SHIFT_DEFUDDLE_BIN", "Path to the defuddle executable"),
+        (
+            "SHIFT_NODE_BIN",
+            "Path to Node.js (required by bundled Defuddle)",
+        ),
         ("SHIFT_DOCLING_BIN", "Path to the docling executable"),
         ("SHIFT_FFMPEG_BIN", "Path to the ffmpeg executable"),
         (

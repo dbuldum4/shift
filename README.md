@@ -67,15 +67,17 @@ Without any engine, DOCX → PDF fails with an install hint instead of Pandoc's
 raw `pdflatex not found` message.
 
 - [Defuddle](https://github.com/kepano/defuddle) for extracting clean article
-  content from web pages (URLs) or local HTML:
+  content from web pages (URLs) or local HTML. Packaged `Shift.app` embeds
+  Defuddle but still needs a system [Node.js](https://nodejs.org/) binary:
 
 ```sh
-npm install -g defuddle
-# or use npx / a project-local node_modules/.bin/defuddle
+brew install node
+# development / non-bundled: npm install -g defuddle
 ```
 
-Set `SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle` when it is not available on
-`PATH`.
+Node is resolved from `PATH`, Homebrew, nvm, fnm, volta, asdf, and mise. Set
+`SHIFT_NODE_BIN=/absolute/path/to/node` when the GUI cannot see your install, or
+`SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle` to override the Defuddle CLI.
 
 - [Docling](https://github.com/docling-project/docling) for layout-aware PDF and
   office conversion to Markdown, HTML, or plain text:

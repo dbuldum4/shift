@@ -69,11 +69,69 @@ cat > "$runtime/bin/defuddle" <<'EOF'
 #!/bin/sh
 set -eu
 root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-node="${SHIFT_NODE_BIN:-}"
-if [ -z "$node" ]; then
-  for candidate in /opt/homebrew/bin/node /usr/local/bin/node node; do
-    if command -v "$candidate" >/dev/null 2>&1; then node="$candidate"; break; fi
+
+# Resolve Node for GUI apps with a minimal PATH (Homebrew, nvm, fnm, volta, asdf, mise).
+resolve_node() {
+  if [ -n "${SHIFT_NODE_BIN:-}" ] && [ -x "${SHIFT_NODE_BIN}" ]; then
+    printf '%s\n' "${SHIFT_NODE_BIN}"
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
   done
+
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+
+  home="${HOME:-}"
+  if [ -n "$home" ]; then
+    nvm_dir="${NVM_DIR:-$home/.nvm}"
+    if [ -d "$nvm_dir/versions/node" ]; then
+      latest="$(ls -1d "$nvm_dir"/versions/node/v* 2>/dev/null | sort -V | tail -n 1 || true)"
+      if [ -n "$latest" ] && [ -x "$latest/bin/node" ]; then
+        printf '%s\n' "$latest/bin/node"
+        return 0
+      fi
+    fi
+
+    for base in "${FNM_DIR:-}" "$home/.local/share/fnm" "$home/.fnm"; do
+      [ -n "$base" ] || continue
+      if [ -d "$base/node-versions" ]; then
+        latest="$(ls -1d "$base"/node-versions/v* 2>/dev/null | sort -V | tail -n 1 || true)"
+        if [ -n "$latest" ] && [ -x "$latest/installation/bin/node" ]; then
+          printf '%s\n' "$latest/installation/bin/node"
+          return 0
+        fi
+      fi
+    done
+
+    for candidate in \
+      "$home/.volta/bin/node" \
+      "$home/.asdf/shims/node" \
+      "$home/.local/share/mise/shims/node" \
+      "$home/.mise/shims/node" \
+      "$home/.local/bin/node"; do
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+node="$(resolve_node)" || node=""
+if [ -z "$node" ] || [ ! -x "$node" ]; then
+  printf '%s\n' \
+    "defuddle: Node.js not found. Install Node (for example: brew install node) or set SHIFT_NODE_BIN to an absolute path to node." >&2
+  exit 127
 fi
 exec "$node" "$root/node/node_modules/defuddle/dist/cli.js" "$@"
 EOF
@@ -87,7 +145,7 @@ SHIFT_NODE_BIN="$(command -v node)" "$runtime/bin/defuddle" --help >/dev/null
 
 # No Developer ID is available yet. Ad-hoc signing keeps the bundle internally
 # consistent, but the release notes must disclose that Gatekeeper notarization
-# is not available for 0.1.x.
+# is not available for 0.2.x.
 codesign --force --deep --sign - "$app"
 
 archive="$output_dir/shift-${version}-macos-${arch}.zip"
