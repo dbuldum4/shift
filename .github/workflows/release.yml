@@ -46,7 +46,7 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
-          gh release create "$tag" dist/*.zip dist/*.sha256 \
+          gh release create "$tag" dist/*.zip dist/*.dmg dist/*.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "Shift ${tag#v}" \
             --notes-file release-notes/0.1.0.md \

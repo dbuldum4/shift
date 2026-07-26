@@ -87,4 +87,18 @@ codesign --force --deep --sign - "$app"
 archive="$output_dir/shift-${version}-macos-${arch}.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
 shasum -a 256 "$archive" > "$archive.sha256"
-printf '%s\n' "$archive"
+
+dmg_root="$(mktemp -d "${TMPDIR:-/tmp}/shift-dmg.XXXXXX")"
+trap 'rm -rf "$dmg_root"' EXIT
+cp -R "$app" "$dmg_root/Shift.app"
+ln -s /Applications "$dmg_root/Applications"
+dmg="$output_dir/shift-${version}-macos-${arch}.dmg"
+hdiutil create \
+  -volname "Shift ${version}" \
+  -srcfolder "$dmg_root" \
+  -ov \
+  -format UDZO \
+  "$dmg"
+shasum -a 256 "$dmg" > "$dmg.sha256"
+
+printf '%s\n%s\n' "$archive" "$dmg"
