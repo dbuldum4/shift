@@ -512,8 +512,11 @@ mod tests {
         );
 
         if let Some(parent) = sliced.parent() {
-            // Password file lives next to sliced.pdf and should be cleaned with the dir.
-            assert!(parent.join("password.txt").is_file() || !parent.exists() || true);
+            // Password file lives next to sliced.pdf; callers delete the whole work dir.
+            assert!(
+                parent.join("password.txt").is_file(),
+                "password.txt should remain in the work dir until the caller cleans it up"
+            );
             let _ = std::fs::remove_dir_all(parent);
         }
         unsafe {
