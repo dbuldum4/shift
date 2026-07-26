@@ -145,7 +145,7 @@ SHIFT_NODE_BIN="$(command -v node)" "$runtime/bin/defuddle" --help >/dev/null
 
 # No Developer ID is available yet. Ad-hoc signing keeps the bundle internally
 # consistent, but the release notes must disclose that Gatekeeper notarization
-# is not available for 0.2.x.
+# is not available for 0.1.x.
 codesign --force --deep --sign - "$app"
 
 archive="$output_dir/shift-${version}-macos-${arch}.zip"

@@ -13,5 +13,5 @@ Docling model weights are intentionally not embedded because upstream selects
 models for the active pipeline and downloads them on demand. They are cached by
 Docling after first use.
 
-The 0.2.x releases are ad-hoc signed and cannot be notarized without an Apple
+The 0.1.x releases are ad-hoc signed and cannot be notarized without an Apple
 Developer ID certificate. The release and website disclose this limitation.
