@@ -46,6 +46,18 @@ layout awareness and exports Markdown, HTML, or plain text (enabling PDF →
 HTML, which MarkItDown and Pandoc cannot do). FFmpeg converts audio and video
 containers, still frames, subtitle tracks, and PNG sequence ZIPs (for example
 MP4 → MP3, WAV → FLAC, video → PNG, MKV → SRT, video → `png-sequence-zip`).
+The sips adapter (macOS only, `/usr/bin/sips`, no install step) owns still-image
+conversion: it reads the families no other engine does — HEIC/HEIF, AVIF, SVG,
+JPEG XL, and camera RAW — and writes PNG, JPG, TIFF, GIF, BMP, JP2, ICNS, and
+PDF (image → PDF is reachable only here). HEIC, AVIF, WEBP, and ICO decode but
+do not have reliable sips CLI encoders, so they are inputs only; WEBP output
+stays with FFmpeg. sips is registered ahead of FFmpeg and therefore wins still → still
+pairs, while FFmpeg keeps everything that starts from a container (frame
+extraction, `png-sequence-zip`). Off macOS the module is not registered at all,
+so its formats are absent from capability lists rather than failing at spawn.
+`preferences::DEFAULT_MODULES` must list every module id in registration order;
+an id missing there is sorted last by `with_priority` and silently loses every
+overlap.
 
 Optional knobs live on `ConversionOptions`:
 
@@ -56,6 +68,7 @@ Optional knobs live on `ConversionOptions`:
 | `defuddle` | frontmatter, language |
 | `pandoc` | standalone, TOC, PDF engine override, reference-doc, citations (off by default) |
 | `markitdown` | keep data URIs |
+| `sips` | max dimension, quality, rotate, flip, strip color profile |
 | `pdf` | password (never persisted), page_from / page_to (qpdf slice) |
 
 App and CLI expose the same conversion flags; defaults match historical fixed

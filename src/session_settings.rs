@@ -3,7 +3,7 @@
 use crate::conversion::{
     ConversionOptions, DefuddleOptions, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
     FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions,
-    PdfInputOptions,
+    PdfInputOptions, SipsFlip, SipsOptions,
 };
 use crate::history::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,9 @@ pub struct SessionConversionOptions {
     pub pandoc: SessionPandocOptions,
     pub defuddle: SessionDefuddleOptions,
     pub docling: SessionDoclingOptions,
+    /// Added after v1 shipped, so old settings files omit it.
+    #[serde(default)]
+    pub sips: SessionSipsOptions,
     pub pdf: SessionPdfInputOptions,
 }
 
@@ -132,6 +135,7 @@ impl SessionConversionOptions {
             pandoc: SessionPandocOptions::from(&options.pandoc),
             defuddle: SessionDefuddleOptions::from(&options.defuddle),
             docling: SessionDoclingOptions::from(&options.docling),
+            sips: SessionSipsOptions::from(&options.sips),
             pdf: SessionPdfInputOptions {
                 // Never persist passwords.
                 page_from: options.pdf.page_from,
@@ -149,6 +153,7 @@ impl SessionConversionOptions {
             pandoc: self.pandoc.to_pandoc_options(),
             defuddle: self.defuddle.to_defuddle_options(),
             docling: self.docling.to_docling_options(),
+            sips: self.sips.to_sips_options(),
             pdf: PdfInputOptions {
                 password: None,
                 page_from: self.pdf.page_from,
@@ -338,6 +343,58 @@ impl SessionDoclingOptions {
                 .table_mode
                 .parse()
                 .unwrap_or(DoclingTableMode::default()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionSipsOptions {
+    pub max_dimension: Option<u32>,
+    pub quality: String,
+    pub rotate_degrees: Option<u32>,
+    /// `horizontal` / `vertical`, or `None` for no mirror.
+    pub flip: Option<String>,
+    pub strip_color_profile: bool,
+}
+
+impl Default for SessionSipsOptions {
+    fn default() -> Self {
+        let defaults = SipsOptions::default();
+        Self {
+            max_dimension: defaults.max_dimension,
+            quality: defaults.quality.id().to_owned(),
+            rotate_degrees: defaults.rotate_degrees,
+            flip: defaults.flip.map(|flip| flip.id().to_owned()),
+            strip_color_profile: defaults.strip_color_profile,
+        }
+    }
+}
+
+impl From<&SipsOptions> for SessionSipsOptions {
+    fn from(value: &SipsOptions) -> Self {
+        Self {
+            max_dimension: value.max_dimension,
+            quality: value.quality.id().to_owned(),
+            rotate_degrees: value.rotate_degrees,
+            flip: value.flip.map(|flip| flip.id().to_owned()),
+            strip_color_profile: value.strip_color_profile,
+        }
+    }
+}
+
+impl SessionSipsOptions {
+    fn to_sips_options(&self) -> SipsOptions {
+        SipsOptions {
+            max_dimension: self.max_dimension,
+            quality: self.quality.parse().unwrap_or_default(),
+            rotate_degrees: self.rotate_degrees,
+            // An unparseable persisted axis falls back to no flip rather than
+            // silently mirroring the image.
+            flip: self
+                .flip
+                .as_deref()
+                .and_then(|value| value.parse::<SipsFlip>().ok()),
+            strip_color_profile: self.strip_color_profile,
         }
     }
 }

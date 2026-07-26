@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn caches_and_purges_artifacts_including_export() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("purge");
         fs::create_dir_all(&dir).unwrap();
         // SAFETY: serialized behind crate::ENV_LOCK.
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn stage_export_file_hardlinks_or_copies() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("export-file");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn concurrent_cache_and_export_staging_reuses_complete_artifact() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("concurrent");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn export_matches_bytes_reads_sidecar() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("match");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn export_matches_rejects_same_length_content_edit() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("stale-edit");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn version_mismatch_purges_stale_cache_entries() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("version");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn cache_artifact_bytes_sanitizes_path_traversal_names() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("traversal");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn cache_artifact_file_copies_source_content() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("cache-file");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn purge_paste_staging_with_zero_ttl_removes_external_staging_only() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cache_dir = unique_temp_dir("paste-cache");
         let paste_dir = unique_temp_dir("paste-staging");
         fs::create_dir_all(&cache_dir).unwrap();
@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn stage_export_bytes_defaults_blank_names_to_artifact() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("blank-name");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn disambiguated_export_preserves_extension_and_content() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("disambiguate");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn purge_artifact_cache_evicts_by_max_bytes() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("max-bytes");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn artifact_cache_dir_and_paste_staging_honor_env_override() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("env-override");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn purge_empty_dir_and_export_only_subdir() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let empty = unique_temp_dir("purge-empty");
         fs::create_dir_all(&empty).unwrap();
         unsafe {
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn cache_artifact_file_missing_source_errors() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("missing-src");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -1145,7 +1145,7 @@ mod tests {
 
     #[test]
     fn stage_export_strips_path_like_names() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("pathlike-export");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn concurrent_purge_and_write_completes() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("concurrent-purge");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn purge_missing_or_non_dir_cache_is_noop() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = unique_temp_dir("purge-missing");
         // Do not create the directory.
         unsafe {
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn ensure_artifact_cache_dir_rejects_symlink_and_file() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = unique_temp_dir("ensure-bad");
         std::fs::create_dir_all(&base).unwrap();
 
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn cache_artifact_bytes_without_extension_uses_hash_suffix() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("no-ext");
         fs::create_dir_all(&dir).unwrap();
         unsafe {
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[test]
     fn purge_artifact_cache_defaults_runs_paste_staging_too() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("purge-defaults");
         let paste_dir = unique_temp_dir("purge-defaults-paste");
         fs::create_dir_all(&dir).unwrap();

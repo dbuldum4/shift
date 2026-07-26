@@ -285,6 +285,11 @@ pub(crate) struct Shift {
     pub(crate) docling_tables: bool,
     pub(crate) docling_table_mode: DoclingTableMode,
     pub(crate) docling_ocr_lang_input: Entity<TextInput>,
+    pub(crate) sips_quality: SipsQuality,
+    pub(crate) sips_max_dimension: Option<u32>,
+    pub(crate) sips_rotate_degrees: Option<u32>,
+    pub(crate) sips_flip: Option<SipsFlip>,
+    pub(crate) sips_strip_color_profile: bool,
     pub(crate) defuddle_frontmatter: bool,
     pub(crate) defuddle_lang_input: Entity<TextInput>,
     pub(crate) pandoc_standalone: bool,
@@ -518,6 +523,11 @@ impl Shift {
             docling_tables: options.docling.tables,
             docling_table_mode: options.docling.table_mode,
             docling_ocr_lang_input,
+            sips_quality: options.sips.quality,
+            sips_max_dimension: options.sips.max_dimension,
+            sips_rotate_degrees: options.sips.rotate_degrees,
+            sips_flip: options.sips.flip,
+            sips_strip_color_profile: options.sips.strip_color_profile,
             defuddle_frontmatter: options.defuddle.frontmatter,
             defuddle_lang_input,
             pandoc_standalone: options.pandoc.standalone,
@@ -1551,6 +1561,13 @@ impl Shift {
                 ocr_lang,
                 tables: self.docling_tables,
                 table_mode: self.docling_table_mode,
+            },
+            sips: SipsOptions {
+                max_dimension: self.sips_max_dimension,
+                quality: self.sips_quality,
+                rotate_degrees: self.sips_rotate_degrees,
+                flip: self.sips_flip,
+                strip_color_profile: self.sips_strip_color_profile,
             },
             pdf: PdfInputOptions {
                 password,
@@ -2781,6 +2798,11 @@ impl Render for Shift {
         let docling_tables = self.docling_tables;
         let docling_table_mode = self.docling_table_mode;
         let docling_ocr_lang_input = self.docling_ocr_lang_input.clone();
+        let sips_quality = self.sips_quality;
+        let sips_max_dimension = self.sips_max_dimension;
+        let sips_rotate_degrees = self.sips_rotate_degrees;
+        let sips_flip = self.sips_flip;
+        let sips_strip_color_profile = self.sips_strip_color_profile;
         let defuddle_frontmatter = self.defuddle_frontmatter;
         let defuddle_lang_input = self.defuddle_lang_input.clone();
         let pandoc_standalone = self.pandoc_standalone;
@@ -2955,6 +2977,11 @@ impl Render for Shift {
                                     docling_tables,
                                     docling_table_mode,
                                     docling_ocr_lang_input,
+                                    sips_quality,
+                                    sips_max_dimension,
+                                    sips_rotate_degrees,
+                                    sips_flip,
+                                    sips_strip_color_profile,
                                     defuddle_frontmatter,
                                     defuddle_lang_input,
                                     pandoc_standalone,

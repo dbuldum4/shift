@@ -136,7 +136,9 @@ pub fn materialize_magic_paste(
 /// Stage raw image bytes from the clipboard as a temporary source file.
 ///
 /// `extension` should be a lowercase extension without the leading dot (e.g. `png`).
-/// Rejects formats that no conversion module accepts as input (e.g. bare SVG).
+/// Rejects formats that no conversion module accepts as input. The accepted set
+/// follows the registry, so it widens as modules are added (SVG, for example,
+/// became stageable with the macOS sips adapter).
 pub fn stage_pasted_image(bytes: &[u8], extension: &str) -> Result<PathBuf, ConversionError> {
     if bytes.is_empty() {
         return Err(ConversionError::new("clipboard image is empty"));
@@ -820,7 +822,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_clipboard_image_format() {
-        let err = stage_pasted_image(b"<svg/>", "svg").unwrap_err();
+        // Rejection is driven by the registry, not a fixed denylist, so this
+        // uses an extension no module will ever claim. It fails before any
+        // staging directory is touched.
+        let err = stage_pasted_image(b"garbage", "zzz").unwrap_err();
         assert!(
             err.to_string().contains("not a supported"),
             "unexpected error: {err}"
@@ -1143,8 +1148,20 @@ exit 0
         assert!(err.to_string().contains("clipboard image is empty"));
         let err = stage_pasted_image(b"x", "").unwrap_err();
         assert!(err.to_string().contains("clipboard image has no format"));
-        let err = stage_pasted_image(b"<svg/>", "svg").unwrap_err();
+        let err = stage_pasted_image(b"garbage", "zzz").unwrap_err();
         assert!(err.to_string().contains("not a supported conversion input"));
+
+        // SVG became stageable once a module could read it (sips, macOS only).
+        let svg = stage_pasted_image(b"<svg/>", "svg");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            svg.as_ref()
+                .map(|path| path.extension().and_then(|e| e.to_str())),
+            Ok(Some("svg")),
+            "sips reads SVG, so a pasted SVG must stage"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(svg.is_err(), "no module reads SVG off macOS");
 
         unsafe {
             std::env::remove_var("SHIFT_PASTE_STAGING_DIR");

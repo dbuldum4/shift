@@ -1067,10 +1067,10 @@ mod tests {
         fn input_extensions(&self) -> &'static [&'static str] {
             self.inputs
         }
-        fn output_formats(&self) -> &'static [OutputFormat] {
+        fn output_formats(&self) -> &[OutputFormat] {
             self.outputs
         }
-        fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+        fn chainable_output_formats(&self) -> &[OutputFormat] {
             &[]
         }
         fn convert(
@@ -1301,10 +1301,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -1718,10 +1718,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -2271,10 +2271,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -2445,14 +2445,14 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[
                     OutputFormat::MARKDOWN,
                     OutputFormat::HTML,
                     OutputFormat("plain"),
                 ]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -2749,10 +2749,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -2814,10 +2814,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &[]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(

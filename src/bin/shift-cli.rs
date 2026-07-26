@@ -3,9 +3,9 @@ use shift_core::conversion::{
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
     FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
-    PdfInputOptions, default_output_path, ensure_public_url_fetch_allowed, expand_input_paths,
-    looks_like_url, materialize_paste_token, parse_magic_paste, prepare_batch_destination,
-    run_batch, url_display_host,
+    PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, default_output_path,
+    ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url, materialize_paste_token,
+    parse_magic_paste, prepare_batch_destination, run_batch, url_display_host,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -101,6 +101,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         pandoc: parsed.pandoc,
         defuddle: parsed.defuddle,
         docling: parsed.docling,
+        sips: parsed.sips,
         pdf: parsed.pdf,
         cancel: Some(Arc::clone(&cancel)),
         progress: None,
@@ -201,6 +202,7 @@ struct ParsedConvertArgs {
     pandoc: PandocOptions,
     defuddle: DefuddleOptions,
     docling: DoclingOptions,
+    sips: SipsOptions,
     pdf: PdfInputOptions,
     recursive: bool,
     verbose: bool,
@@ -225,6 +227,7 @@ impl Default for ParsedConvertArgs {
             pandoc: PandocOptions::default(),
             defuddle: DefuddleOptions::default(),
             docling: DoclingOptions::default(),
+            sips: SipsOptions::default(),
             pdf: PdfInputOptions::default(),
             recursive: false,
             verbose: false,
@@ -453,6 +456,45 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     .parse::<DoclingTableMode>()
                     .map_err(|error| error.to_string())?;
             }
+            "--sips-max-dimension" => {
+                cursor += 1;
+                parsed.sips.max_dimension = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--sips-max-dimension requires pixels".to_owned())?,
+                    "--sips-max-dimension",
+                )?);
+            }
+            "--sips-quality" => {
+                cursor += 1;
+                parsed.sips.quality = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--sips-quality requires balanced|high|small".to_owned())?
+                    .to_string_lossy()
+                    .parse::<SipsQuality>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--sips-rotate" => {
+                cursor += 1;
+                parsed.sips.rotate_degrees = Some(parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--sips-rotate requires degrees clockwise".to_owned())?,
+                    "--sips-rotate",
+                )?);
+            }
+            "--sips-flip" => {
+                cursor += 1;
+                parsed.sips.flip = Some(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--sips-flip requires horizontal|vertical".to_owned())?
+                        .to_string_lossy()
+                        .parse::<SipsFlip>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "--sips-strip-profile" => parsed.sips.strip_color_profile = true,
             "--ocr-lang" => {
                 cursor += 1;
                 parsed.docling.ocr_lang = Some(
@@ -1018,6 +1060,12 @@ fn print_help() {
          --ocr-lang <CODE>       OCR language(s), e.g. eng or eng+deu\n  \
          --docling-tables / --no-docling-tables\n  \
          --docling-table-mode fast|accurate\n\n\
+         Image options (sips, macOS only):\n  \
+         --sips-max-dimension <PX>  Fit inside PX x PX, preserving aspect\n  \
+         --sips-quality balanced|high|small\n  \
+         --sips-rotate <DEGREES>    Rotate clockwise\n  \
+         --sips-flip horizontal|vertical\n  \
+         --sips-strip-profile       Drop the embedded color profile\n\n\
          Inputs may be local paths, file:// URLs, page URLs (http/https,\n\
          extracted with Defuddle), or direct file URLs (downloaded then\n\
          converted). URL fetches are public-internet only by default (no\n\
@@ -1187,7 +1235,7 @@ mod tests {
         use shift_core::conversion::DiagnosticsReport;
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("doctor-env");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1203,6 +1251,7 @@ mod tests {
             "SHIFT_PANDOC_BIN",
             "SHIFT_DEFUDDLE_BIN",
             "SHIFT_DOCLING_BIN",
+            "SHIFT_SIPS_BIN",
             "SHIFT_FFMPEG_BIN",
         ];
 
@@ -1296,7 +1345,7 @@ mod tests {
     #[test]
     fn confirm_network_rejects_private_hosts_without_allow() {
         // Ensure default public-only policy for this process.
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -1334,7 +1383,7 @@ mod tests {
 
     #[test]
     fn confirm_network_urls_includes_remote_file_urls() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -1358,7 +1407,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn batch_writes_multiple_files_to_output_dir() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("batch-dir");
         std::fs::create_dir_all(&dir).unwrap();
         let pandoc = dir.join("fake-pandoc");
@@ -1463,7 +1512,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn convert_writes_beside_source_without_clobbering_it() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("convert-dir");
         std::fs::create_dir_all(&dir).unwrap();
         let pandoc = dir.join("fake-pandoc");
@@ -1508,7 +1557,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn convert_rejects_explicit_output_equal_to_source() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("overwrite-dir");
         std::fs::create_dir_all(&dir).unwrap();
         let pandoc = dir.join("fake-pandoc");
@@ -1631,7 +1680,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn convert_stdout_emits_bytes_without_writing_files() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("stdout-dir");
         std::fs::create_dir_all(&dir).unwrap();
         let pandoc = dir.join("fake-pandoc");
@@ -1951,10 +2000,18 @@ mod tests {
     fn cli_module_ids_match_default_registry() {
         let registry = ConversionRegistry::default();
         let module_ids: Vec<_> = registry.modules().map(|m| m.id()).collect();
-        assert_eq!(
-            module_ids,
-            vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-        );
+        #[cfg(target_os = "macos")]
+        let expected = vec![
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "sips",
+            "ffmpeg",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        assert_eq!(module_ids, expected);
 
         for id in &module_ids {
             let built = build_registry(Some(id)).unwrap();
@@ -2450,6 +2507,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_sips_image_flags() {
+        let parsed = parse_convert_args(&args(&[
+            "IMG_0001.HEIC",
+            "--sips-max-dimension",
+            "1024",
+            "--sips-quality",
+            "small",
+            "--sips-rotate",
+            "90",
+            "--sips-flip",
+            "vertical",
+            "--sips-strip-profile",
+            "-t",
+            "jpg",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.sips.max_dimension, Some(1024));
+        assert_eq!(parsed.sips.quality, SipsQuality::Small);
+        assert_eq!(parsed.sips.rotate_degrees, Some(90));
+        assert_eq!(parsed.sips.flip, Some(SipsFlip::Vertical));
+        assert!(parsed.sips.strip_color_profile);
+        assert_eq!(parsed.target, OutputFormat::JPG);
+
+        // Defaults stay inert so unrelated conversions are unaffected.
+        let plain = parse_convert_args(&args(&["a.png", "-t", "jpg"])).unwrap();
+        assert!(plain.sips.is_default());
+
+        for (argv, needle) in [
+            (args(&["a.png", "--sips-quality", "max"]), "quality"),
+            (args(&["a.png", "--sips-flip", "diagonal"]), "flip"),
+            (
+                args(&["a.png", "--sips-max-dimension", "big"]),
+                "--sips-max-dimension",
+            ),
+            (args(&["a.png", "--sips-rotate", "-90"]), "--sips-rotate"),
+        ] {
+            let err = parse_convert_args(&argv).unwrap_err();
+            assert!(err.contains(needle), "argv={argv:?} error={err}");
+        }
+
+        for (argv, needle) in [
+            (
+                args(&["a.png", "--sips-max-dimension"]),
+                "--sips-max-dimension",
+            ),
+            (args(&["a.png", "--sips-quality"]), "--sips-quality"),
+            (args(&["a.png", "--sips-rotate"]), "--sips-rotate"),
+            (args(&["a.png", "--sips-flip"]), "--sips-flip"),
+        ] {
+            let err = parse_convert_args(&argv).unwrap_err();
+            assert!(err.contains(needle), "argv={argv:?} error={err}");
+        }
+    }
+
+    #[test]
     fn parse_pandoc_standalone_toc_and_pdf_engine() {
         let parsed = parse_convert_args(&args(&[
             "notes.md",
@@ -2650,7 +2762,7 @@ mod tests {
     fn doctor_script_keys_are_stable_across_env() {
         use shift_core::conversion::DiagnosticsReport;
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("doctor-keys");
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("missing-bin");
@@ -2659,6 +2771,7 @@ mod tests {
             "SHIFT_PANDOC_BIN",
             "SHIFT_DEFUDDLE_BIN",
             "SHIFT_DOCLING_BIN",
+            "SHIFT_SIPS_BIN",
             "SHIFT_FFMPEG_BIN",
         ];
         unsafe {
@@ -2799,7 +2912,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn convert_stdout_single_file_happy_path_with_fake() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("stdout-happy");
         std::fs::create_dir_all(&dir).unwrap();
         let pandoc = dir.join("fake-pandoc");
@@ -2839,7 +2952,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn batch_single_file_with_output_dir_forces_batch_path() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp("batch-one");
         std::fs::create_dir_all(&dir).unwrap();
         let pandoc = dir.join("fake-pandoc");

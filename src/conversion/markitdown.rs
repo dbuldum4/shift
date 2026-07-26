@@ -95,11 +95,11 @@ impl ConversionModule for MarkItDownModule {
         EXTENSIONS
     }
 
-    fn output_formats(&self) -> &'static [OutputFormat] {
+    fn output_formats(&self) -> &[OutputFormat] {
         OUTPUTS
     }
 
-    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+    fn chainable_output_formats(&self) -> &[OutputFormat] {
         OUTPUTS
     }
 

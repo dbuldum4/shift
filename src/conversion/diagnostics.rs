@@ -123,14 +123,21 @@ impl DiagnosticsReport {
             let pandoc = scope.spawn(probe_pandoc);
             let defuddle = scope.spawn(probe_defuddle);
             let docling = scope.spawn(probe_docling);
+            #[cfg(target_os = "macos")]
+            let sips = scope.spawn(probe_sips);
             let ffmpeg = scope.spawn(probe_ffmpeg);
-            vec![
+            // Order matches `ConversionRegistry::build_default`.
+            let mut engines = vec![
                 markitdown.join().expect("markitdown probe"),
                 pandoc.join().expect("pandoc probe"),
                 defuddle.join().expect("defuddle probe"),
                 docling.join().expect("docling probe"),
-                ffmpeg.join().expect("ffmpeg probe"),
-            ]
+            ];
+            // Off macOS the module is not registered, so it is not reported.
+            #[cfg(target_os = "macos")]
+            engines.push(sips.join().expect("sips probe"));
+            engines.push(ffmpeg.join().expect("ffmpeg probe"));
+            engines
         });
 
         let selected = resolve_pdf_engine(None)
@@ -640,6 +647,24 @@ fn probe_docling() -> EngineDiagnostic {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn probe_sips() -> EngineDiagnostic {
+    // sips is part of the OS, so there is nothing to install; the hint only
+    // matters if /usr/bin/sips has been removed or shadowed.
+    let install_hint = "sips ships with macOS at /usr/bin/sips".into();
+    let env_override = "SHIFT_SIPS_BIN";
+    let resolved = resolve_tool_path(env_override, "sips", &[PathBuf::from("/usr/bin/sips")]);
+    finish_engine_probe(
+        "sips",
+        "sips",
+        resolved,
+        env_override,
+        install_hint,
+        &["--version"],
+        None,
+    )
+}
+
 fn probe_ffmpeg() -> EngineDiagnostic {
     let install_hint = "brew install ffmpeg".into();
     let env_override = "SHIFT_FFMPEG_BIN";
@@ -822,6 +847,7 @@ fn normalize_tool_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversion::{ConversionModule, FfmpegModule};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -985,7 +1011,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_respects_env_override_and_version() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "shift-diag-probe-{}-{}",
             std::process::id(),
@@ -1016,7 +1042,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_engine_is_reported() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = std::env::temp_dir().join(format!(
             "shift-diag-missing-{}-no-such-bin",
             std::process::id()
@@ -1049,10 +1075,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
             fn convert(
@@ -1107,16 +1133,26 @@ mod tests {
     }
 
     #[test]
-    fn collect_returns_five_engines() {
+    fn collect_reports_every_registered_engine() {
         // Smoke test against the real machine; does not assert readiness.
         let report = DiagnosticsReport::collect();
-        assert_eq!(report.engines.len(), 5);
         assert!(!report.pdf_engines.is_empty());
         let ids: Vec<_> = report.engines.iter().map(|e| e.id).collect();
-        assert_eq!(
-            ids,
-            vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-        );
+        // sips is macOS-only and is not registered elsewhere, so it must not be
+        // reported on other platforms either.
+        #[cfg(target_os = "macos")]
+        let expected = vec![
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "sips",
+            "ffmpeg",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        assert_eq!(ids, expected);
+        assert_eq!(report.engines.len(), expected.len());
     }
 
     #[test]
@@ -1550,7 +1586,15 @@ mod tests {
     fn supported_outputs_cover_media_for_video_input() {
         let registry = ConversionRegistry::default();
         let outs = supported_outputs(&registry, Path::new("clip.mp4"));
+        let ffmpeg = FfmpegModule::default();
         for format in OutputFormat::MEDIA {
+            // WEBP only appears when this machine's ffmpeg was compiled with
+            // libwebp; otherwise it is correctly omitted from capability lists.
+            if *format == OutputFormat::WEBP
+                && !ffmpeg.supports(Path::new("clip.mp4"), OutputFormat::WEBP)
+            {
+                continue;
+            }
             assert!(
                 outs.contains(format),
                 "supported_outputs missing {}",

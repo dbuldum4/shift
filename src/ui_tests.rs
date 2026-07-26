@@ -131,6 +131,31 @@ stem="${stem%.*}"
 printf '# docling fake %%s\\n' "$stem" > "$out_dir/$stem.$to"
 "#;
 
+/// Writes the file named by `--out` so tests never invoke the real
+/// `/usr/bin/sips`, which would reject the synthetic image bytes fixtures use.
+const SIPS_FAKE: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "sips-fake"
+  exit 0
+fi
+
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--out" ]; then
+    out="$arg"
+    prev=""
+    continue
+  fi
+  case "$arg" in
+    --out) prev="--out" ;;
+  esac
+done
+
+[ -z "$out" ] && exit 0
+printf '%s' "shift-fake-image" > "$out"
+"#;
+
 struct TestEnv {
     _guard: MutexGuard<'static, ()>,
     temp: PathBuf,
@@ -171,6 +196,9 @@ impl TestEnv {
         let docling = bin.join("docling");
         write_script(&docling, DOCLING_FAKE);
 
+        let sips = bin.join("sips");
+        write_script(&sips, SIPS_FAKE);
+
         let mut previous = std::collections::HashMap::new();
         set_env(&mut previous, "HOME", Some(home.clone().into_os_string()));
         set_env(
@@ -207,6 +235,11 @@ impl TestEnv {
             &mut previous,
             "SHIFT_DOCLING_BIN",
             Some(docling.clone().into_os_string()),
+        );
+        set_env(
+            &mut previous,
+            "SHIFT_SIPS_BIN",
+            Some(sips.clone().into_os_string()),
         );
         set_env(&mut previous, "SHIFT_ALLOW_PRIVATE_URLS", Some("1".into()));
         // Absolute path so resolve_pdf_engine succeeds without a real engine.
@@ -785,7 +818,7 @@ async fn invalid_ffmpeg_options_fail(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn clipboard_image_converts_via_ffmpeg(cx: &mut TestAppContext) {
+async fn clipboard_image_converts_via_sips(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
     let shift = create_shift(cx);
 
@@ -803,6 +836,10 @@ async fn clipboard_image_converts_via_ffmpeg(cx: &mut TestAppContext) {
         other => panic!("expected Ready, got {other:?}"),
     });
     assert_eq!(format, OutputFormat::PNG);
+    // Still → still is sips on macOS; FFmpeg keeps container inputs.
+    #[cfg(target_os = "macos")]
+    assert_eq!(module, "sips");
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(module, "ffmpeg");
 }
 

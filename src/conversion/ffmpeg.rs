@@ -4,13 +4,14 @@ use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
     InvocationRecord, OutputFormat, TempDirGuard, command_argv_parts, format_argv_display,
     map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command_cancellable, unique_temp_dir,
+    run_command, run_command_cancellable, unique_temp_dir,
 };
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -237,14 +238,27 @@ pub fn is_subtitle_output(format: OutputFormat) -> bool {
 #[derive(Clone, Debug)]
 pub struct FfmpegModule {
     executable: OsString,
+    /// WEBP encoding requires libwebp at compile time. Many macOS ffmpeg
+    /// installs (including the one on this developer machine) have the muxer
+    /// but no encoder, so we probe once and hide WEBP from dispatch rather
+    /// than fail at the end of a conversion.
+    webp_encoder_available: bool,
+    /// Runtime output list: full `MEDIA` when libwebp is available, otherwise
+    /// `MEDIA` without `WEBP`.
+    outputs: Vec<OutputFormat>,
 }
 
 impl Default for FfmpegModule {
     fn default() -> Self {
+        // Absolute path when found so GUI apps with a minimal PATH match
+        // diagnostics readiness (PATH + common_bin_dirs).
+        let executable = resolve_tool_executable("SHIFT_FFMPEG_BIN", "ffmpeg", &[]);
+        let webp_encoder_available = cached_webp_encoder_available(&executable);
+        let outputs = ffmpeg_outputs(webp_encoder_available);
         Self {
-            // Absolute path when found so GUI apps with a minimal PATH match
-            // diagnostics readiness (PATH + common_bin_dirs).
-            executable: resolve_tool_executable("SHIFT_FFMPEG_BIN", "ffmpeg", &[]),
+            executable,
+            webp_encoder_available,
+            outputs,
         }
     }
 }
@@ -253,6 +267,10 @@ impl FfmpegModule {
     pub fn with_executable(executable: impl Into<OsString>) -> Self {
         Self {
             executable: executable.into(),
+            // Unit tests that provide a fake or bare-name binary should not be
+            // blocked by a developer's real ffmpeg configuration.
+            webp_encoder_available: true,
+            outputs: OutputFormat::MEDIA.to_vec(),
         }
     }
 
@@ -268,7 +286,7 @@ impl FfmpegModule {
         output_format: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
-        if !OUTPUTS.contains(&output_format) {
+        if !self.output_formats().contains(&output_format) {
             return Err(ConversionError::new(format!(
                 "FFmpeg does not produce {}",
                 output_format.label()
@@ -1002,6 +1020,51 @@ fn apply_video_encode(command: &mut Command, output_format: OutputFormat, option
     }
 }
 
+fn probe_webp_encoder(executable: &OsStr) -> bool {
+    let mut command = Command::new(executable);
+    command.arg("-hide_banner").arg("-encoders");
+    match run_command(command, Duration::from_secs(5), 512 * 1024) {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.contains("libwebp")
+        }
+        _ => false,
+    }
+}
+
+fn cached_webp_encoder_available(executable: &OsStr) -> bool {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<OsString, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    if let Some(available) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(executable)
+        .copied()
+    {
+        return available;
+    }
+
+    let available = probe_webp_encoder(executable);
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(executable.to_os_string(), available);
+    available
+}
+
+fn ffmpeg_outputs(webp_encoder_available: bool) -> Vec<OutputFormat> {
+    if webp_encoder_available {
+        OutputFormat::MEDIA.to_vec()
+    } else {
+        OutputFormat::MEDIA
+            .iter()
+            .filter(|&&format| format != OutputFormat::WEBP)
+            .copied()
+            .collect()
+    }
+}
+
 impl ConversionModule for FfmpegModule {
     fn id(&self) -> &'static str {
         "ffmpeg"
@@ -1015,12 +1078,25 @@ impl ConversionModule for FfmpegModule {
         INPUTS
     }
 
-    fn output_formats(&self) -> &'static [OutputFormat] {
-        OUTPUTS
+    fn output_formats(&self) -> &[OutputFormat] {
+        &self.outputs
     }
 
-    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+    fn chainable_output_formats(&self) -> &[OutputFormat] {
         CHAINABLE
+    }
+
+    fn supports(&self, input: &Path, output: OutputFormat) -> bool {
+        if output == OutputFormat::WEBP && !self.webp_encoder_available {
+            return false;
+        }
+        let Some(extension) = input.extension().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        self.input_extensions()
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            && self.output_formats().contains(&output)
     }
 
     fn convert(

@@ -212,11 +212,11 @@ impl ConversionModule for DefuddleModule {
         EXTENSIONS
     }
 
-    fn output_formats(&self) -> &'static [OutputFormat] {
+    fn output_formats(&self) -> &[OutputFormat] {
         OUTPUTS
     }
 
-    fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+    fn chainable_output_formats(&self) -> &[OutputFormat] {
         OUTPUTS
     }
 
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn public_url_policy_blocks_private_by_default() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Isolate from the developer's shell env for this process.
         // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn block_private_urls_env_matrix() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: serialized behind crate::ENV_LOCK.
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn ensure_public_url_fetch_allowed_private_hosts_matrix() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
@@ -994,7 +994,7 @@ mod tests {
         );
 
         // Private host rejected before the fake binary runs.
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");

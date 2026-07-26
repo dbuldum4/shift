@@ -30,11 +30,11 @@ use shift_core::conversion::{
     ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingImageExportMode, DoclingOptions,
     DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
     MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfInputOptions, Readiness,
-    available_ready_outputs, available_ready_url_outputs, expand_input_paths, is_audio_output,
-    is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output, looks_like_url,
-    materialize_magic_paste, parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates,
-    run_batch, stage_pasted_image, suggested_output_for_path, suggested_output_for_url,
-    url_display_host,
+    SipsFlip, SipsOptions, SipsQuality, available_ready_outputs, available_ready_url_outputs,
+    expand_input_paths, is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output,
+    is_video_output, looks_like_url, materialize_magic_paste, parse_magic_paste,
+    paths_refer_to_same_file, pdf_engine_candidates, run_batch, stage_pasted_image,
+    suggested_output_for_path, suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -1438,6 +1438,11 @@ pub(crate) struct ConversionPanelView {
     docling_tables: bool,
     docling_table_mode: DoclingTableMode,
     docling_ocr_lang_input: Entity<TextInput>,
+    sips_quality: SipsQuality,
+    sips_max_dimension: Option<u32>,
+    sips_rotate_degrees: Option<u32>,
+    sips_flip: Option<SipsFlip>,
+    sips_strip_color_profile: bool,
     defuddle_frontmatter: bool,
     defuddle_lang_input: Entity<TextInput>,
     pandoc_standalone: bool,
@@ -1478,6 +1483,11 @@ fn conversion_options_panel(
         docling_tables,
         docling_table_mode,
         docling_ocr_lang_input,
+        sips_quality,
+        sips_max_dimension,
+        sips_rotate_degrees,
+        sips_flip,
+        sips_strip_color_profile,
         defuddle_frontmatter,
         defuddle_lang_input,
         pandoc_standalone,
@@ -1495,6 +1505,11 @@ fn conversion_options_panel(
     let show_defuddle = active_modules.contains(&"defuddle");
     let show_pandoc = active_modules.contains(&"pandoc");
     let show_markitdown = active_modules.contains(&"markitdown");
+    let show_sips = active_modules.contains(&"sips");
+    // Quality only affects lossy encoders; hide it for lossless destinations
+    // rather than showing a control that silently does nothing.
+    let show_sips_quality = matches!(output_format.id(), "jpg" | "heic" | "avif" | "jp2");
+    let rotation = sips_rotate_degrees.unwrap_or(0) % 360;
     let show_pdf_pages = show_docling || show_markitdown;
     let show_audio = is_audio_output(output_format) || is_video_output(output_format);
     let show_video = is_video_output(output_format) || is_image_output(output_format);
@@ -2062,6 +2077,200 @@ fn conversion_options_panel(
                         .text_color(THEME.text_dim)
                         .child("Embedded images can produce large artifacts."),
                 )
+        })
+        .when(show_sips, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(THEME.text_muted)
+                        .child("Image"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(THEME.text_muted).child("Size"))
+                        .child(chip(
+                            "sips-size-original",
+                            "Original",
+                            sips_max_dimension.is_none(),
+                            cx,
+                            |this, _cx| {
+                                this.sips_max_dimension = None;
+                            },
+                        ))
+                        .child(chip(
+                            "sips-size-512",
+                            "512 px",
+                            sips_max_dimension == Some(512),
+                            cx,
+                            |this, _cx| {
+                                this.sips_max_dimension = Some(512);
+                            },
+                        ))
+                        .child(chip(
+                            "sips-size-1024",
+                            "1024 px",
+                            sips_max_dimension == Some(1024),
+                            cx,
+                            |this, _cx| {
+                                this.sips_max_dimension = Some(1024);
+                            },
+                        ))
+                        .child(chip(
+                            "sips-size-2048",
+                            "2048 px",
+                            sips_max_dimension == Some(2048),
+                            cx,
+                            |this, _cx| {
+                                this.sips_max_dimension = Some(2048);
+                            },
+                        )),
+                )
+                .when(show_sips_quality, |panel| {
+                    panel.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(THEME.text_muted)
+                                    .child("Quality"),
+                            )
+                            .child(chip(
+                                "sips-quality-balanced",
+                                SipsQuality::Balanced.label(),
+                                sips_quality == SipsQuality::Balanced,
+                                cx,
+                                |this, _cx| {
+                                    this.sips_quality = SipsQuality::Balanced;
+                                },
+                            ))
+                            .child(chip(
+                                "sips-quality-high",
+                                SipsQuality::High.label(),
+                                sips_quality == SipsQuality::High,
+                                cx,
+                                |this, _cx| {
+                                    this.sips_quality = SipsQuality::High;
+                                },
+                            ))
+                            .child(chip(
+                                "sips-quality-small",
+                                SipsQuality::Small.label(),
+                                sips_quality == SipsQuality::Small,
+                                cx,
+                                |this, _cx| {
+                                    this.sips_quality = SipsQuality::Small;
+                                },
+                            )),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(THEME.text_muted).child("Rotate"))
+                        .child(chip(
+                            "sips-rotate-0",
+                            "None",
+                            rotation == 0,
+                            cx,
+                            |this, _cx| {
+                                this.sips_rotate_degrees = None;
+                            },
+                        ))
+                        .child(chip(
+                            "sips-rotate-90",
+                            "90°",
+                            rotation == 90,
+                            cx,
+                            |this, _cx| {
+                                this.sips_rotate_degrees = Some(90);
+                            },
+                        ))
+                        .child(chip(
+                            "sips-rotate-180",
+                            "180°",
+                            rotation == 180,
+                            cx,
+                            |this, _cx| {
+                                this.sips_rotate_degrees = Some(180);
+                            },
+                        ))
+                        .child(chip(
+                            "sips-rotate-270",
+                            "270°",
+                            rotation == 270,
+                            cx,
+                            |this, _cx| {
+                                this.sips_rotate_degrees = Some(270);
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(chip(
+                            "sips-flip-horizontal",
+                            "Flip H",
+                            sips_flip == Some(SipsFlip::Horizontal),
+                            cx,
+                            |this, _cx| {
+                                this.sips_flip = if this.sips_flip == Some(SipsFlip::Horizontal) {
+                                    None
+                                } else {
+                                    Some(SipsFlip::Horizontal)
+                                };
+                            },
+                        ))
+                        .child(chip(
+                            "sips-flip-vertical",
+                            "Flip V",
+                            sips_flip == Some(SipsFlip::Vertical),
+                            cx,
+                            |this, _cx| {
+                                this.sips_flip = if this.sips_flip == Some(SipsFlip::Vertical) {
+                                    None
+                                } else {
+                                    Some(SipsFlip::Vertical)
+                                };
+                            },
+                        ))
+                        .child(chip(
+                            "sips-strip-profile",
+                            if sips_strip_color_profile {
+                                "Strip profile ✓"
+                            } else {
+                                "Strip profile"
+                            },
+                            sips_strip_color_profile,
+                            cx,
+                            |this, _cx| {
+                                this.sips_strip_color_profile = !this.sips_strip_color_profile;
+                            },
+                        )),
+                )
+                .when(output_format == OutputFormat::ICNS, |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(THEME.text_dim)
+                            .child("ICNS needs a square icon size: pick 512 or 1024."),
+                    )
+                })
         })
         .when(show_pdf_pages, |panel| {
             panel

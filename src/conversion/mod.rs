@@ -10,6 +10,7 @@ mod markitdown;
 mod pandoc;
 mod pdf_slice;
 mod process;
+mod sips;
 mod sources;
 mod suggest;
 
@@ -57,6 +58,7 @@ pub use process::{
     resolve_tool_executable, resolve_tool_path, run_command, run_command_cancellable,
     unique_temp_dir,
 };
+pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality};
 pub use sources::{
     MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
 };
@@ -102,6 +104,16 @@ impl OutputFormat {
     pub const VTT: Self = Self("vtt");
     /// PNG frame sequence packaged as a single ZIP (FFmpeg).
     pub const PNG_SEQUENCE_ZIP: Self = Self("png-sequence-zip");
+
+    // Still-image writers owned by the sips adapter (macOS ImageIO).
+    // PNG/JPG/GIF/PDF above are shared with FFmpeg/Pandoc; see
+    // `ConversionRegistry::build_default` for precedence.
+    pub const TIFF: Self = Self("tiff");
+    pub const BMP: Self = Self("bmp");
+    pub const HEIC: Self = Self("heic");
+    pub const AVIF: Self = Self("avif");
+    pub const JP2: Self = Self("jp2");
+    pub const ICNS: Self = Self("icns");
 
     /// Every writer in Pandoc 3.10, ordered by practical end-user popularity.
     /// Closely related variants follow their best-known parent format.
@@ -327,6 +339,28 @@ impl OutputFormat {
         Self::PNG_SEQUENCE_ZIP,
         Self::SRT,
         Self::VTT,
+        // Still images (must stay in sync with `IMAGE`).
+        Self::TIFF,
+        Self::BMP,
+        Self::HEIC,
+        Self::AVIF,
+        Self::JP2,
+        Self::ICNS,
+    ];
+
+    /// Still-image writers that only the sips adapter provides.
+    ///
+    /// Deliberately excludes formats shared with other engines (`PNG`, `JPG`,
+    /// `GIF`, `PDF`); those live in [`Self::MEDIA`] / [`Self::PANDOC`] and stay
+    /// there so the existing "no overlap between catalogs" invariant holds.
+    /// The sips module's full writable set is declared in `sips.rs`.
+    pub const IMAGE: &'static [Self] = &[
+        Self::TIFF,
+        Self::BMP,
+        Self::HEIC,
+        Self::AVIF,
+        Self::JP2,
+        Self::ICNS,
     ];
 
     pub fn id(self) -> &'static str {
@@ -385,6 +419,12 @@ impl OutputFormat {
             "srt" => "SubRip (SRT)",
             "vtt" => "WebVTT",
             "png-sequence-zip" => "PNG Sequence (ZIP)",
+            "tiff" => "TIFF Image",
+            "bmp" => "BMP Image",
+            "heic" => "HEIC Image",
+            "avif" => "AVIF Image",
+            "jp2" => "JPEG 2000",
+            "icns" => "Apple Icon (ICNS)",
             other => other,
         }
     }
@@ -477,6 +517,12 @@ impl OutputFormat {
             "png" => "image/png",
             "jpg" => "image/jpeg",
             "webp" => "image/webp",
+            "tiff" => "image/tiff",
+            "bmp" => "image/bmp",
+            "heic" => "image/heic",
+            "avif" => "image/avif",
+            "jp2" => "image/jp2",
+            "icns" => "image/x-icns",
             "srt" => "application/x-subrip",
             "vtt" => "text/vtt",
             "png-sequence-zip" => "application/zip",
@@ -533,6 +579,9 @@ impl std::str::FromStr for OutputFormat {
             "jpeg" => "jpg",
             "mpg" | "mpg2" => "mpeg",
             "aif" => "aiff",
+            "tif" => "tiff",
+            "heif" => "heic",
+            "jpeg2000" | "jpx" => "jp2",
             "png-zip" | "png_sequence" | "frames-zip" | "png-sequence-zip" => "png-sequence-zip",
             other => other,
         };
@@ -596,6 +645,7 @@ pub struct ConversionOptions {
     pub pandoc: PandocOptions,
     pub defuddle: DefuddleOptions,
     pub docling: DoclingOptions,
+    pub sips: SipsOptions,
     pub pdf: PdfInputOptions,
     /// When set and true, external converter processes should abort.
     ///
@@ -983,9 +1033,9 @@ pub trait ConversionModule: Send + Sync {
     fn id(&self) -> &'static str;
     fn label(&self) -> &'static str;
     fn input_extensions(&self) -> &'static [&'static str];
-    fn output_formats(&self) -> &'static [OutputFormat];
+    fn output_formats(&self) -> &[OutputFormat];
     /// Outputs which may be materialized and safely consumed by another module.
-    fn chainable_output_formats(&self) -> &'static [OutputFormat];
+    fn chainable_output_formats(&self) -> &[OutputFormat];
     fn convert(
         &self,
         input: &Path,
@@ -1061,13 +1111,29 @@ impl ConversionRegistry {
     /// HTML/plain (and higher-quality Markdown when prioritized above
     /// MarkItDown). Pandoc owns publishing writers; Defuddle owns URLs. FFmpeg
     /// owns audio/video container conversion (no document overlap).
+    ///
+    /// sips is registered immediately before FFmpeg, which is the only module
+    /// it overlaps: both accept still images (`png`, `jpg`, `tiff`, `bmp`,
+    /// `gif`) and write `png`/`jpg`/`gif`. sips wins those pairs because it is
+    /// a single ImageIO call with no transcoding pipeline, and because it also
+    /// reads the formats FFmpeg cannot (HEIC, AVIF, SVG, JXL, RAW). FFmpeg
+    /// keeps every pair that starts from a video or audio container, including
+    /// frame extraction and `png-sequence-zip`, since sips declares no
+    /// container inputs. sips does not overlap Pandoc on `pdf`: Pandoc reads no
+    /// raster inputs, so image → PDF is reachable only through sips.
+    ///
+    /// sips is macOS-only. Off macOS the module is not registered at all, so
+    /// its formats are absent from capability lists rather than failing at
+    /// spawn time.
     fn build_default() -> Self {
-        Self::new()
+        let registry = Self::new()
             .with_module(MarkItDownModule::default())
             .with_module(PandocModule::default())
             .with_module(DefuddleModule::default())
-            .with_module(DoclingModule::default())
-            .with_module(FfmpegModule::default())
+            .with_module(DoclingModule::default());
+        #[cfg(target_os = "macos")]
+        let registry = registry.with_module(SipsModule::default());
+        registry.with_module(FfmpegModule::default())
     }
 
     pub fn with_module(mut self, module: impl ConversionModule + 'static) -> Self {
@@ -1123,19 +1189,16 @@ impl ConversionRegistry {
                 continue;
             }
             for &intermediate in first.chainable_output_formats() {
-                if !first.output_formats().contains(&intermediate) {
+                if !first.supports(input, intermediate) {
                     continue;
                 }
+                let synthetic = PathBuf::from(format!("converted.{}", intermediate.extension()));
                 if let Some((_, second)) =
                     self.modules
                         .iter()
                         .enumerate()
                         .find(|(second_index, second)| {
-                            *second_index != first_index
-                                && second.input_extensions().iter().any(|extension| {
-                                    extension.eq_ignore_ascii_case(intermediate.extension())
-                                })
-                                && second.output_formats().contains(&output)
+                            *second_index != first_index && second.supports(&synthetic, output)
                         })
                 {
                     return Some(ConversionRoute::TwoStep {
@@ -1290,22 +1353,27 @@ impl ConversionRegistry {
                 continue;
             }
 
-            reachable.extend(first.output_formats().iter().copied());
+            // Ask each module what it actually supports for this input so
+            // runtime encoder probes (e.g. FFmpeg libwebp) are honored.
+            for &output in OutputFormat::ALL {
+                if first.supports(input, output) {
+                    reachable.insert(output);
+                }
+            }
 
             for &intermediate in first.chainable_output_formats() {
-                if !first.output_formats().contains(&intermediate) {
+                if !first.supports(input, intermediate) {
                     continue;
                 }
+                let synthetic = PathBuf::from(format!("converted.{}", intermediate.extension()));
                 for (second_index, second) in self.modules.iter().enumerate() {
                     if second_index == first_index {
                         continue;
                     }
-                    if second
-                        .input_extensions()
-                        .iter()
-                        .any(|candidate| intermediate.extension().eq_ignore_ascii_case(candidate))
-                    {
-                        reachable.extend(second.output_formats().iter().copied());
+                    for &output in OutputFormat::ALL {
+                        if second.supports(&synthetic, output) {
+                            reachable.insert(output);
+                        }
                     }
                 }
             }
@@ -1633,10 +1701,10 @@ mod tests {
         fn input_extensions(&self) -> &'static [&'static str] {
             self.inputs
         }
-        fn output_formats(&self) -> &'static [OutputFormat] {
+        fn output_formats(&self) -> &[OutputFormat] {
             self.outputs
         }
-        fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+        fn chainable_output_formats(&self) -> &[OutputFormat] {
             self.chainable
         }
         fn convert(
@@ -2060,15 +2128,18 @@ mod tests {
     }
 
     #[test]
-    fn all_catalog_matches_pandoc_plus_media() {
+    fn all_catalog_matches_pandoc_plus_media_plus_image() {
         assert_eq!(
             OutputFormat::ALL.len(),
-            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len()
+            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len() + OutputFormat::IMAGE.len()
         );
         for format in OutputFormat::PANDOC {
             assert!(OutputFormat::ALL.contains(format));
         }
         for format in OutputFormat::MEDIA {
+            assert!(OutputFormat::ALL.contains(format));
+        }
+        for format in OutputFormat::IMAGE {
             assert!(OutputFormat::ALL.contains(format));
         }
     }
@@ -2691,7 +2762,7 @@ mod tests {
     fn pdf_password_is_preprocessed_and_not_passed_to_modules() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let directory = std::env::temp_dir();
         let suffix = std::process::id();
@@ -2845,11 +2916,27 @@ mod tests {
         let all_ids: HashSet<&str> = OutputFormat::ALL.iter().map(|f| f.id()).collect();
         let pandoc_ids: HashSet<&str> = OutputFormat::PANDOC.iter().map(|f| f.id()).collect();
         let media_ids: HashSet<&str> = OutputFormat::MEDIA.iter().map(|f| f.id()).collect();
+        let image_ids: HashSet<&str> = OutputFormat::IMAGE.iter().map(|f| f.id()).collect();
 
         assert_eq!(
             OutputFormat::ALL.len(),
-            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len()
+            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len() + OutputFormat::IMAGE.len()
         );
+        assert_eq!(
+            image_ids.len(),
+            OutputFormat::IMAGE.len(),
+            "duplicate ids in IMAGE"
+        );
+        // IMAGE holds only the writers no other catalog claims; formats sips
+        // shares with FFmpeg/Pandoc (png, jpg, gif, pdf) stay in their original
+        // slice so the three catalogs remain a true partition of ALL.
+        for (name, other) in [("PANDOC", &pandoc_ids), ("MEDIA", &media_ids)] {
+            let overlap: Vec<_> = image_ids.intersection(other).copied().collect();
+            assert!(
+                overlap.is_empty(),
+                "ids appear in both IMAGE and {name}: {overlap:?}"
+            );
+        }
         assert_eq!(
             all_ids.len(),
             OutputFormat::ALL.len(),
@@ -2872,16 +2959,24 @@ mod tests {
             "ids appear in both PANDOC and MEDIA: {overlap:?}"
         );
 
-        let union: HashSet<&str> = pandoc_ids.union(&media_ids).copied().collect();
-        assert_eq!(union, all_ids, "PANDOC ∪ MEDIA must equal ALL");
+        let union: HashSet<&str> = pandoc_ids
+            .union(&media_ids)
+            .copied()
+            .collect::<HashSet<&str>>()
+            .union(&image_ids)
+            .copied()
+            .collect();
+        assert_eq!(union, all_ids, "PANDOC ∪ MEDIA ∪ IMAGE must equal ALL");
 
         // Every ALL entry is in exactly one partition.
         for format in OutputFormat::ALL {
             let in_pandoc = OutputFormat::PANDOC.contains(format);
             let in_media = OutputFormat::MEDIA.contains(format);
-            assert!(
-                in_pandoc ^ in_media,
-                "{} must appear in exactly one of PANDOC/MEDIA (pandoc={in_pandoc}, media={in_media})",
+            let in_image = OutputFormat::IMAGE.contains(format);
+            assert_eq!(
+                usize::from(in_pandoc) + usize::from(in_media) + usize::from(in_image),
+                1,
+                "{} must appear in exactly one of PANDOC/MEDIA/IMAGE (pandoc={in_pandoc}, media={in_media}, image={in_image})",
                 format.id()
             );
         }
@@ -2988,6 +3083,13 @@ mod tests {
             route_head: Option<&'static str>,
         }
 
+        // sips is macOS-only, so still-image expectations are platform-specific.
+        #[cfg(target_os = "macos")]
+        let (still_module, heic_module) = ("sips", Some("sips"));
+        // Off macOS nothing reads HEIC, so that pair is unsupported entirely.
+        #[cfg(not(target_os = "macos"))]
+        let (still_module, heic_module) = ("ffmpeg", None);
+
         let cases = [
             Case {
                 input: "REPORT.DOCX",
@@ -3044,11 +3146,20 @@ mod tests {
                 direct_module: Some("ffmpeg"),
                 route_head: Some("ffmpeg"),
             },
+            // Still → still is sips on macOS (registered ahead of FFmpeg) and
+            // FFmpeg everywhere else. Frame extraction from a container stays
+            // with FFmpeg on every platform; see the `clip.mp4` cases above.
             Case {
                 input: "photo.png",
                 output: OutputFormat::JPG,
-                direct_module: Some("ffmpeg"),
-                route_head: Some("ffmpeg"),
+                direct_module: Some(still_module),
+                route_head: Some(still_module),
+            },
+            Case {
+                input: "photo.heic",
+                output: OutputFormat::JPG,
+                direct_module: heic_module,
+                route_head: heic_module,
             },
             Case {
                 input: "notes.md",
@@ -3237,10 +3348,18 @@ mod tests {
     fn default_registry_module_ids_are_stable() {
         let registry = ConversionRegistry::default();
         let ids: Vec<_> = registry.modules().map(|m| m.id()).collect();
-        assert_eq!(
-            ids,
-            vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-        );
+        #[cfg(target_os = "macos")]
+        let expected = vec![
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "sips",
+            "ffmpeg",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        assert_eq!(ids, expected);
         for id in &ids {
             assert!(registry.has_module(id));
         }
@@ -3290,6 +3409,14 @@ mod tests {
         let registry = ConversionRegistry::default();
         let video_outputs = registry.available_outputs(Path::new("clip.mp4"));
         for format in OutputFormat::MEDIA {
+            // WEBP only appears when this machine's ffmpeg was compiled with libwebp.
+            if *format == OutputFormat::WEBP
+                && registry
+                    .module_for(Path::new("clip.mp4"), OutputFormat::WEBP)
+                    .is_none()
+            {
+                continue;
+            }
             assert!(
                 video_outputs.contains(format),
                 "mp4 should list media output {}",
@@ -3535,9 +3662,16 @@ mod tests {
         let registry = ConversionRegistry::default();
         let input = Path::new("clip.mp4");
         for format in OutputFormat::MEDIA {
-            let ids = registry
-                .route_module_ids(input, *format)
-                .unwrap_or_else(|| panic!("no route clip.mp4 → {}", format.id()));
+            // WEBP routes only when this machine's ffmpeg was compiled with libwebp.
+            let Some(ids) = registry.route_module_ids(input, *format) else {
+                assert_eq!(
+                    *format,
+                    OutputFormat::WEBP,
+                    "unexpected missing route clip.mp4 → {}",
+                    format.id()
+                );
+                continue;
+            };
             assert_eq!(ids, vec!["ffmpeg"], "route for {}", format.id());
         }
     }
@@ -3725,10 +3859,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &[]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -3801,10 +3935,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
@@ -3848,10 +3982,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["txt"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(

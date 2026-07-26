@@ -3,7 +3,20 @@
 use std::io;
 use std::path::PathBuf;
 
-const DEFAULT_MODULES: &[&str] = &["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+/// Must match the registration order in `ConversionRegistry::build_default`.
+///
+/// `with_priority` sorts unlisted ids to the end, so a module missing here
+/// would silently lose every capability overlap regardless of how the registry
+/// was built. `sips` is listed on all platforms; off macOS it is simply never
+/// registered, and the extra id is inert.
+const DEFAULT_MODULES: &[&str] = &[
+    "markitdown",
+    "pandoc",
+    "defuddle",
+    "docling",
+    "sips",
+    "ffmpeg",
+];
 
 pub fn default_module_priority() -> Vec<String> {
     DEFAULT_MODULES.iter().map(|id| (*id).to_owned()).collect()
@@ -155,7 +168,14 @@ mod tests {
     fn normalization_removes_unknowns_and_appends_missing_modules() {
         assert_eq!(
             normalize(["pandoc", "unknown", "pandoc"]),
-            vec!["pandoc", "markitdown", "defuddle", "docling", "ffmpeg"]
+            vec![
+                "pandoc",
+                "markitdown",
+                "defuddle",
+                "docling",
+                "sips",
+                "ffmpeg"
+            ]
         );
     }
 
@@ -167,7 +187,14 @@ mod tests {
 
         assert_eq!(
             load_module_priority(),
-            vec!["docling", "pandoc", "markitdown", "defuddle", "ffmpeg"]
+            vec![
+                "docling",
+                "pandoc",
+                "markitdown",
+                "defuddle",
+                "sips",
+                "ffmpeg"
+            ]
         );
     }
 
@@ -187,7 +214,14 @@ mod tests {
 
         assert_eq!(
             load_module_priority(),
-            vec!["pandoc", "docling", "markitdown", "defuddle", "ffmpeg"]
+            vec![
+                "pandoc",
+                "docling",
+                "markitdown",
+                "defuddle",
+                "sips",
+                "ffmpeg"
+            ]
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -225,11 +259,18 @@ mod tests {
         let saved =
             std::fs::read_to_string(home.join("Library/Application Support/Shift/module-priority"))
                 .unwrap();
-        assert_eq!(saved, "pandoc\ndocling\nmarkitdown\ndefuddle\nffmpeg");
+        assert_eq!(saved, "pandoc\ndocling\nmarkitdown\ndefuddle\nsips\nffmpeg");
 
         assert_eq!(
             load_module_priority(),
-            vec!["pandoc", "docling", "markitdown", "defuddle", "ffmpeg"]
+            vec![
+                "pandoc",
+                "docling",
+                "markitdown",
+                "defuddle",
+                "sips",
+                "ffmpeg"
+            ]
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -251,11 +292,18 @@ mod tests {
 
         save_module_priority(&["docling".to_owned(), "ffmpeg".to_owned()]).unwrap();
         let saved = std::fs::read_to_string(override_dir.join("module-priority")).unwrap();
-        assert_eq!(saved, "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle");
+        assert_eq!(saved, "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle\nsips");
 
         assert_eq!(
             load_module_priority(),
-            vec!["docling", "ffmpeg", "markitdown", "pandoc", "defuddle"]
+            vec![
+                "docling",
+                "ffmpeg",
+                "markitdown",
+                "pandoc",
+                "defuddle",
+                "sips"
+            ]
         );
 
         let _ = std::fs::remove_dir_all(&home);
@@ -270,7 +318,14 @@ mod tests {
 
         assert_eq!(
             load_module_priority(),
-            vec!["pandoc", "ffmpeg", "markitdown", "defuddle", "docling"]
+            vec![
+                "pandoc",
+                "ffmpeg",
+                "markitdown",
+                "defuddle",
+                "docling",
+                "sips"
+            ]
         );
     }
 
@@ -304,7 +359,14 @@ mod tests {
 
         assert_eq!(
             load_module_priority(),
-            vec!["ffmpeg", "markitdown", "pandoc", "defuddle", "docling"]
+            vec![
+                "ffmpeg",
+                "markitdown",
+                "pandoc",
+                "defuddle",
+                "docling",
+                "sips"
+            ]
         );
 
         let _ = std::fs::remove_dir_all(&home);

@@ -162,10 +162,18 @@ fn default_registry_capability_consistency() {
 fn default_registry_module_ids_are_unique_and_stable() {
     let registry = ConversionRegistry::default();
     let ids: Vec<&str> = registry.modules().map(|m| m.id()).collect();
-    assert_eq!(
-        ids,
-        vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-    );
+    #[cfg(target_os = "macos")]
+    let expected = vec![
+        "markitdown",
+        "pandoc",
+        "defuddle",
+        "docling",
+        "sips",
+        "ffmpeg",
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+    assert_eq!(ids, expected);
     let mut seen = std::collections::HashSet::new();
     for id in &ids {
         assert!(seen.insert(*id), "duplicate module id: {id}");

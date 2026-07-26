@@ -668,10 +668,10 @@ mod tests {
             fn input_extensions(&self) -> &'static [&'static str] {
                 &["FOO", "Bar"]
             }
-            fn output_formats(&self) -> &'static [OutputFormat] {
+            fn output_formats(&self) -> &[OutputFormat] {
                 &[OutputFormat::MARKDOWN]
             }
-            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
                 &[]
             }
             fn convert(
