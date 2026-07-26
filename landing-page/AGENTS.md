@@ -14,3 +14,7 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 - Use Geist Mono and keep each direction grounded in Shift's native file-conversion product and the sparse, typographic spirit of the GPUI landing page.
 - Keep every direction minimalist and monochrome like the GPUI reference. Variation should come from layout and information architecture, not loud art direction.
 - Permit only a restrained touch of dark blue for code, output, or interaction emphasis.
+- Remove the original directions. Replace them with six new directions numbered 01–06, derived from original direction 01's structure and original direction 06's cold noir palette.
+- New directions must be extremely minimalist, single-column, and contain no product mockups, diagrams, illustrations, cards-as-visuals, or other decorative visuals.
+- Use the exact lowercase positioning line: “shift is a blazingly fast, native, opinionated, robust, and resilient file converter built for macOS”.
+- Take strong structural cues from the GPUI reference: sparse navigation, small lowercase wordmark, large negative space, modest monospace sizing, understated links, and documentation-like vertical flow.
