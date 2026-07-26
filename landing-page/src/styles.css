@@ -72,6 +72,11 @@ main {
   transition: color 130ms ease;
 }
 
+.page-nav > div {
+  display: flex;
+  gap: 28px;
+}
+
 .wordmark {
   color: var(--white);
   font-weight: 720;
@@ -97,15 +102,9 @@ main {
   text-wrap: balance;
 }
 
-.actions {
-  display: grid;
-  grid-template-columns: 180px minmax(320px, 1fr);
-  gap: 70px;
-  align-items: center;
-  margin-top: 110px;
-}
-
 .download-link {
+  align-self: flex-start;
+  margin-top: 110px;
   padding-bottom: 8px;
   color: var(--dim);
   border-bottom: 1px solid #34383a;
@@ -113,35 +112,7 @@ main {
   transition: color 130ms ease, border-color 130ms ease, transform 130ms var(--ease-out);
 }
 
-.copy-line {
-  display: flex;
-  min-width: 0;
-  min-height: 54px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 14px;
-  cursor: pointer;
-  color: var(--dim);
-  background: #080a0b;
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  font-size: 11px;
-  text-align: left;
-  transition: color 130ms ease, border-color 130ms ease, transform 130ms var(--ease-out);
-}
-
-.copy-line b {
-  color: #668397;
-  font-weight: 500;
-}
-
-.copy-line span:last-child {
-  color: var(--faint);
-  font-size: 9px;
-}
-
-.download-link:active,
-.copy-line:active {
+.download-link:active {
   transform: scale(0.97);
 }
 
@@ -181,10 +152,6 @@ footer small {
     border-color: var(--line-blue);
   }
 
-  .copy-line:hover {
-    color: var(--white);
-    border-color: #3a4145;
-  }
 }
 
 @media (max-width: 620px) {
@@ -203,9 +170,7 @@ footer small {
     text-wrap: pretty;
   }
 
-  .actions {
-    grid-template-columns: 1fr;
-    gap: 34px;
+  .download-link {
     margin-top: 80px;
   }
 }
@@ -219,8 +184,7 @@ footer small {
     animation: reduced-enter 160ms ease both;
   }
 
-  .download-link,
-  .copy-line {
+  .download-link {
     transition: color 130ms ease, border-color 130ms ease;
   }
 

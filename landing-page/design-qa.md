@@ -23,7 +23,7 @@ illustrations, screenshots, gradients, decorative cards, or icon set.
 
 - Exact lowercase statement preserved.
 - Desktop and mobile document widths match their viewport widths.
-- Copy interaction exposes both `copy` and `copied` accessible states.
+- The comparison UI and command block are absent from the production page.
 - GitHub Pages build emits assets under `/shift/`.
 - GitHub Pages workflow is manual-only and cannot deploy from a push.
 

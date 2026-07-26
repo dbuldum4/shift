@@ -49,9 +49,10 @@ pub use markitdown::{MarkItDownModule, MarkItDownOptions};
 pub use pandoc::{PandocModule, PandocOptions, pdf_engine_candidates, resolve_pdf_engine};
 pub use pdf_slice::extract_pdf_pages;
 pub use process::{
-    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, find_executable, is_runnable,
-    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    resolve_tool_path, run_command, run_command_cancellable, unique_temp_dir,
+    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, bundled_runtime_tool,
+    find_executable, is_runnable, max_output_bytes, process_timeout, read_file_limited,
+    resolve_tool_executable, resolve_tool_path, run_command, run_command_cancellable,
+    unique_temp_dir,
 };
 pub use sources::{
     MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,

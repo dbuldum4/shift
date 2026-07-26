@@ -1,7 +1,8 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
-    LimitedOutput, OutputFormat, command_argv_parts, format_argv_display, map_spawn_error,
-    max_output_bytes, process_timeout, resolve_tool_executable, run_command_cancellable,
+    LimitedOutput, OutputFormat, bundled_runtime_tool, command_argv_parts, format_argv_display,
+    map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
+    run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -36,8 +37,12 @@ impl Default for DefuddleModule {
 fn discover_executable() -> OsString {
     // Prefer a project-local node_modules binary when present. Absolute
     // resolution matches diagnostics (PATH + common_bin_dirs).
-    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle");
-    resolve_tool_executable("SHIFT_DEFUDDLE_BIN", "defuddle", &[local])
+    let mut candidates = Vec::new();
+    if let Some(bundled) = bundled_runtime_tool("defuddle") {
+        candidates.push(bundled);
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle"));
+    resolve_tool_executable("SHIFT_DEFUDDLE_BIN", "defuddle", &candidates)
 }
 
 impl DefuddleModule {

@@ -1,0 +1,90 @@
+#!/bin/sh
+set -eu
+
+version="${1:?version required}"
+output_dir="${2:-dist}"
+arch="$(uname -m)"
+app="$output_dir/Shift.app"
+contents="$app/Contents"
+resources="$contents/Resources"
+runtime="$resources/runtime"
+
+rm -rf "$app"
+mkdir -p "$contents/MacOS" "$resources/bin" "$runtime/bin" "$runtime/python" "$runtime/node"
+
+cp target/release/shift "$contents/MacOS/shift"
+cp target/release/shift-cli "$resources/bin/shift-cli"
+
+cat > "$contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key><string>Shift</string>
+  <key>CFBundleExecutable</key><string>shift</string>
+  <key>CFBundleIdentifier</key><string>org.denizbuldum.shift</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>Shift</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>${version#0.}</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+EOF
+
+uv pip install --python 3.11 --target "$runtime/python" \
+  "markitdown[all]==0.1.6" "docling==2.115.0"
+npm install --prefix "$runtime/node" --omit=dev --no-package-lock "defuddle@0.19.2"
+
+cat > "$runtime/bin/markitdown" <<'EOF'
+#!/bin/sh
+set -eu
+root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+python="${SHIFT_PYTHON_BIN:-}"
+if [ -z "$python" ]; then
+  for candidate in /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/opt/python@3.11/bin/python3.11 python3.11; do
+    if command -v "$candidate" >/dev/null 2>&1; then python="$candidate"; break; fi
+  done
+fi
+PYTHONPATH="$root/python" exec "$python" -m markitdown "$@"
+EOF
+
+cat > "$runtime/bin/docling" <<'EOF'
+#!/bin/sh
+set -eu
+root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+python="${SHIFT_PYTHON_BIN:-}"
+if [ -z "$python" ]; then
+  for candidate in /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/opt/python@3.11/bin/python3.11 python3.11; do
+    if command -v "$candidate" >/dev/null 2>&1; then python="$candidate"; break; fi
+  done
+fi
+PYTHONPATH="$root/python" exec "$python" -m docling "$@"
+EOF
+
+cat > "$runtime/bin/defuddle" <<'EOF'
+#!/bin/sh
+set -eu
+root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+node="${SHIFT_NODE_BIN:-}"
+if [ -z "$node" ]; then
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node node; do
+    if command -v "$candidate" >/dev/null 2>&1; then node="$candidate"; break; fi
+  done
+fi
+exec "$node" "$root/node/node_modules/defuddle/dist/cli.js" "$@"
+EOF
+
+chmod +x "$runtime/bin/"* "$contents/MacOS/shift" "$resources/bin/shift-cli"
+
+# No Developer ID is available yet. Ad-hoc signing keeps the bundle internally
+# consistent, but the release notes must disclose that Gatekeeper notarization
+# is not available for 0.1.0.
+codesign --force --deep --sign - "$app"
+
+archive="$output_dir/shift-${version}-macos-${arch}.zip"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+shasum -a 256 "$archive" > "$archive.sha256"
+printf '%s\n' "$archive"

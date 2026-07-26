@@ -1,7 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
-    OutputFormat, command_argv_parts, format_argv_display, map_spawn_error, max_output_bytes,
-    process_timeout, resolve_tool_executable, run_command_cancellable,
+    OutputFormat, bundled_runtime_tool, command_argv_parts, format_argv_display, map_spawn_error,
+    max_output_bytes, process_timeout, resolve_tool_executable, run_command_cancellable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -46,8 +46,12 @@ fn discover_executable() -> OsString {
     // builds can provide a bundled path through SHIFT_MARKITDOWN_BIN.
     // Resolves to an absolute path via PATH + common_bin_dirs so GUI apps
     // with a minimal PATH still spawn the same binary diagnostics reports.
-    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/markitdown");
-    resolve_tool_executable("SHIFT_MARKITDOWN_BIN", "markitdown", &[local])
+    let mut candidates = Vec::new();
+    if let Some(bundled) = bundled_runtime_tool("markitdown") {
+        candidates.push(bundled);
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/markitdown"));
+    resolve_tool_executable("SHIFT_MARKITDOWN_BIN", "markitdown", &candidates)
 }
 
 impl MarkItDownModule {

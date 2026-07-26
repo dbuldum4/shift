@@ -1,7 +1,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
-    OutputFormat, TempDirGuard, command_argv_parts, format_argv_display, map_spawn_error,
-    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
+    OutputFormat, TempDirGuard, bundled_runtime_tool, command_argv_parts, format_argv_display,
+    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
     run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
@@ -161,8 +161,12 @@ impl Default for DoclingModule {
 fn discover_executable() -> OsString {
     // Prefer a project-local venv when present (same convention as MarkItDown).
     // Absolute resolution matches diagnostics so GUI PATH quirks stay consistent.
-    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/docling");
-    resolve_tool_executable("SHIFT_DOCLING_BIN", "docling", &[local])
+    let mut candidates = Vec::new();
+    if let Some(bundled) = bundled_runtime_tool("docling") {
+        candidates.push(bundled);
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/docling"));
+    resolve_tool_executable("SHIFT_DOCLING_BIN", "docling", &candidates)
 }
 
 impl DoclingModule {

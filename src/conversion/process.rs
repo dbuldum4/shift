@@ -589,6 +589,25 @@ pub fn resolve_tool_executable(
         .unwrap_or_else(|| OsString::from(default_name))
 }
 
+/// Locate a converter shipped in `Shift.app/Contents/Resources/runtime/bin`.
+///
+/// The ancestor walk also supports the bundled CLI under `Resources/bin`,
+/// including when Homebrew invokes it through a symlink.
+pub fn bundled_runtime_tool(name: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let executable = executable.canonicalize().unwrap_or(executable);
+    for ancestor in executable.ancestors() {
+        match ancestor.file_name().and_then(|value| value.to_str()) {
+            Some("Resources") => return Some(ancestor.join("runtime/bin").join(name)),
+            Some("Contents") => {
+                return Some(ancestor.join("Resources/runtime/bin").join(name));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

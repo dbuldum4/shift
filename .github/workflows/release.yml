@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build Shift
+        run: cargo build --release --locked
+      - name: Package self-contained converter runtime
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="${{ inputs.tag }}"
+            version="${version#v}"
+          fi
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh "$version"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
+          gh release create "$tag" dist/*.zip dist/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Shift ${tag#v}" \
+            --notes-file release-notes/0.1.0.md \
+            --verify-tag
