@@ -2636,6 +2636,8 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .flex()
                         .flex_col()
                         .gap_3()
+                        .w_full()
+                        .min_w_0()
                         .p_4()
                         .rounded_xl()
                         .bg(THEME.elevated)
@@ -2644,146 +2646,141 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         .shadow(card_shadow())
                         .child(
                             div()
+                                .id("output-drag-source")
                                 .flex()
-                                .flex_wrap()
-                                .items_start()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("output-drag-source")
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .min_w(px(160.0))
-                                        .px_1()
-                                        .py_0p5()
-                                        .rounded_md()
-                                        .cursor_move()
-                                        .hover(|style| style.bg(THEME.hover))
-                                        .on_drag(
-                                            drag_payload,
-                                            move |payload, position, window, cx| {
-                                                begin_output_file_drag(
-                                                    payload,
-                                                    drag_app.clone(),
-                                                    position,
-                                                    window,
-                                                    cx,
-                                                )
-                                            },
+                                .flex_col()
+                                .gap_1()
+                                .w_full()
+                                .min_w_0()
+                                .px_1()
+                                .py_0p5()
+                                .rounded_md()
+                                .cursor_move()
+                                .hover(|style| style.bg(THEME.hover))
+                                .on_drag(
+                                    drag_payload,
+                                    move |payload, position, window, cx| {
+                                        begin_output_file_drag(
+                                            payload,
+                                            drag_app.clone(),
+                                            position,
+                                            window,
+                                            cx,
                                         )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .w_full()
-                                                .child(
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .text_color(THEME.text_muted)
-                                                        .child("⠿"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .text_lg()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .overflow_hidden()
-                                                        .text_ellipsis()
-                                                        .line_clamp(1)
-                                                        .child(file_name_display),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(THEME.text_secondary)
-                                                .child(conversion_detail),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_wrap()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .px_2()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(THEME.badge_fill)
-                                                        .text_xs()
-                                                        .text_color(THEME.badge_text)
-                                                        .child(pipeline_badge),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(THEME.text_muted)
-                                                        .child("Drag to Downloads or Documents"),
-                                                ),
-                                        ),
+                                    },
                                 )
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_shrink_0()
-                                        .flex_wrap()
+                                        .items_center()
                                         .gap_2()
-                                        .child(action_chip(
-                                            "save-conversion",
-                                            "Download",
-                                            cx,
-                                            |this, cx| {
-                                                this.save_output(cx);
-                                            },
-                                        ))
-                                        .child(action_chip(
-                                            "copy-conversion",
-                                            if is_text { "Copy" } else { "Copy path" },
-                                            cx,
-                                            |this, cx| {
-                                                this.copy_output(cx);
-                                            },
-                                        ))
-                                        .child(action_chip(
-                                            "reveal-conversion",
-                                            "Reveal",
-                                            cx,
-                                            |this, cx| {
-                                                this.reveal_output(cx);
-                                            },
-                                        ))
-                                        .child(action_chip(
-                                            "open-conversion",
-                                            "Open",
-                                            cx,
-                                            |this, cx| {
-                                                this.open_output(cx);
-                                            },
-                                        ))
-                                        .when(!commands.is_empty(), |row| {
-                                            row.child(action_chip(
-                                                "show-command",
-                                                if show_command_inspect {
-                                                    "Hide cmd"
-                                                } else {
-                                                    "Show cmd"
-                                                },
-                                                cx,
-                                                |this, cx| {
-                                                    this.show_command_inspect =
-                                                        !this.show_command_inspect;
-                                                    cx.notify();
-                                                },
-                                            ))
-                                        }),
+                                        .w_full()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_color(THEME.text_muted)
+                                                .child("⠿"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_lg()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .line_clamp(1)
+                                                .child(file_name_display),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_secondary)
+                                        .child(conversion_detail),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(THEME.badge_fill)
+                                                .text_xs()
+                                                .text_color(THEME.badge_text)
+                                                .child(pipeline_badge),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(THEME.text_muted)
+                                                .child("Drag to Downloads or Documents"),
+                                        ),
                                 ),
+                        )
+                        // Full-width action row so chips wrap inside the card instead of
+                        // overflowing the right edge when the output panel is narrow.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .w_full()
+                                .min_w_0()
+                                .child(action_chip(
+                                    "save-conversion",
+                                    "Download",
+                                    cx,
+                                    |this, cx| {
+                                        this.save_output(cx);
+                                    },
+                                ))
+                                .child(action_chip(
+                                    "copy-conversion",
+                                    if is_text { "Copy" } else { "Copy path" },
+                                    cx,
+                                    |this, cx| {
+                                        this.copy_output(cx);
+                                    },
+                                ))
+                                .child(action_chip(
+                                    "reveal-conversion",
+                                    "Reveal",
+                                    cx,
+                                    |this, cx| {
+                                        this.reveal_output(cx);
+                                    },
+                                ))
+                                .child(action_chip(
+                                    "open-conversion",
+                                    "Open",
+                                    cx,
+                                    |this, cx| {
+                                        this.open_output(cx);
+                                    },
+                                ))
+                                .when(!commands.is_empty(), |row| {
+                                    row.child(action_chip(
+                                        "show-command",
+                                        if show_command_inspect {
+                                            "Hide cmd"
+                                        } else {
+                                            "Show cmd"
+                                        },
+                                        cx,
+                                        |this, cx| {
+                                            this.show_command_inspect =
+                                                !this.show_command_inspect;
+                                            cx.notify();
+                                        },
+                                    ))
+                                }),
                         )
                         .when(!is_text, |card| {
                             card.child(
