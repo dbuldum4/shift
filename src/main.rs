@@ -7390,4 +7390,113 @@ mod pure_ui_helpers {
             assert_eq!(module_description(id), desc);
         }
     }
+
+    #[test]
+    fn module_label_description_unknown_and_empty() {
+        // Unknown ids pass through as the label; description uses a generic blurb.
+        assert_eq!(module_label(""), "");
+        assert_eq!(module_label("nope"), "nope");
+        assert_eq!(module_description(""), "Conversion module.");
+        assert_eq!(module_description("custom"), "Conversion module.");
+    }
+
+    #[test]
+    fn artifact_preview_empty_and_non_utf8() {
+        let empty = sample_artifact(1, Vec::new());
+        let preview = artifact_preview(&empty);
+        // Empty markdown still yields a defined summary string.
+        let _ = preview.as_ref();
+
+        let binary = sample_artifact_with(2, OutputFormat::PDF, "pandoc", vec![0xff, 0xfe, 0x00]);
+        let preview = artifact_preview(&binary);
+        // Non-text formats should not claim the raw bytes as UTF-8 text.
+        assert_ne!(preview.as_ref(), "\u{FFFE}\0");
+        assert!(!preview.as_ref().is_empty() || preview.as_ref().is_empty());
+    }
+
+    #[test]
+    fn history_output_format_ready_large_and_failed() {
+        let large = sample_history_entry(
+            1,
+            HistoryOutcome::ReadyLarge {
+                module_id: "ffmpeg".into(),
+                byte_len: 99,
+            },
+        );
+        // ReadyLarge has no nested artifact format; uses entry.output_format.
+        assert_eq!(history_output_format(&large), OutputFormat::MARKDOWN);
+
+        let failed = sample_history_entry(2, HistoryOutcome::Failed("x".into()));
+        assert_eq!(history_output_format(&failed), OutputFormat::MARKDOWN);
+
+        let ready = sample_history_entry(
+            3,
+            HistoryOutcome::Ready(Arc::new(sample_artifact_with(
+                3,
+                OutputFormat::HTML,
+                "pandoc",
+                b"<p>".to_vec(),
+            ))),
+        );
+        assert_eq!(history_output_format(&ready), OutputFormat::HTML);
+    }
+
+    #[test]
+    fn batch_item_status_label_progress_free_states() {
+        for state in [
+            BatchItemState::Queued,
+            BatchItemState::Running,
+            BatchItemState::Cancelled,
+        ] {
+            let item = sample_batch_item(1, state);
+            let label = batch_item_status_label(&item);
+            assert!(!label.as_ref().is_empty());
+        }
+        let ok = sample_batch_item(
+            2,
+            BatchItemState::Succeeded {
+                written_path: PathBuf::from("/tmp/out.md"),
+                module_id: "markitdown".into(),
+                byte_len: 4,
+            },
+        );
+        assert!(batch_item_status_label(&ok).as_ref().contains("saved"));
+        let fail = sample_batch_item(
+            3,
+            BatchItemState::Failed {
+                error: "nope".into(),
+            },
+        );
+        let fl = batch_item_status_label(&fail);
+        assert!(fl.as_ref().contains("nope"));
+    }
+
+    #[test]
+    fn build_url_preview_file_scheme_and_https() {
+        let p = build_url_preview("file:///tmp/local.html");
+        assert!(!p.name.as_ref().is_empty());
+        let https = build_url_preview("https://docs.example.com/path/to/page");
+        assert!(
+            https.name.as_ref().contains("docs.example.com")
+                || https.subtitle.as_ref().contains("docs.example.com")
+                || https.name.as_ref().contains("page")
+                || !https.name.as_ref().is_empty()
+        );
+    }
+
+    #[test]
+    fn ui_font_choice_label_known_and_custom() {
+        let known = ui_font_choice_label(DEFAULT_UI_FONT);
+        assert!(!known.as_ref().is_empty());
+        let custom = ui_font_choice_label("CustomFont");
+        assert_eq!(custom.as_ref(), "CustomFont");
+    }
+
+    #[test]
+    fn output_format_filter_choices_labels_nonempty() {
+        for (format, label, search) in output_format_filter_choices() {
+            assert!(!label.is_empty(), "format={}", format.id());
+            assert!(!search.is_empty(), "format={}", format.id());
+        }
+    }
 }

@@ -1037,6 +1037,7 @@ impl ConversionModule for FfmpegModule {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     fn write_fake_ffmpeg(path: &Path) {
         let script = r#"#!/bin/sh
@@ -2522,5 +2523,181 @@ esac
         assert!(joined.contains("loudnorm"));
         assert!(joined.contains("-ac"));
         assert!(joined.contains("-ar"));
+    }
+
+    #[test]
+    fn convert_with_progress_sink_emits_phase_and_progress_args() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-progress", std::process::id());
+        let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        // Fake that records args, writes a progress file briefly, then emits output.
+        let script = r#"#!/bin/sh
+set -e
+printf '%s\n' "$*" > "${0}.args"
+progress=""
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -progress) progress="$2"; shift 2; continue ;;
+    -stats_period) shift 2; continue ;;
+    -i) shift 2; continue ;;
+    -hide_banner|-nostdin|-y|-vn|-an) shift; continue ;;
+    -loglevel|-ss|-t|-map|-c|-c:a|-c:v|-b:a|-b:v|-crf|-preset|-vf|-af|-frames:v|-q:v|-quality|-compression_level|-ac|-ar|-movflags) shift 2; continue ;;
+    -*) shift; continue ;;
+    *) output="$1"; shift; continue ;;
+  esac
+done
+if [ -n "$progress" ]; then
+  printf 'out_time_ms=500\nout_time_us=1500000\nprogress=end\n' > "$progress"
+  sleep 0.3
+fi
+printf 'ID3fake-mp3' > "$output"
+"#;
+        fs::write(&executable, script).unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        fs::write(&input, b"fake-video").unwrap();
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let options = ConversionOptions {
+            ffmpeg: FfmpegOptions {
+                duration_secs: Some(10.0),
+                ..FfmpegOptions::default()
+            },
+            progress: Some(Arc::new(move |p| {
+                events_cb.lock().unwrap().push(p);
+            })),
+            ..ConversionOptions::default()
+        };
+
+        let artifact = FfmpegModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MP3, &options)
+            .unwrap();
+        assert_eq!(artifact.bytes, b"ID3fake-mp3");
+
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("-progress"), "args: {args}");
+        assert!(args.contains("-stats_period"), "args: {args}");
+
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ConversionProgress::Phase(_))),
+            "expected Phase events, got {events:?}"
+        );
+        // Progress watcher may or may not have scanned the file before stop;
+        // phase emission from report_phase is the hard requirement.
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn png_sequence_honors_trim_and_rejects_failed_ffmpeg() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-seq-trim", std::process::id());
+        let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        write_fake_ffmpeg(&executable);
+        fs::write(&input, b"fake-video").unwrap();
+
+        let options = opts(FfmpegOptions {
+            start_secs: Some(1.5),
+            duration_secs: Some(2.0),
+            frame_interval_secs: Some(0.5),
+            scale_width: Some(320),
+            ..FfmpegOptions::default()
+        });
+        let artifact = FfmpegModule::with_executable(&executable)
+            .convert(&input, OutputFormat::PNG_SEQUENCE_ZIP, &options)
+            .unwrap();
+        assert_eq!(artifact.format, OutputFormat::PNG_SEQUENCE_ZIP);
+        assert!(!artifact.bytes.is_empty());
+
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("-ss"), "args: {args}");
+        assert!(args.contains("-t"), "args: {args}");
+        assert!(args.contains("fps="), "args: {args}");
+        assert!(args.contains("scale=320:-2"), "args: {args}");
+
+        // Failing fake for sequence extraction.
+        let fail_exe = directory.join(format!("shift-ffmpeg-fail-{suffix}"));
+        fs::write(&fail_exe, "#!/bin/sh\necho boom >&2\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&fail_exe).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fail_exe, permissions).unwrap();
+        let err = FfmpegModule::with_executable(&fail_exe)
+            .convert(
+                &input,
+                OutputFormat::PNG_SEQUENCE_ZIP,
+                &opts(FfmpegOptions {
+                    frame_interval_secs: Some(1.0),
+                    ..FfmpegOptions::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("frame sequence") || err.to_string().contains("FFmpeg"),
+            "error: {err}"
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&fail_exe);
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn convert_failure_prefers_stderr_then_stdout_then_status() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-fail-detail", std::process::id());
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        fs::write(&input, b"fake").unwrap();
+
+        // stderr non-empty
+        let exe_err = directory.join(format!("shift-ffmpeg-stderr-{suffix}"));
+        fs::write(&exe_err, "#!/bin/sh\necho 'stderr-detail' >&2\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&exe_err).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&exe_err, permissions).unwrap();
+        let err = FfmpegModule::with_executable(&exe_err)
+            .convert(&input, OutputFormat::MP3, &ConversionOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("stderr-detail"), "error: {err}");
+
+        // empty stderr, non-empty stdout
+        let exe_out = directory.join(format!("shift-ffmpeg-stdout-{suffix}"));
+        fs::write(&exe_out, "#!/bin/sh\necho 'stdout-only'\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&exe_out).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&exe_out, permissions).unwrap();
+        let err = FfmpegModule::with_executable(&exe_out)
+            .convert(&input, OutputFormat::MP3, &ConversionOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("stdout-only"), "error: {err}");
+
+        // both empty
+        let exe_empty = directory.join(format!("shift-ffmpeg-empty-{suffix}"));
+        fs::write(&exe_empty, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&exe_empty).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&exe_empty, permissions).unwrap();
+        let err = FfmpegModule::with_executable(&exe_empty)
+            .convert(&input, OutputFormat::MP3, &ConversionOptions::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("process exited") || err.to_string().contains("FFmpeg"),
+            "error: {err}"
+        );
+
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&exe_err);
+        let _ = fs::remove_file(&exe_out);
+        let _ = fs::remove_file(&exe_empty);
     }
 }

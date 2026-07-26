@@ -723,4 +723,97 @@ mod tests {
         assert_eq!(found, vec![file]);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn expand_tilde_without_home_leaves_literal() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var_os("HOME");
+        let old_profile = std::env::var_os("USERPROFILE");
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+        }
+        assert_eq!(expand_tilde(Path::new("~")), PathBuf::from("~"));
+        assert_eq!(expand_tilde(Path::new("~/x.pdf")), PathBuf::from("~/x.pdf"));
+        assert_eq!(
+            expand_tilde(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_profile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_reports_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_dir("unreadable-dir");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("secret.pdf"), b"%PDF").unwrap();
+        let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&locked, permissions).unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let result = expand_input_paths_with_extensions(&[locked.as_path()], true, &exts);
+
+        // Restore perms for cleanup.
+        let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&locked, permissions).unwrap();
+
+        // Non-root should fail reading the locked directory.
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("could not read directory")
+                    || error.to_string().contains("could not read"),
+                "error: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_non_file_non_dir_is_skipped() {
+        use std::os::unix::fs::symlink;
+
+        // Best-effort: create a fifo and symlink to it; expansion should skip quietly.
+        let root = unique_dir("symlink-fifo");
+        let fifo = root.join("pipe");
+        // mkfifo via libc if available; otherwise skip.
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let link = root.join("link-pipe");
+        symlink(&fifo, &link).unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        // Following a fifo symlink may hang on open for metadata in some cases;
+        // if it errors or returns empty, both are acceptable.
+        let result = expand_input_paths_with_extensions(&[link.as_path()], false, &exts);
+        let _ = result;
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&fifo);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

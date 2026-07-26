@@ -3575,4 +3575,338 @@ mod tests {
             assert!(!err.to_string().is_empty());
         }
     }
+
+    #[test]
+    fn conversion_options_debug_and_partial_eq_cover_cancel_and_progress() {
+        let cancel_a = Arc::new(AtomicBool::new(false));
+        let cancel_b = Arc::new(AtomicBool::new(false));
+        let sink_a: ProgressSink = Arc::new(|_| {});
+        let sink_b: ProgressSink = Arc::new(|_| {});
+
+        let base = ConversionOptions::default();
+        let with_cancel = ConversionOptions {
+            cancel: Some(Arc::clone(&cancel_a)),
+            ..ConversionOptions::default()
+        };
+        let with_same_cancel = ConversionOptions {
+            cancel: Some(Arc::clone(&cancel_a)),
+            ..ConversionOptions::default()
+        };
+        let with_other_cancel = ConversionOptions {
+            cancel: Some(Arc::clone(&cancel_b)),
+            ..ConversionOptions::default()
+        };
+        let with_progress = ConversionOptions {
+            progress: Some(Arc::clone(&sink_a)),
+            ..ConversionOptions::default()
+        };
+        let with_same_progress = ConversionOptions {
+            progress: Some(Arc::clone(&sink_a)),
+            ..ConversionOptions::default()
+        };
+        let with_other_progress = ConversionOptions {
+            progress: Some(Arc::clone(&sink_b)),
+            ..ConversionOptions::default()
+        };
+
+        assert_eq!(base, ConversionOptions::default());
+        assert_eq!(with_cancel, with_same_cancel);
+        assert_ne!(with_cancel, with_other_cancel);
+        assert_ne!(with_cancel, base);
+        assert_eq!(with_progress, with_same_progress);
+        assert_ne!(with_progress, with_other_progress);
+
+        let debug = format!("{with_cancel:?}");
+        assert!(debug.contains("ConversionOptions"));
+        assert!(debug.contains("<AtomicBool>"));
+        let debug_progress = format!("{with_progress:?}");
+        assert!(debug_progress.contains("<ProgressSink>"));
+    }
+
+    #[test]
+    fn with_module_provenance_fills_empty_and_preserves_existing() {
+        let bare = ConversionArtifact {
+            file_name: "out.md".into(),
+            media_type: "text/markdown",
+            bytes: b"hi".to_vec(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "old",
+            pipeline: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let filled = bare.with_module_provenance(
+            "pandoc",
+            Some(InvocationRecord {
+                module_id: "pandoc",
+                argv_display: "pandoc in out".into(),
+            }),
+        );
+        assert_eq!(filled.module_id, "pandoc");
+        assert_eq!(filled.pipeline, vec!["pandoc"]);
+        assert_eq!(filled.invocations.len(), 1);
+        assert_eq!(filled.invocations[0].argv_display, "pandoc in out");
+
+        // Existing pipeline/invocations are preserved; only module_id updates.
+        let already = ConversionArtifact {
+            file_name: "out.md".into(),
+            media_type: "text/markdown",
+            bytes: b"hi".to_vec(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "first",
+            pipeline: vec!["first", "second"],
+            invocations: vec![InvocationRecord {
+                module_id: "first",
+                argv_display: "a".into(),
+            }],
+        };
+        let kept = already.with_module_provenance(
+            "override",
+            Some(InvocationRecord {
+                module_id: "override",
+                argv_display: "ignored".into(),
+            }),
+        );
+        assert_eq!(kept.module_id, "override");
+        assert_eq!(kept.pipeline, vec!["first", "second"]);
+        assert_eq!(kept.invocations.len(), 1);
+        assert_eq!(kept.invocations[0].argv_display, "a");
+
+        // Empty pipeline + None invocation leaves invocations empty.
+        let no_inv = ConversionArtifact {
+            file_name: "x.md".into(),
+            media_type: "text/markdown",
+            bytes: Vec::new(),
+            format: OutputFormat::MARKDOWN,
+            module_id: "m",
+            pipeline: Vec::new(),
+            invocations: Vec::new(),
+        }
+        .with_module_provenance("m2", None);
+        assert_eq!(no_inv.pipeline, vec!["m2"]);
+        assert!(no_inv.invocations.is_empty());
+        assert_eq!(no_inv.module_id, "m2");
+    }
+
+    #[test]
+    fn format_byte_size_gigabytes_and_subtitle_preview() {
+        assert_eq!(format_byte_size(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(
+            format_byte_size(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "3.5 GB"
+        );
+
+        let artifact = ConversionArtifact {
+            file_name: "subs.srt".into(),
+            media_type: "application/x-subrip",
+            bytes: b"1\n".to_vec(),
+            format: OutputFormat::SRT,
+            module_id: "ffmpeg",
+            pipeline: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let summary = binary_preview_summary(&artifact);
+        assert!(
+            summary.contains("Subtitles"),
+            "expected Subtitles kind, got: {summary}"
+        );
+        assert!(summary.contains("subs.srt"));
+        assert!(summary.contains("ffmpeg"));
+    }
+
+    #[test]
+    fn convert_url_rejects_invalid_and_uses_custom_module() {
+        struct UrlOnlyModule;
+        impl ConversionModule for UrlOnlyModule {
+            fn id(&self) -> &'static str {
+                "url-only"
+            }
+            fn label(&self) -> &'static str {
+                "URL Only"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                _output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Err(ConversionError::new("files not supported"))
+            }
+            fn supports_url(&self, output: OutputFormat) -> bool {
+                output == OutputFormat::MARKDOWN
+            }
+            fn convert_url(
+                &self,
+                url: &str,
+                output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Ok(ConversionArtifact {
+                    file_name: "page.md".into(),
+                    media_type: "text/markdown",
+                    bytes: format!("# {url}").into_bytes(),
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+
+        let registry = ConversionRegistry::new().with_module(UrlOnlyModule);
+        let err = registry
+            .convert_url("not-a-url", OutputFormat::MARKDOWN)
+            .unwrap_err();
+        assert!(err.to_string().contains("not a valid http(s) URL"));
+
+        let err = registry
+            .convert_url_with_options(
+                "https://example.com/x",
+                OutputFormat::DOCX,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DOCX") || err.to_string().contains("docx"),
+            "error: {err}"
+        );
+
+        let artifact = registry
+            .convert_url("https://example.com/article", OutputFormat::MARKDOWN)
+            .unwrap();
+        assert_eq!(artifact.module_id, "url-only");
+        assert_eq!(artifact.pipeline, vec!["url-only"]);
+        assert!(
+            artifact.text().unwrap().contains("example.com/article"),
+            "text: {:?}",
+            artifact.text()
+        );
+
+        // Default trait convert_url rejects when supports_url is false.
+        struct NoUrlModule;
+        impl ConversionModule for NoUrlModule {
+            fn id(&self) -> &'static str {
+                "no-url"
+            }
+            fn label(&self) -> &'static str {
+                "No URL"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Ok(ConversionArtifact {
+                    file_name: "x.md".into(),
+                    media_type: "text/markdown",
+                    bytes: b"x".to_vec(),
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+        let module = NoUrlModule;
+        let err = module
+            .convert_url(
+                "https://example.com",
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("does not support URL conversion"));
+    }
+
+    #[test]
+    fn convert_shortcut_and_unreadable_input() {
+        struct EchoModule;
+        impl ConversionModule for EchoModule {
+            fn id(&self) -> &'static str {
+                "echo"
+            }
+            fn label(&self) -> &'static str {
+                "Echo"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                input: &Path,
+                output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                let bytes =
+                    std::fs::read(input).map_err(|e| ConversionError::new(e.to_string()))?;
+                Ok(ConversionArtifact {
+                    file_name: "out.md".into(),
+                    media_type: "text/markdown",
+                    bytes,
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "shift-convert-shortcut-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("note.txt");
+        std::fs::write(&input, b"hello").unwrap();
+
+        let registry = ConversionRegistry::new().with_module(EchoModule);
+        let artifact = registry.convert(&input).unwrap();
+        assert_eq!(artifact.bytes, b"hello");
+        assert_eq!(artifact.format, OutputFormat::MARKDOWN);
+
+        let missing = dir.join("missing.txt");
+        let err = registry
+            .convert_to(&missing, OutputFormat::MARKDOWN)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a readable file"),
+            "error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_partial_outputs_missing_parent_returns_zero() {
+        let planned = Path::new("/nonexistent-shift-parent-xyz/out.md");
+        assert_eq!(remove_partial_outputs(planned), 0);
+    }
 }

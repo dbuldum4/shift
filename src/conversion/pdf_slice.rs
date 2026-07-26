@@ -753,4 +753,52 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.args", fake.display()));
         let _ = std::fs::remove_file(&input);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_failure_prefers_stderr_stdout_then_status() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("fail-detail");
+        let input = directory.join(format!("shift-qpdf-fail-in-{suffix}.pdf"));
+        std::fs::write(&input, b"%PDF-1.4 source").unwrap();
+
+        // stderr non-empty
+        let fake_err = directory.join(format!("shift-qpdf-stderr-{suffix}"));
+        write_fake_qpdf(&fake_err, "#!/bin/sh\necho 'qpdf-stderr' >&2\nexit 1\n");
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake_err);
+        }
+        let err = extract_pdf_pages(&input, 1, Some(1), None, None).unwrap_err();
+        assert!(err.to_string().contains("qpdf-stderr"), "error: {err}");
+
+        // empty stderr, non-empty stdout
+        let fake_out = directory.join(format!("shift-qpdf-stdout-{suffix}"));
+        write_fake_qpdf(&fake_out, "#!/bin/sh\necho 'qpdf-stdout'\nexit 1\n");
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake_out);
+        }
+        let err = extract_pdf_pages(&input, 1, Some(1), None, None).unwrap_err();
+        assert!(err.to_string().contains("qpdf-stdout"), "error: {err}");
+
+        // both empty → process exited with status
+        let fake_empty = directory.join(format!("shift-qpdf-empty-{suffix}"));
+        write_fake_qpdf(&fake_empty, "#!/bin/sh\nexit 1\n");
+        unsafe {
+            std::env::set_var("SHIFT_QPDF_BIN", &fake_empty);
+        }
+        let err = extract_pdf_pages(&input, 1, Some(1), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("process exited") || err.to_string().contains("qpdf"),
+            "error: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_QPDF_BIN");
+        }
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&fake_err);
+        let _ = std::fs::remove_file(&fake_out);
+        let _ = std::fs::remove_file(&fake_empty);
+    }
 }

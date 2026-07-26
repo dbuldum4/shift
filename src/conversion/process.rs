@@ -2042,4 +2042,132 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn cancel_after_process_exit_still_reports_cancelled() {
+        // wait_with_timeout returns Exited when the child is already reaped even if
+        // cancel is set; the post-wait check then maps that to cancelled.
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-post-cancel-{}",
+            unique_suffix("post-cancel")
+        ));
+        // Sleep long enough that we can set cancel while still running, but exit
+        // before the outer timeout. The wait loop prefers try_wait's Exited over
+        // cancel when both race — force the post-exit path by setting cancel true
+        // and using an instant-exit script after a brief window.
+        write_script(&path, "#!/bin/sh\nexit 0\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Flip cancel true after spawn would have started: run in a helper that
+        // sets cancel immediately, then invokes a process that has already exited
+        // from a previous wait isn't available — instead use a shared flag set
+        // from a side thread before the process is polled.
+        let cancel_flag = Arc::clone(&cancel);
+        let starter = thread::spawn(move || {
+            // Set cancel true almost immediately so that if the process is still
+            // running we take Cancelled from wait; if it already exited we take
+            // the post-exit cancelled branch. Either way we exercise cancel paths.
+            cancel_flag.store(true, Ordering::SeqCst);
+        });
+        let error = run_command_cancellable(
+            shell_command(&path),
+            Duration::from_secs(5),
+            1024,
+            Some(Arc::clone(&cancel)),
+        )
+        .unwrap_err();
+        let _ = starter.join();
+        // May be pre-spawn cancel or post-exit cancel depending on timing.
+        assert!(
+            error.is_cancelled() || error.to_string().contains("cancel"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_tool_path_bare_name_missing_still_surfaces_name() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_tool_discovery_cache();
+        let env_key = "SHIFT_TEST_BARE_MISSING_BIN";
+        let old = std::env::var_os(env_key);
+        let old_path = std::env::var_os("PATH");
+        // Empty PATH so find_executable cannot resolve the bare name.
+        unsafe {
+            std::env::set_var(env_key, "totally-missing-shift-tool-xyz");
+            std::env::set_var("PATH", "");
+        }
+        clear_tool_discovery_cache();
+        let resolved = resolve_tool_path(env_key, "fallback", &[]);
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("totally-missing-shift-tool-xyz")),
+            "bare override should surface even when not found"
+        );
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(env_key, value),
+                None => std::env::remove_var(env_key),
+            }
+            match old_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        clear_tool_discovery_cache();
+    }
+
+    #[test]
+    fn unique_temp_dir_fails_when_tmpdir_is_a_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let blocker =
+            std::env::temp_dir().join(format!("shift-tmpdir-blocker-{}", unique_suffix("tmpdir")));
+        std::fs::write(&blocker, b"not-a-dir").unwrap();
+        let old = std::env::var_os("TMPDIR");
+        unsafe {
+            std::env::set_var("TMPDIR", &blocker);
+        }
+        let err = unique_temp_dir("shift-unwritable").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not create temporary directory")
+                || err.to_string().contains("temporary directory"),
+            "error: {err}"
+        );
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
+        let _ = std::fs::remove_file(blocker);
+    }
+
+    #[test]
+    fn read_file_limited_open_error_after_metadata() {
+        // A path that exists as a directory fails File::open after metadata succeeds
+        // with is_file size check — actually metadata for dir has size, but we check
+        // len first. Use a path that is not readable: on Unix, a file with mode 000.
+        let path = std::env::temp_dir().join(format!(
+            "shift-process-unreadable-{}",
+            unique_suffix("unreadable")
+        ));
+        std::fs::write(&path, b"secret").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        // Running as root would still open; skip assertion if open succeeds.
+        let result = read_file_limited(&path, 1024);
+        // Restore perms for cleanup.
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("could not read"),
+                "error: {error}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -1335,4 +1335,128 @@ mod tests {
             assert_eq!(input.index_for_mouse_position(point(px(0.0), px(0.0))), 0);
         });
     }
+
+    #[gpui::test]
+    async fn offset_to_utf16_clamps_past_end(cx: &mut TestAppContext) {
+        let text = "a😀b";
+        let input = new_input(cx, text);
+        input.read_with(cx, |input, _| {
+            let total = utf16_len(text);
+            assert_eq!(input.offset_to_utf16(text.len()), total);
+            assert_eq!(input.offset_to_utf16(text.len() + 50), total);
+            assert_eq!(input.offset_to_utf16(0), 0);
+            // Mid-byte of multi-byte char: walker advances whole chars only when
+            // utf8_count reaches offset, so offset inside 😀 lands after it.
+            let after_a = 1;
+            let after_emoji = 1 + "😀".len();
+            assert_eq!(input.offset_to_utf16(after_a), 1);
+            assert_eq!(input.offset_to_utf16(after_emoji), 1 + 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn range_utf16_empty_and_reversed_style_ranges(cx: &mut TestAppContext) {
+        let text = "xy日z";
+        let input = new_input(cx, text);
+        input.read_with(cx, |input, _| {
+            let empty = input.range_to_utf16(&(0..0));
+            assert_eq!(empty, 0..0);
+            assert_eq!(input.range_from_utf16(&empty), 0..0);
+
+            let full = input.range_to_utf16(&(0..text.len()));
+            assert_eq!(input.range_from_utf16(&full), 0..text.len());
+
+            // Point range at end
+            let end = text.len();
+            let end_utf16 = input.offset_to_utf16(end);
+            assert_eq!(input.range_to_utf16(&(end..end)), end_utf16..end_utf16);
+        });
+    }
+
+    #[gpui::test]
+    async fn previous_boundary_from_mid_grapheme_snaps_back(cx: &mut TestAppContext) {
+        let text = "a🇺🇸b";
+        let input = new_input(cx, text);
+        let graphemes: Vec<(usize, &str)> = text.grapheme_indices(true).collect();
+        assert_eq!(graphemes.len(), 3);
+        let flag_start = graphemes[1].0;
+        let flag_end = graphemes[2].0;
+        assert!(flag_end > flag_start + 1);
+
+        input.read_with(cx, |input, _| {
+            // Any mid-flag offset should snap to flag start when going previous.
+            for mid in (flag_start + 1)..flag_end {
+                assert_eq!(
+                    input.previous_boundary(mid),
+                    flag_start,
+                    "mid={mid} flag_start={flag_start}"
+                );
+            }
+            // next from mid flag should land at flag_end ("b")
+            for mid in flag_start..flag_end {
+                assert_eq!(input.next_boundary(mid), flag_end);
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn move_to_same_offset_and_beyond_len_behavior(cx: &mut TestAppContext) {
+        let input = new_input(cx, "abcd");
+        input.update(cx, |input, cx| {
+            input.move_to(2, cx);
+            assert_eq!(input.selected_range, 2..2);
+            input.move_to(2, cx);
+            assert_eq!(input.selected_range, 2..2);
+            // Callers are expected to pass valid offsets; still record current contract.
+            input.move_to(4, cx);
+            assert_eq!(input.selected_range, 4..4);
+            assert_eq!(input.cursor_offset(), 4);
+        });
+    }
+
+    #[gpui::test]
+    async fn select_to_same_offset_collapses_to_caret(cx: &mut TestAppContext) {
+        let input = new_input(cx, "abcdef");
+        input.update(cx, |input, cx| {
+            input.move_to(2, cx);
+            input.select_to(5, cx);
+            assert_eq!(input.selected_range, 2..5);
+            input.select_to(2, cx);
+            assert_eq!(input.selected_range, 2..2);
+            assert!(!input.selection_reversed);
+            assert_eq!(input.cursor_offset(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn set_content_from_shared_string_like_values(cx: &mut TestAppContext) {
+        let input = new_input(cx, "old");
+        input.update(cx, |input, cx| {
+            input.set_content(String::from("owned"), cx);
+            assert_eq!(input.content(), "owned");
+            input.set_content("static", cx);
+            assert_eq!(input.content(), "static");
+        });
+    }
+
+    #[test]
+    fn utf8_offset_from_utf16_null_and_control_chars() {
+        let text = "a\0b\tc\nd";
+        for offset in 0..=utf16_len(text) + 2 {
+            let got = utf8_offset_from_utf16(text, offset);
+            assert!(text.is_char_boundary(got) || got == text.len());
+            assert_eq!(got, expected_utf8_from_utf16(text, offset));
+        }
+    }
+
+    #[test]
+    fn utf8_offset_from_utf16_mixed_scripts_dense() {
+        let text = "Latin Ελληνικά 中文 한글 العربية 🚀✨";
+        let len = utf16_len(text);
+        for offset in 0..=len {
+            let got = utf8_offset_from_utf16(text, offset);
+            assert_eq!(got, expected_utf8_from_utf16(text, offset));
+            assert!(text.is_char_boundary(got));
+        }
+    }
 }

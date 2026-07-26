@@ -1115,4 +1115,110 @@ mod tests {
         prewarm();
         prewarm();
     }
+
+    #[test]
+    fn home_dir_none_when_home_unset() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        reset();
+        assert_eq!(home_dir(), None);
+        assert_eq!(default_start_directory(), None);
+        if let Some(v) = previous {
+            unsafe {
+                std::env::set_var("HOME", v);
+            }
+        }
+    }
+
+    #[test]
+    fn remember_directory_root_like_paths() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("remember-rootish");
+        std::fs::create_dir_all(&home).unwrap();
+        reset();
+
+        // Directory itself
+        remember_directory(&home);
+        assert_eq!(last_dir(), Some(home.clone()));
+
+        // File at top of temp home
+        let file = home.join("top.txt");
+        std::fs::write(&file, b"x").unwrap();
+        remember_directory(&file);
+        assert_eq!(last_dir(), Some(home.clone()));
+
+        // Symlink to directory (if supported)
+        let link = home.join("link-dir");
+        #[cfg(unix)]
+        {
+            let target = home.join("real-dir");
+            std::fs::create_dir_all(&target).unwrap();
+            let _ = std::fs::remove_file(&link);
+            let _ = std::os::unix::fs::symlink(&target, &link);
+            if link.exists() {
+                remember_directory(&link);
+                // is_dir follows symlink → stores link path as dir
+                assert!(last_dir().is_some());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_start_dir_provided_empty_path_buf_falls_through() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = unique_temp("empty-pathbuf");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let _home_guard = HomeGuard::set(&home);
+        reset();
+
+        // Empty PathBuf is not an existing directory.
+        assert_eq!(
+            resolve_start_dir(Some(PathBuf::new())),
+            Some(home.join("Documents"))
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn is_busy_reflects_dialog_open_store() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert!(!is_busy());
+        DIALOG_OPEN.store(true, Ordering::SeqCst);
+        assert!(is_busy());
+        DIALOG_OPEN.store(false, Ordering::SeqCst);
+        assert!(!is_busy());
+    }
+
+    #[test]
+    fn remember_directory_relative_path_when_cwd_parent_exists() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        // Relative file name: parent is "" / current semantics via Path::parent.
+        // If parent resolves to something that is_dir (often "." or ""), may or may not store.
+        // Use an absolute-ish construction under temp instead for determinism.
+        let home = unique_temp("relative-remember");
+        let nested = home.join("n");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("f.txt");
+        std::fs::write(&file, b"").unwrap();
+        remember_directory(&file);
+        assert_eq!(last_dir(), Some(nested));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn begin_dialog_exclusive_then_reset_allows_again() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert!(begin_dialog());
+        assert!(!begin_dialog());
+        reset();
+        assert!(begin_dialog());
+        reset();
+    }
 }

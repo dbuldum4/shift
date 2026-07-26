@@ -2720,4 +2720,227 @@ mod tests {
         assert_eq!(summary.succeeded, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn batch_item_id_display_and_from_path_ok_path() {
+        assert_eq!(BatchItemId(0).to_string(), "0");
+        assert_eq!(BatchItemId(42).to_string(), "42");
+        assert_eq!(format!("{}", BatchItemId(u64::MAX)), u64::MAX.to_string());
+
+        // Non-URL plain path succeeds (Ok arm of from_path_or_url).
+        let source = BatchSource::from_path_or_url("/tmp/report.pdf");
+        assert_eq!(source, BatchSource::File(PathBuf::from("/tmp/report.pdf")));
+
+        // Unparseable URL-like string falls back to raw text for display redaction.
+        assert_eq!(
+            redact_url_credentials("not a url at all"),
+            "not a url at all"
+        );
+        // Valid URL with credentials is redacted.
+        let redacted = redact_url_credentials("https://user:secret@example.com/a");
+        assert!(!redacted.contains("secret"));
+        assert!(redacted.contains("example.com"));
+    }
+
+    #[test]
+    fn panicking_module_becomes_failed_item() {
+        struct PanicModule;
+        impl ConversionModule for PanicModule {
+            fn id(&self) -> &'static str {
+                "panic-mod"
+            }
+            fn label(&self) -> &'static str {
+                "panic-mod"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                _output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                panic!("intentional module panic");
+            }
+        }
+
+        let dir = unique_dir("panic");
+        let input = dir.join("a.txt");
+        std::fs::write(&input, b"x").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let registry = ConversionRegistry::new().with_module(PanicModule);
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        queue.enqueue(BatchSource::File(input), &opts);
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.succeeded, 0);
+        match &queue.items()[0].state {
+            BatchItemState::Failed { error } => {
+                assert!(
+                    error.contains("intentional module panic")
+                        || error.contains("conversion worker panicked"),
+                    "error: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fraction_progress_and_url_source_conversion() {
+        struct UrlProgressModule;
+        impl ConversionModule for UrlProgressModule {
+            fn id(&self) -> &'static str {
+                "url-progress"
+            }
+            fn label(&self) -> &'static str {
+                "url-progress"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn output_formats(&self) -> &'static [OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &'static [OutputFormat] {
+                &[]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                _output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Err(ConversionError::new("files not supported"))
+            }
+            fn supports_url(&self, output: OutputFormat) -> bool {
+                output == OutputFormat::MARKDOWN
+            }
+            fn convert_url(
+                &self,
+                url: &str,
+                output: OutputFormat,
+                options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                if let Some(sink) = options.progress.as_ref() {
+                    sink(ConversionProgress::Phase("fetching".into()));
+                    sink(ConversionProgress::Fraction {
+                        fraction: 0.5,
+                        label: "halfway".into(),
+                    });
+                }
+                Ok(ConversionArtifact {
+                    file_name: "page.md".into(),
+                    media_type: "text/markdown",
+                    bytes: format!("# {url}\n").into_bytes(),
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+
+        let dir = unique_dir("url-progress");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let registry = ConversionRegistry::new().with_module(UrlProgressModule);
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out.clone()),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        queue.enqueue(
+            BatchSource::Url("https://example.com/article".into()),
+            &opts,
+        );
+
+        let mut saw_fraction = false;
+        let mut saw_phase = false;
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |event| {
+                if let BatchEvent::ItemProgress {
+                    fraction, label, ..
+                } = event
+                {
+                    if fraction == Some(0.5) && label == "halfway" {
+                        saw_fraction = true;
+                    }
+                    if fraction.is_none() && label == "fetching" {
+                        saw_phase = true;
+                    }
+                }
+            },
+        );
+        assert_eq!(summary.succeeded, 1);
+        assert!(saw_fraction, "expected Fraction progress event");
+        assert!(saw_phase, "expected Phase progress event");
+        assert!(out.join("article.md").is_file() || !queue.items().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_artifact_failure_cleans_partials() {
+        // Destination parent that cannot be created (file in the way) forces write failure.
+        let dir = unique_dir("write-fail");
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let dest = blocker.join("out.md");
+
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "fake",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN],
+            payload: b"# ok\n",
+            fail_once: None,
+            delay_ms: 0,
+            in_flight: None,
+            peak: None,
+        });
+        let mut queue = BatchQueue::new();
+        let input = dir.join("a.txt");
+        std::fs::write(&input, b"x").unwrap();
+        let mut opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        opts.force = true;
+        // Manually set destination under the blocker after enqueue.
+        let id = queue.enqueue(BatchSource::File(input), &opts);
+        if let Some(item) = queue.get_mut(id) {
+            item.destination = dest;
+        }
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.failed, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

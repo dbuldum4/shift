@@ -4137,4 +4137,142 @@ mod tests {
         assert_eq!(once.id, twice.id);
         assert!(once.archived);
     }
+
+    #[test]
+    fn conversion_state_clone_empty_converting_failed() {
+        assert!(matches!(
+            ConversionState::Empty.clone(),
+            ConversionState::Empty
+        ));
+        assert!(matches!(
+            ConversionState::Converting.clone(),
+            ConversionState::Converting
+        ));
+        let failed = ConversionState::Failed("err".into());
+        match failed.clone() {
+            ConversionState::Failed(msg) => assert_eq!(msg.as_ref(), "err"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_stored_entry_preserves_all_badge_fields() {
+        let entry = ConversionHistoryEntry {
+            id: 77,
+            source: HistorySource::File(PathBuf::from("/tmp/x.docx")),
+            name: "x.docx".into(),
+            detail: "detail-line".into(),
+            extension_label: "DOCX".into(),
+            badge_color: 0xabcdef,
+            badge_text_color: 0x123456,
+            output_format: OutputFormat::HTML,
+            outcome: HistoryOutcome::Failed("nope".into()),
+            archived: true,
+        };
+        let stored = to_stored_entry(&entry);
+        assert_eq!(stored.badge_color, 0xabcdef);
+        assert_eq!(stored.badge_text_color, 0x123456);
+        assert_eq!(stored.extension_label, "DOCX");
+        assert_eq!(stored.detail, "detail-line");
+        assert_eq!(stored.name, "x.docx");
+        assert_eq!(stored.output_format, "html");
+        assert!(stored.archived);
+    }
+
+    #[test]
+    fn from_stored_entry_url_ready_large_round_trip() {
+        let entry = history_entry(
+            8,
+            HistorySource::Url("https://news.example/a".into()),
+            OutputFormat::MARKDOWN,
+            HistoryOutcome::ReadyLarge {
+                module_id: "defuddle".into(),
+                byte_len: 42,
+            },
+            false,
+        );
+        let back = from_stored_entry(to_stored_entry(&entry)).unwrap();
+        assert_eq!(
+            back.source,
+            HistorySource::Url("https://news.example/a".into())
+        );
+        match back.outcome {
+            HistoryOutcome::ReadyLarge {
+                module_id,
+                byte_len,
+            } => {
+                assert_eq!(module_id.as_ref(), "defuddle");
+                assert_eq!(byte_len, 42);
+            }
+            _ => panic!("expected ReadyLarge"),
+        }
+    }
+
+    #[test]
+    fn history_from_store_single_max_id_zero_entry() {
+        let (entries, next_id) = history_from_store(LoadedHistory {
+            entries: vec![StoredHistoryEntry {
+                id: 0,
+                source: StoredSource::File(PathBuf::from("/tmp/z")),
+                name: "z".into(),
+                detail: "d".into(),
+                extension_label: "Z".into(),
+                badge_color: 0,
+                badge_text_color: 0,
+                output_format: "markdown".into(),
+                outcome: StoredOutcome::Failed("x".into()),
+                archived: false,
+            }],
+            next_id: 0,
+        });
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 0);
+        assert_eq!(next_id, 1);
+    }
+
+    #[test]
+    fn store_round_trip_html_and_docx_formats() {
+        for format in [OutputFormat::HTML, OutputFormat::DOCX] {
+            let entry = history_entry(
+                1,
+                HistorySource::File(PathBuf::from("/tmp/doc.md")),
+                format,
+                HistoryOutcome::Ready(Arc::new(artifact(
+                    "out",
+                    format,
+                    "pandoc",
+                    b"body".to_vec(),
+                ))),
+                false,
+            );
+            let back = from_stored_entry(to_stored_entry(&entry)).unwrap();
+            assert_eq!(back.output_format, format);
+            match back.outcome {
+                HistoryOutcome::Ready(a) => {
+                    assert_eq!(a.format, format);
+                    assert_eq!(a.media_type, format.media_type());
+                }
+                _ => panic!("expected Ready"),
+            }
+        }
+    }
+
+    #[test]
+    fn ready_artifact_method_on_state_matches_conversion_state_impl() {
+        let art = Arc::new(artifact(
+            "m.md",
+            OutputFormat::MARKDOWN,
+            "markitdown",
+            b"m".to_vec(),
+        ));
+        let state = ConversionState::Ready(Arc::clone(&art));
+        assert!(state.ready_artifact().is_some());
+        assert!(ConversionState::Empty.ready_artifact().is_none());
+        assert!(ConversionState::Converting.ready_artifact().is_none());
+        assert!(
+            ConversionState::Failed("f".into())
+                .ready_artifact()
+                .is_none()
+        );
+    }
 }

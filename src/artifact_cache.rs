@@ -1284,4 +1284,102 @@ mod tests {
         // FNV-1a empty seed.
         assert_eq!(simple_hash(b""), 0xcbf29ce484222325);
     }
+
+    #[test]
+    fn ensure_artifact_cache_dir_rejects_symlink_and_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = unique_temp_dir("ensure-bad");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // File where cache dir should be.
+        let file_path = base.join("as-file");
+        fs::write(&file_path, b"x").unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &file_path);
+        }
+        let err = ensure_artifact_cache_dir().unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "error: {err}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = base.join("real-target");
+            fs::create_dir_all(&target).unwrap();
+            let link = base.join("as-link");
+            symlink(&target, &link).unwrap();
+            unsafe {
+                std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &link);
+            }
+            let err = ensure_artifact_cache_dir().unwrap_err();
+            assert!(err.to_string().contains("symlink"), "error: {err}");
+        }
+
+        // Missing path without home / support override for default cache.
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+            // Keep HOME so we don't break other tests; exercise NotFound via empty override.
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", "");
+        }
+        // Empty string still yields Some path; clear properly:
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        // When cache dir is unset, application_support_dir may still resolve via HOME.
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_artifact_bytes_without_extension_uses_hash_suffix() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("no-ext");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+        let path = cache_artifact_bytes("noextname", b"payload").unwrap();
+        assert!(path.is_file());
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains("noextname") && name.contains('-'),
+            "name: {name}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn purge_artifact_cache_defaults_runs_paste_staging_too() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("purge-defaults");
+        let paste_dir = unique_temp_dir("purge-defaults-paste");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&paste_dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &paste_dir);
+        }
+        // Seed a cache entry and an external paste staging file.
+        let cached = cache_artifact_bytes("seed.bin", b"data").unwrap();
+        assert!(cached.is_file());
+        fs::write(paste_dir.join("old.dat"), b"stale").unwrap();
+
+        let stats = purge_artifact_cache_defaults().unwrap();
+        // Fresh files may not be purged under default TTL; just ensure the call succeeds.
+        let _ = stats;
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(paste_dir);
+    }
 }

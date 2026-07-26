@@ -1649,4 +1649,254 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn support_dir_uses_home_when_no_app_support_override() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "shift-history-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+            std::env::set_var("HOME", &home);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                support_dir(),
+                Some(home.join("Library/Application Support/Shift"))
+            );
+            assert_eq!(
+                history_db_path(),
+                Some(home.join("Library/Application Support/Shift/history.sqlite"))
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(support_dir(), Some(home.join(".local/share/shift")));
+        }
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn load_and_save_history_fail_without_support_dir() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+            std::env::remove_var("HOME");
+        }
+
+        assert!(support_dir().is_none());
+        assert!(history_db_path().is_none());
+        let empty = load_history();
+        assert!(empty.entries.is_empty());
+        assert_eq!(empty.next_id, 1);
+
+        let err = save_history(&[sample_entry(1, "x", false)], 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("home"));
+
+        let err = save_history_delta(&[sample_entry(1, "x", false)], &[1], &[]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // Without a support dir, clear is still a successful no-op.
+        clear_history_store().unwrap();
+
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn load_history_open_failure_returns_empty() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-history-open-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory where the sqlite file should be makes Connection::open fail.
+        std::fs::create_dir_all(dir.join("history.sqlite")).unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+
+        let loaded = load_history();
+        assert!(loaded.entries.is_empty());
+        assert_eq!(loaded.next_id, 1);
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decode_history_rejects_unknown_source_and_outcome_kinds() {
+        // Craft minimal valid header + one entry with invalid source kind.
+        let mut bad_source = MAGIC.to_vec();
+        bad_source.extend_from_slice(&1u64.to_le_bytes()); // next_id
+        bad_source.extend_from_slice(&1u32.to_le_bytes()); // count
+        bad_source.extend_from_slice(&1u64.to_le_bytes()); // id
+        bad_source.push(99); // unknown source kind
+        bad_source.extend_from_slice(&0u32.to_le_bytes()); // empty source string
+        let err = decode_history(&bad_source).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown history source kind"),
+            "error: {err}"
+        );
+
+        // Valid source, invalid outcome kind.
+        let mut bad_outcome = MAGIC.to_vec();
+        bad_outcome.extend_from_slice(&1u64.to_le_bytes());
+        bad_outcome.extend_from_slice(&1u32.to_le_bytes());
+        bad_outcome.extend_from_slice(&1u64.to_le_bytes());
+        bad_outcome.push(0); // File source
+        bad_outcome.extend_from_slice(&0u32.to_le_bytes()); // empty path
+        for field in ["", "", "", ""] {
+            // name, detail, extension_label, output_format — four strings
+            let _ = field;
+        }
+        // name, detail, extension_label
+        for _ in 0..3 {
+            bad_outcome.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bad_outcome.extend_from_slice(&0u32.to_le_bytes()); // badge_color
+        bad_outcome.extend_from_slice(&0u32.to_le_bytes()); // badge_text_color
+        bad_outcome.extend_from_slice(&0u32.to_le_bytes()); // output_format
+        bad_outcome.push(77); // unknown outcome kind
+        let err = decode_history(&bad_outcome).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown history outcome kind"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn history_entries_rejects_invalid_source_and_outcome_kinds() {
+        let conn = open_history(":memory:").unwrap();
+        // Minimal valid row with illegal source_kind.
+        conn.execute(
+            "INSERT INTO history (
+                id, source_kind, source, name, detail, extension_label,
+                badge_color, badge_text_color, output_format, outcome_kind, archived
+            ) VALUES (1, 9, 'x', 'n', 'd', 'E', 0, 0, 'md', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let err = history_entries(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::IntegralValueOutOfRange(_, 9)),
+            "unexpected: {err:?}"
+        );
+
+        conn.execute("DELETE FROM history", []).unwrap();
+        conn.execute(
+            "INSERT INTO history (
+                id, source_kind, source, name, detail, extension_label,
+                badge_color, badge_text_color, output_format, outcome_kind, archived
+            ) VALUES (2, 0, '/tmp/a', 'n', 'd', 'E', 0, 0, 'md', 9, 0)",
+            [],
+        )
+        .unwrap();
+        let err = history_entries(&conn, true).unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::IntegralValueOutOfRange(_, 9)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn restore_source_path_without_home_keeps_tilde_literal() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(restore_source_path("~"), PathBuf::from("~"));
+        assert_eq!(
+            restore_source_path("~/Documents/a.txt"),
+            PathBuf::from("~/Documents/a.txt")
+        );
+        // store_source_path without home also leaves absolute paths unchanged.
+        assert_eq!(store_source_path(Path::new("/tmp/x")), "/tmp/x".to_owned());
+
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn load_history_entries_query_failure_returns_empty() {
+        // A row with an illegal source_kind makes history_entries fail; load_history
+        // must swallow that and return the empty LoadedHistory arm.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-history-query-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: serialized behind crate::ENV_LOCK.
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+
+        let db_path = history_db_path().unwrap();
+        {
+            let conn = open_history(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO history (
+                    id, source_kind, source, name, detail, extension_label,
+                    badge_color, badge_text_color, output_format, outcome_kind, archived
+                ) VALUES (1, 42, 'x', 'n', 'd', 'E', 0, 0, 'md', 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let loaded = load_history();
+        assert!(loaded.entries.is_empty());
+        assert_eq!(loaded.next_id, 1);
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

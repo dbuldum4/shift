@@ -2333,4 +2333,562 @@ mod tests {
         assert_eq!(both.pdf.page_from, Some(2));
         assert_eq!(both.pdf.page_to, Some(4));
     }
+
+    #[test]
+    fn parse_convert_subcommand_does_not_set_batch_explicit() {
+        let parsed = parse_convert_args(&args(&[
+            "convert", "notes.md", "-t", "html", "-o", "out.html",
+        ]))
+        .unwrap();
+        assert!(!parsed.batch_explicit);
+        assert_eq!(parsed.inputs, args(&["notes.md"]));
+        assert_eq!(parsed.target, OutputFormat::HTML);
+        assert_eq!(parsed.output.as_deref(), Some(Path::new("out.html")));
+    }
+
+    #[test]
+    fn parse_end_of_options_allows_dash_prefixed_inputs() {
+        let parsed =
+            parse_convert_args(&args(&["-t", "markdown", "--", "-weird-name.md", "--also"]))
+                .unwrap();
+        assert_eq!(parsed.inputs, args(&["-weird-name.md", "--also"]));
+        assert_eq!(parsed.target, OutputFormat::MARKDOWN);
+    }
+
+    #[test]
+    fn parse_short_flag_forms_for_io_and_yes_verbose() {
+        let parsed =
+            parse_convert_args(&args(&["a.md", "-o", "out.md", "-y", "-v", "-t", "html"])).unwrap();
+        assert_eq!(parsed.output.as_deref(), Some(Path::new("out.md")));
+        assert!(parsed.yes);
+        assert!(parsed.verbose);
+        assert_eq!(parsed.target, OutputFormat::HTML);
+
+        let parsed = parse_convert_args(&args(&[
+            "a.md",
+            "b.md",
+            "-O",
+            "/tmp/batch-out",
+            "-t",
+            "pdf",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.output_dir.as_deref(),
+            Some(Path::new("/tmp/batch-out"))
+        );
+        assert_eq!(parsed.inputs.len(), 2);
+    }
+
+    #[test]
+    fn parse_all_docling_cli_flags_including_images_and_tables() {
+        for (mode_str, mode) in [
+            ("placeholder", DoclingImageExportMode::Placeholder),
+            ("embedded", DoclingImageExportMode::Embedded),
+            ("referenced", DoclingImageExportMode::Referenced),
+            ("embed", DoclingImageExportMode::Embedded),
+            ("refs", DoclingImageExportMode::Referenced),
+        ] {
+            let parsed = parse_convert_args(&args(&[
+                "scan.pdf",
+                "--docling-images",
+                mode_str,
+                "-t",
+                "markdown",
+            ]))
+            .unwrap();
+            assert_eq!(
+                parsed.docling.image_export_mode, mode,
+                "mode_str={mode_str}"
+            );
+        }
+
+        let tables_on =
+            parse_convert_args(&args(&["scan.pdf", "--docling-tables", "-t", "html"])).unwrap();
+        assert!(tables_on.docling.tables);
+
+        let tables_off =
+            parse_convert_args(&args(&["scan.pdf", "--no-docling-tables", "-t", "html"])).unwrap();
+        assert!(!tables_off.docling.tables);
+
+        let combo = parse_convert_args(&args(&[
+            "scan.pdf",
+            "--docling-images",
+            "referenced",
+            "--no-docling-ocr",
+            "--docling-tables",
+            "--docling-table-mode",
+            "accurate",
+            "--ocr-lang",
+            "eng+fra",
+            "-t",
+            "plain",
+        ]))
+        .unwrap();
+        assert_eq!(
+            combo.docling.image_export_mode,
+            DoclingImageExportMode::Referenced
+        );
+        assert!(!combo.docling.ocr);
+        assert!(combo.docling.tables);
+        assert_eq!(combo.docling.table_mode, DoclingTableMode::Accurate);
+        assert_eq!(combo.docling.ocr_lang.as_deref(), Some("eng+fra"));
+        assert_eq!(combo.target, "plain".parse::<OutputFormat>().unwrap());
+
+        let bad_images =
+            parse_convert_args(&args(&["scan.pdf", "--docling-images", "huge"])).unwrap_err();
+        assert!(
+            bad_images.contains("image export") || bad_images.contains("huge"),
+            "{bad_images}"
+        );
+        let bad_table_mode =
+            parse_convert_args(&args(&["scan.pdf", "--docling-table-mode", "turbo"])).unwrap_err();
+        assert!(
+            bad_table_mode.contains("table mode") || bad_table_mode.contains("turbo"),
+            "{bad_table_mode}"
+        );
+    }
+
+    #[test]
+    fn parse_pandoc_standalone_toc_and_pdf_engine() {
+        let parsed = parse_convert_args(&args(&[
+            "notes.md",
+            "--standalone",
+            "--toc",
+            "--pdf-engine",
+            "xelatex",
+            "--citations",
+            "-t",
+            "pdf",
+        ]))
+        .unwrap();
+        assert!(parsed.pandoc.standalone);
+        assert!(parsed.pandoc.toc);
+        assert!(parsed.pandoc.citations);
+        assert_eq!(parsed.pandoc.pdf_engine.as_deref(), Some("xelatex"));
+        assert_eq!(parsed.target, OutputFormat::PDF);
+    }
+
+    #[test]
+    fn parse_multi_module_flag_combo_does_not_conflict() {
+        // Engine knobs are independent; setting several families at once is allowed.
+        // (There is no CLI rejection of "conflicting module flags".)
+        let parsed = parse_convert_args(&args(&[
+            "mixed.bin",
+            "-t",
+            "markdown",
+            "--module",
+            "docling",
+            "--keep-data-uris",
+            "--standalone",
+            "--toc",
+            "--frontmatter",
+            "--lang",
+            "en",
+            "--docling-images",
+            "embedded",
+            "--no-docling-ocr",
+            "--no-docling-tables",
+            "--docling-table-mode",
+            "fast",
+            "--ocr-lang",
+            "eng",
+            "--pdf-password",
+            "secret",
+            "--pages",
+            "1-2",
+            "--mute",
+            "--mono",
+            "--encode",
+            "copy",
+            "--quality",
+            "small",
+            "--verbose",
+            "--progress",
+            "--force",
+            "-y",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.preferred_module.as_deref(), Some("docling"));
+        assert!(parsed.markitdown.keep_data_uris);
+        assert!(parsed.pandoc.standalone && parsed.pandoc.toc);
+        assert!(parsed.defuddle.frontmatter);
+        assert_eq!(parsed.defuddle.lang.as_deref(), Some("en"));
+        assert_eq!(
+            parsed.docling.image_export_mode,
+            DoclingImageExportMode::Embedded
+        );
+        assert!(!parsed.docling.ocr && !parsed.docling.tables);
+        assert_eq!(parsed.pdf.password.as_deref(), Some("secret"));
+        assert_eq!(parsed.pdf.page_from, Some(1));
+        assert_eq!(parsed.pdf.page_to, Some(2));
+        assert!(parsed.ffmpeg.mute && parsed.ffmpeg.mono);
+        assert_eq!(parsed.ffmpeg.encode_mode, FfmpegEncodeMode::PreferCopy);
+        assert_eq!(parsed.ffmpeg.quality, FfmpegQuality::Small);
+        assert!(parsed.verbose && parsed.progress && parsed.force && parsed.yes);
+    }
+
+    #[test]
+    fn parse_requires_values_for_remaining_flags() {
+        for (argv, needle) in [
+            (args(&["a.md", "--output"]), "--output"),
+            (args(&["a.md", "-o"]), "--output"),
+            (args(&["a.md", "--output-dir"]), "--output-dir"),
+            (args(&["a.md", "-O"]), "--output-dir"),
+            (args(&["a.md", "--docling-images"]), "--docling-images"),
+            (
+                args(&["a.md", "--docling-table-mode"]),
+                "--docling-table-mode",
+            ),
+            (args(&["a.md", "--ocr-lang"]), "--ocr-lang"),
+            (args(&["a.md", "--pdf-password"]), "--pdf-password"),
+            (args(&["a.md", "--page-from"]), "--page-from"),
+            (args(&["a.md", "--page-to"]), "--page-to"),
+            (args(&["a.md", "--pages"]), "--pages"),
+            (args(&["a.md", "--pdf-engine"]), "--pdf-engine"),
+            (args(&["a.md", "--reference-doc"]), "--reference-doc"),
+            (args(&["a.md", "--lang"]), "--lang"),
+            (args(&["clip.mp4", "--duration"]), "--duration"),
+            (args(&["clip.mp4", "--frame"]), "--frame"),
+            (args(&["clip.mp4", "--frame-interval"]), "--frame-interval"),
+            (
+                args(&["clip.mp4", "--subtitle-stream"]),
+                "--subtitle-stream",
+            ),
+            (args(&["clip.mp4", "--encode"]), "--encode"),
+            (args(&["clip.mp4", "--quality"]), "--quality"),
+            (args(&["clip.mp4", "--sample-rate"]), "--sample-rate"),
+            (args(&["clip.mp4", "--scale-width"]), "--scale-width"),
+            (args(&["clip.mp4", "--fps"]), "--fps"),
+            (args(&["clip.mp4", "--audio-stream"]), "--audio-stream"),
+        ] {
+            let err = parse_convert_args(&argv).unwrap_err();
+            assert!(
+                err.contains(needle),
+                "argv={argv:?} expected needle {needle:?} in {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_zero_page_to() {
+        let err = parse_convert_args(&args(&["doc.pdf", "--page-to", "0", "-t", "markdown"]))
+            .unwrap_err();
+        assert!(err.contains("1-based") || err.contains("page-to"), "{err}");
+    }
+
+    #[test]
+    fn recursive_mixes_files_dirs_and_preserves_urls() {
+        let root = unique_temp("mix-recursive");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("inside.md"), b"# inside\n").unwrap();
+        let loose = root.join("loose.html");
+        std::fs::write(&loose, b"<p>loose</p>").unwrap();
+        // Empty dir alone would error; mixed with a file it should expand the dir.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let expanded = resolve_cli_inputs(
+            args(&[
+                loose.to_str().unwrap(),
+                nested.to_str().unwrap(),
+                "https://example.com/page",
+                "file:///tmp/local.md",
+            ]),
+            true,
+        )
+        .unwrap();
+        let paths: Vec<String> = expanded
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("loose.html")),
+            "loose file kept: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("inside.md")),
+            "nested expand: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "https://example.com/page"),
+            "url preserved: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "file:///tmp/local.md"),
+            "file url preserved: {paths:?}"
+        );
+
+        // Empty directory among other inputs still fails when that dir expands to nothing.
+        let err = resolve_cli_inputs(
+            args(&[loose.to_str().unwrap(), empty.to_str().unwrap()]),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no convertible") || err.contains("empty"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recursive_keeps_unexpandable_file_path() {
+        let dir = unique_temp("keep-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let weird = dir.join("no-extension");
+        std::fs::write(&weird, b"data").unwrap();
+        let expanded = resolve_cli_inputs(args(&[weird.to_str().unwrap()]), true).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(PathBuf::from(&expanded[0]), weird);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn doctor_script_keys_are_stable_across_env() {
+        use shift_core::conversion::DiagnosticsReport;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("doctor-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing-bin");
+        let engine_vars = [
+            "SHIFT_MARKITDOWN_BIN",
+            "SHIFT_PANDOC_BIN",
+            "SHIFT_DEFUDDLE_BIN",
+            "SHIFT_DOCLING_BIN",
+            "SHIFT_FFMPEG_BIN",
+        ];
+        unsafe {
+            for key in engine_vars {
+                std::env::set_var(key, &missing);
+            }
+            std::env::remove_var("SHIFT_PDF_ENGINE");
+        }
+
+        let script = DiagnosticsReport::collect().render_script();
+        // Stable key set scripts can depend on regardless of readiness.
+        for key in [
+            "engine.markitdown=",
+            "engine.pandoc=",
+            "engine.defuddle=",
+            "engine.docling=",
+            "engine.ffmpeg=",
+            "pdf.selected=",
+            "pdf.ready=",
+            "healthy=",
+            "complete=",
+            "exit_code=",
+        ] {
+            assert!(
+                script.contains(key),
+                "doctor --script missing stable key {key:?} in:\n{script}"
+            );
+        }
+        // Each engine line carries version= and path= fields.
+        for engine in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+            let line = script
+                .lines()
+                .find(|l| l.starts_with(&format!("engine.{engine}=")))
+                .unwrap_or_else(|| panic!("missing engine.{engine} line"));
+            assert!(
+                line.contains("version=") && line.contains("path="),
+                "engine line shape: {line}"
+            );
+            assert!(
+                line.contains("=missing") || line.contains("=ready"),
+                "readiness label on {line}"
+            );
+        }
+
+        // --doctor alias behaves like doctor.
+        assert!(run(args(&["--doctor", "--quiet"])).is_ok());
+
+        unsafe {
+            for key in engine_vars {
+                std::env::remove_var(key);
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_subcommand_single_input_with_output_path_parses() {
+        let parsed = parse_convert_args(&args(&[
+            "batch",
+            "only.md",
+            "-t",
+            "html",
+            "-o",
+            "/tmp/only.html",
+            "--force",
+        ]))
+        .unwrap();
+        assert!(parsed.batch_explicit);
+        assert_eq!(parsed.inputs, args(&["only.md"]));
+        assert_eq!(parsed.output.as_deref(), Some(Path::new("/tmp/only.html")));
+        assert!(parsed.force);
+        // Explicit batch + single -o is allowed at parse time; run path pins dest.
+    }
+
+    #[test]
+    fn batch_explicit_without_inputs_fails_at_parse() {
+        let err =
+            parse_convert_args(&args(&["batch", "-t", "html", "-O", "/tmp/out"])).unwrap_err();
+        assert!(err.contains("missing input"), "{err}");
+    }
+
+    #[test]
+    fn classify_page_url_local_path_and_multi_token_rejection() {
+        match classify_cli_input(OsStr::new("https://example.com/article")).unwrap() {
+            ClassifiedInput::Token(PasteToken::PageUrl(url)) => {
+                assert_eq!(url, "https://example.com/article");
+            }
+            other => panic!("expected page url, got {other:?}"),
+        }
+        match classify_cli_input(OsStr::new("/tmp/notes.md")).unwrap() {
+            ClassifiedInput::Token(PasteToken::LocalPath(path)) => {
+                assert_eq!(path, Path::new("/tmp/notes.md"));
+            }
+            ClassifiedInput::Path(path) => {
+                assert_eq!(path, Path::new("/tmp/notes.md"));
+            }
+            other => panic!("expected local path, got {other:?}"),
+        }
+        // Multiple tokens in one argument are rejected.
+        let err = classify_cli_input(OsStr::new("a.md b.md")).unwrap_err();
+        assert!(
+            err.contains("single path") || err.contains("multiple"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn materialize_path_variant_and_network_urls_list() {
+        // ClassifiedInput::Path skips existence checks (non-UTF-8 / unclassified tokens).
+        let source =
+            materialize_cli_input(ClassifiedInput::Path(PathBuf::from("/tmp/x.pdf")), None)
+                .unwrap();
+        assert_eq!(source.as_file(), Some(Path::new("/tmp/x.pdf")));
+
+        let items = [
+            classify_cli_input(OsStr::new("https://example.com/a")).unwrap(),
+            classify_cli_input(OsStr::new("/local.md")).unwrap(),
+            classify_cli_input(OsStr::new("https://cdn.example.com/f.pdf")).unwrap(),
+        ];
+        let urls = network_urls_from_classified(&items);
+        assert_eq!(
+            urls,
+            vec!["https://example.com/a", "https://cdn.example.com/f.pdf"]
+        );
+    }
+
+    #[test]
+    fn parse_pages_half_open_and_whitespace() {
+        let err = parse_pages_range(OsStr::new("2-"), "--pages").unwrap_err();
+        assert!(err.contains("FROM-TO") || err.contains("--pages"), "{err}");
+        let err = parse_pages_range(OsStr::new("-5"), "--pages").unwrap_err();
+        assert!(err.contains("FROM-TO") || err.contains("--pages"), "{err}");
+        let (from, to) = parse_pages_range(OsStr::new(" 3 - 7 "), "--pages").unwrap();
+        assert_eq!(from, Some(3));
+        assert_eq!(to, Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_stdout_single_file_happy_path_with_fake() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("stdout-happy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        let input = dir.join("page.html");
+        std::fs::write(&input, b"<p>hello</p>").unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        // Happy path: single input + --stdout + preferred module.
+        let result = run(args(&[
+            "convert",
+            input.to_str().unwrap(),
+            "-t",
+            "markdown",
+            "--stdout",
+            "--module",
+            "pandoc",
+            "-v",
+        ]));
+
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        // Sibling default path must not be created under --stdout.
+        assert!(!dir.join("page.md").exists());
+        assert!(!dir.join("page.converted.md").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_single_file_with_output_dir_forces_batch_path() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp("batch-one");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        let input = dir.join("solo.html");
+        std::fs::write(&input, b"<p>solo</p>").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        let result = run(args(&[
+            input.to_str().unwrap(),
+            "-t",
+            "html",
+            "-O",
+            out.to_str().unwrap(),
+            "--module",
+            "pandoc",
+            "--force",
+        ]));
+
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+        // Batch destination lands under -O even for a single input.
+        let any_out = std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().is_file());
+        assert!(any_out, "expected an output file under {}", out.display());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn non_recursive_rejects_each_directory_input() {
+        let root = unique_temp("non-rec");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let err = resolve_cli_inputs(args(&[a.to_str().unwrap(), "file.md"]), false).unwrap_err();
+        assert!(
+            err.contains("directory") && err.contains("--recursive"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

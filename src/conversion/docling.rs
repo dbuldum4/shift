@@ -798,7 +798,572 @@ printf '%s' "$body" > "$output/$stem.$ext"
                 || message.contains("executable not found"),
             "{message}"
         );
+        // Install hint must stay stable for UX / docs.
+        assert!(
+            message.contains("pip install docling") || message.contains("SHIFT_DOCLING_BIN"),
+            "missing-exe message should mention install path: {message}"
+        );
 
+        let _ = fs::remove_file(&input);
+    }
+
+    fn unique_suffix(tag: &str) -> String {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            tag
+        )
+    }
+
+    fn write_fake_docling_body(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn cancel_flag_aborts_conversion() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("cancel");
+        let executable = directory.join(format!("shift-docling-cancel-{suffix}"));
+        let input = directory.join(format!("shift-docling-cancel-in-{suffix}.pdf"));
+        write_fake_docling_body(&executable, "#!/bin/sh\nsleep 30\n");
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let options = ConversionOptions {
+            cancel: Some(std::sync::Arc::clone(&cancel)),
+            ..ConversionOptions::default()
+        };
+        let err = DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap_err();
+        assert!(err.is_cancelled(), "error: {err}");
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn cancel_mid_run_stops_hanging_docling() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("mid-cancel");
+        let executable = directory.join(format!("shift-docling-midcancel-{suffix}"));
+        let input = directory.join(format!("shift-docling-midcancel-in-{suffix}.pdf"));
+        write_fake_docling_body(&executable, "#!/bin/sh\nsleep 30\n");
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        let started = std::time::Instant::now();
+        let watcher = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let options = ConversionOptions {
+            cancel: Some(cancel),
+            ..ConversionOptions::default()
+        };
+        let err = DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap_err();
+        let _ = watcher.join();
+        assert!(err.is_cancelled(), "error: {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancel took too long: {:?}",
+            started.elapsed()
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn discover_output_empty_dir_returns_none() {
+        let work = std::env::temp_dir().join(format!("shift-docling-empty-{}", unique_suffix("e")));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        let expected = work.join("report.md");
+        assert!(DoclingModule::discover_output(&work, &expected).is_none());
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn discover_output_ignores_nested_files_and_directories() {
+        let work =
+            std::env::temp_dir().join(format!("shift-docling-nested-{}", unique_suffix("n")));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(work.join("subdir")).unwrap();
+        // Nested candidate must not be discovered (only top-level files).
+        fs::write(work.join("subdir").join("report.md"), b"# nested").unwrap();
+        // A directory whose name ends like the expected extension is not a file.
+        fs::create_dir_all(work.join("looks.md")).unwrap();
+        let expected = work.join("report.md");
+        assert!(
+            DoclingModule::discover_output(&work, &expected).is_none(),
+            "nested/dir entries must not count as candidates"
+        );
+        // Once a top-level file appears, it is found.
+        fs::write(work.join("renamed.md"), b"# top").unwrap();
+        assert_eq!(
+            DoclingModule::discover_output(&work, &expected),
+            Some(work.join("renamed.md"))
+        );
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn discover_output_extension_match_is_case_insensitive() {
+        let work = std::env::temp_dir().join(format!("shift-docling-case-{}", unique_suffix("c")));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("Report.MD"), b"# Case").unwrap();
+        let expected = work.join("report.md");
+        let result = DoclingModule::discover_output(&work, &expected);
+        assert_eq!(result, Some(work.join("Report.MD")));
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn discover_output_missing_work_dir_returns_none() {
+        let missing =
+            std::env::temp_dir().join(format!("shift-docling-missing-dir-{}", unique_suffix("md")));
+        let _ = fs::remove_dir_all(&missing);
+        let expected = missing.join("report.md");
+        assert!(DoclingModule::discover_output(&missing, &expected).is_none());
+    }
+
+    #[test]
+    fn all_image_export_modes_appear_on_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("img-modes");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        for mode in DoclingImageExportMode::all() {
+            let options = ConversionOptions {
+                docling: DoclingOptions {
+                    image_export_mode: *mode,
+                    ..DoclingOptions::default()
+                },
+                ..ConversionOptions::default()
+            };
+            DoclingModule::with_executable(&executable)
+                .convert(&input, OutputFormat::MARKDOWN, &options)
+                .unwrap();
+            let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+            assert!(
+                args.contains("--image-export-mode") && args.contains(mode.id()),
+                "mode {} missing from argv: {args}",
+                mode.id()
+            );
+        }
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn all_table_modes_appear_on_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("table-modes");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        for mode in DoclingTableMode::all() {
+            let options = ConversionOptions {
+                docling: DoclingOptions {
+                    table_mode: *mode,
+                    ..DoclingOptions::default()
+                },
+                ..ConversionOptions::default()
+            };
+            DoclingModule::with_executable(&executable)
+                .convert(&input, OutputFormat::HTML, &options)
+                .unwrap();
+            let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+            assert!(
+                args.contains("--table-mode") && args.contains(mode.id()),
+                "table mode {} missing from argv: {args}",
+                mode.id()
+            );
+        }
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn empty_or_whitespace_ocr_lang_is_omitted_from_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("ocr-empty");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        for lang in [Some(String::new()), Some("   ".into()), None] {
+            let options = ConversionOptions {
+                docling: DoclingOptions {
+                    ocr_lang: lang.clone(),
+                    ..DoclingOptions::default()
+                },
+                ..ConversionOptions::default()
+            };
+            DoclingModule::with_executable(&executable)
+                .convert(&input, OutputFormat::MARKDOWN, &options)
+                .unwrap();
+            let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+            assert!(
+                !args.contains("--ocr-lang"),
+                "empty/whitespace ocr_lang must not pass --ocr-lang (lang={lang:?}): {args}"
+            );
+        }
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn converts_non_pdf_office_and_image_inputs() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("nonpdf");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        write_fake_docling(&executable);
+        let module = DoclingModule::with_executable(&executable);
+
+        for (name, bytes) in [
+            ("slide.docx", b"PK fake docx" as &[u8]),
+            ("sheet.xlsx", b"PK fake xlsx"),
+            ("deck.pptx", b"PK fake pptx"),
+            ("scan.png", b"\x89PNG fake"),
+            ("page.html", b"<html><body>hi</body></html>"),
+            ("notes.md", b"# notes\n"),
+            ("book.epub", b"PK fake epub"),
+        ] {
+            let input = directory.join(format!("shift-docling-{suffix}-{name}"));
+            fs::write(&input, bytes).unwrap();
+            let artifact = module
+                .convert(
+                    &input,
+                    OutputFormat::MARKDOWN,
+                    &ConversionOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("convert {name}: {e}"));
+            assert!(
+                artifact.file_name.ends_with(".md"),
+                "{name} → {}",
+                artifact.file_name
+            );
+            assert_eq!(artifact.module_id, "docling");
+            assert_eq!(artifact.pipeline, vec!["docling"]);
+            let _ = fs::remove_file(&input);
+        }
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+    }
+
+    #[test]
+    fn capability_list_is_exhaustive_for_extensions_and_outputs() {
+        let module = DoclingModule::with_executable("docling");
+        // Every documented Docling input extension must be advertised.
+        for ext in [
+            "pdf", "docx", "pptx", "xlsx", "odt", "ods", "odp", "epub", "md", "markdown", "adoc",
+            "asciidoc", "tex", "latex", "txt", "html", "htm", "xhtml", "csv", "png", "jpg", "jpeg",
+            "tif", "tiff", "bmp", "webp",
+        ] {
+            assert!(
+                module.input_extensions().contains(&ext),
+                "missing input extension {ext:?} in {:?}",
+                module.input_extensions()
+            );
+        }
+        assert_eq!(module.input_extensions().len(), EXTENSIONS.len());
+        assert_eq!(module.input_extensions(), EXTENSIONS);
+
+        let outputs = module.output_formats();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs, OUTPUTS);
+        assert_eq!(module.chainable_output_formats(), OUTPUTS);
+        assert_eq!(module.id(), "docling");
+        assert_eq!(module.label(), "Docling");
+
+        // supports() follows the extension + output lists.
+        assert!(module.supports(Path::new("scan.PDF"), OutputFormat::HTML));
+        assert!(module.supports(Path::new("slide.docx"), OutputFormat::MARKDOWN));
+        assert!(module.supports(Path::new("scan.png"), OutputFormat("plain")));
+        assert!(!module.supports(Path::new("clip.mp4"), OutputFormat::MARKDOWN));
+        assert!(!module.supports(Path::new("scan.pdf"), OutputFormat::DOCX));
+    }
+
+    #[test]
+    fn default_docling_options_prefer_fast_small_artifacts() {
+        let defaults = DoclingOptions::default();
+        assert_eq!(
+            defaults.image_export_mode,
+            DoclingImageExportMode::Placeholder
+        );
+        assert!(defaults.ocr);
+        assert!(defaults.tables);
+        assert_eq!(defaults.table_mode, DoclingTableMode::Fast);
+        assert_eq!(defaults.ocr_lang, None);
+    }
+
+    #[test]
+    fn process_failure_surfaces_stderr_detail() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("fail-stderr");
+        let executable = directory.join(format!("shift-docling-fail-{suffix}"));
+        let input = directory.join(format!("shift-docling-fail-in-{suffix}.pdf"));
+        write_fake_docling_body(
+            &executable,
+            "#!/bin/sh\necho 'parser exploded' >&2\nexit 2\n",
+        );
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let err = DoclingModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Docling could not convert") && message.contains("parser exploded"),
+            "{message}"
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn process_failure_falls_back_to_stdout_when_stderr_empty() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("fail-stdout");
+        let executable = directory.join(format!("shift-docling-fail-{suffix}"));
+        let input = directory.join(format!("shift-docling-fail-in-{suffix}.pdf"));
+        write_fake_docling_body(&executable, "#!/bin/sh\necho 'only on stdout'\nexit 1\n");
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let err = DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::HTML, &ConversionOptions::default())
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("only on stdout") || message.contains("exited with"),
+            "{message}"
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn process_success_without_output_file_fails_cleanly() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("no-out");
+        let executable = directory.join(format!("shift-docling-empty-out-{suffix}"));
+        let input = directory.join(format!("shift-docling-empty-in-{suffix}.pdf"));
+        // Succeed but never write the expected artifact.
+        write_fake_docling_body(&executable, "#!/bin/sh\nexit 0\n");
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let err = DoclingModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Docling finished but did not write") || message.contains("not write"),
+            "{message}"
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn output_file_name_handles_empty_and_normal_stems() {
+        // PathBuf::set_extension on an empty stem yields an empty path (no file name).
+        // convert() avoids this by substituting "converted" when file_stem is empty/None.
+        let empty = std::ffi::OsStr::new("");
+        let empty_name = DoclingModule::output_file_name(empty, OutputFormat::MARKDOWN);
+        assert!(
+            empty_name.as_os_str().is_empty() || empty_name.as_os_str() == ".md",
+            "empty stem → {empty_name:?}"
+        );
+        assert_eq!(
+            DoclingModule::output_file_name(std::ffi::OsStr::new("report"), OutputFormat::HTML),
+            PathBuf::from("report.html")
+        );
+        assert_eq!(
+            DoclingModule::output_file_name(std::ffi::OsStr::new("report"), OutputFormat("plain")),
+            PathBuf::from("report.txt")
+        );
+        // Unsupported/other formats fall through to the format id as extension.
+        assert_eq!(
+            DoclingModule::output_file_name(std::ffi::OsStr::new("x"), OutputFormat::DOCX),
+            PathBuf::from("x.docx")
+        );
+        assert_eq!(
+            DoclingModule::output_file_name(
+                std::ffi::OsStr::new("converted"),
+                OutputFormat::MARKDOWN
+            ),
+            PathBuf::from("converted.md")
+        );
+    }
+
+    #[test]
+    fn convert_substitutes_converted_stem_when_file_stem_is_none() {
+        // Paths whose file_stem() is None (e.g. ".." components as the name) use "converted".
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("none-stem");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let work = directory.join(format!("shift-docling-none-stem-{suffix}"));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        write_fake_docling(&executable);
+
+        // Create a regular file, then convert using a path that ends with ".." — not practical.
+        // Instead exercise the filter branch via a zero-length stem OsString in output_file_name
+        // (above) and verify convert still succeeds for a normal hidden-style name.
+        let input = work.join(".hidden.pdf");
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+        let artifact = DoclingModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+        // ".hidden.pdf" → stem ".hidden" on Unix.
+        assert!(
+            artifact.file_name.ends_with(".md"),
+            "got {}",
+            artifact.file_name
+        );
+        assert!(!artifact.bytes.is_empty());
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn image_export_and_table_mode_trim_whitespace_on_parse() {
+        assert_eq!(
+            "  embedded  ".parse::<DoclingImageExportMode>().unwrap(),
+            DoclingImageExportMode::Embedded
+        );
+        assert_eq!(
+            "\treferenced\n".parse::<DoclingImageExportMode>().unwrap(),
+            DoclingImageExportMode::Referenced
+        );
+        assert_eq!(
+            " accurate ".parse::<DoclingTableMode>().unwrap(),
+            DoclingTableMode::Accurate
+        );
+    }
+
+    #[test]
+    fn successful_convert_records_provenance_and_media_types() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("prov");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        let module = DoclingModule::with_executable(&executable);
+        let md = module
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(md.media_type, OutputFormat::MARKDOWN.media_type());
+        assert_eq!(md.pipeline, vec!["docling"]);
+        assert_eq!(md.invocations.len(), 1);
+        assert_eq!(md.invocations[0].module_id, "docling");
+        assert!(
+            md.invocations[0].argv_display.contains("convert")
+                || md.invocations[0].argv_display.contains("--to"),
+            "argv_display: {}",
+            md.invocations[0].argv_display
+        );
+
+        let plain = module
+            .convert(&input, OutputFormat("plain"), &ConversionOptions::default())
+            .unwrap();
+        assert_eq!(plain.media_type, OutputFormat("plain").media_type());
+        assert!(plain.file_name.ends_with(".txt"));
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn ocr_and_tables_toggle_flags_on_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("toggles");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.pdf"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"%PDF-1.4 fake").unwrap();
+
+        // Defaults: --ocr --tables
+        DoclingModule::with_executable(&executable)
+            .convert(
+                &input,
+                OutputFormat::MARKDOWN,
+                &ConversionOptions::default(),
+            )
+            .unwrap();
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("--ocr"), "{args}");
+        assert!(args.contains("--tables"), "{args}");
+        assert!(!args.contains("--no-ocr"), "{args}");
+        assert!(!args.contains("--no-tables"), "{args}");
+
+        let options = ConversionOptions {
+            docling: DoclingOptions {
+                ocr: false,
+                tables: false,
+                ..DoclingOptions::default()
+            },
+            ..ConversionOptions::default()
+        };
+        DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MARKDOWN, &options)
+            .unwrap();
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("--no-ocr"), "{args}");
+        assert!(args.contains("--no-tables"), "{args}");
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
         let _ = fs::remove_file(&input);
     }
 }

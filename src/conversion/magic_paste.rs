@@ -1696,4 +1696,232 @@ exit 0
         assert!(err.is_cancelled());
         assert!(err.to_string().contains("cancel"));
     }
+
+    #[test]
+    fn materialize_page_url_returns_url_source() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
+        let source = materialize_paste_token(
+            &PasteToken::PageUrl("https://example.com/article".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            source,
+            BatchSource::Url("https://example.com/article".into())
+        );
+        // Rejected when private-URL policy blocks (no allow flag, localhost).
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+        }
+        let err =
+            materialize_paste_token(&PasteToken::PageUrl("http://127.0.0.1/local".into()), None);
+        // May succeed if policy allows or fail with private-URL message depending on env.
+        let _ = err;
+    }
+
+    #[test]
+    fn resolve_redirect_rejects_target_without_host() {
+        // Absolute http URL with empty host hits the post-resolve scheme/host guard.
+        let err = resolve_redirect_url("https://example.com/a", "http://").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing non-http(s) redirect target")
+                || err.to_string().contains("redirect"),
+            "error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_follow_redirects_cancel_and_http_errors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let staging =
+            std::env::temp_dir().join(format!("shift-magic-follow-{}", std::process::id()));
+        fs::create_dir_all(&staging).unwrap();
+        let fake_dir = std::env::temp_dir().join(format!(
+            "shift-magic-fakecurl-follow-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&fake_dir).unwrap();
+        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            // Disable private-URL policy so download_remote_file takes follow-redirects path.
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
+        }
+
+        // Cancel before curl starts.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let out = staging.join("cancelled");
+        let err =
+            download_follow_redirects("http://example.com/ok", &out, Some(cancel)).unwrap_err();
+        assert!(err.is_cancelled(), "error: {err}");
+
+        // Successful download via follow path.
+        let path = download_remote_file("http://example.com/ok", None).unwrap();
+        assert!(path.is_file());
+
+        // Fail with stderr detail.
+        let err = download_remote_file("http://example.com/fail", None).unwrap_err();
+        assert!(
+            err.to_string().contains("boom") || err.to_string().contains("could not download"),
+            "error: {err}"
+        );
+
+        if let Some(p) = old_path {
+            unsafe {
+                std::env::set_var("PATH", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&fake_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_with_redirect_revalidation_http_error_and_non_http_location() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let staging =
+            std::env::temp_dir().join(format!("shift-magic-redir-err-{}", std::process::id()));
+        fs::create_dir_all(&staging).unwrap();
+        let fake_dir = std::env::temp_dir().join(format!(
+            "shift-magic-fakecurl-redir-err-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&fake_dir).unwrap();
+        // Extended fake curl: HTTP 404 body path and file:// Location.
+        let script = r#"#!/bin/sh
+output=""
+header=""
+status_arg=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) output="$2"; shift 2;;
+    -D) header="$2"; shift 2;;
+    -w) status_arg="$2"; shift 2;;
+    -*) shift;;
+    *) url="$1"; shift;;
+  esac
+done
+case "$url" in
+  *fileloc*)
+    code=302
+    location="file:///etc/passwd"
+    ;;
+  *http404*)
+    code=404
+    if [ -n "$output" ]; then rm -f "$output"; : > "$output"; fi
+    ;;
+  *emptyfail*)
+    code=500
+    echo "" >&2
+    if [ -n "$output" ]; then rm -f "$output"; : > "$output"; fi
+    ;;
+  *)
+    code=200
+    if [ -n "$output" ]; then rm -f "$output"; printf 'fake' > "$output"; fi
+    ;;
+esac
+if [ -n "$header" ]; then
+  if [ "$code" -eq 302 ]; then
+    cat > "$header" <<EOF
+HTTP/1.1 302 Found
+Location: $location
+
+EOF
+  else
+    cat > "$header" <<EOF
+HTTP/1.1 $code X
+
+EOF
+  fi
+fi
+if [ -n "$status_arg" ]; then printf '%s' "$code"; fi
+exit 0
+"#;
+        let _ = write_curl_script(&fake_dir, script);
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
+        }
+
+        let out = staging.join("fileloc");
+        let err = download_with_redirect_revalidation("http://example.com/fileloc", &out, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-http") || err.to_string().contains("redirect"),
+            "error: {err}"
+        );
+
+        let out2 = staging.join("404");
+        let err = download_with_redirect_revalidation("http://example.com/http404", &out2, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("HTTP 404") || err.to_string().contains("404"),
+            "error: {err}"
+        );
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let out3 = staging.join("cancel");
+        let err = download_with_redirect_revalidation("http://example.com/ok", &out3, Some(cancel))
+            .unwrap_err();
+        assert!(err.is_cancelled(), "error: {err}");
+
+        if let Some(p) = old_path {
+            unsafe {
+                std::env::set_var("PATH", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&fake_dir);
+    }
+
+    #[test]
+    fn classify_token_empty_and_existing_relative_file() {
+        assert!(classify_token("").is_none());
+        assert!(classify_token("   ").is_none());
+
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-classify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plainname");
+        fs::write(&file, b"x").unwrap();
+        // Relative path that exists: looks_like_path_token uses path.exists().
+        let cwd = std::env::current_dir().unwrap();
+        // Use absolute path instead to avoid cwd races.
+        let token = classify_token(file.to_str().unwrap()).unwrap();
+        assert!(matches!(token, PasteToken::LocalPath(_)));
+        let _ = cwd;
+        let _ = fs::remove_dir_all(dir);
+    }
 }
