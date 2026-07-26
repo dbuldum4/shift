@@ -3,7 +3,7 @@ use shift_core::conversion::{
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
     FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
-    PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, default_output_path,
+    PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, default_output_path,
     ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url, materialize_paste_token,
     parse_magic_paste, prepare_batch_destination, run_batch, url_display_host,
 };
@@ -102,6 +102,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         defuddle: parsed.defuddle,
         docling: parsed.docling,
         sips: parsed.sips,
+        spreadsheet: parsed.spreadsheet,
         pdf: parsed.pdf,
         cancel: Some(Arc::clone(&cancel)),
         progress: None,
@@ -203,6 +204,7 @@ struct ParsedConvertArgs {
     defuddle: DefuddleOptions,
     docling: DoclingOptions,
     sips: SipsOptions,
+    spreadsheet: SpreadsheetOptions,
     pdf: PdfInputOptions,
     recursive: bool,
     verbose: bool,
@@ -228,6 +230,7 @@ impl Default for ParsedConvertArgs {
             defuddle: DefuddleOptions::default(),
             docling: DoclingOptions::default(),
             sips: SipsOptions::default(),
+            spreadsheet: SpreadsheetOptions::default(),
             pdf: PdfInputOptions::default(),
             recursive: false,
             verbose: false,
@@ -495,6 +498,33 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                 );
             }
             "--sips-strip-profile" => parsed.sips.strip_color_profile = true,
+            "--sheet" | "--sheet-name" => {
+                cursor += 1;
+                let name = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--sheet requires a sheet name".to_owned())?
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned();
+                if name.is_empty() {
+                    return Err("--sheet requires a non-empty sheet name".to_owned());
+                }
+                parsed.spreadsheet.sheet_name = Some(name);
+            }
+            "--sheet-index" => {
+                cursor += 1;
+                let raw = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--sheet-index requires a 1-based index".to_owned())?
+                    .to_string_lossy();
+                let index = raw.trim().parse::<u32>().map_err(|_| {
+                    format!("--sheet-index expects a positive integer (got `{raw}`)")
+                })?;
+                if index == 0 {
+                    return Err("--sheet-index is 1-based (got 0)".to_owned());
+                }
+                parsed.spreadsheet.sheet_index = Some(index);
+            }
             "--ocr-lang" => {
                 cursor += 1;
                 parsed.docling.ocr_lang = Some(
@@ -890,14 +920,15 @@ fn install_ctrl_c_handler() -> Arc<AtomicBool> {
     }
 }
 
-/// Probe external engines. Exit codes are stable for scripts:
+/// Probe conversion engines. Exit codes are stable for scripts:
 ///
-/// - `0` — at least one conversion engine is ready (usable partial install)
+/// - `0` — at least one conversion engine is ready (usable partial install;
+///   built-in Spreadsheet alone is enough)
 /// - `1` — no conversion engines are ready (or doctor flags were invalid)
 ///
-/// Optional engines and PDF backends do not fail the exit code. Use
-/// `--script` and check `complete=true` or individual `engine.*=ready` lines
-/// when a full install is required.
+/// Built-in engines, optional engines, and PDF backends do not fail the exit
+/// code when other tools are missing. Use `--script` and check `complete=true`
+/// or individual `engine.*=ready` lines when a full install is required.
 ///
 /// Pass `--script` for `key=value` lines, or `--quiet` for exit code only.
 fn run_doctor(arguments: &[OsString]) -> Result<ExitCode, String> {
@@ -934,17 +965,19 @@ fn run_doctor(arguments: &[OsString]) -> Result<ExitCode, String> {
 fn print_doctor_help() {
     println!(
         "Usage: shift-cli doctor [--script] [--quiet]\n\n\
-         Probe MarkItDown, Pandoc, Defuddle, Docling, FFmpeg, and PDF engines.\n\
+         Probe conversion engines (built-in Spreadsheet; MarkItDown, Pandoc,\n\
+         Defuddle, Docling, FFmpeg, sips on macOS) and PDF backends.\n\
          Reports installed/missing status, detected versions, and install hints.\n\n\
          Options:\n  \
          --script, -s   Emit key=value lines for scripts\n  \
          --quiet,  -q   Suppress output; rely on the exit code only\n\n\
          Exit codes:\n  \
-         0  at least one conversion engine is ready\n  \
+         0  at least one conversion engine is ready (built-ins alone count)\n  \
          1  no conversion engines are ready\n\n\
-         Optional engines (Defuddle, Docling) and PDF backends do not fail the\n\
-         exit code. For a full install gate, use `--script` and require\n\
-         `complete=true` or specific `engine.<id>=ready` lines.\n\n\
+         Built-in engines and optional engines (Defuddle, Docling) plus PDF\n\
+         backends do not fail the exit code when other tools are missing. For a\n\
+         full install gate, use `--script` and require `complete=true` or\n\
+         specific `engine.<id>=ready` lines — not exit code alone.\n\n\
          Registered capability (what modules advertise) is listed by\n\
          `shift-cli formats`. Doctor reports whether conversion is currently\n\
          available on this machine."
@@ -1066,6 +1099,9 @@ fn print_help() {
          --sips-rotate <DEGREES>    Rotate clockwise\n  \
          --sips-flip horizontal|vertical\n  \
          --sips-strip-profile       Drop the embedded color profile\n\n\
+         Spreadsheet options (values-only; cell text is preserved as written):\n  \
+         --sheet <NAME>             Sheet name (exact, case-sensitive)\n  \
+         --sheet-index <N>          Sheet index (1-based; ignored if --sheet set)\n\n\
          Inputs may be local paths, file:// URLs, page URLs (http/https,\n\
          extracted with Defuddle), or direct file URLs (downloaded then\n\
          converted). URL fetches are public-internet only by default (no\n\
@@ -1294,17 +1330,22 @@ mod tests {
         let code = run(args(&["doctor", "--quiet"])).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
 
-        // All engines missing → exit 1.
+        // All external engines missing: spreadsheet is still built-in and ready,
+        // so doctor stays exit 0 (usable partial install).
         unsafe {
             for key in engine_vars {
                 std::env::set_var(key, &missing);
             }
         }
         let empty = DiagnosticsReport::collect();
-        assert_eq!(empty.exit_code(), 1);
+        assert!(
+            empty.is_engine_ready("spreadsheet"),
+            "spreadsheet must stay ready without external tools"
+        );
+        assert_eq!(empty.exit_code(), 0);
         assert_eq!(
             run(args(&["doctor", "--quiet"])).unwrap(),
-            ExitCode::from(1)
+            ExitCode::SUCCESS
         );
 
         unsafe {
@@ -2006,11 +2047,19 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "spreadsheet",
             "sips",
             "ffmpeg",
         ];
         #[cfg(not(target_os = "macos"))]
-        let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let expected = vec![
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ];
         assert_eq!(module_ids, expected);
 
         for id in &module_ids {
@@ -2507,6 +2556,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_spreadsheet_sheet_flags() {
+        let by_name =
+            parse_convert_args(&args(&["book.xlsx", "--sheet", "Summary", "-t", "csv"])).unwrap();
+        assert_eq!(by_name.spreadsheet.sheet_name.as_deref(), Some("Summary"));
+        assert_eq!(by_name.target, OutputFormat::CSV);
+
+        let by_index =
+            parse_convert_args(&args(&["book.xlsx", "--sheet-index", "2", "-t", "tsv"])).unwrap();
+        assert_eq!(by_index.spreadsheet.sheet_index, Some(2));
+        assert_eq!(by_index.target, OutputFormat::TSV);
+
+        let plain = parse_convert_args(&args(&["book.xlsx", "-t", "csv"])).unwrap();
+        assert!(plain.spreadsheet.is_default());
+    }
+
+    #[test]
     fn parse_sips_image_flags() {
         let parsed = parse_convert_args(&args(&[
             "IMG_0001.HEIC",
@@ -2555,6 +2620,9 @@ mod tests {
             (args(&["a.png", "--sips-quality"]), "--sips-quality"),
             (args(&["a.png", "--sips-rotate"]), "--sips-rotate"),
             (args(&["a.png", "--sips-flip"]), "--sips-flip"),
+            (args(&["a.xlsx", "--sheet"]), "--sheet"),
+            (args(&["a.xlsx", "--sheet-index"]), "--sheet-index"),
+            (args(&["a.xlsx", "--sheet-index", "0"]), "1-based"),
         ] {
             let err = parse_convert_args(&argv).unwrap_err();
             assert!(err.contains(needle), "argv={argv:?} error={err}");
@@ -2801,7 +2869,14 @@ mod tests {
             );
         }
         // Each engine line carries version= and path= fields.
-        for engine in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+        for engine in [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ] {
             let line = script
                 .lines()
                 .find(|l| l.starts_with(&format!("engine.{engine}=")))

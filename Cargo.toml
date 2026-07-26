@@ -1,6 +1,6 @@
 [package]
 name = "shift"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 default-run = "shift"
@@ -28,6 +28,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+calamine = { version = "0.35.0", features = ["chrono"] }
+csv = "1.4.0"
+rust_xlsxwriter = { version = "0.96.0", features = ["chrono"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"

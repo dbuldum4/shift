@@ -135,6 +135,8 @@ pub fn intern_module_id(id: &str) -> &'static str {
         "pandoc" => "pandoc",
         "defuddle" => "defuddle",
         "docling" => "docling",
+        "spreadsheet" => "spreadsheet",
+        "sips" => "sips",
         "ffmpeg" => "ffmpeg",
         _ => "unknown",
     }
@@ -1267,6 +1269,8 @@ mod tests {
         assert_eq!(intern_module_id("pandoc"), "pandoc");
         assert_eq!(intern_module_id("defuddle"), "defuddle");
         assert_eq!(intern_module_id("docling"), "docling");
+        assert_eq!(intern_module_id("spreadsheet"), "spreadsheet");
+        assert_eq!(intern_module_id("sips"), "sips");
         assert_eq!(intern_module_id("ffmpeg"), "ffmpeg");
         // Unknown ids collapse to the stable "unknown" static.
         assert_eq!(intern_module_id("custom-engine"), "unknown");

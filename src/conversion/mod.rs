@@ -12,6 +12,7 @@ mod pdf_slice;
 mod process;
 mod sips;
 mod sources;
+mod spreadsheet;
 mod suggest;
 
 #[cfg(test)]
@@ -62,6 +63,7 @@ pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality};
 pub use sources::{
     MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
 };
+pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -114,6 +116,11 @@ impl OutputFormat {
     pub const AVIF: Self = Self("avif");
     pub const JP2: Self = Self("jp2");
     pub const ICNS: Self = Self("icns");
+
+    // Spreadsheet writers owned by the spreadsheet adapter (calamine/csv/xlsx).
+    pub const CSV: Self = Self("csv");
+    pub const TSV: Self = Self("tsv");
+    pub const XLSX: Self = Self("xlsx");
 
     /// Every writer in Pandoc 3.10, ordered by practical end-user popularity.
     /// Closely related variants follow their best-known parent format.
@@ -346,7 +353,14 @@ impl OutputFormat {
         Self::AVIF,
         Self::JP2,
         Self::ICNS,
+        // Spreadsheet (must stay in sync with `SPREADSHEET`).
+        Self::CSV,
+        Self::TSV,
+        Self::XLSX,
     ];
+
+    /// Tabular writers owned by the spreadsheet adapter.
+    pub const SPREADSHEET: &'static [Self] = &[Self::CSV, Self::TSV, Self::XLSX];
 
     /// Still-image writers that only the sips adapter provides.
     ///
@@ -425,6 +439,9 @@ impl OutputFormat {
             "avif" => "AVIF Image",
             "jp2" => "JPEG 2000",
             "icns" => "Apple Icon (ICNS)",
+            "csv" => "CSV",
+            "tsv" => "TSV",
+            "xlsx" => "Excel (XLSX)",
             other => other,
         }
     }
@@ -526,6 +543,9 @@ impl OutputFormat {
             "srt" => "application/x-subrip",
             "vtt" => "text/vtt",
             "png-sequence-zip" => "application/zip",
+            "csv" => "text/csv",
+            "tsv" => "text/tab-separated-values",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             _ => "text/plain",
         }
     }
@@ -538,12 +558,14 @@ impl OutputFormat {
                 | "text/html"
                 | "text/plain"
                 | "text/vtt"
+                | "text/csv"
+                | "text/tab-separated-values"
                 | "application/x-subrip"
                 | "application/json"
                 | "application/xml"
         ) || matches!(
             self.id(),
-            "srt" | "vtt" | "plain" | "markdown" | "html" | "gfm"
+            "srt" | "vtt" | "plain" | "markdown" | "html" | "gfm" | "csv" | "tsv"
         )
     }
 }
@@ -646,6 +668,7 @@ pub struct ConversionOptions {
     pub defuddle: DefuddleOptions,
     pub docling: DoclingOptions,
     pub sips: SipsOptions,
+    pub spreadsheet: SpreadsheetOptions,
     pub pdf: PdfInputOptions,
     /// When set and true, external converter processes should abort.
     ///
@@ -665,6 +688,8 @@ impl std::fmt::Debug for ConversionOptions {
             .field("pandoc", &self.pandoc)
             .field("defuddle", &self.defuddle)
             .field("docling", &self.docling)
+            .field("sips", &self.sips)
+            .field("spreadsheet", &self.spreadsheet)
             .field("pdf", &self.pdf)
             .field("cancel", &self.cancel.as_ref().map(|_| "<AtomicBool>"))
             .field(
@@ -690,6 +715,8 @@ impl PartialEq for ConversionOptions {
             && self.pandoc == other.pandoc
             && self.defuddle == other.defuddle
             && self.docling == other.docling
+            && self.sips == other.sips
+            && self.spreadsheet == other.spreadsheet
             && self.pdf == other.pdf
             && arc_ptr_eq(&self.cancel, &other.cancel)
             && arc_ptr_eq(&self.progress, &other.progress)
@@ -1112,6 +1139,11 @@ impl ConversionRegistry {
     /// MarkItDown). Pandoc owns publishing writers; Defuddle owns URLs. FFmpeg
     /// owns audio/video container conversion (no document overlap).
     ///
+    /// The spreadsheet module owns sheet-native pairs (`xlsx`/`xls`/`ods`/`csv`
+    /// ↔ `csv`/`tsv`/`xlsx`) as values-only grids. It does not advertise
+    /// Markdown/HTML, so MarkItDown and Docling keep document → text routes.
+    /// CSV chainable output allows a second hop into those engines when needed.
+    ///
     /// sips is registered immediately before FFmpeg, which is the only module
     /// it overlaps: both accept still images (`png`, `jpg`, `tiff`, `bmp`,
     /// `gif`) and write `png`/`jpg`/`gif`. sips wins those pairs because it is
@@ -1130,7 +1162,8 @@ impl ConversionRegistry {
             .with_module(MarkItDownModule::default())
             .with_module(PandocModule::default())
             .with_module(DefuddleModule::default())
-            .with_module(DoclingModule::default());
+            .with_module(DoclingModule::default())
+            .with_module(SpreadsheetModule);
         #[cfg(target_os = "macos")]
         let registry = registry.with_module(SipsModule::default());
         registry.with_module(FfmpegModule::default())
@@ -2128,10 +2161,13 @@ mod tests {
     }
 
     #[test]
-    fn all_catalog_matches_pandoc_plus_media_plus_image() {
+    fn all_catalog_matches_pandoc_plus_media_plus_image_plus_spreadsheet() {
         assert_eq!(
             OutputFormat::ALL.len(),
-            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len() + OutputFormat::IMAGE.len()
+            OutputFormat::PANDOC.len()
+                + OutputFormat::MEDIA.len()
+                + OutputFormat::IMAGE.len()
+                + OutputFormat::SPREADSHEET.len()
         );
         for format in OutputFormat::PANDOC {
             assert!(OutputFormat::ALL.contains(format));
@@ -2140,6 +2176,9 @@ mod tests {
             assert!(OutputFormat::ALL.contains(format));
         }
         for format in OutputFormat::IMAGE {
+            assert!(OutputFormat::ALL.contains(format));
+        }
+        for format in OutputFormat::SPREADSHEET {
             assert!(OutputFormat::ALL.contains(format));
         }
     }
@@ -2917,24 +2956,48 @@ mod tests {
         let pandoc_ids: HashSet<&str> = OutputFormat::PANDOC.iter().map(|f| f.id()).collect();
         let media_ids: HashSet<&str> = OutputFormat::MEDIA.iter().map(|f| f.id()).collect();
         let image_ids: HashSet<&str> = OutputFormat::IMAGE.iter().map(|f| f.id()).collect();
+        let sheet_ids: HashSet<&str> = OutputFormat::SPREADSHEET.iter().map(|f| f.id()).collect();
 
         assert_eq!(
             OutputFormat::ALL.len(),
-            OutputFormat::PANDOC.len() + OutputFormat::MEDIA.len() + OutputFormat::IMAGE.len()
+            OutputFormat::PANDOC.len()
+                + OutputFormat::MEDIA.len()
+                + OutputFormat::IMAGE.len()
+                + OutputFormat::SPREADSHEET.len()
         );
         assert_eq!(
             image_ids.len(),
             OutputFormat::IMAGE.len(),
             "duplicate ids in IMAGE"
         );
+        assert_eq!(
+            sheet_ids.len(),
+            OutputFormat::SPREADSHEET.len(),
+            "duplicate ids in SPREADSHEET"
+        );
         // IMAGE holds only the writers no other catalog claims; formats sips
         // shares with FFmpeg/Pandoc (png, jpg, gif, pdf) stay in their original
-        // slice so the three catalogs remain a true partition of ALL.
-        for (name, other) in [("PANDOC", &pandoc_ids), ("MEDIA", &media_ids)] {
+        // slice so the catalogs remain a true partition of ALL.
+        for (name, other) in [
+            ("PANDOC", &pandoc_ids),
+            ("MEDIA", &media_ids),
+            ("SPREADSHEET", &sheet_ids),
+        ] {
             let overlap: Vec<_> = image_ids.intersection(other).copied().collect();
             assert!(
                 overlap.is_empty(),
                 "ids appear in both IMAGE and {name}: {overlap:?}"
+            );
+        }
+        for (name, other) in [
+            ("PANDOC", &pandoc_ids),
+            ("MEDIA", &media_ids),
+            ("IMAGE", &image_ids),
+        ] {
+            let overlap: Vec<_> = sheet_ids.intersection(other).copied().collect();
+            assert!(
+                overlap.is_empty(),
+                "ids appear in both SPREADSHEET and {name}: {overlap:?}"
             );
         }
         assert_eq!(
@@ -2965,18 +3028,28 @@ mod tests {
             .collect::<HashSet<&str>>()
             .union(&image_ids)
             .copied()
+            .collect::<HashSet<&str>>()
+            .union(&sheet_ids)
+            .copied()
             .collect();
-        assert_eq!(union, all_ids, "PANDOC ∪ MEDIA ∪ IMAGE must equal ALL");
+        assert_eq!(
+            union, all_ids,
+            "PANDOC ∪ MEDIA ∪ IMAGE ∪ SPREADSHEET must equal ALL"
+        );
 
         // Every ALL entry is in exactly one partition.
         for format in OutputFormat::ALL {
             let in_pandoc = OutputFormat::PANDOC.contains(format);
             let in_media = OutputFormat::MEDIA.contains(format);
             let in_image = OutputFormat::IMAGE.contains(format);
+            let in_sheet = OutputFormat::SPREADSHEET.contains(format);
             assert_eq!(
-                usize::from(in_pandoc) + usize::from(in_media) + usize::from(in_image),
+                usize::from(in_pandoc)
+                    + usize::from(in_media)
+                    + usize::from(in_image)
+                    + usize::from(in_sheet),
                 1,
-                "{} must appear in exactly one of PANDOC/MEDIA/IMAGE (pandoc={in_pandoc}, media={in_media}, image={in_image})",
+                "{} must appear in exactly one of PANDOC/MEDIA/IMAGE/SPREADSHEET (pandoc={in_pandoc}, media={in_media}, image={in_image}, sheet={in_sheet})",
                 format.id()
             );
         }
@@ -3354,17 +3427,60 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "spreadsheet",
             "sips",
             "ffmpeg",
         ];
         #[cfg(not(target_os = "macos"))]
-        let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let expected = vec![
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ];
         assert_eq!(ids, expected);
         for id in &ids {
             assert!(registry.has_module(id));
         }
         assert!(!registry.has_module("libreoffice"));
         assert!(!registry.has_module(""));
+    }
+
+    #[test]
+    fn spreadsheet_owns_tabular_pairs_not_markdown() {
+        let registry = ConversionRegistry::default();
+        assert_eq!(
+            registry
+                .module_for(Path::new("sheet.xlsx"), OutputFormat::CSV)
+                .unwrap()
+                .id(),
+            "spreadsheet"
+        );
+        assert_eq!(
+            registry
+                .module_for(Path::new("data.csv"), OutputFormat::XLSX)
+                .unwrap()
+                .id(),
+            "spreadsheet"
+        );
+        // Document engines still own xlsx → markdown.
+        let md = registry
+            .module_for(Path::new("sheet.xlsx"), OutputFormat::MARKDOWN)
+            .unwrap()
+            .id();
+        assert!(
+            md == "markitdown" || md == "docling" || md == "pandoc",
+            "xlsx→md should stay with a document engine, got {md}"
+        );
+        assert!(
+            registry
+                .module_for(Path::new("sheet.xlsx"), OutputFormat::MARKDOWN)
+                .unwrap()
+                .id()
+                != "spreadsheet"
+        );
     }
 
     #[test]

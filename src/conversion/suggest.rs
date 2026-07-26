@@ -9,6 +9,7 @@ use std::path::Path;
 /// - video containers → MP4
 /// - audio → MP3
 /// - still images → PNG
+/// - sheet-native tabular files → CSV (spreadsheet module)
 /// - PDF / office / HTML → Markdown
 /// - default → Markdown
 pub fn suggested_output_for_path(path: impl AsRef<Path>) -> OutputFormat {
@@ -47,6 +48,14 @@ pub fn suggested_output_for_path(path: impl AsRef<Path>) -> OutputFormat {
         if is_subtitle_output(as_format) {
             return OutputFormat::SRT;
         }
+        // Tabular writers (csv/tsv/xlsx) suggest CSV so the spreadsheet module
+        // wins by default; document → Markdown remains available via the picker.
+        if matches!(
+            as_format,
+            OutputFormat::CSV | OutputFormat::TSV | OutputFormat::XLSX
+        ) {
+            return OutputFormat::CSV;
+        }
     }
 
     match ext.as_str() {
@@ -59,11 +68,13 @@ pub fn suggested_output_for_path(path: impl AsRef<Path>) -> OutputFormat {
         }
         // Stills
         "bmp" | "tif" | "tiff" | "webp" | "jpeg" => OutputFormat::PNG,
-        // Documents / web → Markdown
-        "pdf" | "docx" | "pptx" | "xlsx" | "xls" | "odt" | "ods" | "odp" | "epub" | "html"
-        | "htm" | "xhtml" | "rtf" | "md" | "markdown" | "txt" | "csv" | "json" | "xml" => {
-            OutputFormat::MARKDOWN
+        // Sheet-native → CSV (spreadsheet module owns these pairs).
+        "xlsx" | "xlsm" | "xlsb" | "xls" | "xla" | "xlam" | "ods" | "csv" | "tsv" => {
+            OutputFormat::CSV
         }
+        // Documents / web → Markdown
+        "pdf" | "docx" | "pptx" | "odt" | "odp" | "epub" | "html" | "htm" | "xhtml" | "rtf"
+        | "md" | "markdown" | "txt" | "json" | "xml" => OutputFormat::MARKDOWN,
         _ => OutputFormat::MARKDOWN,
     }
 }
@@ -170,8 +181,8 @@ mod tests {
     #[test]
     fn table_driven_document_extensions_suggest_markdown() {
         let cases = [
-            "pdf", "docx", "pptx", "xlsx", "xls", "odt", "ods", "odp", "epub", "html", "htm",
-            "xhtml", "rtf", "md", "markdown", "txt", "csv", "json", "xml",
+            "pdf", "docx", "pptx", "odt", "odp", "epub", "html", "htm", "xhtml", "rtf", "md",
+            "markdown", "txt", "json", "xml",
         ];
         for ext in cases {
             let path = format!("doc.{ext}");
@@ -179,6 +190,21 @@ mod tests {
                 suggested_output_for_path(&path),
                 OutputFormat::MARKDOWN,
                 "document extension .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_driven_sheet_extensions_suggest_csv() {
+        let cases = [
+            "xlsx", "xlsm", "xlsb", "xls", "xla", "xlam", "ods", "csv", "tsv",
+        ];
+        for ext in cases {
+            let path = format!("sheet.{ext}");
+            assert_eq!(
+                suggested_output_for_path(&path),
+                OutputFormat::CSV,
+                "sheet extension .{ext}"
             );
         }
     }

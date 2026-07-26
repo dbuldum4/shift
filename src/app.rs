@@ -290,6 +290,8 @@ pub(crate) struct Shift {
     pub(crate) sips_rotate_degrees: Option<u32>,
     pub(crate) sips_flip: Option<SipsFlip>,
     pub(crate) sips_strip_color_profile: bool,
+    pub(crate) spreadsheet_sheet_name_input: Entity<TextInput>,
+    pub(crate) spreadsheet_sheet_index_input: Entity<TextInput>,
     pub(crate) defuddle_frontmatter: bool,
     pub(crate) defuddle_lang_input: Entity<TextInput>,
     pub(crate) pandoc_standalone: bool,
@@ -423,6 +425,24 @@ impl Shift {
             )
         });
         let pdf_password_input = cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+        let spreadsheet_sheet_name_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "sheet name",
+                options.spreadsheet.sheet_name.clone().unwrap_or_default(),
+            )
+        });
+        let spreadsheet_sheet_index_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "1",
+                options
+                    .spreadsheet
+                    .sheet_index
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
         let history_search = cx.new(|cx| TextInput::new(cx, "Search history…", ""));
         let history_limit_input =
             cx.new(|cx| TextInput::new(cx, "30", session.history_limit.to_string()));
@@ -528,6 +548,8 @@ impl Shift {
             sips_rotate_degrees: options.sips.rotate_degrees,
             sips_flip: options.sips.flip,
             sips_strip_color_profile: options.sips.strip_color_profile,
+            spreadsheet_sheet_name_input,
+            spreadsheet_sheet_index_input,
             defuddle_frontmatter: options.defuddle.frontmatter,
             defuddle_lang_input,
             pandoc_standalone: options.pandoc.standalone,
@@ -1568,6 +1590,27 @@ impl Shift {
                 rotate_degrees: self.sips_rotate_degrees,
                 flip: self.sips_flip,
                 strip_color_profile: self.sips_strip_color_profile,
+            },
+            spreadsheet: {
+                let sheet_name = self
+                    .spreadsheet_sheet_name_input
+                    .read(cx)
+                    .content()
+                    .trim()
+                    .to_owned();
+                let sheet_index =
+                    parse_optional_u32(self.spreadsheet_sheet_index_input.read(cx).content())?;
+                if sheet_index == Some(0) {
+                    return Err("sheet index is 1-based".into());
+                }
+                SpreadsheetOptions {
+                    sheet_index,
+                    sheet_name: if sheet_name.is_empty() {
+                        None
+                    } else {
+                        Some(sheet_name)
+                    },
+                }
             },
             pdf: PdfInputOptions {
                 password,
@@ -2803,6 +2846,8 @@ impl Render for Shift {
         let sips_rotate_degrees = self.sips_rotate_degrees;
         let sips_flip = self.sips_flip;
         let sips_strip_color_profile = self.sips_strip_color_profile;
+        let spreadsheet_sheet_name_input = self.spreadsheet_sheet_name_input.clone();
+        let spreadsheet_sheet_index_input = self.spreadsheet_sheet_index_input.clone();
         let defuddle_frontmatter = self.defuddle_frontmatter;
         let defuddle_lang_input = self.defuddle_lang_input.clone();
         let pandoc_standalone = self.pandoc_standalone;
@@ -2982,6 +3027,8 @@ impl Render for Shift {
                                     sips_rotate_degrees,
                                     sips_flip,
                                     sips_strip_color_profile,
+                                    spreadsheet_sheet_name_input,
+                                    spreadsheet_sheet_index_input,
                                     defuddle_frontmatter,
                                     defuddle_lang_input,
                                     pandoc_standalone,
@@ -3861,7 +3908,14 @@ mod tests {
 
     #[test]
     fn from_stored_entry_interns_known_module_ids() {
-        for module in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+        for module in [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ] {
             let entry = StoredHistoryEntry {
                 id: 1,
                 source: StoredSource::File(PathBuf::from("/tmp/in")),

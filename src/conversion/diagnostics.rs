@@ -123,6 +123,7 @@ impl DiagnosticsReport {
             let pandoc = scope.spawn(probe_pandoc);
             let defuddle = scope.spawn(probe_defuddle);
             let docling = scope.spawn(probe_docling);
+            let spreadsheet = scope.spawn(probe_spreadsheet);
             #[cfg(target_os = "macos")]
             let sips = scope.spawn(probe_sips);
             let ffmpeg = scope.spawn(probe_ffmpeg);
@@ -132,6 +133,7 @@ impl DiagnosticsReport {
                 pandoc.join().expect("pandoc probe"),
                 defuddle.join().expect("defuddle probe"),
                 docling.join().expect("docling probe"),
+                spreadsheet.join().expect("spreadsheet probe"),
             ];
             // Off macOS the module is not registered, so it is not reported.
             #[cfg(target_os = "macos")]
@@ -253,7 +255,7 @@ impl DiagnosticsReport {
             })
     }
 
-    /// Ready engines among the five conversion modules.
+    /// Ready engines among the registered conversion modules.
     pub fn ready_engine_count(&self) -> usize {
         self.engines
             .iter()
@@ -272,9 +274,11 @@ impl DiagnosticsReport {
     /// - `0` — at least one conversion engine is ready (a usable partial install)
     /// - `1` — no conversion engines are ready
     ///
+    /// Built-in engines (Spreadsheet always; sips on macOS) count as ready without
+    /// an external install, so a machine with only those tools still exits `0`.
     /// Optional engines (Defuddle, Docling) and PDF backends do **not** fail the
-    /// exit code. Scripts that need a full install should check `complete=true`
-    /// in `--script` output or individual `engine.*=ready` lines.
+    /// exit code. Scripts that need a full toolchain should check `complete=true`
+    /// in `--script` output or individual `engine.*=ready` lines — not exit code alone.
     pub fn exit_code(&self) -> i32 {
         if self.ready_engine_count() > 0 { 0 } else { 1 }
     }
@@ -301,8 +305,11 @@ impl DiagnosticsReport {
         out.push_str("Shift diagnostics\n");
         out.push_str("=================\n\n");
         out.push_str(
-            "Registered capability is what modules advertise. Conversion is currently\n\
-             available only when the matching external engine is installed and ready.\n\n",
+            "Registered capability is what modules advertise. Built-in engines\n\
+             (Spreadsheet always; sips on macOS) are ready without installs. Other\n\
+             conversions need the matching external engine installed and ready.\n\
+             Exit code 0 means at least one engine is ready — including built-ins\n\
+             alone. For a full toolchain gate, require complete=yes / complete=true.\n\n",
         );
 
         out.push_str("Conversion engines\n");
@@ -647,6 +654,20 @@ fn probe_docling() -> EngineDiagnostic {
     )
 }
 
+fn probe_spreadsheet() -> EngineDiagnostic {
+    // In-process (calamine + csv + rust_xlsxwriter); always ready, no install.
+    EngineDiagnostic {
+        id: "spreadsheet",
+        label: "Spreadsheet",
+        readiness: Readiness::Ready,
+        version: Some(env!("CARGO_PKG_VERSION").into()),
+        resolved_path: None,
+        env_override: "",
+        install_hint: "built into Shift (calamine / csv / rust_xlsxwriter)".into(),
+        notes: Some("Values-only tabular conversion (no styles or formulas).".into()),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn probe_sips() -> EngineDiagnostic {
     // sips is part of the OS, so there is nothing to install; the hint only
@@ -928,19 +949,26 @@ mod tests {
         assert!(partial.is_healthy());
         assert!(!partial.is_complete());
 
-        let engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-            .into_iter()
-            .map(|id| EngineDiagnostic {
-                id,
-                label: id,
-                readiness: Readiness::Ready,
-                version: Some("1".into()),
-                resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
-                env_override: "X",
-                install_hint: String::new(),
-                notes: None,
-            })
-            .collect();
+        let engines: Vec<_> = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ]
+        .into_iter()
+        .map(|id| EngineDiagnostic {
+            id,
+            label: id,
+            readiness: Readiness::Ready,
+            version: Some("1".into()),
+            resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
+            env_override: "X",
+            install_hint: String::new(),
+            notes: None,
+        })
+        .collect();
         let complete = DiagnosticsReport {
             engines,
             pdf_engines: vec![PdfEngineDiagnostic {
@@ -1146,11 +1174,19 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "spreadsheet",
             "sips",
             "ffmpeg",
         ];
         #[cfg(not(target_os = "macos"))]
-        let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let expected = vec![
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ];
         assert_eq!(ids, expected);
         assert_eq!(report.engines.len(), expected.len());
     }
@@ -1477,12 +1513,18 @@ mod tests {
         );
         for engine in &report.engines {
             assert!(!engine.label.is_empty());
-            assert!(!engine.env_override.is_empty());
-            assert!(engine.env_override.starts_with("SHIFT_"));
-            assert!(matches!(
-                engine.readiness,
-                Readiness::Ready | Readiness::Missing
-            ));
+            // In-process engines (spreadsheet) have no external binary override.
+            if engine.id == "spreadsheet" {
+                assert!(engine.env_override.is_empty());
+                assert_eq!(engine.readiness, Readiness::Ready);
+            } else {
+                assert!(!engine.env_override.is_empty());
+                assert!(engine.env_override.starts_with("SHIFT_"));
+                assert!(matches!(
+                    engine.readiness,
+                    Readiness::Ready | Readiness::Missing
+                ));
+            }
         }
     }
 
@@ -1605,19 +1647,26 @@ mod tests {
 
     #[test]
     fn readiness_complete_requires_all_engines_and_pdf() {
-        let mut engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-            .into_iter()
-            .map(|id| EngineDiagnostic {
-                id,
-                label: id,
-                readiness: Readiness::Ready,
-                version: Some("1".into()),
-                resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
-                env_override: "X",
-                install_hint: String::new(),
-                notes: None,
-            })
-            .collect();
+        let mut engines: Vec<_> = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ]
+        .into_iter()
+        .map(|id| EngineDiagnostic {
+            id,
+            label: id,
+            readiness: Readiness::Ready,
+            version: Some("1".into()),
+            resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
+            env_override: "X",
+            install_hint: String::new(),
+            notes: None,
+        })
+        .collect();
         let mut report = DiagnosticsReport {
             engines: engines.clone(),
             pdf_engines: vec![],
@@ -1647,26 +1696,40 @@ mod tests {
 
     #[test]
     fn script_render_keys_for_all_engines() {
-        let engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-            .into_iter()
-            .map(|id| EngineDiagnostic {
-                id,
-                label: id,
-                readiness: Readiness::Missing,
-                version: None,
-                resolved_path: None,
-                env_override: "X",
-                install_hint: "hint".into(),
-                notes: None,
-            })
-            .collect();
+        let engines: Vec<_> = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ]
+        .into_iter()
+        .map(|id| EngineDiagnostic {
+            id,
+            label: id,
+            readiness: Readiness::Missing,
+            version: None,
+            resolved_path: None,
+            env_override: "X",
+            install_hint: "hint".into(),
+            notes: None,
+        })
+        .collect();
         let report = DiagnosticsReport {
             engines,
             pdf_engines: vec![],
             selected_pdf_engine: None,
         };
         let script = report.render_script();
-        for id in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+        for id in [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ] {
             assert!(
                 script.contains(&format!("engine.{id}=missing")),
                 "missing key for {id} in:\n{script}"
@@ -1750,19 +1813,26 @@ mod tests {
     fn format_availability_for_every_output_format_all() {
         let registry = ConversionRegistry::default();
         // Synthetic report: all engines ready, PDF engine ready.
-        let engines: Vec<_> = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"]
-            .into_iter()
-            .map(|id| EngineDiagnostic {
-                id,
-                label: id,
-                readiness: Readiness::Ready,
-                version: Some("1".into()),
-                resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
-                env_override: "X",
-                install_hint: String::new(),
-                notes: None,
-            })
-            .collect();
+        let engines: Vec<_> = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ]
+        .into_iter()
+        .map(|id| EngineDiagnostic {
+            id,
+            label: id,
+            readiness: Readiness::Ready,
+            version: Some("1".into()),
+            resolved_path: Some(PathBuf::from(format!("/bin/{id}"))),
+            env_override: "X",
+            install_hint: String::new(),
+            notes: None,
+        })
+        .collect();
         let report = DiagnosticsReport {
             engines,
             pdf_engines: vec![PdfEngineDiagnostic {
@@ -1880,12 +1950,20 @@ mod tests {
 
     #[test]
     fn script_key_matrix_mixed_readiness() {
-        let ids = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let ids = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ];
         let readiness = [
             Readiness::Ready,
             Readiness::Missing,
             Readiness::Ready,
             Readiness::Missing,
+            Readiness::Ready,
             Readiness::Ready,
         ];
         let engines: Vec<_> = ids

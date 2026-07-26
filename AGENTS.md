@@ -55,6 +55,13 @@ stays with FFmpeg. sips is registered ahead of FFmpeg and therefore wins still �
 pairs, while FFmpeg keeps everything that starts from a container (frame
 extraction, `png-sequence-zip`). Off macOS the module is not registered at all,
 so its formats are absent from capability lists rather than failing at spawn.
+The spreadsheet adapter (in-process: calamine + csv + rust_xlsxwriter) owns
+tabular pairs — xlsx/xlsm/xlsb/xls/ods/csv/tsv → csv/tsv/xlsx — as cell values
+only (no styles, charts, or formula evaluation). Dates export as ISO calendar
+strings; XLSX writes preserve cell text (no boolean/number inference) except
+re-emitting `YYYY-MM-DD` as Excel dates. It does not advertise Markdown or HTML,
+so MarkItDown/Docling/Pandoc keep document → text routes. Sheet-native paths
+default-suggest CSV; CSV/TSV are chainable for a second hop into document engines.
 `preferences::DEFAULT_MODULES` must list every module id in registration order;
 an id missing there is sorted last by `with_priority` and silently loses every
 overlap.
@@ -69,6 +76,7 @@ Optional knobs live on `ConversionOptions`:
 | `pandoc` | standalone, TOC, PDF engine override, reference-doc, citations (off by default) |
 | `markitdown` | keep data URIs |
 | `sips` | max dimension, quality, rotate, flip, strip color profile |
+| `spreadsheet` | sheet name, sheet index (1-based); values-only csv/tsv/xlsx |
 | `pdf` | password (never persisted), page_from / page_to (qpdf slice) |
 
 App and CLI expose the same conversion flags; defaults match historical fixed

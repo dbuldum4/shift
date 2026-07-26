@@ -30,11 +30,11 @@ use shift_core::conversion::{
     ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingImageExportMode, DoclingOptions,
     DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
     MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfInputOptions, Readiness,
-    SipsFlip, SipsOptions, SipsQuality, available_ready_outputs, available_ready_url_outputs,
-    expand_input_paths, is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output,
-    is_video_output, looks_like_url, materialize_magic_paste, parse_magic_paste,
-    paths_refer_to_same_file, pdf_engine_candidates, run_batch, stage_pasted_image,
-    suggested_output_for_path, suggested_output_for_url, url_display_host,
+    SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, available_ready_outputs,
+    available_ready_url_outputs, expand_input_paths, is_audio_output, is_ffmpeg_output,
+    is_image_output, is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste,
+    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
+    stage_pasted_image, suggested_output_for_path, suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -1443,6 +1443,8 @@ pub(crate) struct ConversionPanelView {
     sips_rotate_degrees: Option<u32>,
     sips_flip: Option<SipsFlip>,
     sips_strip_color_profile: bool,
+    spreadsheet_sheet_name_input: Entity<TextInput>,
+    spreadsheet_sheet_index_input: Entity<TextInput>,
     defuddle_frontmatter: bool,
     defuddle_lang_input: Entity<TextInput>,
     pandoc_standalone: bool,
@@ -1488,6 +1490,8 @@ fn conversion_options_panel(
         sips_rotate_degrees,
         sips_flip,
         sips_strip_color_profile,
+        spreadsheet_sheet_name_input,
+        spreadsheet_sheet_index_input,
         defuddle_frontmatter,
         defuddle_lang_input,
         pandoc_standalone,
@@ -1506,6 +1510,7 @@ fn conversion_options_panel(
     let show_pandoc = active_modules.contains(&"pandoc");
     let show_markitdown = active_modules.contains(&"markitdown");
     let show_sips = active_modules.contains(&"sips");
+    let show_spreadsheet = active_modules.contains(&"spreadsheet");
     // Quality only affects lossy encoders; hide it for lossless destinations
     // rather than showing a control that silently does nothing.
     let show_sips_quality = matches!(output_format.id(), "jpg" | "heic" | "avif" | "jp2");
@@ -2271,6 +2276,68 @@ fn conversion_options_panel(
                             .child("ICNS needs a square icon size: pick 512 or 1024."),
                     )
                 })
+        })
+        .when(show_spreadsheet, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(THEME.text_muted)
+                        .child("Spreadsheet"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child("Sheet name"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(THEME.surface)
+                                        .border_1()
+                                        .border_color(THEME.border)
+                                        .child(spreadsheet_sheet_name_input),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .w(px(88.0))
+                                .child(div().text_xs().text_color(THEME.text_muted).child("Index"))
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(THEME.surface)
+                                        .border_1()
+                                        .border_color(THEME.border)
+                                        .child(spreadsheet_sheet_index_input),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(THEME.text_dim)
+                        .child("Name wins over index. Empty = first sheet. Values only."),
+                )
         })
         .when(show_pdf_pages, |panel| {
             panel
@@ -3284,6 +3351,7 @@ fn module_label(id: &str) -> &str {
         "pandoc" => "Pandoc",
         "defuddle" => "Defuddle",
         "docling" => "Docling",
+        "spreadsheet" => "Spreadsheet",
         "ffmpeg" => "FFmpeg",
         other => other,
     }
@@ -3396,6 +3464,7 @@ fn module_description(id: &str) -> &str {
         "pandoc" => "Publishing formats (DOCX, PDF, HTML, wiki, and more).",
         "defuddle" => "Clean article extraction from URLs and local HTML.",
         "docling" => "Layout-aware PDF and office documents → Markdown/HTML/text.",
+        "spreadsheet" => "Tabular conversion: Excel/ODS/CSV ↔ CSV/TSV/XLSX (values only).",
         "ffmpeg" => "Audio, video, stills, and subtitle conversion.",
         _ => "Conversion module.",
     }
@@ -6846,13 +6915,21 @@ mod pure_ui_helpers {
         assert!(module_description("pandoc").contains("Publishing"));
         assert!(module_description("defuddle").contains("URL"));
         assert!(module_description("docling").contains("Layout"));
+        assert!(module_description("spreadsheet").contains("Tabular"));
         assert!(module_description("ffmpeg").contains("Audio"));
         // Default fallback.
         assert_eq!(module_description("nope"), "Conversion module.");
         assert_eq!(module_description(""), "Conversion module.");
         assert_eq!(module_description("PANDOC"), "Conversion module.");
         // Every known description is non-empty and distinct.
-        let ids = ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+        let ids = [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ];
         let mut set = HashSet::new();
         for id in ids {
             let d = module_description(id);
@@ -7352,7 +7429,14 @@ mod pure_ui_helpers {
 
     #[test]
     fn history_search_and_detail_agree_on_module_names() {
-        for module_id in ["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"] {
+        for module_id in [
+            "markitdown",
+            "pandoc",
+            "defuddle",
+            "docling",
+            "spreadsheet",
+            "ffmpeg",
+        ] {
             let entry = sample_history_entry_custom(
                 1,
                 HistorySource::File(PathBuf::from("/tmp/a.docx")),
@@ -7596,6 +7680,11 @@ mod pure_ui_helpers {
                 "docling",
                 "Docling",
                 "Layout-aware PDF and office documents → Markdown/HTML/text.",
+            ),
+            (
+                "spreadsheet",
+                "Spreadsheet",
+                "Tabular conversion: Excel/ODS/CSV ↔ CSV/TSV/XLSX (values only).",
             ),
             (
                 "ffmpeg",

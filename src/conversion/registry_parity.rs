@@ -168,11 +168,19 @@ fn default_registry_module_ids_are_unique_and_stable() {
         "pandoc",
         "defuddle",
         "docling",
+        "spreadsheet",
         "sips",
         "ffmpeg",
     ];
     #[cfg(not(target_os = "macos"))]
-    let expected = vec!["markitdown", "pandoc", "defuddle", "docling", "ffmpeg"];
+    let expected = vec![
+        "markitdown",
+        "pandoc",
+        "defuddle",
+        "docling",
+        "spreadsheet",
+        "ffmpeg",
+    ];
     assert_eq!(ids, expected);
     let mut seen = std::collections::HashSet::new();
     for id in &ids {

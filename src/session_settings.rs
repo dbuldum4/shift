@@ -3,7 +3,7 @@
 use crate::conversion::{
     ConversionOptions, DefuddleOptions, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
     FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions,
-    PdfInputOptions, SipsFlip, SipsOptions,
+    PdfInputOptions, SipsFlip, SipsOptions, SpreadsheetOptions,
 };
 use crate::history::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,9 @@ pub struct SessionConversionOptions {
     /// Added after v1 shipped, so old settings files omit it.
     #[serde(default)]
     pub sips: SessionSipsOptions,
+    /// Tabular sheet selection; added with the spreadsheet module.
+    #[serde(default)]
+    pub spreadsheet: SessionSpreadsheetOptions,
     pub pdf: SessionPdfInputOptions,
 }
 
@@ -136,6 +139,7 @@ impl SessionConversionOptions {
             defuddle: SessionDefuddleOptions::from(&options.defuddle),
             docling: SessionDoclingOptions::from(&options.docling),
             sips: SessionSipsOptions::from(&options.sips),
+            spreadsheet: SessionSpreadsheetOptions::from(&options.spreadsheet),
             pdf: SessionPdfInputOptions {
                 // Never persist passwords.
                 page_from: options.pdf.page_from,
@@ -154,6 +158,7 @@ impl SessionConversionOptions {
             defuddle: self.defuddle.to_defuddle_options(),
             docling: self.docling.to_docling_options(),
             sips: self.sips.to_sips_options(),
+            spreadsheet: self.spreadsheet.to_spreadsheet_options(),
             pdf: PdfInputOptions {
                 password: None,
                 page_from: self.pdf.page_from,
@@ -395,6 +400,34 @@ impl SessionSipsOptions {
                 .as_deref()
                 .and_then(|value| value.parse::<SipsFlip>().ok()),
             strip_color_profile: self.strip_color_profile,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionSpreadsheetOptions {
+    pub sheet_index: Option<u32>,
+    pub sheet_name: Option<String>,
+}
+
+impl From<&SpreadsheetOptions> for SessionSpreadsheetOptions {
+    fn from(value: &SpreadsheetOptions) -> Self {
+        Self {
+            sheet_index: value.sheet_index,
+            sheet_name: value.sheet_name.clone(),
+        }
+    }
+}
+
+impl SessionSpreadsheetOptions {
+    fn to_spreadsheet_options(&self) -> SpreadsheetOptions {
+        SpreadsheetOptions {
+            sheet_index: self.sheet_index.filter(|index| *index > 0),
+            sheet_name: self
+                .sheet_name
+                .as_ref()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
         }
     }
 }
@@ -788,6 +821,10 @@ mod tests {
             page_from: Some(3),
             page_to: Some(7),
         };
+        settings.options.spreadsheet = SessionSpreadsheetOptions {
+            sheet_index: Some(2),
+            sheet_name: Some("Beta".into()),
+        };
 
         save_session_settings(&path, &settings).unwrap();
         let loaded = load_session_settings(&path);
@@ -823,6 +860,15 @@ mod tests {
         assert_eq!(conversion.pdf.page_from, Some(3));
         assert_eq!(conversion.pdf.page_to, Some(7));
         assert_eq!(conversion.pdf.password, None);
+        assert_eq!(conversion.spreadsheet.sheet_name.as_deref(), Some("Beta"));
+        assert_eq!(conversion.spreadsheet.sheet_index, Some(2));
+
+        // sheet_index 0 is invalid (1-based) and must not survive conversion options.
+        let mut zero_index = loaded;
+        zero_index.options.spreadsheet.sheet_index = Some(0);
+        let stripped = zero_index.to_conversion_options();
+        assert_eq!(stripped.spreadsheet.sheet_index, None);
+        assert_eq!(stripped.spreadsheet.sheet_name.as_deref(), Some("Beta"));
 
         let _ = fs::remove_dir_all(dir);
     }
