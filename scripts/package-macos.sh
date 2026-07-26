@@ -34,7 +34,7 @@ cat > "$contents/Info.plist" <<EOF
 </plist>
 EOF
 
-uv pip install --python 3.11 --target "$runtime/python" \
+uv pip install --python 3.11 --prerelease=allow --target "$runtime/python" \
   "markitdown[all]==0.1.6" "docling==2.115.0"
 npm install --prefix "$runtime/node" --omit=dev --no-package-lock "defuddle@0.19.2"
 
