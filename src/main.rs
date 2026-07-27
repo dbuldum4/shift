@@ -65,8 +65,8 @@ pub(crate) const FONT_MONO: &str = "Geist Mono";
 /// Family names must match what Core Text / GPUI resolve on macOS.
 /// Bundled and system UI font choices. Bundled Geist fonts are registered in `main`.
 pub(crate) const UI_FONT_CHOICES: &[(&str, &str)] = &[
-    ("Geist", "Geist"),
     ("Geist Mono", "Geist Mono"),
+    ("Geist", "Geist"),
     ("System", ".SystemUIFont"),
     ("Menlo", "Menlo"),
     ("SF Mono", "SF Mono"),
@@ -3347,9 +3347,18 @@ fn action_chip(
         }))
 }
 
-fn onboarding_primary_action(
+fn onboarding_step_index(step: OnboardingStep) -> usize {
+    match step {
+        OnboardingStep::Welcome => 0,
+        OnboardingStep::HowItWorks => 1,
+        OnboardingStep::Ready => 2,
+    }
+}
+
+fn onboarding_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
+    primary: bool,
     cx: &mut Context<Shift>,
     on_click: impl Fn(&mut Shift, &mut Context<Shift>) + 'static,
 ) -> impl IntoElement {
@@ -3358,16 +3367,26 @@ fn onboarding_primary_action(
         .flex()
         .items_center()
         .justify_center()
-        .h(px(40.0))
-        .px_4()
-        .rounded_lg()
-        .bg(THEME.text)
-        .text_sm()
+        .h(px(32.0))
+        .px_3()
+        .rounded_md()
+        .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(THEME.text_inverse)
         .cursor_pointer()
-        .hover(|style| style.opacity(0.9))
-        .active(|style| style.opacity(0.78))
+        .when(primary, |btn| {
+            btn.bg(THEME.text)
+                .text_color(THEME.text_inverse)
+                .hover(|style| style.opacity(0.9))
+                .active(|style| style.opacity(0.78))
+        })
+        .when(!primary, |btn| {
+            btn.bg(THEME.elevated)
+                .border_1()
+                .border_color(THEME.border_strong)
+                .text_color(THEME.text_primary)
+                .hover(|style| style.bg(THEME.active).border_color(THEME.border_focused))
+                .active(|style| style.opacity(THEME.active_opacity))
+        })
         .child(label.into())
         .on_click(cx.listener(move |this, _, _, cx| {
             on_click(this, cx);
@@ -3375,122 +3394,56 @@ fn onboarding_primary_action(
         }))
 }
 
-fn onboarding_logo() -> impl IntoElement {
-    div()
-        .size(px(44.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_xl()
-        .bg(THEME.text)
-        .text_2xl()
-        .font_weight(FontWeight::BOLD)
-        .text_color(THEME.text_inverse)
-        .child("S")
-}
-
 fn onboarding_progress(step: OnboardingStep) -> impl IntoElement {
-    let active_index = match step {
-        OnboardingStep::Welcome => 0,
-        OnboardingStep::HowItWorks => 1,
-        OnboardingStep::Ready => 2,
-    };
-    let page_label = format!("0{} / 03", active_index + 1);
-
+    let active = onboarding_step_index(step);
     div()
         .flex()
         .items_center()
-        .gap_3()
-        .child(
+        .gap_1p5()
+        .children((0..3).map(move |index| {
             div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .children((0..3).map(|index| {
-                    div()
-                        .w(px(18.0))
-                        .h(px(3.0))
-                        .rounded_full()
-                        .bg(if index <= active_index {
-                            THEME.text
-                        } else {
-                            THEME.border_strong
-                        })
-                })),
-        )
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(THEME.text_muted)
-                .child(page_label),
-        )
+                .size(px(6.0))
+                .rounded_full()
+                .bg(if index == active {
+                    THEME.text
+                } else {
+                    THEME.border_strong
+                })
+        }))
 }
 
-fn onboarding_info_card(
-    id: &'static str,
-    eyebrow: &'static str,
-    title: &'static str,
-    body: &'static str,
-) -> impl IntoElement {
+fn onboarding_bullet(text: &'static str) -> impl IntoElement {
     div()
-        .id(id)
-        .flex_1()
-        .min_w_0()
         .flex()
-        .flex_col()
+        .items_start()
         .gap_2()
-        .p_4()
-        .rounded_lg()
-        .bg(THEME.surface)
-        .border_1()
-        .border_color(THEME.border)
         .child(
             div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(THEME.text_muted)
-                .child(eyebrow),
+                .mt(px(6.0))
+                .size(px(4.0))
+                .rounded_full()
+                .flex_shrink_0()
+                .bg(THEME.text_muted),
         )
         .child(
             div()
                 .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(THEME.text_primary)
-                .child(title),
+                .text_color(THEME.text_secondary)
+                .child(text),
         )
-        .child(div().text_xs().text_color(THEME.text_secondary).child(body))
 }
 
-fn onboarding_flow_card(
-    id: &'static str,
-    number: &'static str,
-    title: &'static str,
-    body: &'static str,
-) -> impl IntoElement {
+fn onboarding_step_row(number: &'static str, title: &'static str, body: &'static str) -> impl IntoElement {
     div()
-        .id(id)
         .flex()
-        .items_center()
         .gap_3()
-        .p_3()
-        .rounded_lg()
-        .bg(THEME.surface)
-        .border_1()
-        .border_color(THEME.border)
         .child(
             div()
-                .size(px(30.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .bg(THEME.elevated)
-                .border_1()
-                .border_color(THEME.border_strong)
+                .w(px(20.0))
+                .pt(px(1.0))
                 .text_xs()
-                .font_weight(FontWeight::BOLD)
-                .text_color(THEME.text_primary)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(THEME.text_muted)
                 .child(number),
         )
         .child(
@@ -3498,7 +3451,7 @@ fn onboarding_flow_card(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap_0p5()
                 .child(
                     div()
                         .text_sm()
@@ -3506,199 +3459,99 @@ fn onboarding_flow_card(
                         .text_color(THEME.text_primary)
                         .child(title),
                 )
-                .child(div().text_xs().text_color(THEME.text_secondary).child(body)),
+                .child(div().text_sm().text_color(THEME.text_secondary).child(body)),
         )
 }
 
 fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl IntoElement {
-    let body = match step {
-        OnboardingStep::Welcome => div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_4()
-            .child(onboarding_logo())
-            .child(
-                div()
-                    .text_3xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(THEME.text_primary)
-                    .child("Meet Shift"),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .text_center()
-                    .max_w(px(430.0))
-                    .text_sm()
-                    .text_color(THEME.text_secondary)
-                    .child("A focused workspace for turning files and public web pages into formats you can use anywhere."),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .gap_3()
-                    .pt_2()
-                    .child(onboarding_info_card(
-                        "onboarding-welcome-files",
-                        "BRING IN",
-                        "Files or pages",
-                        "Drop a file, open a folder, or paste a URL.",
-                    ))
-                    .child(onboarding_info_card(
-                        "onboarding-welcome-results",
-                        "GET OUT",
-                        "Useful results",
-                        "Inspect, copy, reveal, or download the output.",
-                    )),
-            )
-            .into_any_element(),
-        OnboardingStep::HowItWorks => div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .text_3xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(THEME.text_primary)
-                    .child("A calm three-part workflow"),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .text_center()
-                    .max_w(px(460.0))
-                    .text_sm()
-                    .text_color(THEME.text_secondary)
-                    .child("Shift keeps the decisions simple: bring something in, shape the result, and take it with you."),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .pt_2()
-                    .child(onboarding_flow_card(
-                        "onboarding-flow-bring",
-                        "01",
-                        "Bring something in",
-                        "Drop a file, open a folder, or paste a public URL.",
-                    ))
-                    .child(onboarding_flow_card(
-                        "onboarding-flow-shape",
-                        "02",
-                        "Shape the result",
-                        "Shift suggests a sensible output. Change it anytime from the Output panel.",
-                    ))
-                    .child(onboarding_flow_card(
-                        "onboarding-flow-take",
-                        "03",
-                        "Take it with you",
-                        "Inspect the result, then copy, reveal, drag, or save it where you need it.",
-                    )),
-            )
-            .into_any_element(),
-        OnboardingStep::Ready => div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_4()
-            .child(
-                div()
-                    .size(px(52.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(THEME.surface)
-                    .border_1()
-                    .border_color(THEME.border_strong)
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(THEME.text_primary)
-                    .child("✓"),
-            )
-            .child(
-                div()
-                    .text_3xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(THEME.text_primary)
-                    .child("You’re ready to make your first shift"),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .text_center()
-                    .max_w(px(440.0))
-                    .text_sm()
-                    .text_color(THEME.text_secondary)
-                    .child("Start with something small—a note, a PDF, or a page you want to keep. Your original stays untouched while you decide what to do with the result."),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .mt_2()
-                    .p_4()
-                    .rounded_lg()
-                    .bg(THEME.surface)
-                    .border_1()
-                    .border_color(THEME.border)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(THEME.text_muted)
-                                    .child("YOUR FIRST MOVE"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(THEME.text_primary)
-                                    .child("Choose a file or paste a URL"),
-                            ),
-                    )
-                    .child(div().text_lg().text_color(THEME.text_secondary).child("→")),
-            )
-            .into_any_element(),
+    let (title, body) = match step {
+        OnboardingStep::Welcome => (
+            "Welcome to Shift",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(THEME.text_secondary)
+                        .child(
+                            "Convert files and public pages into formats you can use. Your originals stay untouched.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(onboarding_bullet("Drop a file, open a folder, or paste a URL"))
+                        .child(onboarding_bullet("Pick an output format — Shift suggests one"))
+                        .child(onboarding_bullet("Copy, reveal, drag, or save the result")),
+                )
+                .into_any_element(),
+        ),
+        OnboardingStep::HowItWorks => (
+            "The workspace",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(onboarding_step_row(
+                    "1",
+                    "Source",
+                    "Whatever you drop or paste appears on the left.",
+                ))
+                .child(onboarding_step_row(
+                    "2",
+                    "Output",
+                    "Format and options live on the right. Change them anytime.",
+                ))
+                .child(onboarding_step_row(
+                    "3",
+                    "Result",
+                    "When conversion finishes, inspect it and take it with you.",
+                ))
+                .into_any_element(),
+        ),
+        OnboardingStep::Ready => (
+            "Ready when you are",
+            div()
+                .text_sm()
+                .text_color(THEME.text_secondary)
+                .child(
+                    "Start with a small file or a page you want to keep. You can always convert again.",
+                )
+                .into_any_element(),
+        ),
     };
 
     let footer = div()
         .flex()
         .items_center()
         .justify_between()
-        .pt_2()
-        .when(step != OnboardingStep::Welcome, |footer| {
-            footer.child(action_chip("onboarding-back", "Back", cx, |this, cx| {
-                this.previous_onboarding(cx);
-            }))
-        })
-        .when(step == OnboardingStep::Welcome, |footer| {
-            footer.child(div().w(px(1.0)))
-        })
-        .child(match step {
-            OnboardingStep::Ready => onboarding_primary_action(
-                "onboarding-choose-file",
-                "Choose a file",
-                cx,
-                |this, cx| this.start_onboarding(cx),
-            )
-            .into_any_element(),
-            _ => onboarding_primary_action("onboarding-next", "Continue", cx, |this, cx| {
-                this.advance_onboarding(cx);
-            })
-            .into_any_element(),
-        });
+        .child(onboarding_progress(step))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .when(step != OnboardingStep::Welcome, |row| {
+                    row.child(onboarding_button(
+                        "onboarding-back",
+                        "Back",
+                        false,
+                        cx,
+                        |this, cx| this.previous_onboarding(cx),
+                    ))
+                })
+                .child(onboarding_button(
+                    "onboarding-next",
+                    "Continue",
+                    true,
+                    cx,
+                    |this, cx| this.advance_onboarding(cx),
+                )),
+        );
 
     div()
         .id("onboarding-overlay")
@@ -3713,10 +3566,10 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
         .child(
             div()
                 .id("onboarding-card")
-                .w(px(560.0))
+                .w(px(420.0))
                 .max_h(relative(1.0))
                 .overflow_y_scroll()
-                .p_7()
+                .p_6()
                 .rounded_xl()
                 .bg(THEME.elevated)
                 .border_1()
@@ -3729,50 +3582,17 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .justify_between()
+                        .flex_col()
+                        .gap_2()
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(onboarding_logo())
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(THEME.text_muted)
-                                                .child("A QUICK INTRODUCTION"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(THEME.text_secondary)
-                                                .child("Get oriented before you get to work"),
-                                        ),
-                                ),
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(THEME.text_primary)
+                                .child(title),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_end()
-                                .gap_2()
-                                .child(action_chip(
-                                    "onboarding-skip",
-                                    "Skip intro",
-                                    cx,
-                                    |this, cx| this.finish_onboarding(cx),
-                                ))
-                                .child(onboarding_progress(step)),
-                        ),
+                        .child(body),
                 )
-                .child(body)
                 .child(footer)
                 .with_animation(
                     "onboarding-card-in",

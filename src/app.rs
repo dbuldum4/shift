@@ -1507,11 +1507,6 @@ impl Shift {
         cx.notify();
     }
 
-    pub(crate) fn start_onboarding(&mut self, cx: &mut Context<Self>) {
-        self.finish_onboarding(cx);
-        self.choose_file(cx);
-    }
-
     pub(crate) fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
         if self.onboarding_step.is_none() {
             return;
