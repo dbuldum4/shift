@@ -3362,6 +3362,8 @@ fn onboarding_button(
     cx: &mut Context<Shift>,
     on_click: impl Fn(&mut Shift, &mut Context<Shift>) + 'static,
 ) -> impl IntoElement {
+    // Press feedback: opacity stand-in for scale(0.97) — GPUI divs have no transform.
+    // Primary uses a snappier dip so the CTA feels physical (Emil: 100–160ms press feel).
     div()
         .id(id)
         .flex()
@@ -3396,97 +3398,201 @@ fn onboarding_button(
 
 fn onboarding_progress(step: OnboardingStep) -> impl IntoElement {
     let active = onboarding_step_index(step);
+    // Key by step so the active marker re-animates on navigation (state indication).
     div()
+        .id(ElementId::Name(
+            format!("onboarding-progress-{active}").into(),
+        ))
         .flex()
         .items_center()
         .gap_1p5()
         .children((0..3).map(move |index| {
+            let is_active = index == active;
+            let is_past = index < active;
+            let settled_opacity = if is_active {
+                1.0
+            } else if is_past {
+                0.55
+            } else {
+                0.35
+            };
             div()
-                .size(px(6.0))
+                .id(ElementId::Name(
+                    format!("onboarding-dot-{active}-{index}").into(),
+                ))
+                .h(px(6.0))
+                .w(px(if is_active { 14.0 } else { 6.0 }))
                 .rounded_full()
-                .bg(if index == active {
+                .bg(if is_active || is_past {
                     THEME.text
                 } else {
                     THEME.border_strong
                 })
+                .with_animation(
+                    ElementId::Name(format!("onboarding-dot-in-{active}-{index}").into()),
+                    Animation::new(animation::ONBOARDING_STEP).with_easing(ease_out_quint()),
+                    move |element, progress| {
+                        if is_active {
+                            // Pill expands 6 → 14px while fading in (state indication).
+                            element
+                                .w(px(6.0 + 8.0 * progress))
+                                .opacity(0.45 + 0.55 * progress)
+                        } else {
+                            element.opacity(settled_opacity)
+                        }
+                    },
+                )
         }))
 }
 
-fn onboarding_bullet(text: &'static str) -> impl IntoElement {
+/// Staggered fade-in for onboarding children.
+///
+/// Opacity only inside lists — per-item `mt` would reflow siblings every frame.
+/// Element id and animation id are distinct (same id can thrash GPUI element state).
+/// Animation id includes `step_key` + direction so each navigation restarts the cascade.
+/// Card-level lift lives on the modal shell; pure 0→1 fade is OK here because the
+/// card/scrim stay visible independently (never nest this under a 0-start shell).
+fn onboarding_stagger_in(
+    step_key: usize,
+    index: usize,
+    direction: animation::OnboardingNavDirection,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    let node_id = format!(
+        "onboarding-stagger-{step_key}-{}-{index}",
+        direction.id_tag()
+    );
+    let anim_id = format!(
+        "onboarding-stagger-in-{step_key}-{}-{index}",
+        direction.id_tag()
+    );
     div()
-        .flex()
-        .items_start()
-        .gap_2()
-        .child(
-            div()
-                .mt(px(6.0))
-                .size(px(4.0))
-                .rounded_full()
-                .flex_shrink_0()
-                .bg(THEME.text_muted),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(THEME.text_secondary)
-                .child(text),
+        .id(ElementId::Name(node_id.into()))
+        .child(child)
+        .with_animation(
+            ElementId::Name(anim_id.into()),
+            Animation::new(animation::onboarding_stagger_duration(index))
+                .with_easing(animation::onboarding_stagger_easing(index)),
+            |element, progress| element.opacity(animation::fade_opacity(progress)),
         )
 }
 
-fn onboarding_step_row(number: &'static str, title: &'static str, body: &'static str) -> impl IntoElement {
-    div()
-        .flex()
-        .gap_3()
-        .child(
-            div()
-                .w(px(20.0))
-                .pt(px(1.0))
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(THEME.text_muted)
-                .child(number),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(THEME.text_primary)
-                        .child(title),
-                )
-                .child(div().text_sm().text_color(THEME.text_secondary).child(body)),
-        )
+fn onboarding_bullet(
+    text: &'static str,
+    index: usize,
+    direction: animation::OnboardingNavDirection,
+    step_key: usize,
+) -> impl IntoElement {
+    onboarding_stagger_in(
+        step_key,
+        index,
+        direction,
+        div()
+            .flex()
+            .items_start()
+            .gap_2()
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .size(px(4.0))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(THEME.text_muted),
+            )
+            .child(div().text_sm().text_color(THEME.text_secondary).child(text)),
+    )
 }
 
-fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl IntoElement {
+fn onboarding_step_row(
+    number: &'static str,
+    title: &'static str,
+    body: &'static str,
+    index: usize,
+    direction: animation::OnboardingNavDirection,
+    step_key: usize,
+) -> impl IntoElement {
+    onboarding_stagger_in(
+        step_key,
+        index,
+        direction,
+        div()
+            .flex()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(20.0))
+                    .pt(px(1.0))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(THEME.text_muted)
+                    .child(number),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(THEME.text_primary)
+                            .child(title),
+                    )
+                    .child(div().text_sm().text_color(THEME.text_secondary).child(body)),
+            ),
+    )
+}
+
+fn onboarding_overlay(
+    step: OnboardingStep,
+    nav: animation::OnboardingNavDirection,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let step_key = onboarding_step_index(step);
     let (title, body) = match step {
+        // Stagger indices: title is always 0; body items start at 1 so the cascade reads top-down.
         OnboardingStep::Welcome => (
             "Welcome to Shift",
             div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(
+                .child(onboarding_stagger_in(
+                    step_key,
+                    1,
+                    nav,
                     div()
                         .text_sm()
                         .text_color(THEME.text_secondary)
                         .child(
                             "Convert files and public pages into formats you can use. Your originals stay untouched.",
                         ),
-                )
+                ))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(onboarding_bullet("Drop a file, open a folder, or paste a URL"))
-                        .child(onboarding_bullet("Pick an output format — Shift suggests one"))
-                        .child(onboarding_bullet("Copy, reveal, drag, or save the result")),
+                        .child(onboarding_bullet(
+                            "Drop a file, open a folder, or paste a URL",
+                            2,
+                            nav,
+                            step_key,
+                        ))
+                        .child(onboarding_bullet(
+                            "Pick an output format — Shift suggests one",
+                            3,
+                            nav,
+                            step_key,
+                        ))
+                        .child(onboarding_bullet(
+                            "Copy, reveal, drag, or save the result",
+                            4,
+                            nav,
+                            step_key,
+                        )),
                 )
                 .into_any_element(),
         ),
@@ -3500,28 +3606,42 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
                     "1",
                     "Source",
                     "Whatever you drop or paste appears on the left.",
+                    1,
+                    nav,
+                    step_key,
                 ))
                 .child(onboarding_step_row(
                     "2",
                     "Output",
                     "Format and options live on the right. Change them anytime.",
+                    2,
+                    nav,
+                    step_key,
                 ))
                 .child(onboarding_step_row(
                     "3",
                     "Result",
                     "When conversion finishes, inspect it and take it with you.",
+                    3,
+                    nav,
+                    step_key,
                 ))
                 .into_any_element(),
         ),
         OnboardingStep::Ready => (
             "Ready when you are",
-            div()
-                .text_sm()
-                .text_color(THEME.text_secondary)
-                .child(
-                    "Start with a small file or a page you want to keep. You can always convert again.",
-                )
-                .into_any_element(),
+            onboarding_stagger_in(
+                step_key,
+                1,
+                nav,
+                div()
+                    .text_sm()
+                    .text_color(THEME.text_secondary)
+                    .child(
+                        "Start with a small file or a page you want to keep. You can always convert again.",
+                    ),
+            )
+            .into_any_element(),
         ),
     };
 
@@ -3546,13 +3666,22 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
                 })
                 .child(onboarding_button(
                     "onboarding-next",
-                    "Continue",
+                    if step == OnboardingStep::Ready {
+                        "Get started"
+                    } else {
+                        "Continue"
+                    },
                     true,
                     cx,
                     |this, cx| this.advance_onboarding(cx),
                 )),
         );
 
+    // Modal shell matches every other Shift dialog:
+    // - solid scrim on the root (always painted — never opacity-animated from 0)
+    // - card enters with enter_opacity (0.12 floor) + lift; never fade_opacity(0)
+    // Content stagger is free to fade 0→1 because the shell is already visible.
+    // Step content re-keys so forward/back re-runs stagger + direction slide.
     div()
         .id("onboarding-overlay")
         .absolute()
@@ -3580,24 +3709,63 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
                 .gap_5()
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
+                    // Key by step so navigation restarts stagger + direction-aware slide.
+                    // Opacity lives on staggered children; one shared mt for spatial direction
+                    // (single wrapper — no sibling reflow from per-item margins).
                     div()
+                        .id(ElementId::Name(
+                            format!("onboarding-content-{step_key}-{}", nav.id_tag()).into(),
+                        ))
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(
+                        .child(onboarding_stagger_in(
+                            step_key,
+                            0,
+                            nav,
                             div()
                                 .text_lg()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(THEME.text_primary)
                                 .child(title),
-                        )
-                        .child(body),
+                        ))
+                        .child(body)
+                        .with_animation(
+                            ElementId::Name(
+                                format!("onboarding-content-slide-{step_key}-{}", nav.id_tag())
+                                    .into(),
+                            ),
+                            Animation::new(animation::ONBOARDING_STEP)
+                                .with_easing(ease_out_quint()),
+                            move |element, progress| {
+                                let slide = nav.slide_start_px();
+                                element.mt(px(slide * (1.0 - progress)))
+                            },
+                        ),
                 )
-                .child(footer)
+                .child(
+                    div()
+                        .id(ElementId::Name(
+                            format!("onboarding-footer-{step_key}").into(),
+                        ))
+                        .child(footer)
+                        .with_animation(
+                            ElementId::Name(format!("onboarding-footer-in-{step_key}").into()),
+                            Animation::new(animation::onboarding_stagger_duration(4))
+                                .with_easing(animation::onboarding_stagger_easing(4)),
+                            |element, progress| element.opacity(animation::fade_opacity(progress)),
+                        ),
+                )
                 .with_animation(
                     "onboarding-card-in",
-                    Animation::new(animation::DIALOG_DURATION).with_easing(ease_out_quint()),
-                    |element, progress| element.opacity(0.12 + 0.88 * progress),
+                    Animation::new(animation::ONBOARDING_ENTER).with_easing(ease_out_quint()),
+                    |element, progress| {
+                        // enter_opacity floor + slight lift stands in for scale(0.96) → 1
+                        // (GPUI divs have no transform; never scale(0) or opacity 0 on the shell).
+                        element
+                            .opacity(animation::enter_opacity(progress))
+                            .mt(px(animation::ONBOARDING_SLIDE_PX * (1.0 - progress)))
+                    },
                 ),
         )
 }

@@ -212,6 +212,8 @@ pub(crate) struct Shift {
     pub(crate) settings_section: SettingsSection,
     /// `None` once the first-run guide has been dismissed or completed.
     pub(crate) onboarding_step: Option<OnboardingStep>,
+    /// Last onboarding navigation direction (for direction-aware step motion).
+    pub(crate) onboarding_nav: crate::ui::animation::OnboardingNavDirection,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
     pub(crate) shortcuts_help_open: bool,
@@ -495,6 +497,7 @@ impl Shift {
             settings_open: false,
             settings_section: SettingsSection::Converters,
             onboarding_step: (!session.onboarding_completed).then_some(OnboardingStep::Welcome),
+            onboarding_nav: crate::ui::animation::OnboardingNavDirection::Enter,
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -1487,8 +1490,14 @@ impl Shift {
 
     pub(crate) fn advance_onboarding(&mut self, cx: &mut Context<Self>) {
         self.onboarding_step = match self.onboarding_step {
-            Some(OnboardingStep::Welcome) => Some(OnboardingStep::HowItWorks),
-            Some(OnboardingStep::HowItWorks) => Some(OnboardingStep::Ready),
+            Some(OnboardingStep::Welcome) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Forward;
+                Some(OnboardingStep::HowItWorks)
+            }
+            Some(OnboardingStep::HowItWorks) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Forward;
+                Some(OnboardingStep::Ready)
+            }
             Some(OnboardingStep::Ready) => {
                 self.finish_onboarding(cx);
                 return;
@@ -1500,8 +1509,14 @@ impl Shift {
 
     pub(crate) fn previous_onboarding(&mut self, cx: &mut Context<Self>) {
         self.onboarding_step = match self.onboarding_step {
-            Some(OnboardingStep::HowItWorks) => Some(OnboardingStep::Welcome),
-            Some(OnboardingStep::Ready) => Some(OnboardingStep::HowItWorks),
+            Some(OnboardingStep::HowItWorks) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Back;
+                Some(OnboardingStep::Welcome)
+            }
+            Some(OnboardingStep::Ready) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Back;
+                Some(OnboardingStep::HowItWorks)
+            }
             _ => return,
         };
         cx.notify();
@@ -1512,6 +1527,7 @@ impl Shift {
             return;
         }
         self.onboarding_step = None;
+        self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Enter;
         self.persist_session_settings(cx);
         cx.notify();
     }
@@ -2831,6 +2847,7 @@ impl Render for Shift {
         self.ensure_history_cache(cx);
         let output_format = self.output_format;
         let onboarding_step = self.onboarding_step;
+        let onboarding_nav = self.onboarding_nav;
         let output_menu_open = self.output_menu_open;
         let format_filter_input = self.format_filter_input.clone();
         let format_filter = self.format_filter_input.read(cx).content().to_owned();
@@ -3331,7 +3348,7 @@ impl Render for Shift {
                 ))
             })
             .when_some(onboarding_step, |root, step| {
-                root.child(onboarding_overlay(step, cx))
+                root.child(onboarding_overlay(step, onboarding_nav, cx))
             })
     }
 }

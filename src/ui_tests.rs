@@ -349,6 +349,10 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
         shift.read_with(cx, |this, _| this.onboarding_step),
         Some(OnboardingStep::HowItWorks)
     );
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_nav),
+        crate::ui::animation::OnboardingNavDirection::Forward
+    );
 
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(
@@ -360,6 +364,10 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
         Some(OnboardingStep::HowItWorks)
+    );
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_nav),
+        crate::ui::animation::OnboardingNavDirection::Back
     );
     shift.update(cx, |this, cx| this.previous_onboarding(cx));
     assert_eq!(
