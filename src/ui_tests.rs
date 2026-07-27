@@ -20,7 +20,7 @@ use crate::app::{
 };
 use crate::{
     DEFAULT_UI_FONT, HISTORY_SIDEBAR_MAX, HISTORY_SIDEBAR_MIN, OUTPUT_PANEL_MAX, OUTPUT_PANEL_MIN,
-    PanelResizeTarget, SettingsSection, onboarding_format_choices,
+    PanelResizeTarget, SettingsSection,
 };
 use shift_core::conversion::{
     BatchEvent, BatchFormatSelection, BatchItemId, BatchItemState, BatchProgress, BatchSource,
@@ -335,46 +335,43 @@ async fn can_create_shift(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn onboarding_moves_through_the_core_conversion_flow(cx: &mut TestAppContext) {
-    let env = TestEnv::new();
-    let path = write_input(&env, "onboarding.txt", b"hello shift");
+async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
     let shift = create_shift(cx);
 
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
-        Some(OnboardingStep::ChooseSource)
+        Some(OnboardingStep::Welcome)
     );
 
-    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
-        Some(OnboardingStep::ChooseFormat)
+        Some(OnboardingStep::HowItWorks)
     );
 
-    shift.update(cx, |this, cx| {
-        this.choose_onboarding_format(OutputFormat::MARKDOWN, cx)
-    });
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
-        Some(OnboardingStep::Download)
+        Some(OnboardingStep::Ready)
     );
+
+    shift.update(cx, |this, cx| this.previous_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::HowItWorks)
+    );
+    shift.update(cx, |this, cx| this.previous_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::Welcome)
+    );
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
 
     shift.update(cx, |this, cx| this.finish_onboarding(cx));
     assert!(shift.read_with(cx, |this, _| this.onboarding_step.is_none()));
     assert!(shift_core::load_default_session_settings().onboarding_completed);
-}
-
-#[test]
-fn onboarding_format_choices_never_include_an_unsupported_format() {
-    assert!(onboarding_format_choices(&[]).is_empty());
-    assert_eq!(
-        onboarding_format_choices(&[OutputFormat::MP3, OutputFormat::FLAC]),
-        vec![OutputFormat::MP3, OutputFormat::FLAC]
-    );
-    assert_eq!(
-        onboarding_format_choices(&[OutputFormat::HTML, OutputFormat::MP3]),
-        vec![OutputFormat::HTML]
-    );
 }
 
 #[gpui::test]
@@ -3242,7 +3239,7 @@ async fn action_cancel_work_dismisses_onboarding_before_other_overlays(cx: &mut 
 
     vcx.update(|window, cx| {
         shift.update(cx, |this, cx| {
-            assert_eq!(this.onboarding_step, Some(OnboardingStep::ChooseSource));
+            assert_eq!(this.onboarding_step, Some(OnboardingStep::Welcome));
             this.shortcuts_help_open = true;
             this.action_cancel_work(&CancelWork, window, cx);
             assert!(this.onboarding_step.is_none());

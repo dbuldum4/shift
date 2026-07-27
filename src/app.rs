@@ -185,12 +185,12 @@ pub(crate) struct FolderExpandConfirm {
     pub(crate) expanded: Vec<PathBuf>,
 }
 
-/// The short, first-run path through Shift's core workflow.
+/// The short, first-run introduction to Shift.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OnboardingStep {
-    ChooseSource,
-    ChooseFormat,
-    Download,
+    Welcome,
+    HowItWorks,
+    Ready,
 }
 
 pub(crate) struct Shift {
@@ -494,8 +494,7 @@ impl Shift {
             format_filter_input,
             settings_open: false,
             settings_section: SettingsSection::Converters,
-            onboarding_step: (!session.onboarding_completed)
-                .then_some(OnboardingStep::ChooseSource),
+            onboarding_step: (!session.onboarding_completed).then_some(OnboardingStep::Welcome),
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -737,11 +736,9 @@ impl Shift {
             return;
         }
         let has_dir = paths.iter().any(|path| path.is_dir());
-        // The first-run guide is a single-source conversion walkthrough. A
-        // multi-file (or folder) selection enters the shared batch workflow,
-        // which has no compatible format/download tour step to advance to.
-        // Close the guide before showing batch UI such as folder expansion.
-        if has_dir || paths.len() != 1 || !self.batch_queue.is_empty() {
+        // An external drop is an intentional first action. Close the
+        // introduction before showing the normal conversion workspace.
+        if self.onboarding_step.is_some() {
             self.finish_onboarding(cx);
         }
         if has_dir {
@@ -1221,7 +1218,6 @@ impl Shift {
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
-        self.advance_onboarding_after_source_selection();
         cx.notify();
 
         let preview_path = path.clone();
@@ -1486,33 +1482,34 @@ impl Shift {
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
-        self.advance_onboarding_after_source_selection();
         cx.notify();
     }
 
-    fn advance_onboarding_after_source_selection(&mut self) {
-        if self.onboarding_step == Some(OnboardingStep::ChooseSource) {
-            self.onboarding_step = Some(OnboardingStep::ChooseFormat);
-        }
+    pub(crate) fn advance_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.onboarding_step = match self.onboarding_step {
+            Some(OnboardingStep::Welcome) => Some(OnboardingStep::HowItWorks),
+            Some(OnboardingStep::HowItWorks) => Some(OnboardingStep::Ready),
+            Some(OnboardingStep::Ready) => {
+                self.finish_onboarding(cx);
+                return;
+            }
+            None => return,
+        };
+        cx.notify();
     }
 
-    pub(crate) fn choose_onboarding_format(
-        &mut self,
-        format: OutputFormat,
-        cx: &mut Context<Self>,
-    ) {
-        let format_was_selected = self.output_format == format;
-        self.set_output_format(format, cx);
-        // `set_output_format` intentionally avoids a redundant reconversion.
-        // In the OOBE, choosing the suggested format is still the explicit
-        // Convert action, so start the existing conversion path here.
-        if format_was_selected {
-            self.start_conversion(cx);
-        }
-        if self.onboarding_step.is_some() {
-            self.onboarding_step = Some(OnboardingStep::Download);
-            cx.notify();
-        }
+    pub(crate) fn previous_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.onboarding_step = match self.onboarding_step {
+            Some(OnboardingStep::HowItWorks) => Some(OnboardingStep::Welcome),
+            Some(OnboardingStep::Ready) => Some(OnboardingStep::HowItWorks),
+            _ => return,
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn start_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.finish_onboarding(cx);
+        self.choose_file(cx);
     }
 
     pub(crate) fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
@@ -2839,7 +2836,6 @@ impl Render for Shift {
         self.ensure_history_cache(cx);
         let output_format = self.output_format;
         let onboarding_step = self.onboarding_step;
-        let onboarding_available_outputs = self.cached_available_outputs.clone();
         let output_menu_open = self.output_menu_open;
         let format_filter_input = self.format_filter_input.clone();
         let format_filter = self.format_filter_input.read(cx).content().to_owned();
@@ -2987,9 +2983,7 @@ impl Render for Shift {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .when(onboarding_step != Some(OnboardingStep::ChooseSource), |content| {
-                        content.child(url_input_bar(url_input, window, cx))
-                    })
+                    .child(url_input_bar(url_input, window, cx))
                     .child({
                         // Hover styling uses hitbox hover (stays true while pressed).
                         // Do NOT drive ElementId / with_animation from on_hover: that
@@ -3342,14 +3336,7 @@ impl Render for Shift {
                 ))
             })
             .when_some(onboarding_step, |root, step| {
-                root.child(onboarding_overlay(
-                    step,
-                    output_format,
-                    &onboarding_available_outputs,
-                    self.url_input.clone(),
-                    window,
-                    cx,
-                ))
+                root.child(onboarding_overlay(step, cx))
             })
     }
 }
