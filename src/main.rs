@@ -3645,7 +3645,10 @@ fn onboarding_overlay(
         ),
     };
 
+    // Footer stays fully opaque and interactive across step changes — never re-keyed
+    // or faded from 0 on navigation (that made Continue/Back vanish for ~180ms).
     let footer = div()
+        .id("onboarding-footer")
         .flex()
         .items_center()
         .justify_between()
@@ -3655,6 +3658,13 @@ fn onboarding_overlay(
                 .flex()
                 .items_center()
                 .gap_2()
+                .child(onboarding_button(
+                    "onboarding-skip",
+                    "Skip",
+                    false,
+                    cx,
+                    |this, cx| this.finish_onboarding(cx),
+                ))
                 .when(step != OnboardingStep::Welcome, |row| {
                     row.child(onboarding_button(
                         "onboarding-back",
@@ -3709,53 +3719,51 @@ fn onboarding_overlay(
                 .gap_5()
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
-                    // Key by step so navigation restarts stagger + direction-aware slide.
-                    // Opacity lives on staggered children; one shared mt for spatial direction
-                    // (single wrapper — no sibling reflow from per-item margins).
+                    // Clip during the signed slide. Compensating mb keeps the
+                    // footer's flex slot stable (mt alone would reflow siblings).
                     div()
                         .id(ElementId::Name(
-                            format!("onboarding-content-{step_key}-{}", nav.id_tag()).into(),
+                            format!("onboarding-content-slot-{step_key}-{}", nav.id_tag()).into(),
                         ))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(onboarding_stagger_in(
-                            step_key,
-                            0,
-                            nav,
+                        .overflow_hidden()
+                        .child(
                             div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(THEME.text_primary)
-                                .child(title),
-                        ))
-                        .child(body)
-                        .with_animation(
-                            ElementId::Name(
-                                format!("onboarding-content-slide-{step_key}-{}", nav.id_tag())
-                                    .into(),
-                            ),
-                            Animation::new(animation::ONBOARDING_STEP)
-                                .with_easing(ease_out_quint()),
-                            move |element, progress| {
-                                let slide = nav.slide_start_px();
-                                element.mt(px(slide * (1.0 - progress)))
-                            },
+                                .id(ElementId::Name(
+                                    format!("onboarding-content-{step_key}-{}", nav.id_tag())
+                                        .into(),
+                                ))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(onboarding_stagger_in(
+                                    step_key,
+                                    0,
+                                    nav,
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(THEME.text_primary)
+                                        .child(title),
+                                ))
+                                .child(body)
+                                .with_animation(
+                                    ElementId::Name(
+                                        format!(
+                                            "onboarding-content-slide-{step_key}-{}",
+                                            nav.id_tag()
+                                        )
+                                        .into(),
+                                    ),
+                                    Animation::new(animation::ONBOARDING_STEP)
+                                        .with_easing(ease_out_quint()),
+                                    move |element, progress| {
+                                        let offset = nav.slide_start_px() * (1.0 - progress);
+                                        element.mt(px(offset)).mb(px(-offset))
+                                    },
+                                ),
                         ),
                 )
-                .child(
-                    div()
-                        .id(ElementId::Name(
-                            format!("onboarding-footer-{step_key}").into(),
-                        ))
-                        .child(footer)
-                        .with_animation(
-                            ElementId::Name(format!("onboarding-footer-in-{step_key}").into()),
-                            Animation::new(animation::onboarding_stagger_duration(4))
-                                .with_easing(animation::onboarding_stagger_easing(4)),
-                            |element, progress| element.opacity(animation::fade_opacity(progress)),
-                        ),
-                )
+                .child(footer)
                 .with_animation(
                     "onboarding-card-in",
                     Animation::new(animation::ONBOARDING_ENTER).with_easing(ease_out_quint()),

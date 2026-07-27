@@ -376,9 +376,18 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
     );
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::Ready)
+    );
 
-    shift.update(cx, |this, cx| this.finish_onboarding(cx));
+    // "Get started" is wired to advance_onboarding, not finish_onboarding directly.
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert!(shift.read_with(cx, |this, _| this.onboarding_step.is_none()));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_nav),
+        crate::ui::animation::OnboardingNavDirection::Enter
+    );
     assert!(shift_core::load_default_session_settings().onboarding_completed);
 }
 

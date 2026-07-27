@@ -82,10 +82,14 @@ pub enum OnboardingNavDirection {
 }
 
 impl OnboardingNavDirection {
-    /// Signed slide offset at progress 0 (px). Forward rises from below; back from above.
+    /// Signed content-slide offset at progress 0 (px).
+    ///
+    /// Forward rises from below; back from above. `Enter` is `0` so first paint
+    /// only lifts the card shell — stacking a second content slide on enter felt
+    /// like a double bounce.
     pub fn slide_start_px(self) -> f32 {
         match self {
-            Self::Enter => ONBOARDING_SLIDE_PX,
+            Self::Enter => 0.0,
             Self::Forward => ONBOARDING_SLIDE_PX,
             Self::Back => -ONBOARDING_SLIDE_PX,
         }
@@ -136,10 +140,8 @@ mod tests {
     fn nav_direction_slide_signs() {
         assert!(OnboardingNavDirection::Forward.slide_start_px() > 0.0);
         assert!(OnboardingNavDirection::Back.slide_start_px() < 0.0);
-        assert_eq!(
-            OnboardingNavDirection::Enter.slide_start_px(),
-            OnboardingNavDirection::Forward.slide_start_px()
-        );
+        // Enter keeps content still; the card shell owns first-paint lift.
+        assert_eq!(OnboardingNavDirection::Enter.slide_start_px(), 0.0);
     }
 
     #[test]
