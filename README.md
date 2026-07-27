@@ -146,6 +146,19 @@ SRT/VTT subtitles).
 cargo dev
 ```
 
+To exercise the first-run onboarding without touching your real Shift history
+or preferences, launch an isolated temporary profile:
+
+```sh
+cargo new-user
+```
+
+The command starts the app with empty Application Support and paste-staging
+directories, then removes that temporary state when the app exits.
+
+Use `cargo new-user -- --dry-run` to verify the isolated profile setup without
+launching the app.
+
 The first build downloads and compiles GPUI and may take a few minutes. Dropping
 or choosing a supported file starts conversion automatically and may suggest an
 output format (video → MP4, audio → MP3, documents → Markdown) until you pick

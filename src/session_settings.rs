@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const SETTINGS_VERSION: u32 = 1;
+const SETTINGS_VERSION: u32 = 2;
 const SETTINGS_FILE_NAME: &str = "session-settings.json";
 
 /// Default history sidebar width in logical pixels (matches app constant).
@@ -63,6 +63,11 @@ pub struct SessionSettings {
     /// Show archived entries in the history sidebar.
     #[serde(default = "default_show_archived")]
     pub show_archived: bool,
+    /// Whether the native app's first-run guide has been completed.
+    ///
+    /// This is intentionally app-only: the CLI never loads session settings.
+    #[serde(default)]
+    pub onboarding_completed: bool,
     pub options: SessionConversionOptions,
 }
 
@@ -78,6 +83,7 @@ impl Default for SessionSettings {
             ui_font_family: DEFAULT_UI_FONT_FAMILY.to_owned(),
             history_limit: DEFAULT_HISTORY_LIMIT,
             show_archived: false,
+            onboarding_completed: false,
             options: SessionConversionOptions::default(),
         }
     }
@@ -468,7 +474,10 @@ pub fn load_session_settings(path: impl AsRef<Path>) -> SessionSettings {
     };
     match serde_json::from_slice::<SessionSettings>(&bytes) {
         Ok(mut settings) => {
-            if settings.version == 0 {
+            if settings.version < SETTINGS_VERSION {
+                // Existing installations have already learned the core workflow;
+                // reserve the first-run guide for genuinely new sessions.
+                settings.onboarding_completed = true;
                 settings.version = SETTINGS_VERSION;
             }
             settings.history_limit = settings
@@ -763,6 +772,33 @@ mod tests {
 
         let loaded = load_session_settings(&path);
         assert_eq!(loaded.version, SETTINGS_VERSION);
+        assert!(loaded.onboarding_completed);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn onboarding_completion_round_trips_and_v1_sessions_are_not_interrupted() {
+        let dir = unique_dir("onboarding");
+        let path = dir.join("session-settings.json");
+
+        let settings = SessionSettings {
+            onboarding_completed: true,
+            ..Default::default()
+        };
+        save_session_settings(&path, &settings).unwrap();
+        assert!(load_session_settings(&path).onboarding_completed);
+
+        let legacy = SessionSettings {
+            version: 1,
+            onboarding_completed: false,
+            ..Default::default()
+        };
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = load_session_settings(&path);
+        assert_eq!(migrated.version, SETTINGS_VERSION);
+        assert!(migrated.onboarding_completed);
+
+        assert!(!SessionSettings::default().onboarding_completed);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -914,7 +950,7 @@ mod tests {
 
         let bytes = fs::read(&path).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["version"].as_u64(), Some(1));
+        assert_eq!(value["version"].as_u64(), Some(SETTINGS_VERSION as u64));
         assert_eq!(value["output_format"].as_str(), Some("html"));
         assert_eq!(
             value["history_limit"].as_u64(),

@@ -185,6 +185,14 @@ pub(crate) struct FolderExpandConfirm {
     pub(crate) expanded: Vec<PathBuf>,
 }
 
+/// The short, first-run path through Shift's core workflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OnboardingStep {
+    ChooseSource,
+    ChooseFormat,
+    Download,
+}
+
 pub(crate) struct Shift {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) selected_file: Option<PathBuf>,
@@ -202,6 +210,8 @@ pub(crate) struct Shift {
     pub(crate) format_filter_input: Entity<TextInput>,
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
+    /// `None` once the first-run guide has been dismissed or completed.
+    pub(crate) onboarding_step: Option<OnboardingStep>,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
     pub(crate) shortcuts_help_open: bool,
@@ -484,6 +494,8 @@ impl Shift {
             format_filter_input,
             settings_open: false,
             settings_section: SettingsSection::Converters,
+            onboarding_step: (!session.onboarding_completed)
+                .then_some(OnboardingStep::ChooseSource),
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -725,6 +737,13 @@ impl Shift {
             return;
         }
         let has_dir = paths.iter().any(|path| path.is_dir());
+        // The first-run guide is a single-source conversion walkthrough. A
+        // multi-file (or folder) selection enters the shared batch workflow,
+        // which has no compatible format/download tour step to advance to.
+        // Close the guide before showing batch UI such as folder expansion.
+        if has_dir || paths.len() != 1 || !self.batch_queue.is_empty() {
+            self.finish_onboarding(cx);
+        }
         if has_dir {
             match expand_input_paths(&paths, true) {
                 Ok(expanded) => {
@@ -1202,6 +1221,7 @@ impl Shift {
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
+        self.advance_onboarding_after_source_selection();
         cx.notify();
 
         let preview_path = path.clone();
@@ -1466,6 +1486,41 @@ impl Shift {
         self.save_status = None;
         self.output_menu_open = false;
         self.active_history_id = None;
+        self.advance_onboarding_after_source_selection();
+        cx.notify();
+    }
+
+    fn advance_onboarding_after_source_selection(&mut self) {
+        if self.onboarding_step == Some(OnboardingStep::ChooseSource) {
+            self.onboarding_step = Some(OnboardingStep::ChooseFormat);
+        }
+    }
+
+    pub(crate) fn choose_onboarding_format(
+        &mut self,
+        format: OutputFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let format_was_selected = self.output_format == format;
+        self.set_output_format(format, cx);
+        // `set_output_format` intentionally avoids a redundant reconversion.
+        // In the OOBE, choosing the suggested format is still the explicit
+        // Convert action, so start the existing conversion path here.
+        if format_was_selected {
+            self.start_conversion(cx);
+        }
+        if self.onboarding_step.is_some() {
+            self.onboarding_step = Some(OnboardingStep::Download);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding_step.is_none() {
+            return;
+        }
+        self.onboarding_step = None;
+        self.persist_session_settings(cx);
         cx.notify();
     }
 
@@ -1632,6 +1687,7 @@ impl Shift {
         settings.ui_font_family = self.ui_font_family.clone();
         settings.history_limit = self.history_limit;
         settings.show_archived = self.show_archived;
+        settings.onboarding_completed = self.onboarding_step.is_none();
         if let Ok(options) = self.build_conversion_options(cx) {
             settings.apply_conversion_options(&options);
         }
@@ -2320,6 +2376,10 @@ impl Shift {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.onboarding_step.is_some() {
+            self.finish_onboarding(cx);
+            return;
+        }
         if self.shortcuts_help_open {
             self.shortcuts_help_open = false;
             cx.notify();
@@ -2778,6 +2838,8 @@ impl Render for Shift {
         let ready_outputs = self.cached_ready_outputs.clone();
         self.ensure_history_cache(cx);
         let output_format = self.output_format;
+        let onboarding_step = self.onboarding_step;
+        let onboarding_available_outputs = self.cached_available_outputs.clone();
         let output_menu_open = self.output_menu_open;
         let format_filter_input = self.format_filter_input.clone();
         let format_filter = self.format_filter_input.read(cx).content().to_owned();
@@ -2925,7 +2987,9 @@ impl Render for Shift {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .child(url_input_bar(url_input, window, cx))
+                    .when(onboarding_step != Some(OnboardingStep::ChooseSource), |content| {
+                        content.child(url_input_bar(url_input, window, cx))
+                    })
                     .child({
                         // Hover styling uses hitbox hover (stays true while pressed).
                         // Do NOT drive ElementId / with_animation from on_hover: that
@@ -3274,6 +3338,16 @@ impl Render for Shift {
                         diagnostics,
                         diagnostics_loading,
                     },
+                    cx,
+                ))
+            })
+            .when_some(onboarding_step, |root, step| {
+                root.child(onboarding_overlay(
+                    step,
+                    output_format,
+                    &onboarding_available_outputs,
+                    self.url_input.clone(),
+                    window,
                     cx,
                 ))
             })

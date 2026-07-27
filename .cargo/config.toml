@@ -2,3 +2,5 @@
 dev = "run"
 lint = "clippy --all-targets --all-features -- -D warnings"
 
+# Launch the app with isolated, empty Application Support state.
+new-user = "run --bin shift-new-user"

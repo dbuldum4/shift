@@ -13,7 +13,9 @@ mod ui_tests;
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-use crate::app::{ConversionHistoryEntry, ConversionState, HistoryOutcome, HistorySource, Shift};
+use crate::app::{
+    ConversionHistoryEntry, ConversionState, HistoryOutcome, HistorySource, OnboardingStep, Shift,
+};
 use crate::ui::animation;
 use crate::ui::theme::{THEME, card_shadow};
 use gpui::{
@@ -3343,6 +3345,291 @@ fn action_chip(
             on_click(this, cx);
             cx.stop_propagation();
         }))
+}
+
+fn onboarding_primary_action(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    cx: &mut Context<Shift>,
+    on_click: impl Fn(&mut Shift, &mut Context<Shift>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(40.0))
+        .px_4()
+        .rounded_lg()
+        .bg(THEME.text)
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(THEME.text_inverse)
+        .cursor_pointer()
+        .hover(|style| style.opacity(0.9))
+        .active(|style| style.opacity(0.78))
+        .child(label.into())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            on_click(this, cx);
+            cx.stop_propagation();
+        }))
+}
+
+fn onboarding_progress(step: OnboardingStep) -> impl IntoElement {
+    let active_index = match step {
+        OnboardingStep::ChooseSource => 0,
+        OnboardingStep::ChooseFormat => 1,
+        OnboardingStep::Download => 2,
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .children((0..3).map(|index| {
+            div()
+                .size(px(7.0))
+                .rounded_full()
+                .bg(if index <= active_index {
+                    THEME.text
+                } else {
+                    THEME.border_strong
+                })
+        }))
+}
+
+fn onboarding_overlay(
+    step: OnboardingStep,
+    output_format: OutputFormat,
+    available_outputs: &[OutputFormat],
+    url_input: Entity<TextInput>,
+    window: &mut Window,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let body = match step {
+        OnboardingStep::ChooseSource => div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(THEME.text_primary)
+                    .child("Choose something to convert"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(THEME.text_secondary)
+                    .child("Pick a document, image, audio or video file. You can also paste a public URL below."),
+            )
+            .child(url_input_bar(url_input, window, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(onboarding_primary_action(
+                        "onboarding-choose-file",
+                        "Choose a file",
+                        cx,
+                        |this, cx| this.choose_file(cx),
+                    ))
+                    .child(action_chip("onboarding-dismiss-source", "Not now", cx, |this, cx| {
+                        this.finish_onboarding(cx);
+                    })),
+            )
+            .into_any_element(),
+        OnboardingStep::ChooseFormat if available_outputs.is_empty() => div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(THEME.text_primary)
+                    .child("This source is not supported"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(THEME.text_secondary)
+                    .child("Choose another file or URL to continue with Shift."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(onboarding_primary_action(
+                        "onboarding-choose-supported-file",
+                        "Choose another file",
+                        cx,
+                        |this, cx| this.choose_file(cx),
+                    ))
+                    .child(action_chip(
+                        "onboarding-dismiss-unsupported",
+                        "Finish tour",
+                        cx,
+                        |this, cx| this.finish_onboarding(cx),
+                    )),
+            )
+            .into_any_element(),
+        OnboardingStep::ChooseFormat => {
+            let choices = onboarding_format_choices(available_outputs);
+            div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(THEME.text_primary)
+                        .child("Choose the result"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(THEME.text_secondary)
+                        .child("Shift suggests a format automatically. Pick a compatible result below."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(choices.into_iter().enumerate().map(|(index, format)| {
+                            let selected = format == output_format;
+                            div()
+                                .id(("onboarding-format", index))
+                                .h(px(36.0))
+                                .px_3()
+                                .rounded_lg()
+                                .bg(if selected { THEME.text } else { THEME.surface })
+                                .border_1()
+                                .border_color(if selected { THEME.text } else { THEME.border_strong })
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(if selected { THEME.text_inverse } else { THEME.text_primary })
+                                .cursor_pointer()
+                                .hover(|style| style.bg(if selected { THEME.text } else { THEME.hover }))
+                                .active(|style| style.opacity(THEME.active_opacity))
+                                .child(format.label())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.choose_onboarding_format(format, cx);
+                                    cx.stop_propagation();
+                                }))
+                        })),
+                )
+                .child(action_chip("onboarding-dismiss-format", "Not now", cx, |this, cx| {
+                    this.finish_onboarding(cx);
+                }))
+                .into_any_element()
+        }
+        OnboardingStep::Download => div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(THEME.text_primary)
+                    .child("Download when it’s ready"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(THEME.text_secondary)
+                    .child("Your converted file will appear in the Output panel. Use Download to choose where it goes, or Copy, Reveal and Open to keep working."),
+            )
+            .child(onboarding_primary_action(
+                "onboarding-finish",
+                "Finish tour",
+                cx,
+                |this, cx| this.finish_onboarding(cx),
+            ))
+            .into_any_element(),
+    };
+
+    div()
+        .id("onboarding-overlay")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(THEME.scrim)
+        .child(
+            div()
+                .id("onboarding-card")
+                .w(px(460.0))
+                .p_6()
+                .rounded_xl()
+                .bg(THEME.elevated)
+                .border_1()
+                .border_color(THEME.border_strong)
+                .shadow(card_shadow())
+                .flex()
+                .flex_col()
+                .gap_5()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(THEME.text_muted)
+                                        .child("WELCOME TO SHIFT"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(THEME.text_secondary)
+                                        .child("Convert in three simple steps"),
+                                ),
+                        )
+                        .child(onboarding_progress(step)),
+                )
+                .child(body)
+                .with_animation(
+                    "onboarding-card-in",
+                    Animation::new(animation::DIALOG_DURATION).with_easing(ease_out_quint()),
+                    |element, progress| element.opacity(0.12 + 0.88 * progress),
+                ),
+        )
+}
+
+/// Keep the first-run choices short without ever advertising an unsupported
+/// conversion. Publishing formats are most useful for common documents; media
+/// and other specialized sources fall back to their first compatible formats.
+pub(crate) fn onboarding_format_choices(available_outputs: &[OutputFormat]) -> Vec<OutputFormat> {
+    let preferred: Vec<_> = [
+        OutputFormat::MARKDOWN,
+        OutputFormat::HTML,
+        OutputFormat::PDF,
+    ]
+    .into_iter()
+    .filter(|format| available_outputs.contains(format))
+    .collect();
+
+    if preferred.is_empty() {
+        available_outputs.iter().copied().take(3).collect()
+    } else {
+        preferred
+    }
 }
 
 fn module_label(id: &str) -> &str {

@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "shift-cli"
 path = "src/bin/shift-cli.rs"
 
+[[bin]]
+name = "shift-new-user"
+path = "src/bin/shift-new-user.rs"
+
 [dependencies]
 gpui = "=0.2.2"
 lyon = "1.0"

@@ -14,12 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gpui::{AppContext, Entity, TestAppContext};
 
 use crate::app::{
-    CancelWork, ClearRecent, ConversionState, CopyOutput, HistoryOutcome, HistorySource, OpenAbout,
-    OpenRecent, OpenSettings, RevealOutput, SaveOutput, Shift, ShowShortcuts, ToggleFormatMenu,
+    CancelWork, ClearRecent, ConversionState, CopyOutput, HistoryOutcome, HistorySource,
+    OnboardingStep, OpenAbout, OpenRecent, OpenSettings, RevealOutput, SaveOutput, Shift,
+    ShowShortcuts, ToggleFormatMenu,
 };
 use crate::{
     DEFAULT_UI_FONT, HISTORY_SIDEBAR_MAX, HISTORY_SIDEBAR_MIN, OUTPUT_PANEL_MAX, OUTPUT_PANEL_MIN,
-    PanelResizeTarget, SettingsSection,
+    PanelResizeTarget, SettingsSection, onboarding_format_choices,
 };
 use shift_core::conversion::{
     BatchEvent, BatchFormatSelection, BatchItemId, BatchItemState, BatchProgress, BatchSource,
@@ -331,6 +332,62 @@ async fn can_create_shift(cx: &mut TestAppContext) {
     let shift = create_shift(cx);
     cx.run_until_parked();
     assert!(shift.read_with(cx, |this, _| this.selected_file.is_none()));
+}
+
+#[gpui::test]
+async fn onboarding_moves_through_the_core_conversion_flow(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "onboarding.txt", b"hello shift");
+    let shift = create_shift(cx);
+
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::ChooseSource)
+    );
+
+    shift.update(cx, |this, cx| this.set_selected_file(path.clone(), cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::ChooseFormat)
+    );
+
+    shift.update(cx, |this, cx| {
+        this.choose_onboarding_format(OutputFormat::MARKDOWN, cx)
+    });
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::Download)
+    );
+
+    shift.update(cx, |this, cx| this.finish_onboarding(cx));
+    assert!(shift.read_with(cx, |this, _| this.onboarding_step.is_none()));
+    assert!(shift_core::load_default_session_settings().onboarding_completed);
+}
+
+#[test]
+fn onboarding_format_choices_never_include_an_unsupported_format() {
+    assert!(onboarding_format_choices(&[]).is_empty());
+    assert_eq!(
+        onboarding_format_choices(&[OutputFormat::MP3, OutputFormat::FLAC]),
+        vec![OutputFormat::MP3, OutputFormat::FLAC]
+    );
+    assert_eq!(
+        onboarding_format_choices(&[OutputFormat::HTML, OutputFormat::MP3]),
+        vec![OutputFormat::HTML]
+    );
+}
+
+#[gpui::test]
+async fn multi_file_selection_exits_the_single_file_onboarding(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let first = write_input(&env, "onboarding-first.txt", b"first");
+    let second = write_input(&env, "onboarding-second.txt", b"second");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.ingest_paths(vec![first, second], cx));
+
+    assert!(shift.read_with(cx, |this, _| this.onboarding_step.is_none()));
+    assert_eq!(shift.read_with(cx, |this, _| this.batch_queue.len()), 2);
 }
 
 #[gpui::test]
@@ -3055,6 +3112,7 @@ async fn action_cancel_work_closes_shortcuts_first(cx: &mut TestAppContext) {
 
     vcx.update(|window, cx| {
         shift.update(cx, |this, cx| {
+            this.onboarding_step = None;
             this.shortcuts_help_open = true;
             this.settings_open = true;
             this.action_cancel_work(&CancelWork, window, cx);
@@ -3075,6 +3133,7 @@ async fn action_cancel_work_closes_settings_before_conversion(cx: &mut TestAppCo
 
     vcx.update(|window, cx| {
         shift.update(cx, |this, cx| {
+            this.onboarding_step = None;
             this.set_selected_file(path, cx);
             this.start_conversion(cx);
             this.settings_open = true;
@@ -3101,7 +3160,10 @@ async fn action_cancel_work_dismisses_folder_confirm(cx: &mut TestAppContext) {
     let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
 
     vcx.update(|_window, cx| {
-        shift.update(cx, |this, cx| this.ingest_paths(vec![dir], cx));
+        shift.update(cx, |this, cx| {
+            this.onboarding_step = None;
+            this.ingest_paths(vec![dir], cx);
+        });
     });
     vcx.run_until_parked();
 
@@ -3126,6 +3188,7 @@ async fn action_cancel_work_closes_output_menu(cx: &mut TestAppContext) {
 
     vcx.update(|window, cx| {
         shift.update(cx, |this, cx| {
+            this.onboarding_step = None;
             this.output_menu_open = true;
             this.action_cancel_work(&CancelWork, window, cx);
             assert!(!this.output_menu_open);
@@ -3141,6 +3204,7 @@ async fn action_cancel_work_cancels_active_conversion(cx: &mut TestAppContext) {
 
     vcx.update(|window, cx| {
         shift.update(cx, |this, cx| {
+            this.onboarding_step = None;
             this.set_selected_file(path, cx);
             this.start_conversion(cx);
             this.action_cancel_work(&CancelWork, window, cx);
@@ -3167,6 +3231,22 @@ async fn action_toggle_format_flips_menu_flag(cx: &mut TestAppContext) {
             assert!(this.output_menu_open);
             this.action_toggle_format(&ToggleFormatMenu, window, cx);
             assert!(!this.output_menu_open);
+        });
+    });
+}
+
+#[gpui::test]
+async fn action_cancel_work_dismisses_onboarding_before_other_overlays(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let (shift, vcx) = cx.add_window_view(|_window, cx| Shift::new(cx, 1180.0));
+
+    vcx.update(|window, cx| {
+        shift.update(cx, |this, cx| {
+            assert_eq!(this.onboarding_step, Some(OnboardingStep::ChooseSource));
+            this.shortcuts_help_open = true;
+            this.action_cancel_work(&CancelWork, window, cx);
+            assert!(this.onboarding_step.is_none());
+            assert!(this.shortcuts_help_open);
         });
     });
 }
@@ -4000,6 +4080,7 @@ async fn open_settings_state_flags_via_action(cx: &mut TestAppContext) {
 
     vcx.update(|window, cx| {
         shift.update(cx, |this, cx| {
+            this.onboarding_step = None;
             this.action_open_about(&OpenAbout, window, cx);
         });
     });
