@@ -24,7 +24,7 @@ use gpui::{
     ImageFormat, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
     PathBuilder, PathStyle, Pixels, Point, Render, SharedString, StrokeOptions, SystemMenuType,
     TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, div,
-    ease_out_quint, point, prelude::*, pulsating_between, px, rgb, size,
+    ease_out_quint, point, prelude::*, pulsating_between, px, relative, rgb, size,
 };
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
@@ -3436,6 +3436,7 @@ fn onboarding_info_card(
     div()
         .id(id)
         .flex_1()
+        .min_w_0()
         .flex()
         .flex_col()
         .gap_2()
@@ -3494,6 +3495,7 @@ fn onboarding_flow_card(
         )
         .child(
             div()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -3525,6 +3527,8 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
             )
             .child(
                 div()
+                    .w_full()
+                    .text_center()
                     .max_w(px(430.0))
                     .text_sm()
                     .text_color(THEME.text_secondary)
@@ -3563,6 +3567,8 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
             )
             .child(
                 div()
+                    .w_full()
+                    .text_center()
                     .max_w(px(460.0))
                     .text_sm()
                     .text_color(THEME.text_secondary)
@@ -3623,6 +3629,8 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
             )
             .child(
                 div()
+                    .w_full()
+                    .text_center()
                     .max_w(px(440.0))
                     .text_sm()
                     .text_color(THEME.text_secondary)
@@ -3700,11 +3708,14 @@ fn onboarding_overlay(step: OnboardingStep, cx: &mut Context<Shift>) -> impl Int
         .flex()
         .items_center()
         .justify_center()
+        .p_6()
         .bg(THEME.scrim)
         .child(
             div()
                 .id("onboarding-card")
                 .w(px(560.0))
+                .max_h(relative(1.0))
+                .overflow_y_scroll()
                 .p_7()
                 .rounded_xl()
                 .bg(THEME.elevated)
