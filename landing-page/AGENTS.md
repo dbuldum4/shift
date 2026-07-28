@@ -19,4 +19,4 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 - Use the exact lowercase positioning line: "shift is a blazingly fast, native, opinionated, robust file converter built for macOS".
 - Take strong structural cues from the GPUI reference: sparse navigation, small lowercase wordmark, large negative space, modest monospace sizing, understated links, and documentation-like vertical flow.
 - Final selection: direction 06 only, with a larger product statement. Remove the study switcher and comparison-only code.
-- Prepare GitHub Pages through a manual Actions workflow. Do not deploy or enable Pages without an explicit request.
+- Prepare GitHub Pages through an Actions workflow that deploys automatically on pushes to `main`; manual dispatch is also available. Do not enable or reconfigure Pages in repository settings without an explicit request.

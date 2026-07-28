@@ -4,7 +4,7 @@ The landing page is prepared for the project URL:
 
 `https://dbuldum4.github.io/shift/`
 
-The workflow is intentionally manual and will not deploy on push.
+The workflow deploys automatically on pushes to `main` and can still be triggered manually.
 
 ## First deployment
 
