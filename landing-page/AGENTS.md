@@ -16,7 +16,7 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 - Permit only a restrained touch of dark blue for code, output, or interaction emphasis.
 - Remove the original directions. Replace them with six new directions numbered 01–06, derived from original direction 01's structure and original direction 06's cold noir palette.
 - New directions must be extremely minimalist, single-column, and contain no product mockups, diagrams, illustrations, cards-as-visuals, or other decorative visuals.
-- Use the exact lowercase positioning line: “shift is a blazingly fast, native, opinionated, robust, and resilient file converter built for macOS”.
+- Use the exact lowercase positioning line: "shift is a blazingly fast, native, opinionated, robust file converter built for macOS".
 - Take strong structural cues from the GPUI reference: sparse navigation, small lowercase wordmark, large negative space, modest monospace sizing, understated links, and documentation-like vertical flow.
 - Final selection: direction 06 only, with a larger product statement. Remove the study switcher and comparison-only code.
 - Prepare GitHub Pages through a manual Actions workflow. Do not deploy or enable Pages without an explicit request.
