@@ -565,14 +565,17 @@ static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// atomically with [`std::fs::create_dir`]; if the name already exists, a new
 /// nonce is generated and the call retried.
 pub fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
+    unique_temp_dir_in(&std::env::temp_dir(), prefix)
+}
+
+fn unique_temp_dir_in(base_dir: &Path, prefix: &str) -> Result<PathBuf, ConversionError> {
     for _ in 0..100 {
         let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let base =
-            std::env::temp_dir().join(format!("{prefix}-{}-{counter}-{nanos}", std::process::id()));
+        let base = base_dir.join(format!("{prefix}-{}-{counter}-{nanos}", std::process::id()));
         match std::fs::create_dir(&base) {
             Ok(()) => return Ok(base),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2177,21 +2180,16 @@ mod tests {
 
     #[test]
     fn unique_temp_dir_fails_when_tmpdir_is_a_file() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Create blocker under the real temp root, then point TMPDIR at the file.
         let real_tmp = std::env::temp_dir();
         let blocker = real_tmp.join(format!("shift-tmpdir-blocker-{}", unique_suffix("tmpdir")));
         std::fs::write(&blocker, b"not-a-dir").unwrap();
-        // RAII restore so a panicked assertion cannot leave TMPDIR poisoned.
-        let _tmpdir = EnvVarGuard::set("TMPDIR", &blocker);
-        let err = unique_temp_dir("shift-unwritable").unwrap_err();
+        let err = unique_temp_dir_in(&blocker, "shift-unwritable").unwrap_err();
         assert!(
             err.to_string()
                 .contains("could not create temporary directory")
                 || err.to_string().contains("temporary directory"),
             "error: {err}"
         );
-        drop(_tmpdir);
         let _ = std::fs::remove_file(blocker);
     }
 
