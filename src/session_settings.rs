@@ -1,10 +1,10 @@
 //! Versioned session settings shared by the app and CLI (no secrets).
 
 use crate::conversion::{
-    ConversionOptions, DefuddleOptions, DoclingAsrModel, DoclingImageExportMode, DoclingOptions,
-    DoclingTableMode, DoclingVideoSamplingMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions, SipsFlip, SipsOptions,
-    SpreadsheetOptions,
+    BatchNamingTemplate, ConversionOptions, DefuddleOptions, DoclingAsrModel,
+    DoclingImageExportMode, DoclingOptions, DoclingTableMode, DoclingVideoSamplingMode,
+    FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions,
+    PdfInputOptions, SipsFlip, SipsOptions, SpreadsheetOptions,
 };
 use crate::history::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,10 @@ fn default_show_archived() -> bool {
     false
 }
 
+fn default_batch_naming_template() -> String {
+    BatchNamingTemplate::DEFAULT.to_owned()
+}
+
 /// Durable UI/CLI session knobs. Passwords are never stored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSettings {
@@ -49,6 +53,10 @@ pub struct SessionSettings {
     pub output_format: String,
     pub batch_output_dir: Option<PathBuf>,
     pub batch_force: bool,
+    /// Shared batch file-name template. Invalid legacy/manual values fall back
+    /// to the safe default when the app initializes.
+    #[serde(default = "default_batch_naming_template")]
+    pub batch_naming_template: String,
     /// History sidebar width in logical pixels (main window layout).
     #[serde(default = "default_history_sidebar_width")]
     pub history_sidebar_width: f32,
@@ -79,6 +87,7 @@ impl Default for SessionSettings {
             output_format: OutputFormat::MARKDOWN.id().to_owned(),
             batch_output_dir: None,
             batch_force: false,
+            batch_naming_template: default_batch_naming_template(),
             history_sidebar_width: DEFAULT_HISTORY_SIDEBAR_WIDTH,
             output_panel_width: DEFAULT_OUTPUT_PANEL_WIDTH,
             ui_font_family: DEFAULT_UI_FONT_FAMILY.to_owned(),
@@ -684,6 +693,7 @@ mod tests {
         settings.set_output_format(OutputFormat::HTML);
         settings.batch_force = true;
         settings.batch_output_dir = Some(PathBuf::from("/tmp/out"));
+        settings.batch_naming_template = "{parent}-{stem}.{ext}".into();
         settings.options.docling.ocr_lang = Some("eng".into());
         settings.options.pdf.page_from = Some(2);
         settings.options.pdf.page_to = Some(5);
@@ -695,6 +705,10 @@ mod tests {
         assert_eq!(loaded.output_format(), OutputFormat::HTML);
         assert!(loaded.batch_force);
         assert_eq!(loaded.batch_output_dir, Some(PathBuf::from("/tmp/out")));
+        assert_eq!(
+            loaded.batch_naming_template,
+            "{parent}-{stem}.{ext}".to_owned()
+        );
         assert_eq!(loaded.history_sidebar_width, DEFAULT_HISTORY_SIDEBAR_WIDTH);
         assert_eq!(loaded.output_panel_width, DEFAULT_OUTPUT_PANEL_WIDTH);
         assert_eq!(loaded.ui_font_family, DEFAULT_UI_FONT_FAMILY);
@@ -756,6 +770,7 @@ mod tests {
         obj.remove("history_sidebar_width");
         obj.remove("output_panel_width");
         obj.remove("ui_font_family");
+        obj.remove("batch_naming_template");
         fs::write(&path, serde_json::to_vec_pretty(&legacy).expect("json")).unwrap();
         let migrated = load_session_settings(&path);
         assert_eq!(
@@ -764,6 +779,7 @@ mod tests {
         );
         assert_eq!(migrated.output_panel_width, DEFAULT_OUTPUT_PANEL_WIDTH);
         assert_eq!(migrated.ui_font_family, DEFAULT_UI_FONT_FAMILY);
+        assert_eq!(migrated.batch_naming_template, BatchNamingTemplate::DEFAULT);
 
         let blank = SessionSettings {
             ui_font_family: "   ".into(),

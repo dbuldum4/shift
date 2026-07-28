@@ -1,12 +1,13 @@
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionArtifact,
-    ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
-    DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
+    BatchEnqueueOptions, BatchEvent, BatchInput, BatchNamingTemplate, BatchQueue, BatchSource,
+    ConversionArtifact, ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions,
+    DiagnosticsReport, DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
     DoclingVideoSamplingMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MagicPaste,
     MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
     SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, default_output_path,
-    ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url, materialize_paste_token,
-    parse_magic_paste, prepare_batch_destination, run_batch, url_display_host,
+    ensure_public_url_fetch_allowed, expand_input_paths_preserving_roots, looks_like_url,
+    materialize_paste_token, parse_magic_paste, prepare_batch_destination, run_batch,
+    url_display_host, validate_batch_output_formats,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -60,7 +61,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     }
 
     let parsed = parse_convert_args(&arguments)?;
-    let inputs = resolve_cli_inputs(parsed.inputs, parsed.recursive)?;
+    let inputs = resolve_cli_inputs_with_layout(parsed.inputs, parsed.recursive)?;
 
     if inputs.is_empty() {
         return Err("missing input file or URL (try `shift-cli --help`)".to_owned());
@@ -83,13 +84,22 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
     }
 
-    let use_batch = parsed.batch_explicit || inputs.len() > 1 || parsed.output_dir.is_some();
+    let use_batch = parsed.batch_explicit
+        || inputs.len() > 1
+        || parsed.output_dir.is_some()
+        || !parsed.also_to.is_empty();
     if use_batch && parsed.stdout {
         return Err("batch conversion cannot write to --stdout (use -O/--output-dir)".to_owned());
     }
     if use_batch && parsed.output.is_some() && inputs.len() > 1 {
         return Err(
             "batch conversion with multiple inputs requires -O/--output-dir, not -o/--output"
+                .to_owned(),
+        );
+    }
+    if !parsed.also_to.is_empty() && parsed.output.is_some() {
+        return Err(
+            "fan-out conversion with --also-to requires -O/--output-dir or default destinations, not -o/--output"
                 .to_owned(),
         );
     }
@@ -127,6 +137,8 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             options,
             parsed.output_dir,
             parsed.output,
+            parsed.also_to,
+            parsed.naming_template,
             parsed.force,
             parsed.yes,
             &registry,
@@ -135,7 +147,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     }
 
     // Single-file / single-URL path (in-memory convert, then write or stdout).
-    let input = &inputs[0];
+    let input = &inputs[0].value;
     let classified = classify_cli_input(input)?;
     confirm_network_urls(
         network_urls_from_classified(std::slice::from_ref(&classified)),
@@ -199,6 +211,9 @@ struct ParsedConvertArgs {
     /// Opt into localhost/LAN URL fetches (default: public internet only).
     allow_private_urls: bool,
     target: OutputFormat,
+    /// Additional output formats for one-input fan-out (repeatable `--also-to`).
+    also_to: Vec<OutputFormat>,
+    naming_template: BatchNamingTemplate,
     preferred_module: Option<String>,
     ffmpeg: FfmpegOptions,
     markitdown: MarkItDownOptions,
@@ -226,6 +241,8 @@ impl Default for ParsedConvertArgs {
             yes: false,
             allow_private_urls: false,
             target: OutputFormat::MARKDOWN,
+            also_to: Vec::new(),
+            naming_template: BatchNamingTemplate::default(),
             preferred_module: None,
             ffmpeg: FfmpegOptions::default(),
             markitdown: MarkItDownOptions::default(),
@@ -290,6 +307,27 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     .ok_or_else(|| "--to requires a format".to_owned())?
                     .to_string_lossy()
                     .parse::<OutputFormat>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--also-to" => {
+                cursor += 1;
+                let format = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--also-to requires a format".to_owned())?
+                    .to_string_lossy()
+                    .parse::<OutputFormat>()
+                    .map_err(|error| error.to_string())?;
+                if format != parsed.target && !parsed.also_to.contains(&format) {
+                    parsed.also_to.push(format);
+                }
+            }
+            "--name-template" => {
+                cursor += 1;
+                parsed.naming_template = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--name-template requires a template".to_owned())?
+                    .to_string_lossy()
+                    .parse::<BatchNamingTemplate>()
                     .map_err(|error| error.to_string())?;
             }
             "--module" => {
@@ -719,18 +757,40 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
     Ok(parsed)
 }
 
-/// Expand directories when `--recursive`, or reject bare directory inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedCliInput {
+    value: OsString,
+    relative_parent: Option<PathBuf>,
+}
+
+/// Compatibility helper used by parser-focused tests.
+#[cfg(test)]
 fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsString>, String> {
+    Ok(resolve_cli_inputs_with_layout(inputs, recursive)?
+        .into_iter()
+        .map(|input| input.value)
+        .collect())
+}
+
+/// Expand directories when `--recursive`, retaining each discovered file's
+/// source-root-relative parent for shared batch destination resolution.
+fn resolve_cli_inputs_with_layout(
+    inputs: Vec<OsString>,
+    recursive: bool,
+) -> Result<Vec<ResolvedCliInput>, String> {
     if recursive {
         let mut out = Vec::new();
         for input in inputs {
             if is_network_or_file_url_input(&input) {
-                out.push(input);
+                out.push(ResolvedCliInput {
+                    value: input,
+                    relative_parent: None,
+                });
                 continue;
             }
             let path = PathBuf::from(&input);
-            let expanded =
-                expand_input_paths(&[path.as_path()], true).map_err(|error| error.to_string())?;
+            let expanded = expand_input_paths_preserving_roots(&[path.as_path()], true)
+                .map_err(|error| error.to_string())?;
             if expanded.is_empty() {
                 // Keep the original path so conversion can report a useful error
                 // (unsupported extension, missing file, etc.).
@@ -740,9 +800,15 @@ fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsSt
                         path.display()
                     ));
                 }
-                out.push(input);
+                out.push(ResolvedCliInput {
+                    value: input,
+                    relative_parent: None,
+                });
             } else {
-                out.extend(expanded.into_iter().map(PathBuf::into_os_string));
+                out.extend(expanded.into_iter().map(|expanded| ResolvedCliInput {
+                    relative_parent: expanded.relative_parent().map(Path::to_path_buf),
+                    value: expanded.path.into_os_string(),
+                }));
             }
         }
         if out.is_empty() {
@@ -762,7 +828,13 @@ fn resolve_cli_inputs(inputs: Vec<OsString>, recursive: bool) -> Result<Vec<OsSt
                 ));
             }
         }
-        Ok(inputs)
+        Ok(inputs
+            .into_iter()
+            .map(|value| ResolvedCliInput {
+                value,
+                relative_parent: None,
+            })
+            .collect())
     }
 }
 
@@ -891,11 +963,13 @@ fn build_registry(preferred_module: Option<&str>) -> Result<ConversionRegistry, 
 
 #[allow(clippy::too_many_arguments)]
 fn run_batch_cli(
-    inputs: Vec<OsString>,
+    inputs: Vec<ResolvedCliInput>,
     target: OutputFormat,
     options: ConversionOptions,
     output_dir: Option<PathBuf>,
     single_output: Option<PathBuf>,
+    also_to: Vec<OutputFormat>,
+    naming_template: BatchNamingTemplate,
     force: bool,
     yes: bool,
     registry: &ConversionRegistry,
@@ -906,6 +980,7 @@ fn run_batch_cli(
     enqueue.conversion = options;
     enqueue.force = force;
     enqueue.output_dir = output_dir;
+    enqueue.naming_template = naming_template;
 
     // Process-wide cancel flag installed once; each batch call resets it.
     let cancel = install_ctrl_c_handler();
@@ -913,12 +988,35 @@ fn run_batch_cli(
     // Classify first (no network), confirm all network tokens, then download.
     let mut classified = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        classified.push(classify_cli_input(input)?);
+        classified.push((
+            classify_cli_input(&input.value)?,
+            input.relative_parent.clone(),
+        ));
     }
-    confirm_network_urls(network_urls_from_classified(&classified), yes)?;
-    for item in classified {
+    let urls: Vec<_> = classified
+        .iter()
+        .filter_map(|(item, _)| match item {
+            ClassifiedInput::Token(PasteToken::PageUrl(url) | PasteToken::RemoteFileUrl(url)) => {
+                Some(url.as_str())
+            }
+            ClassifiedInput::Token(PasteToken::LocalPath(_)) | ClassifiedInput::Path(_) => None,
+        })
+        .collect();
+    confirm_network_urls(urls, yes)?;
+    for (item, relative_parent) in classified {
         let source = materialize_cli_input(item, Some(Arc::clone(&cancel)))?;
-        queue.enqueue(source, &enqueue);
+        let input = if let Some(relative_parent) = relative_parent {
+            BatchInput::with_relative_parent(source, relative_parent)
+                .map_err(|error| error.to_string())?
+        } else {
+            BatchInput::new(source)
+        };
+        let mut formats = Vec::with_capacity(also_to.len() + 1);
+        formats.push(target);
+        formats.extend(also_to.iter().copied());
+        validate_batch_output_formats(registry, &input.source, &formats)
+            .map_err(|error| error.to_string())?;
+        queue.enqueue_fan_out(input, &also_to, &enqueue);
     }
 
     // Single input + -o path: pin the destination for that one item.
@@ -1196,14 +1294,16 @@ fn print_help() {
         "Shift converts files and URLs through the same modules as the native app.\n\n\
          Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force] [--module <ID>]\n  \
          shift-cli convert <INPUT|URL> …\n  \
-         shift-cli batch <INPUT|URL>… [-t <FORMAT>] [-O <DIR>] [--force]\n  \
+         shift-cli batch <INPUT|URL>… [-t <FORMAT>] [--also-to <FORMAT>]… [-O <DIR>] [--force]\n  \
          shift-cli <INPUT>… -O <DIR> [-t <FORMAT>]   # multi-file batch (shared queue)\n  \
          shift-cli formats\n  \
          shift-cli doctor [--script] [--quiet]\n\n\
          General options:\n  \
          -t, --to <FORMAT>       Output format id (default: markdown)\n  \
+         --also-to <FORMAT>      Also create this output (repeatable; shared fan-out queue)\n  \
          -o, --output <PATH>     Write a single output to PATH\n  \
          -O, --output-dir <DIR>  Write every batch output into DIR\n  \
+         --name-template <TEXT>  Batch name; {{stem}}, {{parent}}, {{format}}, {{ext}}\n  \
          --stdout                Write bytes to stdout (single input only)\n  \
          --force                 Overwrite existing outputs\n  \
          --yes, -y               Skip interactive confirms (network fetch); scripts\n  \
@@ -1282,13 +1382,16 @@ fn print_help() {
          unless --yes is set. Non-interactive (non-TTY) runs require --yes for\n\
          any network fetch. --yes never unlocks private hosts.\n\
          Directory inputs require --recursive (union of registered extensions).\n\
+         Recursive outputs preserve source-root-relative folders below -O.\n\
+         Naming templates are file names, never paths; unsafe/traversal\n\
+         characters are rejected and the output extension is enforced.\n\
          Use `shift-cli formats` to list registered conversion capability.\n\
          Use `shift-cli doctor` to see which engines are installed and ready.\n\
          Overwrite policy (single-file and batch):\n  \
          - Existing outputs require --force (otherwise the item fails).\n  \
          - The source file is never overwritten.\n  \
          - Missing parent directories of -o / -O paths are created.\n  \
-         - Batch only: when two inputs resolve to the same output name in one\n    \
+         - Batch only: when two jobs resolve to the same output name in one\n    \
          queue, later items get stem-1.ext, stem-2.ext, … so both can succeed.\n  \
          Single-file: if no -o is supplied, Shift writes beside the source.\n  \
          Batch: prefer -O/--output-dir for multi-file runs."
@@ -1555,6 +1658,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_repeatable_fan_out_and_safe_naming_template() {
+        let parsed = parse_convert_args(&args(&[
+            "report.docx",
+            "-t",
+            "markdown",
+            "--also-to",
+            "html",
+            "--also-to",
+            "pdf",
+            "--name-template",
+            "{parent}-{stem}-{format}.{ext}",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.also_to, vec![OutputFormat::HTML, OutputFormat::PDF]);
+        assert_eq!(
+            parsed.naming_template.as_str(),
+            "{parent}-{stem}-{format}.{ext}"
+        );
+
+        let error = parse_convert_args(&args(&[
+            "report.docx",
+            "--name-template",
+            "../{stem}.{ext}",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("unsafe") || error.contains("character"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn confirm_network_rejects_private_hosts_without_allow() {
         // Ensure default public-only policy for this process.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1656,6 +1791,89 @@ mod tests {
         assert!(out.join("a.converted.html").is_file() || out.join("a.html").is_file());
         assert!(out.join("b.converted.html").is_file() || out.join("b.html").is_file());
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_batch_preserves_hierarchy_and_applies_shared_template() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp("recursive-layout");
+        let source_root = dir.join("inbox");
+        let nested = source_root.join("team").join("drafts");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let source = nested.join("report.html");
+        std::fs::write(&source, b"<p>report</p>").unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        let result = run(args(&[
+            source_root.to_str().unwrap(),
+            "--recursive",
+            "-t",
+            "markdown",
+            "-O",
+            out.to_str().unwrap(),
+            "--name-template",
+            "{parent}-{stem}-{format}.{ext}",
+            "--module",
+            "pandoc",
+            "--force",
+        ]));
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(result.is_ok(), "recursive batch failed: {result:?}");
+        assert!(
+            out.join("team/drafts/drafts-report-markdown.md").is_file(),
+            "root-relative hierarchy or shared name template was not applied"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeatable_also_to_fans_out_one_source_through_batch_runner() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp("also-to");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("report.html");
+        let out = dir.join("out");
+        std::fs::write(&source, b"<p>report</p>").unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let pandoc = dir.join("fake-pandoc");
+        write_fake_pandoc(&pandoc);
+        unsafe {
+            std::env::set_var("SHIFT_PANDOC_BIN", &pandoc);
+        }
+
+        let result = run(args(&[
+            source.to_str().unwrap(),
+            "-t",
+            "markdown",
+            "--also-to",
+            "html",
+            "--also-to",
+            "markdown",
+            "-O",
+            out.to_str().unwrap(),
+            "--module",
+            "pandoc",
+            "--force",
+        ]));
+        unsafe {
+            std::env::remove_var("SHIFT_PANDOC_BIN");
+        }
+
+        assert!(result.is_ok(), "fan-out batch failed: {result:?}");
+        assert!(out.join("report.md").is_file());
+        assert!(out.join("report.html").is_file());
         let _ = std::fs::remove_dir_all(dir);
     }
 

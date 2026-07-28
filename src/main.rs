@@ -27,19 +27,20 @@ use gpui::{
     ease_out_quint, point, prelude::*, pulsating_between, px, relative, rgb, size,
 };
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
-    BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
-    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingAsrModel,
-    DoclingImageExportMode, DoclingOptions, DoclingTableMode, DoclingVideoSamplingMode,
-    FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
-    MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
-    Readiness, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, available_ready_outputs,
-    available_ready_url_outputs, expand_input_paths, ffmpeg_supports_target_size_output,
-    is_audio_output, is_docling_timed_input, is_docling_video_input, is_ffmpeg_output,
-    is_image_output, is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste,
-    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
-    sips_supports_target_size_output, stage_pasted_image, suggested_output_for_path,
-    suggested_output_for_url, url_display_host,
+    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput, BatchItem, BatchItemId,
+    BatchItemState, BatchNamingTemplate, BatchQueue, BatchSource, ConversionArtifact,
+    ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
+    DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
+    DoclingVideoSamplingMode, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
+    MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
+    PdfCompression, PdfInputOptions, Readiness, SipsFlip, SipsOptions, SipsQuality,
+    SpreadsheetOptions, available_outputs_for_batch_source, available_ready_outputs,
+    available_ready_url_outputs, expand_input_paths_preserving_roots,
+    ffmpeg_supports_target_size_output, is_audio_output, is_docling_timed_input,
+    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+    looks_like_url, materialize_magic_paste, parse_magic_paste, paths_refer_to_same_file,
+    pdf_engine_candidates, run_batch, sips_supports_target_size_output, stage_pasted_image,
+    suggested_output_for_path, suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -541,15 +542,30 @@ fn batch_item_status_label(item: &BatchItem) -> SharedString {
     }
 }
 
-fn batch_queue_panel(
-    items: &[BatchItem],
-    output_dir: Option<&Path>,
+struct BatchPanelView<'a> {
+    items: &'a [BatchItem],
+    output_dir: Option<&'a Path>,
     running: bool,
     force: bool,
     status: Option<SharedString>,
-    item_progress: &HashMap<u64, (Option<f32>, SharedString)>,
-    cx: &mut Context<Shift>,
-) -> impl IntoElement {
+    item_progress: &'a HashMap<u64, (Option<f32>, SharedString)>,
+    naming_template_input: Entity<TextInput>,
+    format_menu: Option<BatchItemId>,
+    available_formats: &'a HashMap<u64, Vec<OutputFormat>>,
+}
+
+fn batch_queue_panel(view: BatchPanelView<'_>, cx: &mut Context<Shift>) -> impl IntoElement {
+    let BatchPanelView {
+        items,
+        output_dir,
+        running,
+        force,
+        status,
+        item_progress,
+        naming_template_input,
+        format_menu,
+        available_formats,
+    } = view;
     let progress_queued = items
         .iter()
         .filter(|item| matches!(item.state, BatchItemState::Queued))
@@ -736,6 +752,48 @@ fn batch_queue_panel(
                 .text_color(THEME.text_muted)
                 .child(format!("Output: {folder_label}")),
         )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(210.0))
+                        .h(px(32.0))
+                        .px_2()
+                        .rounded_md()
+                        .bg(THEME.surface)
+                        .border_1()
+                        .border_color(THEME.border)
+                        .child(naming_template_input),
+                )
+                .child(
+                    div()
+                        .id("batch-apply-naming")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(THEME.elevated)
+                        .border_1()
+                        .border_color(THEME.border_strong)
+                        .text_xs()
+                        .text_color(THEME.text_primary)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(THEME.active))
+                        .child("Apply names")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.apply_batch_naming_template(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(THEME.text_dim)
+                        .child("{stem} {parent} {format} {ext}"),
+                ),
+        )
         .when_some(status, |panel, status| {
             panel.child(
                 div()
@@ -755,6 +813,7 @@ fn batch_queue_panel(
                 .gap_1()
                 .children(items.iter().map(|item| {
                     let id = item.id;
+                    let current_format = item.resolved_format();
                     let name: SharedString = item.source.display_name().into();
                     let mut detail = batch_item_status_label(item).to_string();
                     if matches!(item.state, BatchItemState::Running) {
@@ -776,14 +835,14 @@ fn batch_queue_panel(
                         }
                     };
                     let retryable = item.state.is_retryable() && !running;
-                    let can_override = matches!(item.state, BatchItemState::Queued) && !running;
+                    let can_edit = matches!(item.state, BatchItemState::Queued) && !running;
                     let success_path = match &item.state {
                         BatchItemState::Succeeded { written_path, .. } => {
                             Some(written_path.clone())
                         }
                         _ => None,
                     };
-                    div()
+                    let row = div()
                         .id(ElementId::Name(format!("batch-item-{}", id.0).into()))
                         .flex()
                         .items_center()
@@ -822,9 +881,7 @@ fn batch_queue_panel(
                                         .child(format_label),
                                 ),
                         )
-                        .when(can_override, |row| {
-                            let is_override =
-                                matches!(item.format_selection, BatchFormatSelection::Override(_));
+                        .when(can_edit, |row| {
                             row.child(
                                 div()
                                     .id(ElementId::Name(format!("batch-format-{}", id.0).into()))
@@ -836,9 +893,74 @@ fn batch_queue_panel(
                                     .cursor_pointer()
                                     .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
                                     .active(|style| style.opacity(THEME.active_opacity))
-                                    .child(if is_override { "Inherit" } else { "Override" })
+                                    .child("Format ▾")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_batch_item_format(id, cx);
+                                        this.toggle_batch_format_menu(id, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        })
+                        .when(
+                            can_edit
+                                && matches!(
+                                    item.format_selection,
+                                    BatchFormatSelection::Override(_)
+                                ),
+                            |row| {
+                                row.child(
+                                    div()
+                                        .id(ElementId::Name(
+                                            format!("batch-inherit-{}", id.0).into(),
+                                        ))
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .text_color(THEME.text_secondary)
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
+                                        .child("Inherit")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.inherit_batch_item_format(id, cx);
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                            },
+                        )
+                        .when(can_edit, |row| {
+                            row.child(
+                                div()
+                                    .id(ElementId::Name(
+                                        format!("batch-add-output-{}", id.0).into(),
+                                    ))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(THEME.text_secondary)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
+                                    .child("+ output")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.add_batch_item_output(id, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        })
+                        .when(can_edit, |row| {
+                            row.child(
+                                div()
+                                    .id(ElementId::Name(format!("batch-remove-{}", id.0).into()))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(THEME.text_muted)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(THEME.hover).text_color(THEME.text))
+                                    .child("Remove")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_batch_item(id, cx);
                                         cx.stop_propagation();
                                     })),
                             )
@@ -880,7 +1002,57 @@ fn batch_queue_panel(
                                         cx.stop_propagation();
                                     })),
                             )
-                        })
+                        });
+                    let choices = available_formats.get(&id.0).cloned().unwrap_or_default();
+                    let format_picker = if format_menu == Some(id) {
+                        Some(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("batch-format-menu-{}", id.0).into(),
+                                ))
+                                .max_h(px(180.0))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .p_2()
+                                .rounded_md()
+                                .bg(THEME.elevated)
+                                .border_1()
+                                .border_color(THEME.border_strong)
+                                .children(choices.into_iter().enumerate().map(
+                                    |(index, format)| {
+                                        let selected = format == current_format;
+                                        div()
+                                            .id(ElementId::Name(
+                                                format!("batch-format-choice-{}-{index}", id.0)
+                                                    .into(),
+                                            ))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(if selected { THEME.active } else { THEME.raised })
+                                            .text_xs()
+                                            .text_color(THEME.text_primary)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(THEME.hover))
+                                            .child(format.label())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_batch_item_format(id, format, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                    },
+                                )),
+                        )
+                    } else {
+                        None
+                    };
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(row)
+                        .when_some(format_picker, |card, picker| card.child(picker))
                 })),
         )
         .with_animation(
@@ -6218,14 +6390,18 @@ mod ui_perf {
     fn sample_batch_item(id: u64, state: BatchItemState) -> BatchItem {
         BatchItem {
             id: BatchItemId(id),
+            group_id: id,
             source: BatchSource::File(PathBuf::from(format!("/tmp/input{id}.pdf"))),
+            relative_parent: None,
             output_format: OutputFormat::MARKDOWN,
             format_selection: BatchFormatSelection::Inherit,
             options: ConversionOptions::default(),
+            naming_template: BatchNamingTemplate::default(),
             destination: PathBuf::from(format!("/tmp/out{id}.md")),
             force: false,
             state,
             attempts: 0,
+            provenance: None,
         }
     }
 
@@ -6856,14 +7032,18 @@ mod pure_ui_helpers {
     fn sample_batch_item(id: u64, state: BatchItemState) -> BatchItem {
         BatchItem {
             id: BatchItemId(id),
+            group_id: id,
             source: BatchSource::File(PathBuf::from(format!("/tmp/input{id}.pdf"))),
+            relative_parent: None,
             output_format: OutputFormat::MARKDOWN,
             format_selection: BatchFormatSelection::Inherit,
             options: ConversionOptions::default(),
+            naming_template: BatchNamingTemplate::default(),
             destination: PathBuf::from(format!("/tmp/out{id}.md")),
             force: false,
             state,
             attempts: 0,
+            provenance: None,
         }
     }
 
