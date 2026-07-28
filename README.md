@@ -12,10 +12,11 @@ module uses [Pandoc](https://pandoc.org/) for its complete reader/writer format
 set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle),
 which removes clutter and returns clean Markdown or HTML.
 [Docling](https://github.com/docling-project/docling) reads PDFs and other
-documents with layout-aware parsing and exports Markdown, HTML, or plain text
-(including PDF → HTML). [qpdf](https://qpdf.sourceforge.io/) provides PDF page
-extraction, rotation, compression (lossless Flate or smaller lossy image
-recompress), linearization, and page splitting.
+documents with layout-aware parsing and exports Markdown, HTML, plain text,
+JSON, or WebVTT (including PDF → HTML). Its local ASR pipeline can also turn
+audio and video into a dedicated transcript. [qpdf](https://qpdf.sourceforge.io/)
+provides PDF page extraction, rotation, compression (lossless Flate or smaller
+lossy image recompress), linearization, and page splitting.
 [FFmpeg](https://ffmpeg.org/) converts audio and video containers, extracts
 still frames and subtitles, and exposes trim/quality/stream options in the app
 and CLI. The output menu ranks mainstream formats first, followed by authoring,
@@ -83,17 +84,20 @@ Node is resolved from `PATH`, Homebrew, nvm, fnm, volta, asdf, and mise. Set
 `SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle` to override the Defuddle CLI.
 
 - [Docling](https://github.com/docling-project/docling) for layout-aware PDF and
-  office conversion to Markdown, HTML, or plain text:
+  office conversion to Markdown, HTML, plain text, JSON, or WebVTT. Install its
+  pinned ASR/video extras to transcribe audio and video locally:
 
 ```sh
 # into the project venv used by MarkItDown, or any environment on PATH
-uv pip install --python .venv/bin/python docling
-# or: pip install docling
+uv pip install --python .venv/bin/python \
+  'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0'
+# or: pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0'
 ```
 
 Set `SHIFT_DOCLING_BIN=/absolute/path/to/docling` when it is not available on
-`PATH`. First runs may download model weights. Prefer Docling above MarkItDown
-in Settings when you want higher-quality PDF → Markdown.
+`PATH`. Audio/video transcription also needs FFmpeg; the chosen Whisper model
+downloads on first use. Prefer Docling above MarkItDown in Settings when you
+want higher-quality PDF → Markdown.
 
 - [qpdf](https://qpdf.sourceforge.io/) for PDF toolkit operations:
 
@@ -124,7 +128,8 @@ with sections for engines on the active route:
 - **FFmpeg** — quality, encode mode, trim, frame time, mono/sample rate, scale,
   FPS, mute, loudness normalize, burn embedded subtitles, stream indices, frame
   interval for **PNG Sequence (ZIP)**
-- **Docling** — image export mode, OCR, OCR language, tables, table mode
+- **Docling** — image export mode, OCR, OCR language, tables, table mode;
+  audio/video ASR model, video frame sampling, and optional speaker diarization
 - **PDF toolkit** — page range, password (session only), 90° rotation,
   preserve/lossless/smaller compression, web linearization, and split-page ZIP
   output
@@ -233,6 +238,12 @@ cargo run --bin shift-cli -- scan.pdf --to html --module docling
 # Prefer Docling for PDF → Markdown quality
 cargo run --bin shift-cli -- scan.pdf --module docling
 
+# Local audio/video transcription (Markdown), or timed WebVTT
+cargo run --bin shift-cli -- interview.m4a --to transcript --module docling \
+  --docling-asr-model turbo
+cargo run --bin shift-cli -- recording.mp4 --to vtt --module docling \
+  --docling-video-sampling scene --docling-video-diarization
+
 # Extract audio from a video with FFmpeg
 cargo run --bin shift-cli -- clip.mp4 --to mp3
 
@@ -294,7 +305,7 @@ batch queue, colliding output names are uniquified (`report.md`, `report-1.md`).
 GPUI app ─────┐                          ┌─ MarkItDownModule
               ├── ConversionRegistry ───┼─ PandocModule
 shift-cli ────┘                          ├─ DefuddleModule  (URLs + HTML)
-         └── BatchQueue / run_batch      ├─ DoclingModule   (PDF/office → md/html/text)
+         └── BatchQueue / run_batch      ├─ DoclingModule   (docs/audio/video → md/html/text/json/vtt)
                                          └─ FfmpegModule    (audio/video/stills/subs)
 ```
 

@@ -42,7 +42,11 @@ pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
     available_ready_outputs, available_ready_url_outputs, format_availability, supported_outputs,
 };
-pub use docling::{DoclingImageExportMode, DoclingModule, DoclingOptions, DoclingTableMode};
+pub use docling::{
+    DoclingAsrModel, DoclingImageExportMode, DoclingModule, DoclingOptions, DoclingTableMode,
+    DoclingVideoSamplingMode, is_docling_audio_input, is_docling_timed_input,
+    is_docling_video_input,
+};
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
     is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
@@ -82,6 +86,9 @@ impl OutputFormat {
     pub const PDF: Self = Self("pdf");
     pub const PPTX: Self = Self("pptx");
     pub const EPUB: Self = Self("epub");
+    /// Dedicated local speech-transcription action. Docling writes Markdown.
+    pub const TRANSCRIPT: Self = Self("transcript");
+    pub const JSON: Self = Self("json");
 
     // Media containers written by FFmpeg (and accepted as inputs there).
     pub const MP3: Self = Self("mp3");
@@ -157,7 +164,7 @@ impl OutputFormat {
         Self("org"),
         Self("revealjs"),
         Self("beamer"),
-        Self("json"),
+        Self::JSON,
         Self("xml"),
         Self("opml"),
         Self("docbook"),
@@ -245,18 +252,28 @@ impl OutputFormat {
         Self::VTT,
     ];
 
+    /// User-facing actions whose destination is owned exclusively by Docling.
+    ///
+    /// Docling also writes formats in `PANDOC`/`MEDIA` (Markdown, HTML, JSON,
+    /// plain text, and VTT); this slice contains only its non-overlapping
+    /// transcript-intent alias.
+    pub const DOCLING: &'static [Self] = &[Self::TRANSCRIPT];
+
     /// Full UI/parse catalog: publishing formats first, then media.
     ///
     /// Prefer [`Self::all`] when iterating. This slice exists for call sites that
     /// need a `'static` list (menus, `available_outputs` filtering).
     pub const ALL: &'static [Self] = &[
-        // Pandoc writers (must stay in sync with `PANDOC`).
+        // Primary publishing actions.
         Self::MARKDOWN,
         Self::HTML,
         Self::PDF,
         Self::DOCX,
         Self::PPTX,
         Self("plain"),
+        // Dedicated Docling ASR action (Markdown payload with transcript intent).
+        Self::TRANSCRIPT,
+        // Remaining Pandoc writers (must otherwise stay in sync with `PANDOC`).
         Self("gfm"),
         Self("commonmark"),
         Self("commonmark_x"),
@@ -402,6 +419,7 @@ impl OutputFormat {
             "docx" => "Word (DOCX)",
             "pptx" => "PowerPoint (PPTX)",
             "plain" => "Plain Text",
+            "transcript" => "Transcript (Markdown)",
             "gfm" => "GitHub-Flavored Markdown",
             "commonmark" => "CommonMark",
             "commonmark_x" => "CommonMark (extended)",
@@ -415,7 +433,7 @@ impl OutputFormat {
             "org" => "Org Mode",
             "revealjs" => "Reveal.js Slides",
             "beamer" => "LaTeX Beamer",
-            "json" => "Pandoc JSON",
+            "json" => "JSON",
             "xml" => "Pandoc XML",
             "mediawiki" => "MediaWiki",
             "jira" => "Jira Wiki",
@@ -475,8 +493,8 @@ impl OutputFormat {
 
     pub fn extension(self) -> &'static str {
         match self.0 {
-            "markdown" | "gfm" | "commonmark" | "commonmark_x" | "markdown_github"
-            | "markdown_mmd" | "markdown_phpextra" | "markdown_strict" => "md",
+            "markdown" | "transcript" | "gfm" | "commonmark" | "commonmark_x"
+            | "markdown_github" | "markdown_mmd" | "markdown_phpextra" | "markdown_strict" => "md",
             "html" | "html4" | "html5" => "html",
             "chunkedhtml" => "zip",
             "docx" => "docx",
@@ -515,7 +533,7 @@ impl OutputFormat {
 
     pub fn media_type(self) -> &'static str {
         match self.0 {
-            "markdown" | "gfm" | "commonmark" | "commonmark_x" => "text/markdown",
+            "markdown" | "transcript" | "gfm" | "commonmark" | "commonmark_x" => "text/markdown",
             "html" | "html4" | "html5" => "text/html",
             "chunkedhtml" => "application/zip",
             "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -579,7 +597,7 @@ impl OutputFormat {
                 | "application/xml"
         ) || matches!(
             self.id(),
-            "srt" | "vtt" | "plain" | "markdown" | "html" | "gfm" | "csv" | "tsv"
+            "srt" | "vtt" | "plain" | "markdown" | "transcript" | "html" | "gfm" | "csv" | "tsv"
         )
     }
 }
@@ -2182,6 +2200,7 @@ mod tests {
         assert_eq!(
             OutputFormat::ALL.len(),
             OutputFormat::PANDOC.len()
+                + OutputFormat::DOCLING.len()
                 + OutputFormat::MEDIA.len()
                 + OutputFormat::IMAGE.len()
                 + OutputFormat::SPREADSHEET.len()
@@ -2191,6 +2210,9 @@ mod tests {
             assert!(OutputFormat::ALL.contains(format));
         }
         for format in OutputFormat::MEDIA {
+            assert!(OutputFormat::ALL.contains(format));
+        }
+        for format in OutputFormat::DOCLING {
             assert!(OutputFormat::ALL.contains(format));
         }
         for format in OutputFormat::IMAGE {
@@ -2224,13 +2246,14 @@ mod tests {
         let video_outputs = registry.available_outputs(Path::new("clip.mov"));
         assert!(video_outputs.contains(&OutputFormat::MP4));
         assert!(video_outputs.contains(&OutputFormat::MP3));
-        // Video → audio (FFmpeg) → Markdown (MarkItDown) is a valid two-step route.
+        // Docling owns direct audio/video transcription to Markdown; the older
+        // FFmpeg → MarkItDown chain remains a fallback when Docling is absent.
         assert!(video_outputs.contains(&OutputFormat::MARKDOWN));
         assert!(
             registry
                 .module_for(Path::new("clip.mov"), OutputFormat::MARKDOWN)
-                .is_none(),
-            "Markdown is only available via the FFmpeg → MarkItDown chain"
+                .is_some_and(|module| module.id() == "docling"),
+            "Docling should own the direct video → Markdown transcript route"
         );
     }
 
@@ -2988,6 +3011,7 @@ mod tests {
 
         let all_ids: HashSet<&str> = OutputFormat::ALL.iter().map(|f| f.id()).collect();
         let pandoc_ids: HashSet<&str> = OutputFormat::PANDOC.iter().map(|f| f.id()).collect();
+        let docling_ids: HashSet<&str> = OutputFormat::DOCLING.iter().map(|f| f.id()).collect();
         let media_ids: HashSet<&str> = OutputFormat::MEDIA.iter().map(|f| f.id()).collect();
         let image_ids: HashSet<&str> = OutputFormat::IMAGE.iter().map(|f| f.id()).collect();
         let sheet_ids: HashSet<&str> = OutputFormat::SPREADSHEET.iter().map(|f| f.id()).collect();
@@ -2997,10 +3021,16 @@ mod tests {
         assert_eq!(
             OutputFormat::ALL.len(),
             OutputFormat::PANDOC.len()
+                + OutputFormat::DOCLING.len()
                 + OutputFormat::MEDIA.len()
                 + OutputFormat::IMAGE.len()
                 + OutputFormat::SPREADSHEET.len()
                 + OutputFormat::PDF_TOOLKIT.len()
+        );
+        assert_eq!(
+            docling_ids.len(),
+            OutputFormat::DOCLING.len(),
+            "duplicate ids in DOCLING"
         );
         assert_eq!(
             image_ids.len(),
@@ -3022,6 +3052,7 @@ mod tests {
         // slice so the catalogs remain a true partition of ALL.
         for (name, other) in [
             ("PANDOC", &pandoc_ids),
+            ("DOCLING", &docling_ids),
             ("MEDIA", &media_ids),
             ("SPREADSHEET", &sheet_ids),
         ] {
@@ -3033,6 +3064,7 @@ mod tests {
         }
         for (name, other) in [
             ("PANDOC", &pandoc_ids),
+            ("DOCLING", &docling_ids),
             ("MEDIA", &media_ids),
             ("IMAGE", &image_ids),
             ("PDF_TOOLKIT", &pdf_toolkit_ids),
@@ -3076,9 +3108,24 @@ mod tests {
             overlap.is_empty(),
             "ids appear in both PANDOC and MEDIA: {overlap:?}"
         );
+        for (name, other) in [
+            ("PANDOC", &pandoc_ids),
+            ("MEDIA", &media_ids),
+            ("IMAGE", &image_ids),
+            ("SPREADSHEET", &sheet_ids),
+        ] {
+            let overlap: Vec<_> = docling_ids.intersection(other).copied().collect();
+            assert!(
+                overlap.is_empty(),
+                "ids appear in both DOCLING and {name}: {overlap:?}"
+            );
+        }
 
         let union: HashSet<&str> = pandoc_ids
             .union(&media_ids)
+            .copied()
+            .collect::<HashSet<&str>>()
+            .union(&docling_ids)
             .copied()
             .collect::<HashSet<&str>>()
             .union(&image_ids)
@@ -3092,24 +3139,26 @@ mod tests {
             .collect();
         assert_eq!(
             union, all_ids,
-            "PANDOC ∪ MEDIA ∪ IMAGE ∪ SPREADSHEET ∪ PDF_TOOLKIT must equal ALL"
+            "PANDOC ∪ DOCLING ∪ MEDIA ∪ IMAGE ∪ SPREADSHEET ∪ PDF_TOOLKIT must equal ALL"
         );
 
         // Every ALL entry is in exactly one partition.
         for format in OutputFormat::ALL {
             let in_pandoc = OutputFormat::PANDOC.contains(format);
+            let in_docling = OutputFormat::DOCLING.contains(format);
             let in_media = OutputFormat::MEDIA.contains(format);
             let in_image = OutputFormat::IMAGE.contains(format);
             let in_sheet = OutputFormat::SPREADSHEET.contains(format);
             let in_pdf_toolkit = OutputFormat::PDF_TOOLKIT.contains(format);
             assert_eq!(
                 usize::from(in_pandoc)
+                    + usize::from(in_docling)
                     + usize::from(in_media)
                     + usize::from(in_image)
                     + usize::from(in_sheet)
                     + usize::from(in_pdf_toolkit),
                 1,
-                "{} must appear in exactly one output partition (pandoc={in_pandoc}, media={in_media}, image={in_image}, sheet={in_sheet}, pdf_toolkit={in_pdf_toolkit})",
+                "{} must appear in exactly one output partition (pandoc={in_pandoc}, docling={in_docling}, media={in_media}, image={in_image}, sheet={in_sheet}, pdf_toolkit={in_pdf_toolkit})",
                 format.id()
             );
         }
@@ -3719,16 +3768,11 @@ mod tests {
     fn two_step_url_and_file_route_ids_cover_common_chains() {
         let registry = ConversionRegistry::default();
 
-        // Video → Markdown is two-step (ffmpeg → markitdown).
+        // Video → Markdown is a direct Docling ASR route.
         let ids = registry
             .route_module_ids(Path::new("clip.mp4"), OutputFormat::MARKDOWN)
-            .expect("video→md chain");
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], "ffmpeg");
-        assert!(
-            ids[1] == "markitdown" || ids[1] == "pandoc",
-            "second hop unexpected: {ids:?}"
-        );
+            .expect("video→md route");
+        assert_eq!(ids, vec!["docling"]);
 
         // Local HTML → DOCX: defuddle/markitdown chain or pandoc direct.
         let html_docx = registry.route_module_ids(Path::new("page.html"), OutputFormat::DOCX);
@@ -3856,7 +3900,12 @@ mod tests {
                 );
                 continue;
             };
-            assert_eq!(ids, vec!["ffmpeg"], "route for {}", format.id());
+            let expected = if *format == OutputFormat::VTT {
+                vec!["docling"]
+            } else {
+                vec!["ffmpeg"]
+            };
+            assert_eq!(ids, expected, "route for {}", format.id());
         }
     }
 
