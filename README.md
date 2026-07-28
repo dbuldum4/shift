@@ -368,6 +368,41 @@ separators, unknown placeholders, control characters, and platform-reserved
 file-name characters. If a template omits the correct extension, Shift appends
 it. The default is `{stem}.{ext}`.
 
+## macOS workflows and automation
+
+The packaged app registers as an **alternate Finder viewer** for Shift's
+convertible document, spreadsheet, image, audio, video, and subtitle formats.
+Select one or more files in Finder and choose **Open With → Shift** (or run
+`open -a Shift file1 file2`). A single file opens its normal preview; multiple
+files enter the existing batch queue. Shift never makes itself the default app
+for these formats.
+
+For Shortcuts or Automator, use **Run Shell Script** and pass the Shortcut's
+input files as arguments. `shift-cli` emits only completed artifact paths to
+standard output; progress and diagnostics remain on standard error:
+
+```sh
+shift-cli batch "$@" --to markdown --output-dir "$HOME/Desktop/Shift output" --yes
+```
+
+For a drop folder, keep output **outside** the watched tree so Shift cannot
+consume its own artifacts. The watcher waits for an unchanged file before it
+uses the shared `BatchQueue` / `run_batch` path; Ctrl-C stops the current item
+and the remaining queue safely.
+
+```sh
+# Test the current inbox once (useful in a Shortcut).
+shift-cli watch "$HOME/Inbox" -O "$HOME/Shift output" -t pdf --once --yes
+
+# Keep monitoring: check every second and require two seconds of stability.
+shift-cli watch "$HOME/Inbox" -O "$HOME/Shift output" -t markdown \
+  --poll 1 --debounce 2 --yes
+```
+
+Watch mode accepts the same converter flags as `batch` (`--module`, OCR,
+media, PDF range, and so on). It deliberately does not save watched folders or
+secrets: automation should be explicit, inspectable, and easy to stop.
+
 ## Architecture
 
 ```text

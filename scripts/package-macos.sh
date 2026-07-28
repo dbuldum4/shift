@@ -30,6 +30,35 @@ cat > "$contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>${version#0.}</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <!-- Finder advertises Shift as an alternate viewer, never the default. The
+       executable also accepts one or many local paths for `open -a Shift …`. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Shift convertible files</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>pdf</string><string>txt</string><string>md</string><string>markdown</string>
+        <string>html</string><string>htm</string><string>doc</string><string>docx</string>
+        <string>ppt</string><string>pptx</string><string>odt</string><string>rtf</string>
+        <string>epub</string><string>csv</string><string>tsv</string><string>xls</string>
+        <string>xlsx</string><string>xlsm</string><string>xlsb</string><string>ods</string>
+        <string>mp3</string><string>wav</string><string>flac</string><string>m4a</string>
+        <string>aac</string><string>ogg</string><string>opus</string><string>mp4</string>
+        <string>mov</string><string>mkv</string><string>webm</string><string>avi</string>
+        <string>m4v</string><string>mpeg</string><string>mpg</string><string>ts</string>
+        <string>3gp</string><string>png</string><string>jpg</string><string>jpeg</string>
+        <string>gif</string><string>webp</string><string>heic</string><string>heif</string>
+        <string>avif</string><string>svg</string><string>tiff</string><string>tif</string>
+        <string>bmp</string><string>jxl</string><string>ico</string><string>jp2</string>
+        <string>dng</string><string>cr2</string><string>cr3</string><string>nef</string>
+        <string>arw</string><string>orf</string><string>raf</string><string>rw2</string>
+        <string>srt</string><string>vtt</string>
+      </array>
+    </dict>
+  </array>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
