@@ -1,5 +1,5 @@
 const statement =
-  "shift is a blazingly fast, native, opinionated, robust file converter built for macOS";
+  "shift is a blazingly fast, native, opinionated, and robust file converter built for macOS";
 
 const githubUrl = "https://github.com/dbuldum4/shift";
 const releaseUrl = `${githubUrl}/releases/tag/v0.3.0`;
