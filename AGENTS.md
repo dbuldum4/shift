@@ -89,6 +89,15 @@ Optional knobs live on `ConversionOptions`:
 | `spreadsheet` | sheet name, sheet index (1-based); values-only csv/tsv/xlsx |
 | `pdf` | password (never persisted), page_from / page_to, rotate, compression, linearize, split pages |
 
+`ConversionOptions.target_size_bytes` is a shared **final-artifact** goal.
+Modules must explicitly opt in through `ConversionModule::supports_target_size`;
+never silently ignore it. Dispatch clears the goal on intermediate two-step
+hops and only applies it on the final convert. FFmpeg owns lossy audio/video
+fitting (practical floors ~32 kbps audio / ~80 kbps video; short clips near the
+16 KiB minimum may not fit) and sips owns lossy still fitting via quality
+ladders (large stills may also need a max dimension). Callers persist and pass
+the goal identically in app, CLI, recipes, and batch snapshots.
+
 App and CLI expose the same conversion flags; defaults match historical fixed
 invocations. Batch items may `Inherit` or `Override` the session output format
 (`BatchFormatSelection`). Keep capability lists explicit so unsupported pairs

@@ -13,6 +13,7 @@ use super::{
     run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -221,7 +222,7 @@ impl SipsModule {
 
     /// Lossy destinations where `formatOptions` changes the result.
     fn honors_quality(output_format: OutputFormat) -> bool {
-        matches!(output_format.id(), "jpg" | "heic" | "avif" | "jp2")
+        sips_supports_target_size_output(output_format)
     }
 
     fn output_file_name(stem: &std::ffi::OsStr, output_format: OutputFormat) -> PathBuf {
@@ -251,74 +252,110 @@ impl SipsModule {
 
         // `--out` writes a new file; the source is never modified in place.
         let knobs = &options.sips;
-        let mut command = Command::new(&self.executable);
-        command.arg("-s").arg("format").arg(format_arg);
-        if Self::honors_quality(output_format) {
-            command
-                .arg("-s")
-                .arg("formatOptions")
-                .arg(knobs.quality.format_option());
-        }
-        if let Some(max) = knobs.max_dimension.filter(|value| *value > 0) {
-            command.arg("-Z").arg(max.to_string());
-        }
-        if let Some(degrees) = knobs.rotate_degrees.filter(|value| value % 360 != 0) {
-            command.arg("-r").arg((degrees % 360).to_string());
-        }
-        if let Some(flip) = knobs.flip {
-            command.arg("-f").arg(flip.id());
-        }
-        if knobs.strip_color_profile {
-            command.arg("--deleteColorManagementProperties");
-        }
-        command.arg(input).arg("--out").arg(&produced);
-
-        let display_parts = command_argv_parts(&command);
-        let invocation = InvocationRecord {
-            module_id: self.id(),
-            argv_display: format_argv_display(&display_parts),
+        let quality_attempts: Vec<String> = if options.target_size_bytes.is_some() {
+            // ImageIO accepts numeric percentages for lossy encoders. Try from
+            // highest to lowest so the first artifact under the cap is also
+            // the best-quality artifact among these deterministic passes.
+            [92, 82, 72, 62, 52, 42, 32, 22, 12, 5]
+                .into_iter()
+                .map(|quality| quality.to_string())
+                .collect()
+        } else {
+            vec![knobs.quality.format_option().to_owned()]
         };
+        let mut invocations = Vec::new();
+        let mut fitted = None;
+        let mut smallest = usize::MAX;
 
-        let output = run_command_cancellable(
-            command,
-            process_timeout(),
-            max_output_bytes(),
-            options.cancel.clone(),
-        )
-        .map_err(|error| {
-            map_spawn_error(
-                error,
-                "sips could not be launched. It ships with macOS at /usr/bin/sips; \
-                 set SHIFT_SIPS_BIN to override.",
+        for (attempt, quality) in quality_attempts.iter().enumerate() {
+            let _ = fs::remove_file(&produced);
+            let mut command = Command::new(&self.executable);
+            command.arg("-s").arg("format").arg(format_arg);
+            if Self::honors_quality(output_format) {
+                command.arg("-s").arg("formatOptions").arg(quality);
+            }
+            if let Some(max) = knobs.max_dimension.filter(|value| *value > 0) {
+                command.arg("-Z").arg(max.to_string());
+            }
+            if let Some(degrees) = knobs.rotate_degrees.filter(|value| value % 360 != 0) {
+                command.arg("-r").arg((degrees % 360).to_string());
+            }
+            if let Some(flip) = knobs.flip {
+                command.arg("-f").arg(flip.id());
+            }
+            if knobs.strip_color_profile {
+                command.arg("--deleteColorManagementProperties");
+            }
+            command.arg(input).arg("--out").arg(&produced);
+
+            invocations.push(InvocationRecord {
+                module_id: self.id(),
+                argv_display: format_argv_display(&command_argv_parts(&command)),
+            });
+            if let Some(sink) = options.progress.as_ref() {
+                sink(super::ConversionProgress::Phase(format!(
+                    "Image fit pass {}…",
+                    attempt + 1
+                )));
+            }
+
+            let output = run_command_cancellable(
+                command,
+                process_timeout(),
+                max_output_bytes(),
+                options.cancel.clone(),
             )
-        })?;
+            .map_err(|error| {
+                map_spawn_error(
+                    error,
+                    "sips could not be launched. It ships with macOS at /usr/bin/sips; \
+                     set SHIFT_SIPS_BIN to override.",
+                )
+            })?;
 
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let detail = if detail.is_empty() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if stdout.is_empty() {
-                    format!("process exited with {}", output.status)
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let detail = if detail.is_empty() {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    if stdout.is_empty() {
+                        format!("process exited with {}", output.status)
+                    } else {
+                        stdout
+                    }
                 } else {
-                    stdout
-                }
-            } else {
-                detail
-            };
-            return Err(ConversionError::new(format!(
-                "sips could not convert {}: {detail}{}",
-                input.display(),
-                Self::failure_hint(output_format)
-            )));
-        }
+                    detail
+                };
+                return Err(ConversionError::new(format!(
+                    "sips could not convert {}: {detail}{}",
+                    input.display(),
+                    Self::failure_hint(output_format)
+                )));
+            }
 
-        // sips exits 0 even when it silently declines to write some formats,
-        // so treat a missing file as a failure rather than an empty artifact.
-        let bytes = read_file_limited(&produced, max_output_bytes()).map_err(|error| {
+            // sips exits 0 even when it silently declines to write some formats,
+            // so treat a missing file as a failure rather than an empty artifact.
+            let bytes = read_file_limited(&produced, max_output_bytes()).map_err(|error| {
+                ConversionError::new(format!(
+                    "sips finished but did not write {}: {error}{}",
+                    produced.display(),
+                    Self::failure_hint(output_format)
+                ))
+            })?;
+            smallest = smallest.min(bytes.len());
+            if options
+                .target_size_bytes
+                .is_none_or(|target| bytes.len() as u64 <= target)
+            {
+                fitted = Some(bytes);
+                break;
+            }
+        }
+        let bytes = fitted.ok_or_else(|| {
             ConversionError::new(format!(
-                "sips finished but did not write {}: {error}{}",
-                produced.display(),
-                Self::failure_hint(output_format)
+                "image could not fit under {} bytes (smallest attempt was {} bytes); \
+                 choose a larger target or a smaller max dimension",
+                options.target_size_bytes.unwrap_or_default(),
+                smallest
             ))
         })?;
 
@@ -333,7 +370,7 @@ impl SipsModule {
             format: output_format,
             module_id: self.id(),
             pipeline: vec![self.id()],
-            invocations: vec![invocation],
+            invocations,
         })
     }
 
@@ -346,6 +383,10 @@ impl SipsModule {
             _ => "",
         }
     }
+}
+
+pub fn sips_supports_target_size_output(output_format: OutputFormat) -> bool {
+    matches!(output_format.id(), "jpg" | "jp2")
 }
 
 impl ConversionModule for SipsModule {
@@ -367,6 +408,10 @@ impl ConversionModule for SipsModule {
 
     fn chainable_output_formats(&self) -> &[OutputFormat] {
         CHAINABLE
+    }
+
+    fn supports_target_size(&self, output: OutputFormat) -> bool {
+        Self::honors_quality(output)
     }
 
     fn convert(
@@ -493,6 +538,33 @@ printf '%s' "fake-image-bytes" > "$out"
         let args = fixture.args();
         assert!(args.contains("-s format jpeg"), "args: {args}");
         assert!(args.contains("--out"), "args: {args}");
+    }
+
+    #[test]
+    fn target_size_uses_highest_fitting_numeric_quality() {
+        let fixture = Fixture::new("fit", "heic");
+        let options = ConversionOptions {
+            target_size_bytes: Some(16 * 1024),
+            ..ConversionOptions::default()
+        };
+        let artifact = SipsModule::with_executable(&fixture.executable)
+            .convert(&fixture.input, OutputFormat::JPG, &options)
+            .unwrap();
+
+        assert!(artifact.bytes.len() <= 16 * 1024);
+        assert_eq!(artifact.invocations.len(), 1);
+        let args = fixture.args();
+        assert!(args.contains("-s formatOptions 92"), "args: {args}");
+    }
+
+    #[test]
+    fn target_size_capabilities_are_limited_to_lossy_writers() {
+        let module = SipsModule::with_executable("/bin/true");
+        assert!(module.supports_target_size(OutputFormat::JPG));
+        assert!(module.supports_target_size(OutputFormat::JP2));
+        assert!(!module.supports_target_size(OutputFormat::PNG));
+        assert!(!module.supports_target_size(OutputFormat::TIFF));
+        assert!(!module.supports_target_size(OutputFormat::PDF));
     }
 
     #[test]

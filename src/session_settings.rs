@@ -133,6 +133,10 @@ pub struct SessionConversionOptions {
     #[serde(default)]
     pub spreadsheet: SessionSpreadsheetOptions,
     pub pdf: SessionPdfInputOptions,
+    /// Optional final-artifact size goal. Added after settings schema v2, so
+    /// existing files deserialize to no target.
+    #[serde(default)]
+    pub target_size_bytes: Option<u64>,
 }
 
 impl SessionConversionOptions {
@@ -156,6 +160,7 @@ impl SessionConversionOptions {
                 linearize: options.pdf.linearize,
                 split_pages: options.pdf.split_pages,
             },
+            target_size_bytes: options.target_size_bytes,
         }
     }
 
@@ -179,6 +184,7 @@ impl SessionConversionOptions {
                 linearize: self.pdf.linearize,
                 split_pages: self.pdf.split_pages,
             },
+            target_size_bytes: self.target_size_bytes,
             cancel: None,
             progress: None,
         }
@@ -1370,5 +1376,27 @@ mod tests {
         assert_eq!(loaded.output_format(), OutputFormat::MARKDOWN);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn target_size_round_trips_and_old_json_defaults_to_none() {
+        let options = ConversionOptions {
+            target_size_bytes: Some(10_000_000),
+            ..ConversionOptions::default()
+        };
+        let stored = SessionConversionOptions::from_conversion_options(&options);
+        assert_eq!(stored.target_size_bytes, Some(10_000_000));
+        assert_eq!(
+            stored.to_conversion_options().target_size_bytes,
+            Some(10_000_000)
+        );
+
+        let mut old_json = serde_json::to_value(SessionConversionOptions::default()).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("target_size_bytes");
+        let old: SessionConversionOptions = serde_json::from_value(old_json).unwrap();
+        assert_eq!(old.target_size_bytes, None);
     }
 }

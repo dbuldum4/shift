@@ -48,8 +48,9 @@ pub use docling::{
     is_docling_video_input,
 };
 pub use ffmpeg::{
-    FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
-    is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+    FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality,
+    ffmpeg_supports_target_size_output, input_looks_like_media, is_audio_output, is_ffmpeg_output,
+    is_image_output, is_subtitle_output, is_video_output,
 };
 pub use inspection::{
     ArtifactInspection, MAX_INSPECTION_PREFIX_BYTES, MAX_INSPECTION_SUFFIX_BYTES, inspect_binary,
@@ -69,7 +70,7 @@ pub use process::{
     unique_temp_dir,
 };
 pub use qpdf::{PdfCompression, QpdfModule};
-pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality};
+pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};
 pub use sources::{
     MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
 };
@@ -712,6 +713,12 @@ pub struct ConversionOptions {
     pub sips: SipsOptions,
     pub spreadsheet: SpreadsheetOptions,
     pub pdf: PdfInputOptions,
+    /// Best-effort upper bound for the final artifact.
+    ///
+    /// Only modules that explicitly opt into target-size encoding may consume
+    /// this value. It is global rather than engine-specific so a saved session,
+    /// recipe, batch item, and CLI invocation all describe the same user goal.
+    pub target_size_bytes: Option<u64>,
     /// When set and true, external converter processes should abort.
     ///
     /// Used by the shared batch runner for cooperative cancellation. Compared
@@ -733,6 +740,7 @@ impl std::fmt::Debug for ConversionOptions {
             .field("sips", &self.sips)
             .field("spreadsheet", &self.spreadsheet)
             .field("pdf", &self.pdf)
+            .field("target_size_bytes", &self.target_size_bytes)
             .field("cancel", &self.cancel.as_ref().map(|_| "<AtomicBool>"))
             .field(
                 "progress",
@@ -760,6 +768,7 @@ impl PartialEq for ConversionOptions {
             && self.sips == other.sips
             && self.spreadsheet == other.spreadsheet
             && self.pdf == other.pdf
+            && self.target_size_bytes == other.target_size_bytes
             && arc_ptr_eq(&self.cancel, &other.cancel)
             && arc_ptr_eq(&self.progress, &other.progress)
     }
@@ -1086,6 +1095,11 @@ pub trait ConversionModule: Send + Sync {
     fn output_formats(&self) -> &[OutputFormat];
     /// Outputs which may be materialized and safely consumed by another module.
     fn chainable_output_formats(&self) -> &[OutputFormat];
+    /// Whether this module can honor [`ConversionOptions::target_size_bytes`]
+    /// for the requested output instead of silently ignoring it.
+    fn supports_target_size(&self, _output: OutputFormat) -> bool {
+        false
+    }
     fn convert(
         &self,
         input: &Path,
@@ -1334,6 +1348,7 @@ impl ConversionRegistry {
         route: ConversionRoute<'_>,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        validate_target_size_for_route(route, output, options)?;
         // PDF page-range / password preprocess (qpdf). If qpdf handles the
         // password, remove it from the module options so it never reaches an
         // external tool command line.
@@ -1372,10 +1387,14 @@ impl ConversionRegistry {
                 intermediate,
                 second,
             } => {
-                // First hop may be FFmpeg (trim/encode). Pass the full options
-                // snapshot on hop 2 so second-module knobs (e.g. MarkItDown
-                // keep-data-uris) still apply; modules ignore foreign fields.
-                let hop1 = first.convert(input, intermediate, &options)?;
+                // Target size is a final-artifact goal. Intermediate hops must
+                // not re-encode or quality-ladder under the final byte budget
+                // (e.g. HEIC→MP3 via JPG, or MP4→JP2 via JPG).
+                let hop1_options = options_for_intermediate_hop(&options);
+                // Pass the full options snapshot on hop 2 so second-module knobs
+                // (e.g. MarkItDown keep-data-uris) still apply; modules ignore
+                // foreign fields.
+                let hop1 = first.convert(input, intermediate, &hop1_options)?;
                 let hop1 = ensure_direct_provenance(hop1, first.id());
                 self.finish_chain(&hop1, output, second, &options)
             }
@@ -1526,6 +1545,7 @@ impl ConversionRegistry {
                 output.label()
             ))
         })?;
+        validate_target_size_for_route(route, output, options)?;
 
         match route {
             ConversionRoute::Direct(module) => {
@@ -1537,12 +1557,51 @@ impl ConversionRegistry {
                 intermediate,
                 second,
             } => {
-                let hop1 = first.convert_url(url, intermediate, options)?;
+                let hop1_options = options_for_intermediate_hop(options);
+                let hop1 = first.convert_url(url, intermediate, &hop1_options)?;
                 let hop1 = ensure_direct_provenance(hop1, first.id());
                 self.finish_chain(&hop1, output, second, options)
             }
         }
     }
+}
+
+/// Intermediate hops must not apply the final fit-to-size budget.
+fn options_for_intermediate_hop(options: &ConversionOptions) -> ConversionOptions {
+    let mut hop = options.clone();
+    hop.target_size_bytes = None;
+    hop
+}
+
+fn validate_target_size_for_route(
+    route: ConversionRoute<'_>,
+    output: OutputFormat,
+    options: &ConversionOptions,
+) -> Result<(), ConversionError> {
+    let Some(target) = options.target_size_bytes else {
+        return Ok(());
+    };
+    if target < 16 * 1024 {
+        return Err(ConversionError::new("target size must be at least 16 KiB"));
+    }
+    if target as usize > max_output_bytes() {
+        return Err(ConversionError::new(format!(
+            "target size exceeds Shift's {} byte artifact limit",
+            max_output_bytes()
+        )));
+    }
+    let final_module = match route {
+        ConversionRoute::Direct(module) => module,
+        ConversionRoute::TwoStep { second, .. } => second,
+    };
+    if !final_module.supports_target_size(output) {
+        return Err(ConversionError::new(format!(
+            "{} cannot fit {} output to a target size",
+            final_module.label(),
+            output.label()
+        )));
+    }
+    Ok(())
 }
 
 fn is_pdf_path(path: &Path) -> bool {
@@ -1753,6 +1812,8 @@ mod tests {
         chainable: &'static [OutputFormat],
         marker: &'static [u8],
         seen_input: Option<Arc<Mutex<Option<PathBuf>>>>,
+        seen_target_size: Option<Arc<Mutex<Option<Option<u64>>>>>,
+        supports_target_size: bool,
         assert_password_absent: bool,
     }
 
@@ -1772,6 +1833,9 @@ mod tests {
         fn chainable_output_formats(&self) -> &[OutputFormat] {
             self.chainable
         }
+        fn supports_target_size(&self, _output: OutputFormat) -> bool {
+            self.supports_target_size
+        }
         fn convert(
             &self,
             input: &Path,
@@ -1783,6 +1847,9 @@ mod tests {
                     options.pdf.password.is_none(),
                     "PDF password should be removed by qpdf preprocessing before the module runs"
                 );
+            }
+            if let Some(seen) = &self.seen_target_size {
+                *seen.lock().unwrap() = Some(options.target_size_bytes);
             }
             if let Some(seen) = &self.seen_input {
                 *seen.lock().unwrap() = Some(input.to_owned());
@@ -1814,6 +1881,8 @@ mod tests {
             chainable,
             marker,
             seen_input: None,
+            seen_target_size: None,
+            supports_target_size: false,
             assert_password_absent: false,
         }
     }
@@ -4301,6 +4370,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn target_size_rejects_too_small_and_unsupported_routes_before_spawn() {
+        let input =
+            std::env::temp_dir().join(format!("shift-target-route-{}.md", std::process::id()));
+        std::fs::write(&input, "# test").unwrap();
+        let registry = ConversionRegistry::default();
+
+        let unsupported = registry
+            .convert_to_with_options(
+                &input,
+                OutputFormat::HTML,
+                &ConversionOptions {
+                    target_size_bytes: Some(1_000_000),
+                    ..ConversionOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            unsupported.to_string().contains("cannot fit"),
+            "{unsupported}"
+        );
+
+        let tiny = registry
+            .convert_to_with_options(
+                &input,
+                OutputFormat::HTML,
+                &ConversionOptions {
+                    target_size_bytes: Some(1),
+                    ..ConversionOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(tiny.to_string().contains("at least 16 KiB"), "{tiny}");
+
+        let _ = std::fs::remove_file(input);
+    }
+
+    #[test]
+    fn two_step_target_size_applies_only_to_final_hop() {
+        let hop1_seen = Arc::new(Mutex::new(None));
+        let hop2_seen = Arc::new(Mutex::new(None));
+        let mut first = fake(
+            "first",
+            &["src"],
+            &[OutputFormat::JPG],
+            &[OutputFormat::JPG],
+            b"intermediate",
+        );
+        first.seen_target_size = Some(hop1_seen.clone());
+        let mut second = fake("second", &["jpg"], &[OutputFormat::MP3], &[], b"fitted-mp3");
+        second.supports_target_size = true;
+        second.seen_target_size = Some(hop2_seen.clone());
+        let registry = ConversionRegistry::new()
+            .with_module(first)
+            .with_module(second);
+
+        let input =
+            std::env::temp_dir().join(format!("shift-target-chain-{}.src", std::process::id()));
+        std::fs::write(&input, b"source").unwrap();
+
+        let artifact = registry
+            .convert_to_with_options(
+                &input,
+                OutputFormat::MP3,
+                &ConversionOptions {
+                    target_size_bytes: Some(100_000),
+                    ..ConversionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(artifact.bytes, b"fitted-mp3");
+        assert_eq!(artifact.pipeline, vec!["first", "second"]);
+        assert_eq!(*hop1_seen.lock().unwrap(), Some(None));
+        assert_eq!(*hop2_seen.lock().unwrap(), Some(Some(100_000)));
+
+        let _ = std::fs::remove_file(input);
     }
 
     #[test]
