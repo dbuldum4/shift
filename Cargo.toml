@@ -1,10 +1,16 @@
 [package]
 name = "shift"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 default-run = "shift"
 license = "MIT"
+description = "A native macOS file and URL converter with a parity-focused CLI"
+repository = "https://github.com/dbuldum4/shift"
+readme = "README.md"
+keywords = ["conversion", "markdown", "macos", "media", "documents"]
+categories = ["command-line-utilities", "multimedia"]
+publish = false
 
 [lib]
 name = "shift_core"
