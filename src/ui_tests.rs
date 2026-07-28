@@ -4503,6 +4503,39 @@ async fn set_ready_artifact_marks_ready_and_clears_cached_path(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn binary_ready_artifact_exposes_safe_header_inspection(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.extend_from_slice(&320u32.to_be_bytes());
+    png.extend_from_slice(&200u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0]);
+
+    shift.update(cx, |this, _cx| {
+        this.set_ready_artifact(sample_ready_artifact(
+            "preview.png",
+            OutputFormat::PNG,
+            "ffmpeg",
+            png,
+        ));
+        let artifact = this
+            .conversion
+            .ready_artifact()
+            .expect("ready binary artifact");
+        let inspection = artifact.inspection();
+        assert_eq!(inspection.kind, "Image");
+        assert!(
+            inspection
+                .facts
+                .iter()
+                .any(|fact| fact.contains("320 × 200 px")),
+            "{inspection:?}"
+        );
+        assert!(inspection.note.contains("Header inspection"));
+    });
+}
+
+#[gpui::test]
 async fn copy_output_text_ready_sets_clipboard_status(cx: &mut TestAppContext) {
     let env = TestEnv::new();
     let path = write_input(&env, "copy_text.txt", b"clipboard body");
