@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 3;
 const SETTINGS_FILE_NAME: &str = "session-settings.json";
 
 /// Default history sidebar width in logical pixels (matches app constant).
@@ -150,6 +150,10 @@ impl SessionConversionOptions {
                 // Never persist passwords.
                 page_from: options.pdf.page_from,
                 page_to: options.pdf.page_to,
+                rotate_degrees: options.pdf.rotate_degrees,
+                compression: options.pdf.compression.id().into(),
+                linearize: options.pdf.linearize,
+                split_pages: options.pdf.split_pages,
             },
         }
     }
@@ -169,6 +173,10 @@ impl SessionConversionOptions {
                 password: None,
                 page_from: self.pdf.page_from,
                 page_to: self.pdf.page_to,
+                rotate_degrees: self.pdf.rotate_degrees,
+                compression: self.pdf.compression.parse().unwrap_or_default(),
+                linearize: self.pdf.linearize,
+                split_pages: self.pdf.split_pages,
             },
             cancel: None,
             progress: None,
@@ -442,6 +450,14 @@ impl SessionSpreadsheetOptions {
 pub struct SessionPdfInputOptions {
     pub page_from: Option<u32>,
     pub page_to: Option<u32>,
+    #[serde(default)]
+    pub rotate_degrees: Option<u16>,
+    #[serde(default)]
+    pub compression: String,
+    #[serde(default)]
+    pub linearize: bool,
+    #[serde(default)]
+    pub split_pages: Option<u32>,
 }
 
 /// Resolve the default session settings path under Application Support.
@@ -777,6 +793,34 @@ mod tests {
     }
 
     #[test]
+    fn v2_pdf_settings_without_toolkit_fields_migrate_to_defaults() {
+        let dir = unique_dir("pdf-toolkit-v2");
+        let path = dir.join("session-settings.json");
+        let mut legacy = serde_json::to_value(SessionSettings {
+            version: 2,
+            ..Default::default()
+        })
+        .expect("serialize v2 settings");
+        let pdf = legacy["options"]["pdf"]
+            .as_object_mut()
+            .expect("serialized PDF options");
+        pdf.remove("rotate_degrees");
+        pdf.remove("compression");
+        pdf.remove("linearize");
+        pdf.remove("split_pages");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let migrated = load_session_settings(&path);
+        assert_eq!(migrated.version, SETTINGS_VERSION);
+        assert_eq!(migrated.options.pdf, SessionPdfInputOptions::default());
+        assert_eq!(
+            migrated.to_conversion_options().pdf.compression,
+            crate::conversion::PdfCompression::Preserve
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn onboarding_completion_round_trips_and_v1_sessions_are_not_interrupted() {
         let dir = unique_dir("onboarding");
         let path = dir.join("session-settings.json");
@@ -856,6 +900,10 @@ mod tests {
         settings.options.pdf = SessionPdfInputOptions {
             page_from: Some(3),
             page_to: Some(7),
+            rotate_degrees: Some(90),
+            compression: "lossless".into(),
+            linearize: true,
+            split_pages: Some(2),
         };
         settings.options.spreadsheet = SessionSpreadsheetOptions {
             sheet_index: Some(2),
@@ -878,6 +926,13 @@ mod tests {
         assert_eq!(conversion.pandoc.pdf_engine.as_deref(), Some("xelatex"));
         assert!(conversion.pandoc.standalone);
         assert!(conversion.pandoc.toc);
+        assert_eq!(conversion.pdf.rotate_degrees, Some(90));
+        assert_eq!(
+            conversion.pdf.compression,
+            crate::conversion::PdfCompression::Lossless
+        );
+        assert!(conversion.pdf.linearize);
+        assert_eq!(conversion.pdf.split_pages, Some(2));
         assert_eq!(
             conversion.pandoc.reference_doc,
             Some(PathBuf::from("/tmp/ref.docx"))
@@ -1218,17 +1273,18 @@ mod tests {
         let path = dir.join("session-settings.json");
 
         let future = SessionSettings {
-            version: 2,
+            version: SETTINGS_VERSION + 1,
             show_archived: true,
             history_limit: 11,
             ..Default::default()
         };
-        // Write raw JSON so save_session_settings does not rewrite version to 1.
+        // Write raw JSON so save_session_settings does not rewrite the future version.
         fs::write(&path, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
 
         let loaded = load_session_settings(&path);
         assert_eq!(
-            loaded.version, 2,
+            loaded.version,
+            SETTINGS_VERSION + 1,
             "future version should be preserved on load"
         );
         assert!(loaded.show_archived);

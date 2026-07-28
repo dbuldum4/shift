@@ -3,9 +3,10 @@ use shift_core::conversion::{
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
     FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
-    PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, default_output_path,
-    ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url, materialize_paste_token,
-    parse_magic_paste, prepare_batch_destination, run_batch, url_display_host,
+    PdfCompression, PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions,
+    default_output_path, ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url,
+    materialize_paste_token, parse_magic_paste, prepare_batch_destination, run_batch,
+    url_display_host,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -572,6 +573,44 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                 parsed.pdf.page_from = from;
                 parsed.pdf.page_to = to;
             }
+            "--pdf-rotate" => {
+                cursor += 1;
+                let degrees = parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--pdf-rotate requires 90, 180, or 270".to_owned())?,
+                    "--pdf-rotate",
+                )?;
+                if !matches!(degrees, 90 | 180 | 270) {
+                    return Err("--pdf-rotate requires 90, 180, or 270".to_owned());
+                }
+                parsed.pdf.rotate_degrees = Some(degrees as u16);
+            }
+            "--pdf-compression" => {
+                cursor += 1;
+                parsed.pdf.compression = arguments
+                    .get(cursor)
+                    .ok_or_else(|| {
+                        "--pdf-compression requires preserve|lossless|smaller".to_owned()
+                    })?
+                    .to_string_lossy()
+                    .parse::<PdfCompression>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--pdf-linearize" => parsed.pdf.linearize = true,
+            "--pdf-split-pages" => {
+                cursor += 1;
+                let pages = parse_u32(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--pdf-split-pages requires a page count".to_owned())?,
+                    "--pdf-split-pages",
+                )?;
+                if pages == 0 {
+                    return Err("--pdf-split-pages must be at least 1".to_owned());
+                }
+                parsed.pdf.split_pages = Some(pages);
+            }
             "--" => {
                 cursor += 1;
                 while cursor < arguments.len() {
@@ -1071,11 +1110,15 @@ fn print_help() {
          --mono                  Downmix to mono when re-encoding\n  \
          --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
          --scale-width <PX>      Scale video/image width (height auto)\n\n\
-         PDF input options:\n  \
+         PDF toolkit options (qpdf):\n  \
          --pdf-password <SECRET> Password for encrypted PDFs\n  \
          --pages <FROM-TO>       1-based inclusive page range (e.g. 2-5)\n  \
          --page-from <N>         1-based start page\n  \
-         --page-to <N>           1-based end page\n\n\
+         --page-to <N>           1-based end page\n  \
+         --pdf-rotate <DEG>      Rotate selected pages by 90, 180, or 270\n  \
+         --pdf-compression <MODE> preserve|lossless|smaller\n  \
+         --pdf-linearize         Optimize PDF output for web delivery\n  \
+         --pdf-split-pages <N>   Pages per PDF in pdf-pages-zip output\n\n\
          MarkItDown options:\n  \
          --keep-data-uris        Keep base64 data URIs in Markdown output\n\n\
          Pandoc options:\n  \
@@ -1863,6 +1906,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_pdf_toolkit_flags_and_rejects_invalid_values() {
+        let parsed = parse_convert_args(&args(&[
+            "scan.pdf",
+            "--to",
+            "pdf-pages-zip",
+            "--pages",
+            "2-8",
+            "--pdf-rotate",
+            "90",
+            "--pdf-compression",
+            "smaller",
+            "--pdf-linearize",
+            "--pdf-split-pages",
+            "2",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.target, OutputFormat::PDF_PAGES_ZIP);
+        assert_eq!(parsed.pdf.page_from, Some(2));
+        assert_eq!(parsed.pdf.page_to, Some(8));
+        assert_eq!(parsed.pdf.rotate_degrees, Some(90));
+        assert_eq!(parsed.pdf.compression, PdfCompression::Smaller);
+        assert!(parsed.pdf.linearize);
+        assert_eq!(parsed.pdf.split_pages, Some(2));
+
+        for invalid in ["0", "45", "360"] {
+            let error =
+                parse_convert_args(&args(&["scan.pdf", "--pdf-rotate", invalid])).unwrap_err();
+            assert!(error.contains("--pdf-rotate"), "{error}");
+        }
+        let error =
+            parse_convert_args(&args(&["scan.pdf", "--pdf-compression", "maximum"])).unwrap_err();
+        assert!(error.contains("compression"), "{error}");
+        let error = parse_convert_args(&args(&["scan.pdf", "--pdf-split-pages", "0"])).unwrap_err();
+        assert!(error.contains("at least 1"), "{error}");
+    }
+
+    #[test]
     fn parse_secs_and_u32_helpers() {
         assert_eq!(parse_secs(OsStr::new("2.5"), "--start").unwrap(), 2.5);
         assert_eq!(parse_secs(OsStr::new("0"), "--duration").unwrap(), 0.0);
@@ -2047,6 +2127,7 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "qpdf",
             "spreadsheet",
             "sips",
             "ffmpeg",
@@ -2057,6 +2138,7 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "qpdf",
             "spreadsheet",
             "ffmpeg",
         ];

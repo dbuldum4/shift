@@ -11,6 +11,7 @@ mod markitdown;
 mod pandoc;
 mod pdf_slice;
 mod process;
+mod qpdf;
 mod sips;
 mod sources;
 mod spreadsheet;
@@ -63,6 +64,7 @@ pub use process::{
     resolve_tool_executable, resolve_tool_path, run_command, run_command_cancellable,
     unique_temp_dir,
 };
+pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality};
 pub use sources::{
     MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
@@ -110,6 +112,8 @@ impl OutputFormat {
     pub const VTT: Self = Self("vtt");
     /// PNG frame sequence packaged as a single ZIP (FFmpeg).
     pub const PNG_SEQUENCE_ZIP: Self = Self("png-sequence-zip");
+    /// Lossless per-page PDFs packaged as one downloadable artifact.
+    pub const PDF_PAGES_ZIP: Self = Self("pdf-pages-zip");
 
     // Still-image writers owned by the sips adapter (macOS ImageIO).
     // PNG/JPG/GIF/PDF above are shared with FFmpeg/Pandoc; see
@@ -350,6 +354,8 @@ impl OutputFormat {
         Self::PNG_SEQUENCE_ZIP,
         Self::SRT,
         Self::VTT,
+        // PDF toolkit.
+        Self::PDF_PAGES_ZIP,
         // Still images (must stay in sync with `IMAGE`).
         Self::TIFF,
         Self::BMP,
@@ -365,6 +371,9 @@ impl OutputFormat {
 
     /// Tabular writers owned by the spreadsheet adapter.
     pub const SPREADSHEET: &'static [Self] = &[Self::CSV, Self::TSV, Self::XLSX];
+
+    /// Downloadable compound artifacts owned by the PDF toolkit.
+    pub const PDF_TOOLKIT: &'static [Self] = &[Self::PDF_PAGES_ZIP];
 
     /// Still-image writers that only the sips adapter provides.
     ///
@@ -437,6 +446,7 @@ impl OutputFormat {
             "srt" => "SubRip (SRT)",
             "vtt" => "WebVTT",
             "png-sequence-zip" => "PNG Sequence (ZIP)",
+            "pdf-pages-zip" => "PDF Pages (ZIP)",
             "tiff" => "TIFF Image",
             "bmp" => "BMP Image",
             "heic" => "HEIC Image",
@@ -497,7 +507,7 @@ impl OutputFormat {
             "icml" => "icml",
             "fb2" => "fb2",
             "plain" | "ansi" => "txt",
-            "png-sequence-zip" => "zip",
+            "png-sequence-zip" | "pdf-pages-zip" => "zip",
             // Media format ids match their file extensions.
             other => other,
         }
@@ -546,7 +556,7 @@ impl OutputFormat {
             "icns" => "image/x-icns",
             "srt" => "application/x-subrip",
             "vtt" => "text/vtt",
-            "png-sequence-zip" => "application/zip",
+            "png-sequence-zip" | "pdf-pages-zip" => "application/zip",
             "csv" => "text/csv",
             "tsv" => "text/tab-separated-values",
             "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -609,6 +619,7 @@ impl std::str::FromStr for OutputFormat {
             "heif" => "heic",
             "jpeg2000" | "jpx" => "jp2",
             "png-zip" | "png_sequence" | "frames-zip" | "png-sequence-zip" => "png-sequence-zip",
+            "pdf-zip" | "pdf_pages" | "pdf-pages" | "pdf-pages-zip" => "pdf-pages-zip",
             other => other,
         };
         Self::ALL
@@ -636,6 +647,14 @@ pub struct PdfInputOptions {
     pub page_from: Option<u32>,
     /// 1-based inclusive page range end.
     pub page_to: Option<u32>,
+    /// Relative clockwise rotation applied after page selection.
+    pub rotate_degrees: Option<u16>,
+    /// Stream and image rewrite policy for PDF outputs.
+    pub compression: PdfCompression,
+    /// Produce a web-optimized, linearized PDF.
+    pub linearize: bool,
+    /// Pages per PDF inside `pdf-pages-zip` (defaults to one).
+    pub split_pages: Option<u32>,
 }
 
 impl PdfInputOptions {
@@ -1129,6 +1148,9 @@ impl ConversionRegistry {
     /// Markdown/HTML, so MarkItDown and Docling keep document → text routes.
     /// CSV chainable output allows a second hop into those engines when needed.
     ///
+    /// qpdf owns lossless PDF → PDF rewrites and PDF page ZIPs. It is a direct
+    /// route and does not compete with document extraction engines.
+    ///
     /// sips is registered immediately before FFmpeg, which is the only module
     /// it overlaps: both accept still images (`png`, `jpg`, `tiff`, `bmp`,
     /// `gif`) and write `png`/`jpg`/`gif`. sips wins those pairs because it is
@@ -1148,6 +1170,7 @@ impl ConversionRegistry {
             .with_module(PandocModule::default())
             .with_module(DefuddleModule::default())
             .with_module(DoclingModule::default())
+            .with_module(QpdfModule::default())
             .with_module(SpreadsheetModule);
         #[cfg(target_os = "macos")]
         let registry = registry.with_module(SipsModule::default());
@@ -1296,22 +1319,26 @@ impl ConversionRegistry {
         // external tool command line.
         let mut options = options.clone();
         let mut slice_guard: Option<TempDirGuard> = None;
-        let convert_input = if is_pdf_path(input) && options.pdf.needs_preprocessing() {
-            let sliced = extract_pdf_pages(
-                input,
-                options.pdf.page_from.unwrap_or(1),
-                options.pdf.page_to,
-                options.pdf.password.as_deref(),
-                options.cancel.clone(),
-            )?;
-            options.pdf.password = None;
-            if let Some(parent) = sliced.parent() {
-                slice_guard = Some(TempDirGuard(parent.to_path_buf()));
-            }
-            sliced
-        } else {
-            input.to_path_buf()
-        };
+        let direct_qpdf = matches!(route, ConversionRoute::Direct(module) if module.id() == "qpdf");
+        let convert_input =
+            if is_pdf_path(input) && options.pdf.needs_preprocessing() && !direct_qpdf {
+                let sliced = extract_pdf_pages(
+                    input,
+                    options.pdf.page_from.unwrap_or(1),
+                    options.pdf.page_to,
+                    options.pdf.password.as_deref(),
+                    options.cancel.clone(),
+                )?;
+                options.pdf.password = None;
+                options.pdf.page_from = None;
+                options.pdf.page_to = None;
+                if let Some(parent) = sliced.parent() {
+                    slice_guard = Some(TempDirGuard(parent.to_path_buf()));
+                }
+                sliced
+            } else {
+                input.to_path_buf()
+            };
         let _slice_cleanup = slice_guard;
         let input = convert_input.as_path();
 
@@ -2150,13 +2177,14 @@ mod tests {
     }
 
     #[test]
-    fn all_catalog_matches_pandoc_plus_media_plus_image_plus_spreadsheet() {
+    fn all_catalog_matches_its_output_partitions() {
         assert_eq!(
             OutputFormat::ALL.len(),
             OutputFormat::PANDOC.len()
                 + OutputFormat::MEDIA.len()
                 + OutputFormat::IMAGE.len()
                 + OutputFormat::SPREADSHEET.len()
+                + OutputFormat::PDF_TOOLKIT.len()
         );
         for format in OutputFormat::PANDOC {
             assert!(OutputFormat::ALL.contains(format));
@@ -2168,6 +2196,9 @@ mod tests {
             assert!(OutputFormat::ALL.contains(format));
         }
         for format in OutputFormat::SPREADSHEET {
+            assert!(OutputFormat::ALL.contains(format));
+        }
+        for format in OutputFormat::PDF_TOOLKIT {
             assert!(OutputFormat::ALL.contains(format));
         }
     }
@@ -2627,6 +2658,7 @@ mod tests {
             page_from: Some(2),
             page_to: Some(5),
             password: Some("x".into()),
+            ..Default::default()
         };
         assert!(range.needs_slice());
         assert!(range.needs_preprocessing());
@@ -2958,6 +2990,8 @@ mod tests {
         let media_ids: HashSet<&str> = OutputFormat::MEDIA.iter().map(|f| f.id()).collect();
         let image_ids: HashSet<&str> = OutputFormat::IMAGE.iter().map(|f| f.id()).collect();
         let sheet_ids: HashSet<&str> = OutputFormat::SPREADSHEET.iter().map(|f| f.id()).collect();
+        let pdf_toolkit_ids: HashSet<&str> =
+            OutputFormat::PDF_TOOLKIT.iter().map(|f| f.id()).collect();
 
         assert_eq!(
             OutputFormat::ALL.len(),
@@ -2965,6 +2999,7 @@ mod tests {
                 + OutputFormat::MEDIA.len()
                 + OutputFormat::IMAGE.len()
                 + OutputFormat::SPREADSHEET.len()
+                + OutputFormat::PDF_TOOLKIT.len()
         );
         assert_eq!(
             image_ids.len(),
@@ -2975,6 +3010,11 @@ mod tests {
             sheet_ids.len(),
             OutputFormat::SPREADSHEET.len(),
             "duplicate ids in SPREADSHEET"
+        );
+        assert_eq!(
+            pdf_toolkit_ids.len(),
+            OutputFormat::PDF_TOOLKIT.len(),
+            "duplicate ids in PDF_TOOLKIT"
         );
         // IMAGE holds only the writers no other catalog claims; formats sips
         // shares with FFmpeg/Pandoc (png, jpg, gif, pdf) stay in their original
@@ -2994,11 +3034,24 @@ mod tests {
             ("PANDOC", &pandoc_ids),
             ("MEDIA", &media_ids),
             ("IMAGE", &image_ids),
+            ("PDF_TOOLKIT", &pdf_toolkit_ids),
         ] {
             let overlap: Vec<_> = sheet_ids.intersection(other).copied().collect();
             assert!(
                 overlap.is_empty(),
                 "ids appear in both SPREADSHEET and {name}: {overlap:?}"
+            );
+        }
+        for (name, other) in [
+            ("PANDOC", &pandoc_ids),
+            ("MEDIA", &media_ids),
+            ("IMAGE", &image_ids),
+            ("SPREADSHEET", &sheet_ids),
+        ] {
+            let overlap: Vec<_> = pdf_toolkit_ids.intersection(other).copied().collect();
+            assert!(
+                overlap.is_empty(),
+                "ids appear in both PDF_TOOLKIT and {name}: {overlap:?}"
             );
         }
         assert_eq!(
@@ -3032,10 +3085,13 @@ mod tests {
             .collect::<HashSet<&str>>()
             .union(&sheet_ids)
             .copied()
+            .collect::<HashSet<&str>>()
+            .union(&pdf_toolkit_ids)
+            .copied()
             .collect();
         assert_eq!(
             union, all_ids,
-            "PANDOC ∪ MEDIA ∪ IMAGE ∪ SPREADSHEET must equal ALL"
+            "PANDOC ∪ MEDIA ∪ IMAGE ∪ SPREADSHEET ∪ PDF_TOOLKIT must equal ALL"
         );
 
         // Every ALL entry is in exactly one partition.
@@ -3044,13 +3100,15 @@ mod tests {
             let in_media = OutputFormat::MEDIA.contains(format);
             let in_image = OutputFormat::IMAGE.contains(format);
             let in_sheet = OutputFormat::SPREADSHEET.contains(format);
+            let in_pdf_toolkit = OutputFormat::PDF_TOOLKIT.contains(format);
             assert_eq!(
                 usize::from(in_pandoc)
                     + usize::from(in_media)
                     + usize::from(in_image)
-                    + usize::from(in_sheet),
+                    + usize::from(in_sheet)
+                    + usize::from(in_pdf_toolkit),
                 1,
-                "{} must appear in exactly one of PANDOC/MEDIA/IMAGE/SPREADSHEET (pandoc={in_pandoc}, media={in_media}, image={in_image}, sheet={in_sheet})",
+                "{} must appear in exactly one output partition (pandoc={in_pandoc}, media={in_media}, image={in_image}, sheet={in_sheet}, pdf_toolkit={in_pdf_toolkit})",
                 format.id()
             );
         }
@@ -3428,6 +3486,7 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "qpdf",
             "spreadsheet",
             "sips",
             "ffmpeg",
@@ -3438,6 +3497,7 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "qpdf",
             "spreadsheet",
             "ffmpeg",
         ];
@@ -3706,6 +3766,7 @@ mod tests {
                 page_from: from,
                 page_to: to,
                 password: password.map(str::to_owned),
+                ..Default::default()
             };
             assert_eq!(
                 opts.needs_slice(),

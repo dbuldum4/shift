@@ -28,7 +28,8 @@ resolution, retry, cancellation, or recursive source discovery.
 - Optional `ConversionOptions.progress` (`ProgressSink`) reports phase/fraction;
   FFmpeg may emit determinate progress, other engines stay indeterminate.
 - PDF page range is preprocessed with `qpdf` in shared dispatch
-  (`pdf_slice.rs`) before modules run; not a global readiness requirement.
+  (`pdf_slice.rs`) before non-qpdf modules run. The qpdf adapter handles
+  PDF-native rewrites directly so extraction and toolkit options use one process.
 - Session UI knobs (except secrets) persist in `session_settings.rs` under
   Application Support; CLI never loads that file. Module priority stays in
   `preferences.rs`.
@@ -62,6 +63,9 @@ strings; XLSX writes preserve cell text (no boolean/number inference) except
 re-emitting `YYYY-MM-DD` as Excel dates. It does not advertise Markdown or HTML,
 so MarkItDown/Docling/Pandoc keep document → text routes. Sheet-native paths
 default-suggest CSV; CSV/TSV are chainable for a second hop into document engines.
+The qpdf adapter owns PDF → PDF and PDF → `pdf-pages-zip`, including page
+selection, secure password input, rotation, compression, linearization, and
+split grouping. It never mutates the source and records its invocation.
 `preferences::DEFAULT_MODULES` must list every module id in registration order;
 an id missing there is sorted last by `with_priority` and silently loses every
 overlap.
@@ -77,7 +81,7 @@ Optional knobs live on `ConversionOptions`:
 | `markitdown` | keep data URIs |
 | `sips` | max dimension, quality, rotate, flip, strip color profile |
 | `spreadsheet` | sheet name, sheet index (1-based); values-only csv/tsv/xlsx |
-| `pdf` | password (never persisted), page_from / page_to (qpdf slice) |
+| `pdf` | password (never persisted), page_from / page_to, rotate, compression, linearize, split pages |
 
 App and CLI expose the same conversion flags; defaults match historical fixed
 invocations. Batch items may `Inherit` or `Override` the session output format

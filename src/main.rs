@@ -31,8 +31,8 @@ use shift_core::conversion::{
     BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
     ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingImageExportMode, DoclingOptions,
     DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
-    MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfInputOptions, Readiness,
-    SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, available_ready_outputs,
+    MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
+    Readiness, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, available_ready_outputs,
     available_ready_url_outputs, expand_input_paths, is_audio_output, is_ffmpeg_output,
     is_image_output, is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste,
     parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
@@ -1457,6 +1457,10 @@ pub(crate) struct ConversionPanelView {
     pdf_page_from_input: Entity<TextInput>,
     pdf_page_to_input: Entity<TextInput>,
     pdf_password_input: Entity<TextInput>,
+    pdf_rotate_degrees: Option<u16>,
+    pdf_compression: PdfCompression,
+    pdf_linearize: bool,
+    pdf_split_pages_input: Entity<TextInput>,
     markitdown_keep_data_uris: bool,
 }
 
@@ -1504,6 +1508,10 @@ fn conversion_options_panel(
         pdf_page_from_input,
         pdf_page_to_input,
         pdf_password_input,
+        pdf_rotate_degrees,
+        pdf_compression,
+        pdf_linearize,
+        pdf_split_pages_input,
         markitdown_keep_data_uris,
     } = view;
     let show_ffmpeg = active_modules.contains(&"ffmpeg");
@@ -1513,11 +1521,13 @@ fn conversion_options_panel(
     let show_markitdown = active_modules.contains(&"markitdown");
     let show_sips = active_modules.contains(&"sips");
     let show_spreadsheet = active_modules.contains(&"spreadsheet");
+    let show_qpdf = active_modules.contains(&"qpdf");
     // Quality only affects lossy encoders; hide it for lossless destinations
     // rather than showing a control that silently does nothing.
     let show_sips_quality = matches!(output_format.id(), "jpg" | "heic" | "avif" | "jp2");
     let rotation = sips_rotate_degrees.unwrap_or(0) % 360;
-    let show_pdf_pages = show_docling || show_markitdown;
+    let show_pdf_pages = show_docling || show_markitdown || show_qpdf;
+    let pdf_rotation = pdf_rotate_degrees.unwrap_or(0);
     let show_audio = is_audio_output(output_format) || is_video_output(output_format);
     let show_video = is_video_output(output_format) || is_image_output(output_format);
     let show_frame = is_image_output(output_format);
@@ -2423,6 +2433,144 @@ fn conversion_options_panel(
                                 .child(pdf_password_input),
                         ),
                 )
+        })
+        .when(show_qpdf, |panel| {
+            panel
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(THEME.text_muted)
+                        .child("PDF toolkit"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(THEME.text_muted).child("Rotate"))
+                        .child(chip(
+                            "pdf-rotate-none",
+                            "None",
+                            pdf_rotation == 0,
+                            cx,
+                            |this, _cx| this.pdf_rotate_degrees = None,
+                        ))
+                        .child(chip(
+                            "pdf-rotate-90",
+                            "90°",
+                            pdf_rotation == 90,
+                            cx,
+                            |this, _cx| this.pdf_rotate_degrees = Some(90),
+                        ))
+                        .child(chip(
+                            "pdf-rotate-180",
+                            "180°",
+                            pdf_rotation == 180,
+                            cx,
+                            |this, _cx| this.pdf_rotate_degrees = Some(180),
+                        ))
+                        .child(chip(
+                            "pdf-rotate-270",
+                            "270°",
+                            pdf_rotation == 270,
+                            cx,
+                            |this, _cx| this.pdf_rotate_degrees = Some(270),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child("Compression"),
+                        )
+                        .child(chip(
+                            "pdf-compress-preserve",
+                            PdfCompression::Preserve.label(),
+                            pdf_compression == PdfCompression::Preserve,
+                            cx,
+                            |this, _cx| this.pdf_compression = PdfCompression::Preserve,
+                        ))
+                        .child(chip(
+                            "pdf-compress-lossless",
+                            PdfCompression::Lossless.label(),
+                            pdf_compression == PdfCompression::Lossless,
+                            cx,
+                            |this, _cx| this.pdf_compression = PdfCompression::Lossless,
+                        ))
+                        .child(chip(
+                            "pdf-compress-smaller",
+                            PdfCompression::Smaller.label(),
+                            pdf_compression == PdfCompression::Smaller,
+                            cx,
+                            |this, _cx| this.pdf_compression = PdfCompression::Smaller,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child("Web delivery"),
+                        )
+                        .child(chip(
+                            "pdf-linearize-off",
+                            "Standard",
+                            !pdf_linearize,
+                            cx,
+                            |this, _cx| this.pdf_linearize = false,
+                        ))
+                        .child(chip(
+                            "pdf-linearize-on",
+                            "Linearized",
+                            pdf_linearize,
+                            cx,
+                            |this, _cx| this.pdf_linearize = true,
+                        )),
+                )
+                .when(output_format == OutputFormat::PDF_PAGES_ZIP, |section| {
+                    section
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child("Pages per split PDF"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(THEME.surface)
+                                        .border_1()
+                                        .border_color(THEME.border)
+                                        .child(pdf_split_pages_input),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_dim)
+                                .child("Each split PDF is packaged into one ZIP download."),
+                        )
+                })
         })
         .when(show_defuddle, |panel| {
             panel
@@ -3819,6 +3967,7 @@ fn module_label(id: &str) -> &str {
         "pandoc" => "Pandoc",
         "defuddle" => "Defuddle",
         "docling" => "Docling",
+        "qpdf" => "qpdf",
         "spreadsheet" => "Spreadsheet",
         "ffmpeg" => "FFmpeg",
         other => other,
@@ -3932,6 +4081,7 @@ fn module_description(id: &str) -> &str {
         "pandoc" => "Publishing formats (DOCX, PDF, HTML, wiki, and more).",
         "defuddle" => "Clean article extraction from URLs and local HTML.",
         "docling" => "Layout-aware PDF and office documents → Markdown/HTML/text.",
+        "qpdf" => "Lossless PDF rewrite, rotation, optimization, and page splitting.",
         "spreadsheet" => "Tabular conversion: Excel/ODS/CSV ↔ CSV/TSV/XLSX (values only).",
         "ffmpeg" => "Audio, video, stills, and subtitle conversion.",
         _ => "Conversion module.",
@@ -4841,6 +4991,7 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
             "Path to Node.js (required by bundled Defuddle)",
         ),
         ("SHIFT_DOCLING_BIN", "Path to the docling executable"),
+        ("SHIFT_QPDF_BIN", "Path to the qpdf executable"),
         ("SHIFT_FFMPEG_BIN", "Path to the ffmpeg executable"),
         (
             "SHIFT_PDF_ENGINE",
@@ -5298,7 +5449,7 @@ fn settings_about_panel(priority: &[String]) -> impl IntoElement + use<> {
                 .text_xs()
                 .text_color(THEME.text_muted)
                 .child(
-                    "MarkItDown · Pandoc · Defuddle · Docling · FFmpeg",
+                    "MarkItDown · Pandoc · Defuddle · Docling · qpdf · Spreadsheet · sips · FFmpeg",
                 ),
         )
 }

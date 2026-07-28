@@ -1,6 +1,7 @@
 use crate::*;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
+use shift_core::conversion::PdfCompression;
 use std::io;
 use std::sync::mpsc::TryRecvError;
 
@@ -314,6 +315,10 @@ pub(crate) struct Shift {
     pub(crate) pdf_page_from_input: Entity<TextInput>,
     pub(crate) pdf_page_to_input: Entity<TextInput>,
     pub(crate) pdf_password_input: Entity<TextInput>,
+    pub(crate) pdf_rotate_degrees: Option<u16>,
+    pub(crate) pdf_compression: PdfCompression,
+    pub(crate) pdf_linearize: bool,
+    pub(crate) pdf_split_pages_input: Entity<TextInput>,
     pub(crate) markitdown_keep_data_uris: bool,
 }
 
@@ -437,6 +442,17 @@ impl Shift {
             )
         });
         let pdf_password_input = cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+        let pdf_split_pages_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "1",
+                options
+                    .pdf
+                    .split_pages
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            )
+        });
         let spreadsheet_sheet_name_input = cx.new(|cx| {
             TextInput::new(
                 cx,
@@ -574,6 +590,10 @@ impl Shift {
             pdf_page_from_input,
             pdf_page_to_input,
             pdf_password_input,
+            pdf_rotate_degrees: options.pdf.rotate_degrees,
+            pdf_compression: options.pdf.compression,
+            pdf_linearize: options.pdf.linearize,
+            pdf_split_pages_input,
             markitdown_keep_data_uris: options.markitdown.keep_data_uris,
         }
     }
@@ -1588,6 +1608,10 @@ impl Shift {
             parse_optional_u32(self.ffmpeg_subtitle_stream_input.read(cx).content())?;
         let page_from = parse_optional_u32(self.pdf_page_from_input.read(cx).content())?;
         let page_to = parse_optional_u32(self.pdf_page_to_input.read(cx).content())?;
+        let split_pages = parse_optional_u32(self.pdf_split_pages_input.read(cx).content())?;
+        if split_pages == Some(0) {
+            return Err("PDF split group must be at least 1 page".into());
+        }
         let password = {
             let value = self.pdf_password_input.read(cx).content().trim().to_owned();
             if value.is_empty() { None } else { Some(value) }
@@ -1679,6 +1703,10 @@ impl Shift {
                 password,
                 page_from,
                 page_to,
+                rotate_degrees: self.pdf_rotate_degrees,
+                compression: self.pdf_compression,
+                linearize: self.pdf_linearize,
+                split_pages,
             },
             cancel: None,
             progress: None,
@@ -2928,6 +2956,10 @@ impl Render for Shift {
         let pdf_page_from_input = self.pdf_page_from_input.clone();
         let pdf_page_to_input = self.pdf_page_to_input.clone();
         let pdf_password_input = self.pdf_password_input.clone();
+        let pdf_rotate_degrees = self.pdf_rotate_degrees;
+        let pdf_compression = self.pdf_compression;
+        let pdf_linearize = self.pdf_linearize;
+        let pdf_split_pages_input = self.pdf_split_pages_input.clone();
         let markitdown_keep_data_uris = self.markitdown_keep_data_uris;
         let diagnostics = self.diagnostics.clone();
         let diagnostics_loading = self.diagnostics_loading;
@@ -3109,6 +3141,10 @@ impl Render for Shift {
                                     pdf_page_from_input,
                                     pdf_page_to_input,
                                     pdf_password_input,
+                                    pdf_rotate_degrees,
+                                    pdf_compression,
+                                    pdf_linearize,
+                                    pdf_split_pages_input,
                                     markitdown_keep_data_uris,
                                 },
                                 conversion_progress,
