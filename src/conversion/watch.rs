@@ -42,7 +42,10 @@ impl WatchTracker {
     /// Return all convertible files in a deliberate one-shot snapshot.
     ///
     /// `watch --once` uses this instead of waiting out a debounce interval.
-    pub fn snapshot(&mut self, input_dir: &Path) -> Result<Vec<ExpandedInputPath>, ConversionError> {
+    pub fn snapshot(
+        &mut self,
+        input_dir: &Path,
+    ) -> Result<Vec<ExpandedInputPath>, ConversionError> {
         let paths = expand_input_paths_preserving_roots(&[input_dir], true)?;
         let now = SystemTime::now();
         self.files.clear();

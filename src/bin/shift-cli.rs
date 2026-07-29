@@ -446,10 +446,7 @@ fn run_watch_batch(
             ) {
                 Ok(input) => input,
                 Err(error) => {
-                    eprintln!(
-                        "shift-cli: skipped {}: {error}",
-                        expanded.path.display()
-                    );
+                    eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
                     continue;
                 }
             }
@@ -460,10 +457,7 @@ fn run_watch_batch(
         formats.push(enqueue.output_format);
         formats.extend(also_to.iter().copied());
         if let Err(error) = validate_batch_output_formats(registry, &input.source, &formats) {
-            eprintln!(
-                "shift-cli: skipped {}: {error}",
-                expanded.path.display()
-            );
+            eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
             continue;
         }
         let ids = queue.enqueue_fan_out(input, also_to, enqueue);
@@ -4490,13 +4484,8 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::write(&file, "not a folder").unwrap();
-        let err = parse_watch_args(&args(&[
-            "watch",
-            file.to_str().unwrap(),
-            "-O",
-            "/tmp/out",
-        ]))
-        .unwrap_err();
+        let err = parse_watch_args(&args(&["watch", file.to_str().unwrap(), "-O", "/tmp/out"]))
+            .unwrap_err();
         assert!(err.contains("local directory"));
         let _ = std::fs::remove_file(file);
     }
