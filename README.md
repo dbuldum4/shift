@@ -122,6 +122,11 @@ persist under Application Support (`session-settings.json`).
 
 **Result actions:** Download, Copy (text to clipboard, or path for binary),
 Reveal in Finder, Open, engine pipeline badge, Show command (redacted argv).
+Binary results also show a local, bounded header inspection: image dimensions,
+PDF version/page-object markers, media container/audio facts, or ZIP entry
+counts where the format exposes them. Shift never decodes media or extracts
+archive contents merely to render this inspection; use **Open** for a full
+preview in your default app.
 FFmpeg long encodes can show determinate progress; other engines stay
 indeterminate. Failed conversions surface install hints when an engine is
 missing.

@@ -5,6 +5,7 @@ mod defuddle;
 mod diagnostics;
 mod docling;
 mod ffmpeg;
+mod inspection;
 mod magic_paste;
 mod markitdown;
 mod pandoc;
@@ -44,6 +45,9 @@ pub use docling::{DoclingImageExportMode, DoclingModule, DoclingOptions, Docling
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality, input_looks_like_media,
     is_audio_output, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+};
+pub use inspection::{
+    ArtifactInspection, MAX_INSPECTION_PREFIX_BYTES, MAX_INSPECTION_SUFFIX_BYTES, inspect_binary,
 };
 pub use magic_paste::{
     MAX_REMOTE_FILE_BYTES, MagicPaste, PasteToken, REMOTE_DOWNLOAD_TIMEOUT,
@@ -774,7 +778,13 @@ impl ConversionArtifact {
         if self.format.is_text_previewable() {
             return text_preview_excerpt(&self.bytes);
         }
-        binary_preview_summary(self)
+        self.inspection().summary()
+    }
+
+    /// Header-derived facts for a binary result, safe to render without
+    /// decoding media or extracting archive contents.
+    pub fn inspection(&self) -> ArtifactInspection {
+        inspect_binary(self.format, &self.bytes)
     }
 
     /// Fill pipeline/invocations for a single-module conversion when unset.
@@ -931,31 +941,6 @@ fn text_preview_excerpt(bytes: &[u8]) -> String {
         excerpt.push_str("The conversion completed with an empty document.");
     }
     excerpt
-}
-
-fn binary_preview_summary(artifact: &ConversionArtifact) -> String {
-    let size = format_byte_size(artifact.bytes.len() as u64);
-    let pipeline = if artifact.pipeline.is_empty() {
-        artifact.module_id.to_owned()
-    } else {
-        artifact.pipeline.join(" → ")
-    };
-    let kind = if ffmpeg::is_video_output(artifact.format) {
-        "Video"
-    } else if ffmpeg::is_audio_output(artifact.format) {
-        "Audio"
-    } else if ffmpeg::is_image_output(artifact.format) {
-        "Image"
-    } else if ffmpeg::is_subtitle_output(artifact.format) {
-        "Subtitles"
-    } else {
-        "Binary"
-    };
-    format!(
-        "{kind} · {} · {size}\nFile: {}\nEngine: {pipeline}\n\nNot shown inline — Download, drag, or Reveal after save.\nNo media player in Shift; open with your default app after saving.",
-        artifact.format.label(),
-        artifact.file_name,
-    )
 }
 
 fn format_byte_size(bytes: u64) -> String {
@@ -2113,7 +2098,11 @@ mod tests {
             summary.contains("Audio") || summary.contains("MP3") || summary.contains("mp3"),
             "{summary}"
         );
-        assert!(summary.contains("Not shown inline"), "{summary}");
+        assert!(summary.contains("preview"), "{summary}");
+        assert!(
+            summary.contains("Open") || summary.contains("Download"),
+            "binary notes should steer to Open/Download: {summary}"
+        );
         assert!(!summary.contains("player widget"), "{summary}");
     }
 
@@ -2446,9 +2435,17 @@ mod tests {
         };
         assert_eq!(binary.text(), Some("not really video"));
         let bin_preview = binary.preview_summary();
-        assert!(bin_preview.contains("Not shown inline"), "{bin_preview}");
+        assert!(bin_preview.contains("preview"), "{bin_preview}");
         assert!(
             bin_preview.contains("Video") || bin_preview.contains("MP4"),
+            "{bin_preview}"
+        );
+        assert!(
+            bin_preview.contains("Size:") || bin_preview.contains("Size "),
+            "expected a size fact: {bin_preview}"
+        );
+        assert!(
+            bin_preview.contains("Open") || bin_preview.contains("Download"),
             "{bin_preview}"
         );
     }
@@ -2702,7 +2699,11 @@ mod tests {
             let text_preview = text.preview_summary();
             assert!(text_preview.contains("Title") || text_preview.contains("truncated"));
             let binary_preview = binary.preview_summary();
-            assert!(binary_preview.contains("Not shown inline"));
+            assert!(binary_preview.contains("preview"));
+            assert!(
+                binary_preview.contains("Open") || binary_preview.contains("Download"),
+                "{binary_preview}"
+            );
         }
 
         #[test]
@@ -3638,8 +3639,13 @@ mod tests {
                 );
             } else {
                 assert!(
-                    preview.contains("Not shown inline"),
-                    "expected binary preview for {}: {preview}",
+                    preview.contains("preview"),
+                    "expected binary inspection for {}: {preview}",
+                    format.id()
+                );
+                assert!(
+                    preview.contains("Open") || preview.contains("Download"),
+                    "binary notes should steer to Open/Download for {}: {preview}",
                     format.id()
                 );
             }
@@ -3947,19 +3953,27 @@ mod tests {
         let artifact = ConversionArtifact {
             file_name: "subs.srt".into(),
             media_type: "application/x-subrip",
-            bytes: b"1\n".to_vec(),
+            bytes: b"1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_vec(),
             format: OutputFormat::SRT,
             module_id: "ffmpeg",
             pipeline: Vec::new(),
             invocations: Vec::new(),
         };
-        let summary = binary_preview_summary(&artifact);
+        // SRT is text-previewable — the normal Ready path uses text excerpts.
+        assert!(artifact.format.is_text_previewable());
+        let text_preview = artifact.preview_summary();
         assert!(
-            summary.contains("Subtitles"),
-            "expected Subtitles kind, got: {summary}"
+            text_preview.contains("Hi") || text_preview.contains("00:00:01"),
+            "expected text excerpt for SRT, got: {text_preview}"
         );
-        assert!(summary.contains("subs.srt"));
-        assert!(summary.contains("ffmpeg"));
+        // Direct inspection still labels the format without implying a player.
+        let summary = artifact.inspection().summary();
+        assert!(
+            summary.contains("preview"),
+            "expected inspection, got: {summary}"
+        );
+        assert!(summary.contains("SRT") || summary.contains("SubRip"));
+        assert!(summary.contains("Open") || summary.contains("Download"));
     }
 
     #[test]

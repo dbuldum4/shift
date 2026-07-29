@@ -2881,8 +2881,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
             let file_name_full = artifact.file_name.clone();
             let file_name_display = ellipsize_chars(&artifact.file_name, 42);
             let size = format_file_size(artifact.bytes.len() as u64);
-            let excerpt = artifact_preview(artifact.as_ref());
             let is_text = artifact.format.is_text_previewable();
+            // Inspect binaries once per Ready paint; skip text-path preview work
+            // for binary results (excerpt is only mounted when is_text).
+            let inspection = (!is_text).then(|| artifact.inspection());
+            let excerpt = if is_text {
+                artifact_preview(artifact.as_ref())
+            } else {
+                SharedString::default()
+            };
             let pipeline_badge: SharedString = if artifact.pipeline.is_empty() {
                 module_label(artifact.module_id).into()
             } else {
@@ -3070,13 +3077,41 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     ))
                                 }),
                         )
-                        .when(!is_text, |card| {
+                        .when_some(inspection, |card, inspection| {
                             card.child(
                                 div()
-                                    .text_xs()
-                                    .text_color(THEME.text_muted)
+                                    .id("binary-artifact-inspection")
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .bg(THEME.raised)
+                                    .border_1()
+                                    .border_color(THEME.border)
                                     .child(
-                                        "Not shown inline — Download, drag the file above, or Open with your default app.",
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(THEME.text_secondary)
+                                            .child(format!("{} inspection", inspection.kind)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(THEME.text_primary)
+                                            .child(inspection.headline),
+                                    )
+                                    .children(inspection.facts.into_iter().map(|fact| {
+                                        div().text_xs().text_color(THEME.text_secondary).child(fact)
+                                    }))
+                                    .child(
+                                        div()
+                                            .pt_1()
+                                            .text_xs()
+                                            .text_color(THEME.text_muted)
+                                            .child(inspection.note),
                                     ),
                             )
                         })
@@ -7690,6 +7725,25 @@ mod pure_ui_helpers {
         };
         let bp = artifact_preview(&binary);
         assert!(!bp.is_empty());
+
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&480u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let image = ConversionArtifact {
+            file_name: "preview.png".into(),
+            media_type: "image/png",
+            bytes: png,
+            format: OutputFormat::PNG,
+            module_id: "ffmpeg",
+            pipeline: vec!["ffmpeg"],
+            invocations: Vec::new(),
+        };
+        let image_preview = artifact_preview(&image);
+        assert!(
+            image_preview.as_ref().contains("640 × 480 px"),
+            "{image_preview}"
+        );
 
         let empty_text = sample_artifact(2, Vec::new());
         let _ = artifact_preview(&empty_text); // must not panic
