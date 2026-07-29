@@ -286,6 +286,15 @@ cargo run --bin shift-cli -- notes.md --to docx --reference-doc ~/Templates/ref.
 
 # Recursive folder batch
 cargo run --bin shift-cli -- ./inbox --recursive -O ./out -t markdown --force
+# Recreates nested folders below ./out.
+
+# One input → several outputs (repeat --also-to as needed)
+cargo run --bin shift-cli -- report.docx -t markdown \
+  --also-to html --also-to pdf -O ./out
+
+# Safe shared naming template
+cargo run --bin shift-cli -- ./inbox --recursive -O ./out \
+  --name-template '{parent}-{stem}-{format}.{ext}'
 
 # Verbose redacted command lines + progress on stderr
 cargo run --bin shift-cli -- clip.mp4 --to mp3 --verbose --progress
@@ -307,14 +316,34 @@ cargo run --bin shift-cli -- formats
 
 After `cargo install --path . --bin shift-cli`, use `shift-cli` directly in the
 same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
-In the native app, multi-select or multi-drop opens the queue panel: choose an
-output folder, press Start (or Cancel), and Retry failed items. Files are only
-queued on drop — conversion does not auto-start. Progress, retry, and
-cancellation use the same `run_batch` runner as the CLI (Ctrl-C cancels).
+In the native app, multi-select or multi-drop opens the queue panel. Each queued
+output has a capability-filtered **Format** picker, **+ output** adds
+another output for the same source, and **Remove** drops a queued output. Choose
+an output folder, optionally apply a naming template, then press Start (or
+Cancel) and Retry failed items. Files are only queued on drop — conversion does
+not auto-start. Progress, retry, and cancellation use the same `run_batch`
+runner as the CLI (Ctrl-C cancels).
 
 Overwrite policy matches single-file and batch: an existing destination fails
 unless you pass `--force` (app batch does not force-overwrite). Within one
 batch queue, colliding output names are uniquified (`report.md`, `report-1.md`).
+Recursive folder batches preserve the path below each selected source folder,
+so `inbox/team/drafts/report.pdf` writes to
+`out/team/drafts/report.md`.
+
+Batch naming templates are resolved in the shared queue and accept:
+
+| Placeholder | Value |
+|---|---|
+| `{stem}` | Source file or URL stem |
+| `{parent}` | Immediate source parent directory (`root` when unavailable) |
+| `{format}` | Canonical output format id, such as `markdown` |
+| `{ext}` | Output extension, such as `md` |
+
+Templates create a file name, not a path. Shift rejects traversal, directory
+separators, unknown placeholders, control characters, and platform-reserved
+file-name characters. If a template omits the correct extension, Shift appends
+it. The default is `{stem}.{ext}`.
 
 ## Architecture
 

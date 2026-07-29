@@ -11,6 +11,25 @@ pub const MAX_EXPAND_DEPTH: usize = 8;
 /// Hard cap on files returned from a single expand call.
 pub const MAX_EXPAND_FILES: usize = 500;
 
+/// One expanded local input plus its path relative to the selected folder.
+///
+/// `relative_path` is `None` for an explicitly selected file. For files found
+/// below a selected directory it contains the path below that directory,
+/// including the file name. Batch callers use its parent to recreate the
+/// source hierarchy below the chosen output directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpandedInputPath {
+    pub path: PathBuf,
+    pub relative_path: Option<PathBuf>,
+}
+
+impl ExpandedInputPath {
+    /// Safe root-relative directory to reproduce below a batch output folder.
+    pub fn relative_parent(&self) -> Option<&Path> {
+        self.relative_path.as_deref().and_then(Path::parent)
+    }
+}
+
 /// Collect the union of input extensions from every module in `registry`.
 pub fn supported_input_extensions(registry: &ConversionRegistry) -> HashSet<String> {
     let mut set = HashSet::new();
@@ -42,8 +61,23 @@ pub fn expand_input_paths(
     paths: &[impl AsRef<Path>],
     recursive: bool,
 ) -> Result<Vec<PathBuf>, ConversionError> {
+    Ok(expand_input_paths_preserving_roots(paths, recursive)?
+        .into_iter()
+        .map(|expanded| expanded.path)
+        .collect())
+}
+
+/// Expand paths while retaining each recursively discovered file's path below
+/// the selected directory.
+///
+/// This is the preferred batch API. The compatibility
+/// [`expand_input_paths`] wrapper intentionally returns only file paths.
+pub fn expand_input_paths_preserving_roots(
+    paths: &[impl AsRef<Path>],
+    recursive: bool,
+) -> Result<Vec<ExpandedInputPath>, ConversionError> {
     let extensions = default_supported_input_extensions();
-    expand_input_paths_with_extensions(paths, recursive, extensions)
+    expand_input_paths_preserving_roots_with_extensions(paths, recursive, extensions)
 }
 
 /// Like [`expand_input_paths`], but uses an explicit extension allow-list.
@@ -52,12 +86,36 @@ pub fn expand_input_paths_with_extensions(
     recursive: bool,
     extensions: &HashSet<String>,
 ) -> Result<Vec<PathBuf>, ConversionError> {
+    Ok(
+        expand_input_paths_preserving_roots_with_extensions(paths, recursive, extensions)?
+            .into_iter()
+            .map(|expanded| expanded.path)
+            .collect(),
+    )
+}
+
+/// Like [`expand_input_paths_preserving_roots`], but uses an explicit extension
+/// allow-list.
+pub fn expand_input_paths_preserving_roots_with_extensions(
+    paths: &[impl AsRef<Path>],
+    recursive: bool,
+    extensions: &HashSet<String>,
+) -> Result<Vec<ExpandedInputPath>, ConversionError> {
     let mut out = Vec::new();
     let mut visited = HashSet::new();
 
     for path in paths {
         let path = expand_tilde(path.as_ref());
-        expand_one(&path, recursive, extensions, 0, &mut visited, &mut out)?;
+        let root = path.is_dir().then_some(path.as_path());
+        expand_one(
+            &path,
+            root,
+            recursive,
+            extensions,
+            0,
+            &mut visited,
+            &mut out,
+        )?;
     }
 
     Ok(out)
@@ -82,11 +140,12 @@ fn expand_tilde(path: &Path) -> PathBuf {
 
 fn expand_one(
     path: &Path,
+    root: Option<&Path>,
     recursive: bool,
     extensions: &HashSet<String>,
     depth: usize,
     visited: &mut HashSet<PathBuf>,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<ExpandedInputPath>,
 ) -> Result<(), ConversionError> {
     if out.len() >= MAX_EXPAND_FILES {
         return Err(ConversionError::new(format!(
@@ -117,21 +176,21 @@ fn expand_one(
             ))
         })?;
         if target_meta.is_dir() {
-            return expand_directory(path, recursive, extensions, depth, visited, out);
+            return expand_directory(path, root, recursive, extensions, depth, visited, out);
         }
         if target_meta.is_file() {
-            maybe_push_file(path, extensions, out);
+            maybe_push_file(path, root, extensions, out);
             return Ok(());
         }
         return Ok(());
     }
 
     if metadata.is_dir() {
-        return expand_directory(path, recursive, extensions, depth, visited, out);
+        return expand_directory(path, root, recursive, extensions, depth, visited, out);
     }
 
     if metadata.is_file() {
-        maybe_push_file(path, extensions, out);
+        maybe_push_file(path, root, extensions, out);
     }
 
     Ok(())
@@ -139,11 +198,12 @@ fn expand_one(
 
 fn expand_directory(
     path: &Path,
+    root: Option<&Path>,
     recursive: bool,
     extensions: &HashSet<String>,
     depth: usize,
     visited: &mut HashSet<PathBuf>,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<ExpandedInputPath>,
 ) -> Result<(), ConversionError> {
     if !recursive {
         return Err(ConversionError::new(format!(
@@ -181,7 +241,7 @@ fn expand_directory(
         if is_hidden(&child) {
             continue;
         }
-        expand_one(&child, recursive, extensions, depth + 1, visited, out)?;
+        expand_one(&child, root, recursive, extensions, depth + 1, visited, out)?;
         if out.len() > MAX_EXPAND_FILES {
             return Err(ConversionError::new(format!(
                 "too many input files (limit is {MAX_EXPAND_FILES}); narrow the selection"
@@ -191,7 +251,12 @@ fn expand_directory(
     Ok(())
 }
 
-fn maybe_push_file(path: &Path, extensions: &HashSet<String>, out: &mut Vec<PathBuf>) {
+fn maybe_push_file(
+    path: &Path,
+    root: Option<&Path>,
+    extensions: &HashSet<String>,
+    out: &mut Vec<ExpandedInputPath>,
+) {
     let Some(ext) = path
         .extension()
         .and_then(|value| value.to_str())
@@ -200,7 +265,12 @@ fn maybe_push_file(path: &Path, extensions: &HashSet<String>, out: &mut Vec<Path
         return;
     };
     if extensions.contains(&ext) {
-        out.push(path.to_path_buf());
+        let relative_path =
+            root.and_then(|root| path.strip_prefix(root).ok().map(Path::to_path_buf));
+        out.push(ExpandedInputPath {
+            path: path.to_path_buf(),
+            relative_path,
+        });
     }
 }
 
@@ -296,6 +366,43 @@ mod tests {
             found,
             vec![dir.join("a.pdf"), dir.join("m.pdf"), dir.join("z.pdf")]
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detailed_expansion_retains_root_relative_hierarchy() {
+        let dir = unique_dir("relative");
+        let nested = dir.join("team").join("drafts");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("report.pdf");
+        std::fs::write(&file, b"%PDF").unwrap();
+        let direct = dir.join("direct.pdf");
+        std::fs::write(&direct, b"%PDF").unwrap();
+
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let found =
+            expand_input_paths_preserving_roots_with_extensions(&[dir.as_path()], true, &exts)
+                .unwrap();
+        assert_eq!(
+            found,
+            vec![
+                ExpandedInputPath {
+                    path: direct.clone(),
+                    relative_path: Some(PathBuf::from("direct.pdf")),
+                },
+                ExpandedInputPath {
+                    path: file,
+                    relative_path: Some(PathBuf::from("team/drafts/report.pdf")),
+                },
+            ]
+        );
+        assert_eq!(found[1].relative_parent(), Some(Path::new("team/drafts")));
+
+        let explicit =
+            expand_input_paths_preserving_roots_with_extensions(&[direct.as_path()], false, &exts)
+                .unwrap();
+        assert_eq!(explicit[0].relative_path, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

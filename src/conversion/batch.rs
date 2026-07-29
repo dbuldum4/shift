@@ -7,12 +7,13 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
-    OutputFormat, ProgressSink, default_output_path, looks_like_url, normalize_path,
-    paths_refer_to_same_file,
+    InvocationRecord, OutputFormat, ProgressSink, default_output_path, looks_like_url,
+    normalize_path, paths_refer_to_same_file,
 };
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use url::Url;
@@ -119,6 +120,13 @@ pub enum BatchItemState {
     Cancelled,
 }
 
+/// Redacted conversion provenance retained for every successful batch job.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BatchProvenance {
+    pub pipeline: Vec<&'static str>,
+    pub invocations: Vec<InvocationRecord>,
+}
+
 impl BatchItemState {
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -162,20 +170,275 @@ impl BatchFormatSelection {
     }
 }
 
+/// Validated file-name template used by shared batch destination resolution.
+///
+/// Supported placeholders:
+/// - `{stem}`: source file/URL stem
+/// - `{ext}`: output extension
+/// - `{format}`: canonical output format id
+/// - `{parent}`: immediate source parent directory (or `root`)
+///
+/// Templates produce one file name, never a path. Directory separators,
+/// traversal components, control characters, and platform-reserved file-name
+/// characters are rejected before any conversion starts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchNamingTemplate(String);
+
+impl BatchNamingTemplate {
+    pub const DEFAULT: &'static str = "{stem}.{ext}";
+    const PLACEHOLDERS: &'static [&'static str] = &["stem", "ext", "format", "parent"];
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn render_file_name(
+        &self,
+        source: &BatchSource,
+        format: OutputFormat,
+    ) -> Result<PathBuf, ConversionError> {
+        let (stem, parent) = match source {
+            BatchSource::File(path) => {
+                let stem = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("converted");
+                let parent = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("root");
+                (
+                    sanitize_template_value(stem),
+                    sanitize_template_value(parent),
+                )
+            }
+            BatchSource::Url(url) => {
+                let name = suggested_url_file_name(url, format);
+                let stem = Path::new(&name)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("page");
+                let parent = Url::parse(url)
+                    .ok()
+                    .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| "web".to_owned());
+                (
+                    sanitize_template_value(stem),
+                    sanitize_template_value(&parent),
+                )
+            }
+        };
+
+        let mut rendered = self.0.clone();
+        rendered = rendered.replace("{stem}", &stem);
+        rendered = rendered.replace("{ext}", format.extension());
+        rendered = rendered.replace("{format}", format.id());
+        rendered = rendered.replace("{parent}", &parent);
+        let mut rendered = rendered.trim().to_owned();
+        if rendered.is_empty()
+            || matches!(rendered.as_str(), "." | "..")
+            || rendered.starts_with('.')
+        {
+            return Err(ConversionError::new(
+                "batch naming template produced an unsafe or empty file name",
+            ));
+        }
+        if rendered.chars().count() > 240 {
+            rendered = rendered.chars().take(220).collect();
+            rendered = rendered.trim_end_matches('.').to_owned();
+        }
+
+        let mut name = PathBuf::from(&rendered);
+        if name.components().count() != 1 {
+            return Err(ConversionError::new(
+                "batch naming template must produce a file name, not a path",
+            ));
+        }
+        if name.extension().and_then(|value| value.to_str()) != Some(format.extension()) {
+            let current = name
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("converted");
+            name = PathBuf::from(format!("{current}.{}", format.extension()));
+        }
+        Ok(name)
+    }
+}
+
+impl Default for BatchNamingTemplate {
+    fn default() -> Self {
+        Self(Self::DEFAULT.to_owned())
+    }
+}
+
+impl fmt::Display for BatchNamingTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for BatchNamingTemplate {
+    type Err = ConversionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ConversionError::new(
+                "batch naming template cannot be empty",
+            ));
+        }
+        if value.chars().count() > 200 {
+            return Err(ConversionError::new(
+                "batch naming template cannot exceed 200 characters",
+            ));
+        }
+        if value.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        }) {
+            return Err(ConversionError::new(
+                "batch naming template contains an unsafe file-name character",
+            ));
+        }
+        if value.starts_with('.') {
+            return Err(ConversionError::new(
+                "batch naming template cannot produce a hidden file name",
+            ));
+        }
+
+        let mut remainder = value;
+        while let Some(open) = remainder.find('{') {
+            if remainder[..open].contains('}') {
+                return Err(ConversionError::new(
+                    "batch naming template has an unmatched `}`",
+                ));
+            }
+            let after_open = &remainder[open + 1..];
+            let Some(close) = after_open.find('}') else {
+                return Err(ConversionError::new(
+                    "batch naming template has an unmatched `{`",
+                ));
+            };
+            let placeholder = &after_open[..close];
+            if !Self::PLACEHOLDERS.contains(&placeholder) {
+                return Err(ConversionError::new(format!(
+                    "unknown batch naming placeholder `{{{placeholder}}}` (use {{stem}}, {{ext}}, {{format}}, or {{parent}})"
+                )));
+            }
+            remainder = &after_open[close + 1..];
+        }
+        if remainder.contains('}') {
+            return Err(ConversionError::new(
+                "batch naming template has an unmatched `}`",
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+fn sanitize_template_value(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_control()
+                || matches!(
+                    ch,
+                    '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' | '{' | '}'
+                )
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .take(160)
+        .collect();
+    let value = value.trim().trim_matches('.').trim();
+    if value.is_empty() {
+        "converted".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+/// A source plus optional directory hierarchy retained from recursive folder
+/// expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchInput {
+    pub source: BatchSource,
+    pub relative_parent: Option<PathBuf>,
+}
+
+impl BatchInput {
+    pub fn new(source: BatchSource) -> Self {
+        Self {
+            source,
+            relative_parent: None,
+        }
+    }
+
+    pub fn with_relative_parent(
+        source: BatchSource,
+        relative_parent: impl AsRef<Path>,
+    ) -> Result<Self, ConversionError> {
+        let relative_parent = validate_relative_parent(relative_parent.as_ref())?;
+        Ok(Self {
+            source,
+            relative_parent,
+        })
+    }
+}
+
+fn validate_relative_parent(path: &Path) -> Result<Option<PathBuf>, ConversionError> {
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ConversionError::new(format!(
+            "unsafe recursive output hierarchy: {}",
+            path.display()
+        )));
+    }
+    let normalized: PathBuf = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect();
+    Ok((!normalized.as_os_str().is_empty()).then_some(normalized))
+}
+
 /// One unit of work in the batch queue.
 #[derive(Clone, Debug)]
 pub struct BatchItem {
     pub id: BatchItemId,
+    /// Jobs in the same group came from one source fan-out.
+    pub group_id: u64,
     pub source: BatchSource,
+    /// Root-relative source directory retained during recursive expansion.
+    pub relative_parent: Option<PathBuf>,
     pub output_format: OutputFormat,
     /// Inherit vs per-item override; [`Self::output_format`] is the resolved value.
     pub format_selection: BatchFormatSelection,
     pub options: ConversionOptions,
+    pub naming_template: BatchNamingTemplate,
     /// Planned destination (may be adjusted on write for collisions).
     pub destination: PathBuf,
     pub force: bool,
     pub state: BatchItemState,
     pub attempts: u32,
+    pub provenance: Option<BatchProvenance>,
 }
 
 impl BatchItem {
@@ -192,6 +455,7 @@ pub struct BatchEnqueueOptions {
     pub conversion: ConversionOptions,
     /// When set, all outputs land in this directory (file names from sources).
     pub output_dir: Option<PathBuf>,
+    pub naming_template: BatchNamingTemplate,
     pub force: bool,
 }
 
@@ -201,6 +465,7 @@ impl BatchEnqueueOptions {
             output_format,
             conversion: ConversionOptions::default(),
             output_dir: None,
+            naming_template: BatchNamingTemplate::default(),
             force: false,
         }
     }
@@ -271,6 +536,7 @@ pub enum BatchEvent {
         path: PathBuf,
         module_id: String,
         byte_len: usize,
+        provenance: BatchProvenance,
     },
     ItemFailed {
         id: BatchItemId,
@@ -289,6 +555,7 @@ pub enum BatchEvent {
 pub struct BatchQueue {
     items: Vec<BatchItem>,
     next_id: u64,
+    next_group_id: u64,
 }
 
 impl BatchQueue {
@@ -341,20 +608,92 @@ impl BatchQueue {
     ///
     /// New items default to [`BatchFormatSelection::Inherit`].
     pub fn enqueue(&mut self, source: BatchSource, opts: &BatchEnqueueOptions) -> BatchItemId {
-        let destination =
-            resolve_destination(&source, opts.output_format, opts.output_dir.as_deref());
+        self.enqueue_input(BatchInput::new(source), opts)
+    }
+
+    /// Enqueue one source with recursive hierarchy metadata.
+    pub fn enqueue_input(&mut self, input: BatchInput, opts: &BatchEnqueueOptions) -> BatchItemId {
+        let group_id = self.allocate_group_id();
+        self.push_job(
+            input,
+            group_id,
+            opts.output_format,
+            BatchFormatSelection::Inherit,
+            opts,
+        )
+    }
+
+    /// Enqueue one source to the primary format and every additional format.
+    ///
+    /// Additional duplicates (including the primary format) are ignored while
+    /// preserving first-seen order. Each output is a normal queue job, so
+    /// destination collision handling, retry, cancellation, progress, and
+    /// provenance remain centralized in [`run_batch`].
+    pub fn enqueue_fan_out(
+        &mut self,
+        input: BatchInput,
+        additional_formats: &[OutputFormat],
+        opts: &BatchEnqueueOptions,
+    ) -> Vec<BatchItemId> {
+        let group_id = self.allocate_group_id();
+        let mut formats = vec![opts.output_format];
+        for &format in additional_formats {
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+
+        formats
+            .into_iter()
+            .map(|format| {
+                let selection = if format == opts.output_format {
+                    BatchFormatSelection::Inherit
+                } else {
+                    BatchFormatSelection::Override(format)
+                };
+                self.push_job(input.clone(), group_id, format, selection, opts)
+            })
+            .collect()
+    }
+
+    fn allocate_group_id(&mut self) -> u64 {
+        let group_id = self.next_group_id;
+        self.next_group_id = self.next_group_id.wrapping_add(1);
+        group_id
+    }
+
+    fn push_job(
+        &mut self,
+        input: BatchInput,
+        group_id: u64,
+        format: OutputFormat,
+        format_selection: BatchFormatSelection,
+        opts: &BatchEnqueueOptions,
+    ) -> BatchItemId {
+        let destination = resolve_destination_with_policy(
+            &input.source,
+            format,
+            opts.output_dir.as_deref(),
+            input.relative_parent.as_deref(),
+            &opts.naming_template,
+        )
+        .unwrap_or_else(|_| resolve_destination(&input.source, format, opts.output_dir.as_deref()));
         let id = BatchItemId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
         self.items.push(BatchItem {
             id,
-            source,
-            output_format: opts.output_format,
-            format_selection: BatchFormatSelection::Inherit,
+            group_id,
+            source: input.source,
+            relative_parent: input.relative_parent,
+            output_format: format,
+            format_selection,
             options: opts.conversion.clone(),
+            naming_template: opts.naming_template.clone(),
             destination,
             force: opts.force,
             state: BatchItemState::Queued,
             attempts: 0,
+            provenance: None,
         });
         id
     }
@@ -371,6 +710,55 @@ impl BatchQueue {
             .collect()
     }
 
+    /// Add another output job to an existing source fan-out group.
+    pub fn add_output_for_item(
+        &mut self,
+        id: BatchItemId,
+        format: OutputFormat,
+        output_dir: Option<&Path>,
+    ) -> Option<BatchItemId> {
+        let template = self.get(id)?.clone();
+        if !matches!(template.state, BatchItemState::Queued) {
+            return None;
+        }
+        if self
+            .items
+            .iter()
+            .any(|item| item.group_id == template.group_id && item.resolved_format() == format)
+        {
+            return None;
+        }
+        let opts = BatchEnqueueOptions {
+            output_format: format,
+            conversion: template.options.clone(),
+            output_dir: output_dir.map(Path::to_path_buf),
+            naming_template: template.naming_template.clone(),
+            force: template.force,
+        };
+        Some(self.push_job(
+            BatchInput {
+                source: template.source,
+                relative_parent: template.relative_parent,
+            },
+            template.group_id,
+            format,
+            BatchFormatSelection::Override(format),
+            &opts,
+        ))
+    }
+
+    /// Effective formats already represented in one source fan-out group.
+    pub fn group_formats(&self, id: BatchItemId) -> Vec<OutputFormat> {
+        let Some(group_id) = self.get(id).map(|item| item.group_id) else {
+            return Vec::new();
+        };
+        self.items
+            .iter()
+            .filter(|item| item.group_id == group_id)
+            .map(BatchItem::resolved_format)
+            .collect()
+    }
+
     /// Re-queue a failed or cancelled item.
     pub fn retry(&mut self, id: BatchItemId) -> bool {
         let Some(item) = self.get_mut(id) else {
@@ -380,6 +768,7 @@ impl BatchQueue {
             return false;
         }
         item.state = BatchItemState::Queued;
+        item.provenance = None;
         true
     }
 
@@ -434,9 +823,41 @@ impl BatchQueue {
     pub fn set_output_dir(&mut self, output_dir: Option<&Path>) {
         for item in &mut self.items {
             if matches!(item.state, BatchItemState::Queued) {
-                item.destination =
-                    resolve_destination(&item.source, item.output_format, output_dir);
+                item.destination = resolve_destination_with_policy(
+                    &item.source,
+                    item.output_format,
+                    output_dir,
+                    item.relative_parent.as_deref(),
+                    &item.naming_template,
+                )
+                .unwrap_or_else(|_| {
+                    resolve_destination(&item.source, item.output_format, output_dir)
+                });
             }
+        }
+    }
+
+    /// Apply a validated naming template to every queued job.
+    pub fn set_naming_template_for_queued(
+        &mut self,
+        template: BatchNamingTemplate,
+        output_dir: Option<&Path>,
+    ) {
+        for item in &mut self.items {
+            if !matches!(item.state, BatchItemState::Queued) {
+                continue;
+            }
+            item.naming_template = template.clone();
+            item.destination = resolve_destination_with_policy(
+                &item.source,
+                item.resolved_format(),
+                output_dir,
+                item.relative_parent.as_deref(),
+                &item.naming_template,
+            )
+            .unwrap_or_else(|_| {
+                resolve_destination(&item.source, item.resolved_format(), output_dir)
+            });
         }
     }
 
@@ -473,7 +894,14 @@ impl BatchQueue {
                     format
                 }
             };
-            item.destination = resolve_destination(&item.source, format, output_dir);
+            item.destination = resolve_destination_with_policy(
+                &item.source,
+                format,
+                output_dir,
+                item.relative_parent.as_deref(),
+                &item.naming_template,
+            )
+            .unwrap_or_else(|_| resolve_destination(&item.source, format, output_dir));
         }
     }
 
@@ -485,16 +913,34 @@ impl BatchQueue {
         inherited: OutputFormat,
         output_dir: Option<&Path>,
     ) -> bool {
-        let Some(item) = self.get_mut(id) else {
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
             return false;
         };
+        let item = &self.items[index];
         if !matches!(item.state, BatchItemState::Queued) {
             return false;
         }
-        item.format_selection = selection;
         let format = selection.resolve(inherited);
+        // A fan-out group represents one source rendered to distinct formats.
+        // Rejecting a duplicate here keeps per-item changes from quietly
+        // scheduling two identical writes (which would otherwise be
+        // uniquified and surprise the caller with `name-1.ext`).
+        if self.items.iter().any(|other| {
+            other.id != id && other.group_id == item.group_id && other.resolved_format() == format
+        }) {
+            return false;
+        }
+        let item = &mut self.items[index];
+        item.format_selection = selection;
         item.output_format = format;
-        item.destination = resolve_destination(&item.source, format, output_dir);
+        item.destination = resolve_destination_with_policy(
+            &item.source,
+            format,
+            output_dir,
+            item.relative_parent.as_deref(),
+            &item.naming_template,
+        )
+        .unwrap_or_else(|_| resolve_destination(&item.source, format, output_dir));
         true
     }
 
@@ -538,36 +984,87 @@ pub fn resolve_destination(
     format: OutputFormat,
     output_dir: Option<&Path>,
 ) -> PathBuf {
-    match source {
-        BatchSource::File(path) => {
-            if let Some(dir) = output_dir {
-                // Use the source stem with the target extension. Only insert the
-                // `.converted` guard when the resulting path would still point at
-                // the source file (for example, an output_dir equal to the source
-                // directory with a same-extension conversion).
-                let mut file_name = PathBuf::from(path.file_stem().unwrap_or_default());
-                if file_name.as_os_str().is_empty() {
-                    file_name = PathBuf::from("converted");
-                }
-                file_name.set_extension(format.extension());
-                let candidate = dir.join(&file_name);
-                if paths_refer_to_same_file(path, &candidate) {
-                    file_name.set_extension(format!("converted.{}", format.extension()));
-                }
-                dir.join(file_name)
+    resolve_destination_with_policy(
+        source,
+        format,
+        output_dir,
+        None,
+        &BatchNamingTemplate::default(),
+    )
+    .unwrap_or_else(|_| match source {
+        BatchSource::File(path) => default_output_path(path, format),
+        BatchSource::Url(url) => PathBuf::from(suggested_url_file_name(url, format)),
+    })
+}
+
+/// Resolve a batch destination using shared hierarchy and naming policies.
+pub fn resolve_destination_with_policy(
+    source: &BatchSource,
+    format: OutputFormat,
+    output_dir: Option<&Path>,
+    relative_parent: Option<&Path>,
+    naming_template: &BatchNamingTemplate,
+) -> Result<PathBuf, ConversionError> {
+    let relative_parent = relative_parent
+        .map(validate_relative_parent)
+        .transpose()?
+        .flatten();
+    let mut file_name = naming_template.render_file_name(source, format)?;
+    let base = match (source, output_dir) {
+        (_, Some(dir)) => {
+            if let Some(relative_parent) = relative_parent {
+                dir.join(relative_parent)
             } else {
-                default_output_path(path, format)
+                dir.to_path_buf()
             }
         }
-        BatchSource::Url(url) => {
-            let name = suggested_url_file_name(url, format);
-            if let Some(dir) = output_dir {
-                dir.join(name)
-            } else {
-                PathBuf::from(name)
-            }
+        (BatchSource::File(path), None) => path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf(),
+        (BatchSource::Url(_), None) => PathBuf::new(),
+    };
+
+    let candidate = base.join(&file_name);
+    if source
+        .as_file()
+        .is_some_and(|path| paths_refer_to_same_file(path, &candidate))
+    {
+        file_name.set_extension(format!("converted.{}", format.extension()));
+    }
+    Ok(base.join(file_name))
+}
+
+/// Capability-filtered outputs for a batch source. Both UI and CLI fan-out
+/// validation use this helper so unsupported pairs fail before engine spawn.
+pub fn available_outputs_for_batch_source(
+    registry: &ConversionRegistry,
+    source: &BatchSource,
+) -> Vec<OutputFormat> {
+    match source {
+        BatchSource::File(path) => registry.available_outputs(path),
+        BatchSource::Url(_) => registry.available_url_outputs(),
+    }
+}
+
+/// Reject unsupported fan-out targets before any external converter launches.
+pub fn validate_batch_output_formats(
+    registry: &ConversionRegistry,
+    source: &BatchSource,
+    formats: &[OutputFormat],
+) -> Result<(), ConversionError> {
+    let available = available_outputs_for_batch_source(registry, source);
+    for format in formats {
+        if !available.contains(format) {
+            return Err(ConversionError::new(format!(
+                "{} cannot convert to {}",
+                source.display_name(),
+                format.label()
+            )));
         }
     }
+    Ok(())
 }
 
 /// Suggest a file name for a URL conversion result.
@@ -741,6 +1238,7 @@ enum BatchOutcome {
         path: PathBuf,
         module_id: String,
         byte_len: usize,
+        provenance: BatchProvenance,
     },
     Cancelled,
     Failed {
@@ -805,14 +1303,25 @@ fn run_task(
                 task.source.as_file(),
                 task.force,
             )
-            .map(|path| (path, artifact.module_id.to_owned(), artifact.bytes.len()))
+            .map(|path| {
+                (
+                    path,
+                    artifact.module_id.to_owned(),
+                    artifact.bytes.len(),
+                    BatchProvenance {
+                        pipeline: artifact.pipeline.clone(),
+                        invocations: artifact.invocations.clone(),
+                    },
+                )
+            })
         });
 
     match result {
-        Ok((path, module_id, byte_len)) => BatchOutcome::Succeeded {
+        Ok((path, module_id, byte_len, provenance)) => BatchOutcome::Succeeded {
             path,
             module_id,
             byte_len,
+            provenance,
         },
         Err(error) if error.is_cancelled() || cancel.load(Ordering::SeqCst) => {
             BatchOutcome::Cancelled
@@ -961,6 +1470,7 @@ pub fn run_batch(
                                 path,
                                 module_id,
                                 byte_len,
+                                provenance,
                             } => {
                                 // Write already committed: always report success so
                                 // cancel-then-retry does not leave an on-disk file
@@ -973,6 +1483,7 @@ pub fn run_batch(
                                         byte_len,
                                     };
                                     item.destination = path.clone();
+                                    item.provenance = Some(provenance.clone());
                                 }
                                 summary.succeeded += 1;
                                 on_event(BatchEvent::ItemSucceeded {
@@ -981,6 +1492,7 @@ pub fn run_batch(
                                     path,
                                     module_id,
                                     byte_len,
+                                    provenance,
                                 });
                             }
                             BatchOutcome::Cancelled => {
@@ -1122,7 +1634,7 @@ mod tests {
                 bytes: self.payload.to_vec(),
                 format: output,
                 module_id: self.label,
-                pipeline: Vec::new(),
+                pipeline: vec![self.label],
                 invocations: Vec::new(),
             })
         }
@@ -1147,6 +1659,51 @@ mod tests {
         let source = BatchSource::File(PathBuf::from("/docs/report.pdf"));
         let dest = resolve_destination(&source, OutputFormat::MARKDOWN, Some(Path::new("/out")));
         assert_eq!(dest, PathBuf::from("/out/report.md"));
+    }
+
+    #[test]
+    fn naming_templates_render_documented_placeholders_and_reject_paths() {
+        let source = BatchSource::File(PathBuf::from("/docs/team/report.final.pdf"));
+        let template: BatchNamingTemplate = "{parent}-{stem}-{format}.{ext}".parse().unwrap();
+        assert_eq!(
+            template
+                .render_file_name(&source, OutputFormat::MARKDOWN)
+                .unwrap(),
+            PathBuf::from("team-report.final-markdown.md")
+        );
+
+        for unsafe_template in [
+            "../{stem}.{ext}",
+            "{stem}/{format}.{ext}",
+            "{unknown}.{ext}",
+            ".{stem}.{ext}",
+            "{stem",
+        ] {
+            assert!(
+                unsafe_template.parse::<BatchNamingTemplate>().is_err(),
+                "accepted unsafe template {unsafe_template}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_relative_parent_is_recreated_under_output_dir() {
+        let source = BatchSource::File(PathBuf::from("/source/team/drafts/report.pdf"));
+        let template = BatchNamingTemplate::default();
+        let destination = resolve_destination_with_policy(
+            &source,
+            OutputFormat::MARKDOWN,
+            Some(Path::new("/out")),
+            Some(Path::new("team/drafts")),
+            &template,
+        )
+        .unwrap();
+        assert_eq!(destination, PathBuf::from("/out/team/drafts/report.md"));
+
+        assert!(
+            BatchInput::with_relative_parent(source, "../escape").is_err(),
+            "relative output hierarchy must reject traversal"
+        );
     }
 
     #[test]
@@ -1222,6 +1779,119 @@ mod tests {
                 .any(|event| matches!(event, BatchEvent::ItemSucceeded { .. }))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fan_out_creates_deterministic_jobs_that_share_runner_semantics() {
+        let dir = unique_dir("fan-out");
+        let input = dir.join("source.txt");
+        let out = dir.join("out");
+        std::fs::write(&input, b"source").unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let registry = ConversionRegistry::new().with_module(CountingModule {
+            label: "fanout-fake",
+            inputs: &["txt"],
+            outputs: &[OutputFormat::MARKDOWN, OutputFormat::HTML],
+            payload: b"converted",
+            fail_once: None,
+            delay_ms: 0,
+            in_flight: None,
+            peak: None,
+        });
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions {
+            output_format: OutputFormat::MARKDOWN,
+            output_dir: Some(out.clone()),
+            force: true,
+            ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
+        };
+        let ids = queue.enqueue_fan_out(
+            BatchInput::new(BatchSource::File(input)),
+            &[
+                OutputFormat::HTML,
+                OutputFormat::MARKDOWN,
+                OutputFormat::HTML,
+            ],
+            &opts,
+        );
+        assert_eq!(ids, vec![BatchItemId(0), BatchItemId(1)]);
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(BatchItem::resolved_format)
+                .collect::<Vec<_>>(),
+            vec![OutputFormat::MARKDOWN, OutputFormat::HTML]
+        );
+        assert_eq!(queue.items()[0].group_id, queue.items()[1].group_id);
+
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.succeeded, 2);
+        assert!(out.join("source.md").is_file());
+        assert!(out.join("source.html").is_file());
+        assert!(queue.items().iter().all(|item| item.attempts == 1));
+        assert!(queue.items().iter().all(|item| {
+            item.provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.pipeline == vec!["fanout-fake"])
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn add_and_remove_fan_out_jobs_stay_in_one_group() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let primary = queue.enqueue(BatchSource::File(PathBuf::from("/tmp/a.txt")), &opts);
+        let extra = queue
+            .add_output_for_item(primary, OutputFormat::HTML, Some(Path::new("/out")))
+            .expect("extra output");
+        assert_eq!(
+            queue.group_formats(primary),
+            vec![OutputFormat::MARKDOWN, OutputFormat::HTML]
+        );
+        assert!(
+            queue
+                .add_output_for_item(primary, OutputFormat::HTML, Some(Path::new("/out")))
+                .is_none(),
+            "duplicate group format should be ignored"
+        );
+        assert!(queue.remove(extra));
+        assert_eq!(queue.group_formats(primary), vec![OutputFormat::MARKDOWN]);
+    }
+
+    #[test]
+    fn per_item_format_change_cannot_duplicate_a_fan_out_output() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let ids = queue.enqueue_fan_out(
+            BatchInput::new(BatchSource::File(PathBuf::from("/tmp/a.txt"))),
+            &[OutputFormat::HTML],
+            &opts,
+        );
+
+        assert!(
+            !queue.set_item_format_selection(
+                ids[0],
+                BatchFormatSelection::Override(OutputFormat::HTML),
+                OutputFormat::MARKDOWN,
+                Some(Path::new("/out")),
+            ),
+            "a fan-out group must contain each output format at most once"
+        );
+        assert_eq!(
+            queue.group_formats(ids[0]),
+            vec![OutputFormat::MARKDOWN, OutputFormat::HTML]
+        );
+        assert_eq!(
+            queue.items()[0].format_selection,
+            BatchFormatSelection::Inherit
+        );
     }
 
     #[test]
@@ -1862,6 +2532,7 @@ mod tests {
                 output_format: OutputFormat::MARKDOWN,
                 conversion: ConversionOptions::default(),
                 output_dir: Some(PathBuf::from("/Users/me/Exports")),
+                naming_template: BatchNamingTemplate::default(),
                 force: false,
             };
 
@@ -2068,14 +2739,18 @@ mod tests {
     fn batch_item_resolved_format_and_state_helpers() {
         let item = BatchItem {
             id: BatchItemId(0),
+            group_id: 0,
             source: BatchSource::File(PathBuf::from("/tmp/x.pdf")),
+            relative_parent: None,
             output_format: OutputFormat::MARKDOWN,
             format_selection: BatchFormatSelection::Override(OutputFormat::HTML),
             options: ConversionOptions::default(),
+            naming_template: BatchNamingTemplate::default(),
             destination: PathBuf::from("/tmp/x.html"),
             force: false,
             state: BatchItemState::Queued,
             attempts: 0,
+            provenance: None,
         };
         assert_eq!(item.resolved_format(), OutputFormat::HTML);
 

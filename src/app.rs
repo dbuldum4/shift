@@ -183,7 +183,7 @@ pub(crate) struct OpenRecent {
 /// Pending folder expansion confirmation before batch enqueue.
 #[derive(Clone)]
 pub(crate) struct FolderExpandConfirm {
-    pub(crate) expanded: Vec<PathBuf>,
+    pub(crate) expanded: Vec<ExpandedInputPath>,
 }
 
 /// The short, first-run introduction to Shift.
@@ -265,6 +265,10 @@ pub(crate) struct Shift {
     pub(crate) batch_generation: u64,
     pub(crate) batch_cancel: Arc<AtomicBool>,
     pub(crate) batch_status: Option<SharedString>,
+    /// Expanded per-item format picker in the batch queue.
+    pub(crate) batch_format_menu: Option<BatchItemId>,
+    /// Batch file-name template; parsed and applied in shared batch code.
+    pub(crate) batch_naming_template_input: Entity<TextInput>,
     /// When true, batch writes overwrite existing outputs (CLI `--force` parity).
     pub(crate) batch_force: bool,
     /// Per-item progress labels/fractions from the batch runner.
@@ -508,6 +512,13 @@ impl Shift {
         let history_search = cx.new(|cx| TextInput::new(cx, "Search history…", ""));
         let history_limit_input =
             cx.new(|cx| TextInput::new(cx, "30", session.history_limit.to_string()));
+        let batch_naming_template = session
+            .batch_naming_template
+            .parse::<BatchNamingTemplate>()
+            .unwrap_or_default()
+            .to_string();
+        let batch_naming_template_input =
+            cx.new(|cx| TextInput::new(cx, "{stem}.{ext}", batch_naming_template));
         let (history, next_history_id) = history_from_store(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
@@ -581,6 +592,8 @@ impl Shift {
             batch_generation: 0,
             batch_cancel: Arc::new(AtomicBool::new(false)),
             batch_status: None,
+            batch_format_menu: None,
+            batch_naming_template_input,
             batch_force: session.batch_force,
             batch_item_progress: HashMap::new(),
             folder_confirm: None,
@@ -806,7 +819,7 @@ impl Shift {
             self.finish_onboarding(cx);
         }
         if has_dir {
-            match expand_input_paths(&paths, true) {
+            match expand_input_paths_preserving_roots(&paths, true) {
                 Ok(expanded) => {
                     if expanded.is_empty() {
                         self.batch_status =
@@ -848,7 +861,7 @@ impl Shift {
         let Some(confirm) = self.folder_confirm.take() else {
             return;
         };
-        self.enqueue_paths(confirm.expanded, false, cx);
+        self.enqueue_expanded_paths(confirm.expanded, false, cx);
     }
 
     pub(crate) fn dismiss_folder_confirm(&mut self, cx: &mut Context<Self>) {
@@ -857,6 +870,67 @@ impl Shift {
         cx.notify();
     }
 
+    pub(crate) fn toggle_batch_format_menu(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
+        if self.batch_running
+            || self
+                .batch_queue
+                .get(id)
+                .is_none_or(|item| !matches!(item.state, BatchItemState::Queued))
+        {
+            return;
+        }
+        self.batch_format_menu = (self.batch_format_menu != Some(id)).then_some(id);
+        cx.notify();
+    }
+
+    pub(crate) fn select_batch_item_format(
+        &mut self,
+        id: BatchItemId,
+        format: OutputFormat,
+        cx: &mut Context<Self>,
+    ) {
+        if self.batch_running {
+            return;
+        }
+        let supported = self
+            .batch_queue
+            .get(id)
+            .map(|item| available_outputs_for_batch_source(&self.registry, &item.source))
+            .is_some_and(|available| available.contains(&format));
+        if !supported {
+            self.batch_status = Some("That output is not supported for this source.".into());
+            cx.notify();
+            return;
+        }
+        let already_added = self.batch_queue.get(id).is_some_and(|item| {
+            self.batch_queue.items().iter().any(|other| {
+                other.id != id
+                    && other.group_id == item.group_id
+                    && other.resolved_format() == format
+            })
+        });
+        if already_added {
+            self.batch_status = Some("That output is already queued for this source.".into());
+            cx.notify();
+            return;
+        }
+        if self.batch_queue.set_item_format_selection(
+            id,
+            BatchFormatSelection::Override(format),
+            self.output_format,
+            self.batch_output_dir.as_deref(),
+        ) {
+            self.batch_format_menu = None;
+            self.batch_status = Some(format!("Item output set to {}.", format.label()).into());
+            cx.notify();
+        }
+    }
+
+    /// Compatibility action for existing shortcuts/tests: pin the current
+    /// global format, then return to inheritance on the next toggle. The batch
+    /// row's user-facing picker uses [`Self::select_batch_item_format`] to
+    /// choose genuine capability-filtered alternatives.
+    #[cfg(test)]
     pub(crate) fn toggle_batch_item_format(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
         if self.batch_running {
             return;
@@ -874,14 +948,112 @@ impl Shift {
             self.output_format,
             self.batch_output_dir.as_deref(),
         ) {
-            self.batch_status = Some(match selection {
-                BatchFormatSelection::Inherit => "Item format: inherit global.".into(),
-                BatchFormatSelection::Override(format) => {
-                    format!("Item format pinned to {}.", format.label()).into()
-                }
-            });
             cx.notify();
         }
+    }
+
+    pub(crate) fn inherit_batch_item_format(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
+        if self.batch_running {
+            return;
+        }
+        if self.batch_queue.set_item_format_selection(
+            id,
+            BatchFormatSelection::Inherit,
+            self.output_format,
+            self.batch_output_dir.as_deref(),
+        ) {
+            self.batch_status = Some("Item output now follows the global format.".into());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn add_batch_item_output(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
+        if self.batch_running {
+            return;
+        }
+        let Some(item) = self.batch_queue.get(id) else {
+            return;
+        };
+        let available = available_outputs_for_batch_source(&self.registry, &item.source);
+        let used = self.batch_queue.group_formats(id);
+        let Some(format) = available.into_iter().find(|format| !used.contains(format)) else {
+            self.batch_status = Some("Every supported output is already queued.".into());
+            cx.notify();
+            return;
+        };
+        if self
+            .batch_queue
+            .add_output_for_item(id, format, self.batch_output_dir.as_deref())
+            .is_some()
+        {
+            self.batch_status =
+                Some(format!("Added {} output for this source.", format.label()).into());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn remove_batch_item(&mut self, id: BatchItemId, cx: &mut Context<Self>) {
+        if self.batch_running {
+            return;
+        }
+        if self.batch_queue.remove(id) {
+            if self.batch_format_menu == Some(id) {
+                self.batch_format_menu = None;
+            }
+            self.batch_item_progress.remove(&id.0);
+            self.batch_status = Some("Removed queued output.".into());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn apply_batch_naming_template(&mut self, cx: &mut Context<Self>) {
+        if self.batch_running {
+            self.batch_status = Some("Cannot change naming while a batch is running.".into());
+            cx.notify();
+            return;
+        }
+        let value = self.batch_naming_template_input.read(cx).content();
+        match value.parse::<BatchNamingTemplate>() {
+            Ok(template) => {
+                self.batch_queue.set_naming_template_for_queued(
+                    template.clone(),
+                    self.batch_output_dir.as_deref(),
+                );
+                self.batch_status = Some(format!("Naming: {template}").into());
+                self.persist_session_settings(cx);
+            }
+            Err(error) => {
+                self.batch_status = Some(error.to_string().into());
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn enqueue_expanded_paths(
+        &mut self,
+        expanded: Vec<ExpandedInputPath>,
+        auto_start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut inputs = Vec::with_capacity(expanded.len());
+        for expanded in expanded {
+            let relative_parent = expanded.relative_parent().map(Path::to_path_buf);
+            let source = BatchSource::File(expanded.path);
+            let input = if let Some(relative_parent) = relative_parent {
+                match BatchInput::with_relative_parent(source, relative_parent) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        self.batch_status = Some(error.to_string().into());
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else {
+                BatchInput::new(source)
+            };
+            inputs.push(input);
+        }
+        self.enqueue_batch_inputs(inputs, auto_start, cx);
     }
 
     pub(crate) fn enqueue_paths(
@@ -922,7 +1094,20 @@ impl Shift {
         auto_start: bool,
         cx: &mut Context<Self>,
     ) {
-        if sources.is_empty() {
+        self.enqueue_batch_inputs(
+            sources.into_iter().map(BatchInput::new).collect(),
+            auto_start,
+            cx,
+        );
+    }
+
+    fn enqueue_batch_inputs(
+        &mut self,
+        inputs: Vec<BatchInput>,
+        auto_start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if inputs.is_empty() {
             return;
         }
         if self.batch_running {
@@ -931,8 +1116,8 @@ impl Shift {
             cx.notify();
             return;
         }
-        for source in &sources {
-            if let Some(path) = source.as_file() {
+        for input in &inputs {
+            if let Some(path) = input.source.as_file() {
                 file_picker::remember_directory(path);
             }
         }
@@ -944,14 +1129,30 @@ impl Shift {
                 return;
             }
         };
+        let naming_template = match self
+            .batch_naming_template_input
+            .read(cx)
+            .content()
+            .parse::<BatchNamingTemplate>()
+        {
+            Ok(template) => template,
+            Err(error) => {
+                self.batch_status = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
         let enqueue = BatchEnqueueOptions {
             output_format: self.output_format,
             conversion: options,
             output_dir: self.batch_output_dir.clone(),
+            naming_template,
             force: self.batch_force,
         };
-        let count = sources.len();
-        self.batch_queue.enqueue_many(sources, &enqueue);
+        let count = inputs.len();
+        for input in inputs {
+            self.batch_queue.enqueue_input(input, &enqueue);
+        }
         // Focus first file for the drop-zone card when entering batch mode.
         if let Some(item) = self.batch_queue.items().first() {
             if let Some(path) = item.source.as_file() {
@@ -989,6 +1190,21 @@ impl Shift {
                 return;
             }
         };
+        let naming_template = match self
+            .batch_naming_template_input
+            .read(cx)
+            .content()
+            .parse::<BatchNamingTemplate>()
+        {
+            Ok(template) => template,
+            Err(error) => {
+                self.batch_status = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        self.batch_queue
+            .set_naming_template_for_queued(naming_template, self.batch_output_dir.as_deref());
         self.batch_queue
             .refresh_inherited_formats(self.output_format, self.batch_output_dir.as_deref());
         for item in self.batch_queue.items_mut() {
@@ -998,6 +1214,7 @@ impl Shift {
             }
         }
         self.batch_item_progress.clear();
+        self.batch_format_menu = None;
 
         // Fresh cancel flag per run so a prior Clear/Cancel cannot be undone by
         // a later start, and so an abandoned worker keeps its own flag.
@@ -1142,6 +1359,7 @@ impl Shift {
                 module_id,
                 byte_len,
                 source_name,
+                provenance,
             } => {
                 if let Some(item) = self.batch_queue.get_mut(id) {
                     item.state = BatchItemState::Succeeded {
@@ -1150,6 +1368,7 @@ impl Shift {
                         byte_len,
                     };
                     item.destination = path.clone();
+                    item.provenance = Some(provenance);
                 }
                 self.batch_status =
                     Some(format!("Saved {source_name} → {}", path.display()).into());
@@ -1242,6 +1461,7 @@ impl Shift {
             self.batch_status = None;
         }
         self.batch_queue.clear();
+        self.batch_format_menu = None;
         cx.notify();
     }
 
@@ -1788,6 +2008,14 @@ impl Shift {
         settings.set_output_format(self.output_format);
         settings.batch_output_dir = self.batch_output_dir.clone();
         settings.batch_force = self.batch_force;
+        if let Ok(template) = self
+            .batch_naming_template_input
+            .read(cx)
+            .content()
+            .parse::<BatchNamingTemplate>()
+        {
+            settings.batch_naming_template = template.to_string();
+        }
         settings.history_sidebar_width = self.history_sidebar_width;
         settings.output_panel_width = self.output_panel_width;
         settings.ui_font_family = self.ui_font_family.clone();
@@ -3054,6 +3282,17 @@ impl Render for Shift {
         let batch_force = self.batch_force;
         let batch_status = self.batch_status.clone();
         let batch_item_progress = self.batch_item_progress.clone();
+        let batch_naming_template_input = self.batch_naming_template_input.clone();
+        let batch_format_menu = self.batch_format_menu;
+        let batch_available_formats: HashMap<u64, Vec<OutputFormat>> = batch_items
+            .iter()
+            .map(|item| {
+                (
+                    item.id.0,
+                    available_outputs_for_batch_source(&self.registry, &item.source),
+                )
+            })
+            .collect();
         let cached_ready_path = self.cached_ready_path.clone();
         let target_size_input = self.target_size_input.clone();
         let focus_handle = self.focus_handle.clone();
@@ -3085,6 +3324,9 @@ impl Render for Shift {
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.output_menu_open {
                     this.output_menu_open = false;
+                    cx.notify();
+                }
+                if this.batch_format_menu.take().is_some() {
                     cx.notify();
                 }
             }))
@@ -3164,12 +3406,17 @@ impl Render for Shift {
                     .bg(THEME.background)
                     .when(show_batch, |panel| {
                         panel.child(batch_queue_panel(
-                            &batch_items,
-                            batch_output_dir.as_deref(),
-                            batch_running,
-                            batch_force,
-                            batch_status,
-                            &batch_item_progress,
+                            BatchPanelView {
+                                items: &batch_items,
+                                output_dir: batch_output_dir.as_deref(),
+                                running: batch_running,
+                                force: batch_force,
+                                status: batch_status,
+                                item_progress: &batch_item_progress,
+                                naming_template_input: batch_naming_template_input,
+                                format_menu: batch_format_menu,
+                                available_formats: &batch_available_formats,
+                            },
                             cx,
                         ))
                     })

@@ -30,9 +30,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use batch::{
-    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
-    BatchProgress, BatchQueue, BatchSource, BatchSummary, prepare_batch_destination,
-    resolve_destination, run_batch, suggested_url_file_name, uniquify_destination,
+    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput, BatchItem, BatchItemId,
+    BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance, BatchQueue, BatchSource,
+    BatchSummary, available_outputs_for_batch_source, prepare_batch_destination,
+    resolve_destination, resolve_destination_with_policy, run_batch, suggested_url_file_name,
+    uniquify_destination, validate_batch_output_formats,
 };
 pub use defuddle::{
     DefuddleModule, DefuddleOptions, block_private_urls, ensure_public_url_fetch_allowed,
@@ -72,7 +74,9 @@ pub use process::{
 pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};
 pub use sources::{
-    MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths, supported_input_extensions,
+    ExpandedInputPath, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths,
+    expand_input_paths_preserving_roots, expand_input_paths_preserving_roots_with_extensions,
+    expand_input_paths_with_extensions, supported_input_extensions,
 };
 pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};

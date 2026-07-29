@@ -25,7 +25,7 @@ use crate::{
 use shift_core::conversion::{
     BatchEvent, BatchFormatSelection, BatchItemId, BatchItemState, BatchProgress, BatchSource,
     ConversionArtifact, DiagnosticsReport, EngineDiagnostic, FfmpegQuality, OutputFormat,
-    Readiness,
+    Readiness, available_outputs_for_batch_source,
 };
 use shift_core::history::{MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use std::sync::Arc;
@@ -772,6 +772,47 @@ async fn toggle_batch_item_format_pins_override(cx: &mut TestAppContext) {
 
     let inherited = shift.read_with(cx, |this, _| this.batch_queue.items()[0].output_format);
     assert_eq!(inherited, OutputFormat::HTML);
+}
+
+#[gpui::test]
+async fn batch_format_cycle_and_extra_output_use_capability_filtered_jobs(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "fanout.txt", b"text");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.enqueue_paths(vec![path], false, cx));
+    let (id, alternative) = shift.read_with(cx, |this, _| {
+        let item = &this.batch_queue.items()[0];
+        let format = available_outputs_for_batch_source(&this.registry, &item.source)
+            .into_iter()
+            .find(|format| *format != item.resolved_format())
+            .expect("test source should have another output");
+        (item.id, format)
+    });
+    shift.update(cx, |this, cx| {
+        this.select_batch_item_format(id, alternative, cx)
+    });
+    cx.run_until_parked();
+
+    let selected = shift.read_with(cx, |this, _| {
+        let item = &this.batch_queue.items()[0];
+        (item.format_selection, item.resolved_format())
+    });
+    assert!(matches!(selected.0, BatchFormatSelection::Override(_)));
+    assert_eq!(selected.1, alternative);
+
+    shift.update(cx, |this, cx| this.add_batch_item_output(id, cx));
+    cx.run_until_parked();
+    let (len, formats) = shift.read_with(cx, |this, _| {
+        (this.batch_queue.len(), this.batch_queue.group_formats(id))
+    });
+    assert_eq!(len, 2);
+    assert_eq!(formats.len(), 2);
+    assert_ne!(formats[0], formats[1]);
+
+    let extra = shift.read_with(cx, |this, _| this.batch_queue.items()[1].id);
+    shift.update(cx, |this, cx| this.remove_batch_item(extra, cx));
+    assert_eq!(shift.read_with(cx, |this, _| this.batch_queue.len()), 1);
 }
 
 #[gpui::test]
@@ -5192,6 +5233,7 @@ async fn apply_batch_event_updates_item_and_status(cx: &mut TestAppContext) {
             path: env.temp.join("out.md"),
             module_id: "markitdown".into(),
             byte_len: 12,
+            provenance: Default::default(),
         });
         assert!(matches!(
             this.batch_queue.items()[0].state,
