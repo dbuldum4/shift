@@ -44,6 +44,8 @@ pub fn extract_pdf_pages(
         None => format!("{from}-z"),
     };
     let mut command = Command::new(&executable);
+    // Match the toolkit module: warnings-only (default exit 3) still write output.
+    command.arg("--warning-exit-0");
     command.arg(input);
     if let Some(password) = password.map(str::trim).filter(|value| !value.is_empty()) {
         let password_file = work_dir.join("password.txt");
@@ -65,7 +67,9 @@ pub fn extract_pdf_pages(
                 ))
             })?;
         }
-        command.arg(format!("--password-file={}", password_file.display()));
+        command
+            .arg(format!("--password-file={}", password_file.display()))
+            .arg("--decrypt");
     }
     command
         .arg("--pages")
@@ -206,6 +210,10 @@ mod tests {
             "password must be passed through a file, args: {args}"
         );
         assert!(
+            args.contains("--decrypt"),
+            "encrypted input must be decrypted, args: {args}"
+        );
+        assert!(
             !args.contains("--password=s3cret"),
             "password must not appear on the command line, args: {args}"
         );
@@ -265,6 +273,10 @@ mod tests {
         assert!(
             args.contains("--password-file="),
             "password must be passed through a file, args: {args}"
+        );
+        assert!(
+            args.contains("--decrypt"),
+            "encrypted input must be decrypted, args: {args}"
         );
         assert!(
             !args.contains("--password=s3cret"),

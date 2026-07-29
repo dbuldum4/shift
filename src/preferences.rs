@@ -14,6 +14,7 @@ const DEFAULT_MODULES: &[&str] = &[
     "pandoc",
     "defuddle",
     "docling",
+    "qpdf",
     "spreadsheet",
     "sips",
     "ffmpeg",
@@ -174,6 +175,7 @@ mod tests {
                 "markitdown",
                 "defuddle",
                 "docling",
+                "qpdf",
                 "spreadsheet",
                 "sips",
                 "ffmpeg"
@@ -194,6 +196,7 @@ mod tests {
                 "pandoc",
                 "markitdown",
                 "defuddle",
+                "qpdf",
                 "spreadsheet",
                 "sips",
                 "ffmpeg"
@@ -222,6 +225,7 @@ mod tests {
                 "docling",
                 "markitdown",
                 "defuddle",
+                "qpdf",
                 "spreadsheet",
                 "sips",
                 "ffmpeg"
@@ -265,7 +269,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             saved,
-            "pandoc\ndocling\nmarkitdown\ndefuddle\nspreadsheet\nsips\nffmpeg"
+            "pandoc\ndocling\nmarkitdown\ndefuddle\nqpdf\nspreadsheet\nsips\nffmpeg"
         );
 
         assert_eq!(
@@ -275,6 +279,7 @@ mod tests {
                 "docling",
                 "markitdown",
                 "defuddle",
+                "qpdf",
                 "spreadsheet",
                 "sips",
                 "ffmpeg"
@@ -302,7 +307,7 @@ mod tests {
         let saved = std::fs::read_to_string(override_dir.join("module-priority")).unwrap();
         assert_eq!(
             saved,
-            "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle\nspreadsheet\nsips"
+            "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle\nqpdf\nspreadsheet\nsips"
         );
 
         assert_eq!(
@@ -313,6 +318,7 @@ mod tests {
                 "markitdown",
                 "pandoc",
                 "defuddle",
+                "qpdf",
                 "spreadsheet",
                 "sips"
             ]
@@ -336,6 +342,7 @@ mod tests {
                 "markitdown",
                 "defuddle",
                 "docling",
+                "qpdf",
                 "spreadsheet",
                 "sips",
             ]
@@ -378,6 +385,7 @@ mod tests {
                 "pandoc",
                 "defuddle",
                 "docling",
+                "qpdf",
                 "spreadsheet",
                 "sips",
             ]

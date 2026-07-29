@@ -13,7 +13,10 @@ set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle)
 which removes clutter and returns clean Markdown or HTML.
 [Docling](https://github.com/docling-project/docling) reads PDFs and other
 documents with layout-aware parsing and exports Markdown, HTML, or plain text
-(including PDF → HTML). [FFmpeg](https://ffmpeg.org/) converts audio and video containers, extracts
+(including PDF → HTML). [qpdf](https://qpdf.sourceforge.io/) provides PDF page
+extraction, rotation, compression (lossless Flate or smaller lossy image
+recompress), linearization, and page splitting.
+[FFmpeg](https://ffmpeg.org/) converts audio and video containers, extracts
 still frames and subtitles, and exposes trim/quality/stream options in the app
 and CLI. The output menu ranks mainstream formats first, followed by authoring,
 publishing, wiki, presentation, media, and specialized formats.
@@ -92,6 +95,18 @@ Set `SHIFT_DOCLING_BIN=/absolute/path/to/docling` when it is not available on
 `PATH`. First runs may download model weights. Prefer Docling above MarkItDown
 in Settings when you want higher-quality PDF → Markdown.
 
+- [qpdf](https://qpdf.sourceforge.io/) for PDF toolkit operations:
+
+```sh
+brew install qpdf
+```
+
+Set `SHIFT_QPDF_BIN=/absolute/path/to/qpdf` when it is not available on `PATH`.
+Page extract/rotate and Flate recompress are lossless; **Smaller** compression
+re-encodes suitable images with JPEG (lossy) for size. PDF passwords are passed
+through restrictive temporary files and never appear in converter command lines
+or persisted session settings.
+
 - [FFmpeg](https://ffmpeg.org/) for audio and video conversion:
 
 ```sh
@@ -110,8 +125,9 @@ with sections for engines on the active route:
   FPS, mute, loudness normalize, burn embedded subtitles, stream indices, frame
   interval for **PNG Sequence (ZIP)**
 - **Docling** — image export mode, OCR, OCR language, tables, table mode
-- **PDF input** — page range (requires [qpdf](https://qpdf.sourceforge.io/)),
-  password (session only; never written to disk)
+- **PDF toolkit** — page range, password (session only), 90° rotation,
+  preserve/lossless/smaller compression, web linearization, and split-page ZIP
+  output
 - **Defuddle** — frontmatter, language
 - **Pandoc** — standalone, TOC, PDF engine, reference DOCX/PPTX
 - **MarkItDown** — keep data URIs
@@ -229,8 +245,13 @@ cargo run --bin shift-cli -- clip.mkv --to png --frame 12.5
 cargo run --bin shift-cli -- clip.mkv --to srt --subtitle-stream 0
 cargo run --bin shift-cli -- clip.mp4 --to png-sequence-zip --frame-interval 1
 
-# PDF pages (needs qpdf) and OCR language (Docling)
+# PDF pages and OCR language (Docling)
 cargo run --bin shift-cli -- scan.pdf --module docling --pages 2-5 --ocr-lang eng
+
+# Lossless PDF rewrite, rotation, web optimization, and split-page ZIP
+cargo run --bin shift-cli -- scan.pdf --to pdf --pages 2-5 --pdf-rotate 90 \
+  --pdf-compression lossless --pdf-linearize
+cargo run --bin shift-cli -- scan.pdf --to pdf-pages-zip --pdf-split-pages 1
 
 # Pandoc reference template
 cargo run --bin shift-cli -- notes.md --to docx --reference-doc ~/Templates/ref.docx

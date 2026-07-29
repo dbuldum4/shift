@@ -123,6 +123,7 @@ impl DiagnosticsReport {
             let pandoc = scope.spawn(probe_pandoc);
             let defuddle = scope.spawn(probe_defuddle);
             let docling = scope.spawn(probe_docling);
+            let qpdf = scope.spawn(probe_qpdf);
             let spreadsheet = scope.spawn(probe_spreadsheet);
             #[cfg(target_os = "macos")]
             let sips = scope.spawn(probe_sips);
@@ -133,6 +134,7 @@ impl DiagnosticsReport {
                 pandoc.join().expect("pandoc probe"),
                 defuddle.join().expect("defuddle probe"),
                 docling.join().expect("docling probe"),
+                qpdf.join().expect("qpdf probe"),
                 spreadsheet.join().expect("spreadsheet probe"),
             ];
             // Off macOS the module is not registered, so it is not reported.
@@ -654,6 +656,24 @@ fn probe_docling() -> EngineDiagnostic {
     )
 }
 
+fn probe_qpdf() -> EngineDiagnostic {
+    let install_hint = "brew install qpdf".into();
+    let env_override = "SHIFT_QPDF_BIN";
+    let resolved = resolve_tool_path(env_override, "qpdf", &[]);
+    finish_engine_probe(
+        "qpdf",
+        "qpdf",
+        resolved,
+        env_override,
+        install_hint,
+        &["--version"],
+        Some(
+            "PDF rewrite, rotation, compression (lossless Flate or smaller/lossy images), and page splitting."
+                .into(),
+        ),
+    )
+}
+
 fn probe_spreadsheet() -> EngineDiagnostic {
     // In-process (calamine + csv + rust_xlsxwriter); always ready, no install.
     EngineDiagnostic {
@@ -954,6 +974,7 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "qpdf",
             "spreadsheet",
             "ffmpeg",
         ]
@@ -1174,6 +1195,7 @@ mod tests {
             "pandoc",
             "defuddle",
             "docling",
+            "qpdf",
             "spreadsheet",
             "sips",
             "ffmpeg",

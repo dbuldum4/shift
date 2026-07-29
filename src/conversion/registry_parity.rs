@@ -168,6 +168,7 @@ fn default_registry_module_ids_are_unique_and_stable() {
         "pandoc",
         "defuddle",
         "docling",
+        "qpdf",
         "spreadsheet",
         "sips",
         "ffmpeg",
@@ -178,6 +179,7 @@ fn default_registry_module_ids_are_unique_and_stable() {
         "pandoc",
         "defuddle",
         "docling",
+        "qpdf",
         "spreadsheet",
         "ffmpeg",
     ];
