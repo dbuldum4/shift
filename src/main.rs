@@ -34,10 +34,11 @@ use shift_core::conversion::{
     FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
     MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
     Readiness, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, available_ready_outputs,
-    available_ready_url_outputs, expand_input_paths, is_audio_output, is_docling_timed_input,
-    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
-    looks_like_url, materialize_magic_paste, parse_magic_paste, paths_refer_to_same_file,
-    pdf_engine_candidates, run_batch, stage_pasted_image, suggested_output_for_path,
+    available_ready_url_outputs, expand_input_paths, ffmpeg_supports_target_size_output,
+    is_audio_output, is_docling_timed_input, is_docling_video_input, is_ffmpeg_output,
+    is_image_output, is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste,
+    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
+    sips_supports_target_size_output, stage_pasted_image, suggested_output_for_path,
     suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
@@ -1379,6 +1380,35 @@ fn parse_optional_u32(value: &str) -> Result<Option<u32>, String> {
         .map_err(|_| format!("expected a whole number, got “{value}”"))
 }
 
+fn parse_optional_target_megabytes(value: &str) -> Result<Option<u64>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let megabytes = value
+        .parse::<f64>()
+        .map_err(|_| format!("expected target size in MB, got “{value}”"))?;
+    let bytes = megabytes * 1_000_000.0;
+    if !bytes.is_finite() || bytes < 16.0 * 1024.0 {
+        return Err("target size must be at least 0.02 MB".into());
+    }
+    if bytes > u64::MAX as f64 {
+        return Err("target size is too large".into());
+    }
+    Ok(Some(bytes.round() as u64))
+}
+
+fn format_target_megabytes(bytes: u64) -> String {
+    let mut value = format!("{:.2}", bytes as f64 / 1_000_000.0);
+    while value.ends_with('0') {
+        value.pop();
+    }
+    if value.ends_with('.') {
+        value.pop();
+    }
+    value
+}
+
 fn chip(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -1422,6 +1452,7 @@ fn chip(
 pub(crate) struct ConversionPanelView {
     active_modules: Vec<&'static str>,
     output_format: OutputFormat,
+    target_size_input: Entity<TextInput>,
     quality: FfmpegQuality,
     encode_mode: FfmpegEncodeMode,
     mono: bool,
@@ -1481,6 +1512,7 @@ fn conversion_options_panel(
     let ConversionPanelView {
         active_modules,
         output_format,
+        target_size_input,
         quality,
         encode_mode,
         mono,
@@ -1540,6 +1572,12 @@ fn conversion_options_panel(
     let show_sips = active_modules.contains(&"sips");
     let show_spreadsheet = active_modules.contains(&"spreadsheet");
     let show_qpdf = active_modules.contains(&"qpdf");
+    let target_size_supported = (show_ffmpeg && ffmpeg_supports_target_size_output(output_format))
+        || (show_sips && sips_supports_target_size_output(output_format));
+    let target_size_active = !target_size_input.read(cx).content().trim().is_empty();
+    // Keep an active but unsupported goal visible so changing formats never
+    // strands a hidden setting that makes conversion fail.
+    let show_target_size = target_size_supported || target_size_active;
     // Quality only affects lossy encoders; hide it for lossless destinations
     // rather than showing a control that silently does nothing.
     let show_sips_quality = matches!(output_format.id(), "jpg" | "heic" | "avif" | "jp2");
@@ -1605,6 +1643,98 @@ fn conversion_options_panel(
                         })),
                 ),
         )
+        .when(show_target_size, |panel| {
+            panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(THEME.text_muted)
+                            .child(if target_size_supported {
+                                "Fit to size"
+                            } else {
+                                "Fit to size · unavailable"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .items_center()
+                            .child(chip(
+                                "target-size-off",
+                                "Off",
+                                target_size_input.read(cx).content().trim().is_empty(),
+                                cx,
+                                |this, cx| {
+                                    this.target_size_input
+                                        .update(cx, |input, cx| input.set_content("", cx));
+                                },
+                            ))
+                            .when(target_size_supported, |row| {
+                                row.child(chip(
+                                    "target-size-email",
+                                    "Email · 10 MB",
+                                    target_size_input.read(cx).content().trim() == "10",
+                                    cx,
+                                    |this, cx| {
+                                        this.target_size_input
+                                            .update(cx, |input, cx| input.set_content("10", cx));
+                                    },
+                                ))
+                                .child(chip(
+                                    "target-size-message",
+                                    "Message · 25 MB",
+                                    target_size_input.read(cx).content().trim() == "25",
+                                    cx,
+                                    |this, cx| {
+                                        this.target_size_input
+                                            .update(cx, |input, cx| input.set_content("25", cx));
+                                    },
+                                ))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .flex_1()
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(THEME.surface)
+                                    .border_1()
+                                    .border_color(THEME.border)
+                                    .child(target_size_input.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(THEME.text_muted)
+                                    .child("MB maximum"),
+                            ),
+                    )
+                    .child(
+                        div().text_xs().text_color(THEME.text_dim).child(
+                            if target_size_supported {
+                                "Shift re-encodes and retries when the first pass is too large. \
+                                 Large stills may also need a max dimension; short video clips \
+                                 have practical bitrate floors."
+                            } else {
+                                "This output cannot honor the current cap. Turn it off or choose a supported lossy format."
+                            },
+                        ),
+                    ),
+            )
+        })
         .when(show_ffmpeg, |panel| {
             panel.child(
                 div()
@@ -5310,6 +5440,10 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
         ("SHIFT_DOCLING_BIN", "Path to the docling executable"),
         ("SHIFT_QPDF_BIN", "Path to the qpdf executable"),
         ("SHIFT_FFMPEG_BIN", "Path to the ffmpeg executable"),
+        (
+            "SHIFT_FFPROBE_BIN",
+            "Path to ffprobe for target-size media duration",
+        ),
         (
             "SHIFT_PDF_ENGINE",
             "PDF engine for Pandoc (typst, xelatex, …)",

@@ -3861,6 +3861,8 @@ async fn build_conversion_options_with_many_session_knobs(cx: &mut TestAppContex
             .update(cx, |input, cx| input.set_content("1.5", cx));
         this.ffmpeg_duration_input
             .update(cx, |input, cx| input.set_content("10", cx));
+        this.target_size_input
+            .update(cx, |input, cx| input.set_content("9.5", cx));
         this.pdf_page_from_input
             .update(cx, |input, cx| input.set_content("2", cx));
         this.pdf_page_to_input
@@ -3893,6 +3895,7 @@ async fn build_conversion_options_with_many_session_knobs(cx: &mut TestAppContex
         assert!(options.markitdown.keep_data_uris);
         assert_eq!(options.ffmpeg.start_secs, Some(1.5));
         assert_eq!(options.ffmpeg.duration_secs, Some(10.0));
+        assert_eq!(options.target_size_bytes, Some(9_500_000));
         assert_eq!(options.pdf.page_from, Some(2));
         assert_eq!(options.pdf.page_to, Some(5));
         assert_eq!(options.pdf.rotate_degrees, Some(180));
@@ -3909,6 +3912,32 @@ async fn build_conversion_options_with_many_session_knobs(cx: &mut TestAppContex
             .expect("ZIP options should include split_pages");
         assert_eq!(zip_options.pdf.split_pages, Some(2));
     });
+}
+
+#[gpui::test]
+async fn target_size_input_rejects_tiny_and_non_numeric_values(cx: &mut TestAppContext) {
+    let shift = create_shift(cx);
+    shift.update(cx, |this, cx| {
+        this.target_size_input
+            .update(cx, |input, cx| input.set_content("nope", cx));
+        assert!(this.build_conversion_options(cx).is_err());
+        this.target_size_input
+            .update(cx, |input, cx| input.set_content("0.001", cx));
+        assert!(this.build_conversion_options(cx).is_err());
+        this.target_size_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        assert_eq!(
+            this.build_conversion_options(cx).unwrap().target_size_bytes,
+            None
+        );
+    });
+}
+
+#[test]
+fn target_size_display_trims_only_insignificant_zeroes() {
+    assert_eq!(super::format_target_megabytes(10_000_000), "10");
+    assert_eq!(super::format_target_megabytes(9_500_000), "9.5");
+    assert_eq!(super::format_target_megabytes(16_384), "0.02");
 }
 
 #[gpui::test]

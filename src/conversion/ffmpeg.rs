@@ -235,9 +235,51 @@ pub fn is_subtitle_output(format: OutputFormat) -> bool {
     matches!(format.id(), "srt" | "vtt")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetBitrates {
+    audio_bps: Option<u64>,
+    video_bps: Option<u64>,
+}
+
+impl TargetBitrates {
+    fn scale(self, factor: f64) -> Self {
+        Self {
+            audio_bps: self
+                .audio_bps
+                .map(|value| ((value as f64 * factor) as u64).max(24_000)),
+            video_bps: self
+                .video_bps
+                .map(|value| ((value as f64 * factor) as u64).max(80_000)),
+        }
+    }
+}
+
+pub fn ffmpeg_supports_target_size_output(format: OutputFormat) -> bool {
+    matches!(
+        format.id(),
+        "mp3"
+            | "aac"
+            | "m4a"
+            | "ogg"
+            | "opus"
+            | "ac3"
+            | "wma"
+            | "mp4"
+            | "webm"
+            | "mkv"
+            | "mov"
+            | "avi"
+            | "m4v"
+            | "mpeg"
+            | "ts"
+            | "3gp"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct FfmpegModule {
     executable: OsString,
+    ffprobe_executable: OsString,
     /// WEBP encoding requires libwebp at compile time. Many macOS ffmpeg
     /// installs (including the one on this developer machine) have the muxer
     /// but no encoder, so we probe once and hide WEBP from dispatch rather
@@ -253,10 +295,12 @@ impl Default for FfmpegModule {
         // Absolute path when found so GUI apps with a minimal PATH match
         // diagnostics readiness (PATH + common_bin_dirs).
         let executable = resolve_tool_executable("SHIFT_FFMPEG_BIN", "ffmpeg", &[]);
+        let ffprobe_executable = resolve_tool_executable("SHIFT_FFPROBE_BIN", "ffprobe", &[]);
         let webp_encoder_available = cached_webp_encoder_available(&executable);
         let outputs = ffmpeg_outputs(webp_encoder_available);
         Self {
             executable,
+            ffprobe_executable,
             webp_encoder_available,
             outputs,
         }
@@ -265,10 +309,24 @@ impl Default for FfmpegModule {
 
 impl FfmpegModule {
     pub fn with_executable(executable: impl Into<OsString>) -> Self {
+        let executable = executable.into();
         Self {
-            executable: executable.into(),
+            ffprobe_executable: executable.clone(),
+            executable,
             // Unit tests that provide a fake or bare-name binary should not be
             // blocked by a developer's real ffmpeg configuration.
+            webp_encoder_available: true,
+            outputs: OutputFormat::MEDIA.to_vec(),
+        }
+    }
+
+    pub fn with_executables(
+        executable: impl Into<OsString>,
+        ffprobe_executable: impl Into<OsString>,
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            ffprobe_executable: ffprobe_executable.into(),
             webp_encoder_available: true,
             outputs: OutputFormat::MEDIA.to_vec(),
         }
@@ -305,65 +363,123 @@ impl FfmpegModule {
         let work_dir = unique_temp_dir("shift-ffmpeg")?;
         let cleanup = TempDirGuard(work_dir.clone());
         let produced = work_dir.join(Self::output_file_name(stem, output_format));
-
-        let mut command = self.build_command(input, &produced, output_format, &options.ffmpeg)?;
-        let progress_path = if options.progress.is_some() {
-            let path = work_dir.join("ffmpeg-progress.txt");
-            // Truncate so a stale file cannot confuse the reader.
-            fs::write(&path, b"").ok();
-            command.arg("-progress").arg(&path);
-            command.arg("-stats_period").arg("0.5");
-            Some(path)
-        } else {
-            None
+        let mut target_bitrates = match options.target_size_bytes {
+            Some(target) => Some(self.target_bitrates(
+                input,
+                output_format,
+                &options.ffmpeg,
+                target,
+                options,
+            )?),
+            None => None,
         };
+        let max_attempts = if target_bitrates.is_some() { 4 } else { 1 };
+        let mut invocations = Vec::new();
+        let mut fitted_bytes = None;
+        let mut smallest = u64::MAX;
 
-        let invocation = InvocationRecord {
-            module_id: self.id(),
-            argv_display: format_argv_display(&command_argv_parts(&command)),
-        };
-
-        report_phase(options, "FFmpeg converting…");
-        let progress_stop = spawn_progress_watcher(progress_path.clone(), options);
-
-        let output = run_command_cancellable(
-            command,
-            process_timeout(),
-            max_output_bytes(),
-            options.cancel.clone(),
-        );
-        stop_progress_watcher(progress_stop);
-        let output = output.map_err(|error| {
-            map_spawn_error(
-                error,
-                "FFmpeg is not installed. Install it with `brew install ffmpeg`, \
-                 or set SHIFT_FFMPEG_BIN.",
-            )
-        })?;
-
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let detail = if detail.is_empty() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if stdout.is_empty() {
-                    format!("process exited with {}", output.status)
-                } else {
-                    stdout
-                }
+        for attempt in 0..max_attempts {
+            let _ = fs::remove_file(&produced);
+            let mut command = self.build_command_with_target(
+                input,
+                &produced,
+                output_format,
+                &options.ffmpeg,
+                target_bitrates,
+            )?;
+            let progress_path = if options.progress.is_some() {
+                let path = work_dir.join(format!("ffmpeg-progress-{attempt}.txt"));
+                fs::write(&path, b"").ok();
+                command.arg("-progress").arg(&path);
+                command.arg("-stats_period").arg("0.5");
+                Some(path)
             } else {
-                detail
+                None
             };
-            return Err(ConversionError::new(format!(
-                "FFmpeg could not convert {} to {}: {detail}",
-                input.display(),
-                output_format.label()
-            )));
+
+            invocations.push(InvocationRecord {
+                module_id: self.id(),
+                argv_display: format_argv_display(&command_argv_parts(&command)),
+            });
+            report_phase(
+                options,
+                if target_bitrates.is_some() {
+                    "FFmpeg fitting output…"
+                } else {
+                    "FFmpeg converting…"
+                },
+            );
+            let progress_stop = spawn_progress_watcher(progress_path, options);
+            let output = run_command_cancellable(
+                command,
+                process_timeout(),
+                max_output_bytes(),
+                options.cancel.clone(),
+            );
+            stop_progress_watcher(progress_stop);
+            let output = output.map_err(|error| {
+                map_spawn_error(
+                    error,
+                    "FFmpeg is not installed. Install it with `brew install ffmpeg`, \
+                     or set SHIFT_FFMPEG_BIN.",
+                )
+            })?;
+
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let detail = if detail.is_empty() {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    if stdout.is_empty() {
+                        format!("process exited with {}", output.status)
+                    } else {
+                        stdout
+                    }
+                } else {
+                    detail
+                };
+                return Err(ConversionError::new(format!(
+                    "FFmpeg could not convert {} to {}: {detail}",
+                    input.display(),
+                    output_format.label()
+                )));
+            }
+
+            let actual_size = fs::metadata(&produced)
+                .map_err(|error| {
+                    ConversionError::new(format!(
+                        "FFmpeg finished but did not write {}: {error}",
+                        produced.display()
+                    ))
+                })?
+                .len();
+            smallest = smallest.min(actual_size);
+            if options
+                .target_size_bytes
+                .is_none_or(|target| actual_size <= target)
+            {
+                fitted_bytes = Some(read_file_limited(&produced, max_output_bytes()).map_err(
+                    |error| {
+                        ConversionError::new(format!(
+                            "FFmpeg output was not readable at {}: {error}",
+                            produced.display()
+                        ))
+                    },
+                )?);
+                break;
+            }
+
+            let target = options.target_size_bytes.unwrap_or_default();
+            let factor = (target as f64 / actual_size as f64 * 0.94).clamp(0.20, 0.92);
+            target_bitrates = target_bitrates.map(|bitrates| bitrates.scale(factor));
         }
 
-        let bytes = read_file_limited(&produced, max_output_bytes()).map_err(|error| {
+        let bytes = fitted_bytes.ok_or_else(|| {
             ConversionError::new(format!(
-                "FFmpeg finished but did not write {}: {error}",
-                produced.display()
+                "media could not fit under {} bytes after {max_attempts} passes \
+                 (smallest attempt was {smallest} bytes); choose a larger target, \
+                 shorter duration, or smaller dimensions \
+                 (video planning floors ~80 kbps video / ~32 kbps audio)",
+                options.target_size_bytes.unwrap_or_default()
             ))
         })?;
 
@@ -378,7 +494,7 @@ impl FfmpegModule {
             format: output_format,
             module_id: self.id(),
             pipeline: vec![self.id()],
-            invocations: vec![invocation],
+            invocations,
         })
     }
 
@@ -502,12 +618,24 @@ impl FfmpegModule {
         })
     }
 
+    #[cfg(test)]
     fn build_command(
         &self,
         input: &Path,
         produced: &Path,
         output_format: OutputFormat,
         options: &FfmpegOptions,
+    ) -> Result<Command, ConversionError> {
+        self.build_command_with_target(input, produced, output_format, options, None)
+    }
+
+    fn build_command_with_target(
+        &self,
+        input: &Path,
+        produced: &Path,
+        output_format: OutputFormat,
+        options: &FfmpegOptions,
+        target_bitrates: Option<TargetBitrates>,
     ) -> Result<Command, ConversionError> {
         validate_options(options)?;
 
@@ -543,10 +671,108 @@ impl FfmpegModule {
         }
 
         apply_stream_maps(&mut command, output_format, options);
-        apply_encode_settings(&mut command, input, output_format, options)?;
+        apply_encode_settings(&mut command, input, output_format, options, target_bitrates)?;
 
         command.arg(produced);
         Ok(command)
+    }
+
+    fn target_bitrates(
+        &self,
+        input: &Path,
+        output_format: OutputFormat,
+        options: &FfmpegOptions,
+        target_bytes: u64,
+        conversion: &ConversionOptions,
+    ) -> Result<TargetBitrates, ConversionError> {
+        if !ffmpeg_supports_target_size_output(output_format) {
+            return Err(ConversionError::new(format!(
+                "FFmpeg cannot fit {} output to a target size",
+                output_format.label()
+            )));
+        }
+        if options.encode_mode == FfmpegEncodeMode::PreferCopy {
+            return Err(ConversionError::new(
+                "stream copy cannot guarantee a target size; choose Auto or Re-encode",
+            ));
+        }
+        let duration = if let Some(duration) = options.duration_secs {
+            duration
+        } else {
+            let total = self.probe_duration(input, conversion)?;
+            (total - options.start_secs.unwrap_or(0.0)).max(0.0)
+        };
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(ConversionError::new(
+                "could not determine a positive media duration for target-size encoding; \
+                 set Duration explicitly",
+            ));
+        }
+
+        // Reserve six percent for container/index overhead. Subsequent passes
+        // correct encoder/container variance using the actual artifact size.
+        let total_bps = ((target_bytes as f64 * 8.0 / duration) * 0.94) as u64;
+        if is_audio_output(output_format) {
+            return Ok(TargetBitrates {
+                audio_bps: Some(total_bps.clamp(24_000, 320_000)),
+                video_bps: None,
+            });
+        }
+
+        let audio_bps = if options.mute {
+            None
+        } else {
+            Some((total_bps / 6).clamp(32_000, 128_000))
+        };
+        let video_bps = total_bps.saturating_sub(audio_bps.unwrap_or(0)).max(80_000);
+        Ok(TargetBitrates {
+            audio_bps,
+            video_bps: Some(video_bps),
+        })
+    }
+
+    fn probe_duration(
+        &self,
+        input: &Path,
+        options: &ConversionOptions,
+    ) -> Result<f64, ConversionError> {
+        let mut command = Command::new(&self.ffprobe_executable);
+        command
+            .arg("-v")
+            .arg("error")
+            .arg("-show_entries")
+            .arg("format=duration")
+            .arg("-of")
+            .arg("default=noprint_wrappers=1:nokey=1")
+            .arg(input);
+        let output = run_command_cancellable(
+            command,
+            Duration::from_secs(15),
+            64 * 1024,
+            options.cancel.clone(),
+        )
+        .map_err(|error| {
+            map_spawn_error(
+                error,
+                "ffprobe is required to fit media to a target size. Install FFmpeg \
+                 with `brew install ffmpeg`, set SHIFT_FFPROBE_BIN, or set Duration.",
+            )
+        })?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(ConversionError::new(format!(
+                "ffprobe could not determine media duration: {}",
+                if detail.is_empty() {
+                    output.status.to_string()
+                } else {
+                    detail
+                }
+            )));
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| ConversionError::new("ffprobe returned an invalid media duration"))
     }
 }
 
@@ -775,6 +1001,7 @@ fn apply_encode_settings(
     input: &Path,
     output_format: OutputFormat,
     options: &FfmpegOptions,
+    target_bitrates: Option<TargetBitrates>,
 ) -> Result<(), ConversionError> {
     if is_subtitle_output(output_format) {
         // Let FFmpeg pick a subtitle encoder for the container (srt/webvtt).
@@ -783,7 +1010,8 @@ fn apply_encode_settings(
 
     let want_copy = options.encode_mode == FfmpegEncodeMode::PreferCopy
         && !is_image_output(output_format)
-        && !options.forces_reencode();
+        && !options.forces_reencode()
+        && target_bitrates.is_none();
 
     if want_copy {
         command.arg("-c").arg("copy");
@@ -793,7 +1021,7 @@ fn apply_encode_settings(
     if options.encode_mode == FfmpegEncodeMode::PreferCopy {
         return Err(ConversionError::new(
             "stream copy cannot be combined with mono, sample-rate, scale, fps, mute, \
-             normalize-audio, burn-subtitles, frame interval, or still-image output; \
+             normalize-audio, burn-subtitles, frame interval, target size, or still-image output; \
              choose Auto/Re-encode or clear those options",
         ));
     }
@@ -852,11 +1080,16 @@ fn apply_encode_settings(
     }
 
     if is_audio_output(output_format) {
-        apply_audio_encode(command, output_format, options);
+        apply_audio_encode(
+            command,
+            output_format,
+            options,
+            target_bitrates.and_then(|target| target.audio_bps),
+        );
     } else if is_image_output(output_format) {
         apply_image_encode(command, output_format, options);
     } else if is_video_output(output_format) {
-        apply_video_encode(command, output_format, options);
+        apply_video_encode(command, output_format, options, target_bitrates);
         if options.mute {
             // Belt-and-suspenders if maps did not already drop audio.
             command.arg("-an");
@@ -875,12 +1108,22 @@ fn apply_encode_settings(
     Ok(())
 }
 
-fn apply_audio_encode(command: &mut Command, output_format: OutputFormat, options: &FfmpegOptions) {
-    let bitrate = match options.quality {
-        FfmpegQuality::High => "320k",
-        FfmpegQuality::Balanced => "192k",
-        FfmpegQuality::Small => "96k",
-    };
+fn apply_audio_encode(
+    command: &mut Command,
+    output_format: OutputFormat,
+    options: &FfmpegOptions,
+    target_bps: Option<u64>,
+) {
+    let bitrate = target_bps
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            match options.quality {
+                FfmpegQuality::High => "320k",
+                FfmpegQuality::Balanced => "192k",
+                FfmpegQuality::Small => "96k",
+            }
+            .to_owned()
+        });
     match output_format.id() {
         "wav" => {
             command.arg("-c:a").arg("pcm_s16le");
@@ -896,32 +1139,32 @@ fn apply_audio_encode(command: &mut Command, output_format: OutputFormat, option
         }
         "mp3" => {
             command.arg("-c:a").arg("libmp3lame");
-            command.arg("-b:a").arg(bitrate);
+            command.arg("-b:a").arg(&bitrate);
         }
         "aac" | "m4a" => {
             command.arg("-c:a").arg("aac");
-            command.arg("-b:a").arg(bitrate);
+            command.arg("-b:a").arg(&bitrate);
         }
         "caf" => {
             command.arg("-c:a").arg("pcm_s16le");
         }
         "ogg" | "opus" => {
             command.arg("-c:a").arg("libopus");
-            command.arg("-b:a").arg(bitrate);
+            command.arg("-b:a").arg(&bitrate);
         }
         "ac3" => {
             command.arg("-c:a").arg("ac3");
-            command.arg("-b:a").arg(bitrate);
+            command.arg("-b:a").arg(&bitrate);
         }
         "wma" => {
             command.arg("-c:a").arg("wmav2");
-            command.arg("-b:a").arg(bitrate);
+            command.arg("-b:a").arg(&bitrate);
         }
         "aiff" => {
             command.arg("-c:a").arg("pcm_s16be");
         }
         _ => {
-            command.arg("-b:a").arg(bitrate);
+            command.arg("-b:a").arg(&bitrate);
         }
     }
 }
@@ -956,7 +1199,12 @@ fn apply_image_encode(command: &mut Command, output_format: OutputFormat, option
     }
 }
 
-fn apply_video_encode(command: &mut Command, output_format: OutputFormat, options: &FfmpegOptions) {
+fn apply_video_encode(
+    command: &mut Command,
+    output_format: OutputFormat,
+    options: &FfmpegOptions,
+    target_bitrates: Option<TargetBitrates>,
+) {
     if output_format == OutputFormat::GIF {
         // Palette-based GIF is more complex; fps/scale filters already applied.
         return;
@@ -967,19 +1215,31 @@ fn apply_video_encode(command: &mut Command, output_format: OutputFormat, option
         FfmpegQuality::Balanced => "23",
         FfmpegQuality::Small => "28",
     };
-    let audio_bitrate = match options.quality {
-        FfmpegQuality::High => "192k",
-        FfmpegQuality::Balanced => "128k",
-        FfmpegQuality::Small => "96k",
-    };
+    let audio_bitrate = target_bitrates
+        .and_then(|target| target.audio_bps)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            match options.quality {
+                FfmpegQuality::High => "192k",
+                FfmpegQuality::Balanced => "128k",
+                FfmpegQuality::Small => "96k",
+            }
+            .to_owned()
+        });
 
     if output_format.id() == "webm" {
         command.arg("-c:v").arg("libvpx-vp9");
-        command.arg("-crf").arg(crf);
-        command.arg("-b:v").arg("0");
+        if let Some(video_bps) = target_bitrates.and_then(|target| target.video_bps) {
+            command.arg("-b:v").arg(video_bps.to_string());
+            command.arg("-maxrate").arg(video_bps.to_string());
+            command.arg("-bufsize").arg((video_bps * 2).to_string());
+        } else {
+            command.arg("-crf").arg(crf);
+            command.arg("-b:v").arg("0");
+        }
         if !options.mute {
             command.arg("-c:a").arg("libopus");
-            command.arg("-b:a").arg(audio_bitrate);
+            command.arg("-b:a").arg(&audio_bitrate);
         }
     } else if matches!(
         output_format.id(),
@@ -991,14 +1251,20 @@ fn apply_video_encode(command: &mut Command, output_format: OutputFormat, option
             FfmpegQuality::Balanced => "medium",
             FfmpegQuality::Small => "veryfast",
         });
-        command.arg("-crf").arg(crf);
+        if let Some(video_bps) = target_bitrates.and_then(|target| target.video_bps) {
+            command.arg("-b:v").arg(video_bps.to_string());
+            command.arg("-maxrate").arg(video_bps.to_string());
+            command.arg("-bufsize").arg((video_bps * 2).to_string());
+        } else {
+            command.arg("-crf").arg(crf);
+        }
         if !options.mute {
             command.arg("-c:a").arg(if output_format.id() == "mpeg" {
                 "mp2"
             } else {
                 "aac"
             });
-            command.arg("-b:a").arg(audio_bitrate);
+            command.arg("-b:a").arg(&audio_bitrate);
         }
         if matches!(output_format.id(), "mp4" | "m4v" | "mov") {
             command.arg("-movflags").arg("+faststart");
@@ -1086,6 +1352,10 @@ impl ConversionModule for FfmpegModule {
         CHAINABLE
     }
 
+    fn supports_target_size(&self, output: OutputFormat) -> bool {
+        ffmpeg_supports_target_size_output(output)
+    }
+
     fn supports(&self, input: &Path, output: OutputFormat) -> bool {
         if output == OutputFormat::WEBP && !self.webp_encoder_available {
             return false;
@@ -1124,7 +1394,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -i) shift 2; continue ;;
     -hide_banner|-nostdin|-y|-vn|-an) shift; continue ;;
-    -loglevel|-ss|-t|-map|-c|-c:a|-c:v|-b:a|-b:v|-crf|-preset|-vf|-af|-frames:v|-q:v|-quality|-compression_level|-ac|-ar|-movflags|-progress|-stats_period) shift 2; continue ;;
+    -loglevel|-ss|-t|-map|-c|-c:a|-c:v|-b:a|-b:v|-maxrate|-bufsize|-crf|-preset|-vf|-af|-frames:v|-q:v|-quality|-compression_level|-ac|-ar|-movflags|-progress|-stats_period) shift 2; continue ;;
     -*) shift; continue ;;
     *) output="$1"; shift; continue ;;
   esac
@@ -1146,6 +1416,36 @@ case "$output" in
   *.gif) printf 'GIFfake' > "$output" ;;
   *) printf 'fake-media' > "$output" ;;
 esac
+"#;
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn write_fake_fit_ffmpeg(path: &Path) {
+        let script = r#"#!/bin/sh
+set -e
+case " $* " in
+  *" -show_entries format=duration "*) printf '10.0\n'; exit 0 ;;
+esac
+printf '%s\n' "$*" > "${0}.args"
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -i) shift 2; continue ;;
+    -hide_banner|-nostdin|-y|-vn|-an) shift; continue ;;
+    -loglevel|-ss|-t|-map|-c|-c:a|-c:v|-b:a|-b:v|-maxrate|-bufsize|-crf|-preset|-vf|-af|-frames:v|-q:v|-quality|-compression_level|-ac|-ar|-movflags|-progress|-stats_period) shift 2; continue ;;
+    -*) shift; continue ;;
+    *) output="$1"; shift; continue ;;
+  esac
+done
+count=0
+[ -f "${0}.count" ] && count=$(cat "${0}.count")
+count=$((count + 1))
+printf '%s' "$count" > "${0}.count"
+if [ "$count" -eq 1 ]; then size=120000; else size=80000; fi
+dd if=/dev/zero of="$output" bs=1 count="$size" 2>/dev/null
 "#;
         fs::write(path, script).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -1183,6 +1483,83 @@ esac
 
         let _ = fs::remove_file(&executable);
         let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn target_size_probes_duration_and_retries_actual_output() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-fit", std::process::id());
+        let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        write_fake_fit_ffmpeg(&executable);
+        fs::write(&input, b"fake-video").unwrap();
+
+        let options = ConversionOptions {
+            target_size_bytes: Some(100_000),
+            ..ConversionOptions::default()
+        };
+        let artifact = FfmpegModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MP3, &options)
+            .unwrap();
+
+        assert_eq!(artifact.bytes.len(), 80_000);
+        assert_eq!(artifact.invocations.len(), 2);
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(args.contains("-b:a"), "args: {args}");
+        assert!(!args.contains("-c copy"), "args: {args}");
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(format!("{}.count", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn target_size_capabilities_exclude_lossless_and_non_media_outputs() {
+        let module = FfmpegModule::with_executable("/bin/true");
+        assert!(module.supports_target_size(OutputFormat::MP3));
+        assert!(module.supports_target_size(OutputFormat::MP4));
+        assert!(!module.supports_target_size(OutputFormat::WAV));
+        assert!(!module.supports_target_size(OutputFormat::FLAC));
+        assert!(!module.supports_target_size(OutputFormat::PNG));
+        assert!(!module.supports_target_size(OutputFormat::SRT));
+    }
+
+    #[test]
+    fn target_size_rejects_prefer_copy_before_spawn() {
+        let directory = std::env::temp_dir();
+        let suffix = format!("{}-copy-fit", std::process::id());
+        // Prefer a non-existent binary so a regression that reaches spawn fails
+        // loudly instead of accidentally succeeding with a system ffmpeg.
+        let executable = directory.join(format!("shift-ffmpeg-missing-{suffix}"));
+        let input = directory.join(format!("shift-ffmpeg-input-{suffix}.mp4"));
+        fs::write(&input, b"fake-video").unwrap();
+
+        let options = ConversionOptions {
+            target_size_bytes: Some(100_000),
+            ffmpeg: FfmpegOptions {
+                encode_mode: FfmpegEncodeMode::PreferCopy,
+                duration_secs: Some(10.0),
+                ..FfmpegOptions::default()
+            },
+            ..ConversionOptions::default()
+        };
+        let err = FfmpegModule::with_executable(&executable)
+            .convert(&input, OutputFormat::MP3, &options)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("stream copy") || message.contains("target size"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Auto") || message.contains("Re-encode") || message.contains("stream"),
+            "{message}"
+        );
+        // Must not have attempted to launch the missing binary under another path.
+        assert!(!executable.exists());
+
         let _ = fs::remove_file(&input);
     }
 

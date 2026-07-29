@@ -105,6 +105,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         sips: parsed.sips,
         spreadsheet: parsed.spreadsheet,
         pdf: parsed.pdf,
+        target_size_bytes: parsed.target_size_bytes,
         cancel: Some(Arc::clone(&cancel)),
         progress: None,
     };
@@ -207,6 +208,7 @@ struct ParsedConvertArgs {
     sips: SipsOptions,
     spreadsheet: SpreadsheetOptions,
     pdf: PdfInputOptions,
+    target_size_bytes: Option<u64>,
     recursive: bool,
     verbose: bool,
     progress: bool,
@@ -233,6 +235,7 @@ impl Default for ParsedConvertArgs {
             sips: SipsOptions::default(),
             spreadsheet: SpreadsheetOptions::default(),
             pdf: PdfInputOptions::default(),
+            target_size_bytes: None,
             recursive: false,
             verbose: false,
             progress: false,
@@ -400,6 +403,15 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .get(cursor)
                         .ok_or_else(|| "--scale-width requires pixels".to_owned())?,
                     "--scale-width",
+                )?);
+            }
+            "--target-size" => {
+                cursor += 1;
+                parsed.target_size_bytes = Some(parse_byte_size(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--target-size requires a size such as 10MB".to_owned())?,
+                    "--target-size",
                 )?);
             }
             "--keep-data-uris" => parsed.markitdown.keep_data_uris = true,
@@ -1146,6 +1158,39 @@ fn parse_positive_number(value: &OsStr, flag: &str, allow_zero: bool) -> Result<
     }
 }
 
+fn parse_byte_size(value: &OsStr, flag: &str) -> Result<u64, String> {
+    let raw = value.to_string_lossy();
+    let normalized = raw.trim().to_ascii_lowercase().replace(' ', "");
+    let (number, multiplier) = if let Some(value) = normalized.strip_suffix("gib") {
+        (value, 1024_u64.pow(3))
+    } else if let Some(value) = normalized.strip_suffix("gb") {
+        (value, 1_000_000_000)
+    } else if let Some(value) = normalized.strip_suffix("mib") {
+        (value, 1024_u64.pow(2))
+    } else if let Some(value) = normalized.strip_suffix("mb") {
+        (value, 1_000_000)
+    } else if let Some(value) = normalized.strip_suffix("kib") {
+        (value, 1024)
+    } else if let Some(value) = normalized.strip_suffix("kb") {
+        (value, 1_000)
+    } else if let Some(value) = normalized.strip_suffix('b') {
+        (value, 1)
+    } else {
+        // A bare value is user-facing megabytes, matching the native app.
+        (normalized.as_str(), 1_000_000)
+    };
+    let number = number
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} expects a size such as 10MB (got `{raw}`)"))?;
+    let bytes = number * multiplier as f64;
+    if !bytes.is_finite() || bytes < 16.0 * 1024.0 || bytes > u64::MAX as f64 {
+        return Err(format!(
+            "{flag} must be a finite size of at least 16KiB (got `{raw}`)"
+        ));
+    }
+    Ok(bytes.round() as u64)
+}
+
 fn print_help() {
     println!(
         "Shift converts files and URLs through the same modules as the native app.\n\n\
@@ -1184,6 +1229,9 @@ fn print_help() {
          --mono                  Downmix to mono when re-encoding\n  \
          --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
          --scale-width <PX>      Scale video/image width (height auto)\n\n\
+         Fit to size (FFmpeg lossy media and sips JPG/JP2):\n  \
+         --target-size <SIZE>    Fit supported output under SIZE (10MB, 750KiB;\n  \
+                                 bare values are interpreted as MB)\n\n\
          PDF toolkit options (qpdf):\n  \
          --pdf-password <SECRET> Password for encrypted PDFs\n  \
          --pages <FROM-TO>       1-based inclusive page range (e.g. 2-5)\n  \
@@ -2046,6 +2094,27 @@ mod tests {
         assert!(err.contains("--scale-width"), "{err}");
         let err = parse_u32(OsStr::new("-2"), "--audio-stream").unwrap_err();
         assert!(err.contains("--audio-stream"), "{err}");
+    }
+
+    #[test]
+    fn parses_target_sizes_with_units_and_megabyte_default() {
+        assert_eq!(
+            parse_byte_size(OsStr::new("10MB"), "--target-size").unwrap(),
+            10_000_000
+        );
+        assert_eq!(
+            parse_byte_size(OsStr::new("1.5 MiB"), "--target-size").unwrap(),
+            1_572_864
+        );
+        assert_eq!(
+            parse_byte_size(OsStr::new("2"), "--target-size").unwrap(),
+            2_000_000
+        );
+        assert!(parse_byte_size(OsStr::new("1KB"), "--target-size").is_err());
+
+        let parsed =
+            parse_convert_args(&args(&["clip.mp4", "--target-size", "25MB", "-t", "mp4"])).unwrap();
+        assert_eq!(parsed.target_size_bytes, Some(25_000_000));
     }
 
     #[test]

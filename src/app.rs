@@ -277,6 +277,8 @@ pub(crate) struct Shift {
     pub(crate) conversion_progress: Option<(Option<f32>, SharedString)>,
     /// Cached path for the ready artifact (binary copy / reveal / open).
     pub(crate) cached_ready_path: Option<PathBuf>,
+    /// User-facing decimal megabyte goal for modules that support fit-to-size.
+    pub(crate) target_size_input: Entity<TextInput>,
     // Session conversion options (shown for engines on the active route).
     pub(crate) ffmpeg_quality: FfmpegQuality,
     pub(crate) ffmpeg_encode_mode: FfmpegEncodeMode,
@@ -408,6 +410,16 @@ impl Shift {
                     .ffmpeg
                     .subtitle_stream
                     .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
+        });
+        let target_size_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "optional MB",
+                options
+                    .target_size_bytes
+                    .map(crate::format_target_megabytes)
                     .unwrap_or_default(),
             )
         });
@@ -575,6 +587,7 @@ impl Shift {
             conversion_cancel: Arc::new(AtomicBool::new(false)),
             conversion_progress: None,
             cached_ready_path: None,
+            target_size_input,
             ffmpeg_quality: options.ffmpeg.quality,
             ffmpeg_encode_mode: options.ffmpeg.encode_mode,
             ffmpeg_mono: options.ffmpeg.mono,
@@ -1634,6 +1647,8 @@ impl Shift {
         let audio_stream = parse_optional_u32(self.ffmpeg_audio_stream_input.read(cx).content())?;
         let subtitle_stream =
             parse_optional_u32(self.ffmpeg_subtitle_stream_input.read(cx).content())?;
+        let target_size_bytes =
+            parse_optional_target_megabytes(self.target_size_input.read(cx).content())?;
         let page_from = parse_optional_u32(self.pdf_page_from_input.read(cx).content())?;
         let page_to = parse_optional_u32(self.pdf_page_to_input.read(cx).content())?;
         // Only send split_pages for ZIP output so a leftover field from a prior
@@ -1762,6 +1777,7 @@ impl Shift {
                 linearize: self.pdf_linearize,
                 split_pages,
             },
+            target_size_bytes,
             cancel: None,
             progress: None,
         })
@@ -3039,6 +3055,7 @@ impl Render for Shift {
         let batch_status = self.batch_status.clone();
         let batch_item_progress = self.batch_item_progress.clone();
         let cached_ready_path = self.cached_ready_path.clone();
+        let target_size_input = self.target_size_input.clone();
         let focus_handle = self.focus_handle.clone();
 
         div()
@@ -3172,6 +3189,7 @@ impl Render for Shift {
                                 conversion_options: ConversionPanelView {
                                     active_modules: active_option_modules,
                                     output_format,
+                                    target_size_input,
                                     quality: ffmpeg_quality,
                                     encode_mode: ffmpeg_encode_mode,
                                     mono: ffmpeg_mono,

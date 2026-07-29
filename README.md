@@ -120,8 +120,10 @@ brew install ffmpeg
 ```
 
 Set `SHIFT_FFMPEG_BIN=/absolute/path/to/ffmpeg` when it is not available on
-`PATH`. Media conversions write into a temporary workspace and return the
-artifact without modifying the source file. Large outputs may need a higher
+`PATH`. Fit-to-size conversions also use the `ffprobe` installed with FFmpeg;
+set `SHIFT_FFPROBE_BIN=/absolute/path/to/ffprobe` to override it. Media
+conversions write into a temporary workspace and return the artifact without
+modifying the source file. Large outputs may need a higher
 `SHIFT_CONVERSION_MAX_OUTPUT_BYTES` (default 64 MiB).
 
 In the native app, selecting a source reveals a **Conversion options** panel
@@ -130,6 +132,12 @@ with sections for engines on the active route:
 - **FFmpeg** — quality, encode mode, trim, frame time, mono/sample rate, scale,
   FPS, mute, loudness normalize, burn embedded subtitles, stream indices, frame
   interval for **PNG Sequence (ZIP)**
+- **Fit to size** — supported lossy media and still-image routes can target a
+  maximum artifact size. Shift calculates an initial bitrate or image quality,
+  checks the produced file, and retries when container or encoder overhead puts
+  it above the requested cap. Video planning floors (~80 kbps video / ~32 kbps
+  audio) limit how small short clips can go; large stills may also need a max
+  dimension so quality alone can fit.
 - **Docling** — image export mode, OCR, OCR language, tables, table mode;
   audio/video ASR model, video frame sampling, and optional speaker diarization
 - **PDF toolkit** — page range, password (session only), 90° rotation,
@@ -255,6 +263,10 @@ cargo run --bin shift-cli -- clip.mp4 --to mp3
 # Trim, re-encode, scale, mute, normalize
 cargo run --bin shift-cli -- clip.mp4 --to mp4 --start 10 --duration 30 \
   --quality high --scale-width 1280 --fps 30 --mute --normalize-audio
+
+# Fit compressed media under an attachment limit (bare values mean decimal MB)
+cargo run --bin shift-cli -- clip.mp4 --to mp4 --target-size 10MB
+cargo run --bin shift-cli -- interview.wav --to mp3 --target-size 25
 
 # Still frame, subtitle extract, PNG sequence ZIP
 cargo run --bin shift-cli -- clip.mkv --to png --frame 12.5
