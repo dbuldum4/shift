@@ -1,12 +1,12 @@
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchQueue, BatchSource, ConversionArtifact,
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
-    DoclingImageExportMode, DoclingOptions, DoclingTableMode, FfmpegEncodeMode, FfmpegOptions,
-    FfmpegQuality, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
-    PdfCompression, PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions,
-    default_output_path, ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url,
-    materialize_paste_token, parse_magic_paste, prepare_batch_destination, run_batch,
-    url_display_host,
+    DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
+    DoclingVideoSamplingMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MagicPaste,
+    MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
+    SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, default_output_path,
+    ensure_public_url_fetch_allowed, expand_input_paths, looks_like_url, materialize_paste_token,
+    parse_magic_paste, prepare_batch_destination, run_batch, url_display_host,
 };
 use shift_core::preferences::load_module_priority;
 use std::ffi::{OsStr, OsString};
@@ -460,6 +460,58 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     .parse::<DoclingTableMode>()
                     .map_err(|error| error.to_string())?;
             }
+            "--docling-asr-model" => {
+                cursor += 1;
+                parsed.docling.asr_model = arguments
+                    .get(cursor)
+                    .ok_or_else(|| {
+                        "--docling-asr-model requires tiny|base|small|medium|large|turbo".to_owned()
+                    })?
+                    .to_string_lossy()
+                    .parse::<DoclingAsrModel>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--docling-video-sampling" => {
+                cursor += 1;
+                parsed.docling.video_sampling_mode = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--docling-video-sampling requires fixed|scene".to_owned())?
+                    .to_string_lossy()
+                    .parse::<DoclingVideoSamplingMode>()
+                    .map_err(|error| error.to_string())?;
+            }
+            "--docling-video-frame-interval" => {
+                cursor += 1;
+                parsed.docling.video_frame_interval_secs = parse_positive_number(
+                    arguments.get(cursor).ok_or_else(|| {
+                        "--docling-video-frame-interval requires seconds".to_owned()
+                    })?,
+                    "--docling-video-frame-interval",
+                    false,
+                )?;
+            }
+            "--docling-video-cuts-per-minute" => {
+                cursor += 1;
+                parsed.docling.video_cuts_per_minute = parse_positive_number(
+                    arguments.get(cursor).ok_or_else(|| {
+                        "--docling-video-cuts-per-minute requires a rate".to_owned()
+                    })?,
+                    "--docling-video-cuts-per-minute",
+                    true,
+                )?;
+            }
+            "--docling-video-prominence" => {
+                cursor += 1;
+                parsed.docling.video_prominence = parse_positive_number(
+                    arguments.get(cursor).ok_or_else(|| {
+                        "--docling-video-prominence requires a threshold".to_owned()
+                    })?,
+                    "--docling-video-prominence",
+                    true,
+                )?;
+            }
+            "--docling-video-diarization" => parsed.docling.video_diarization = true,
+            "--no-docling-video-diarization" => parsed.docling.video_diarization = false,
             "--sips-max-dimension" => {
                 cursor += 1;
                 parsed.sips.max_dimension = Some(parse_u32(
@@ -1077,6 +1129,23 @@ fn parse_u32(value: &OsStr, flag: &str) -> Result<u32, String> {
         .map_err(|_| format!("{flag} expects a non-negative integer"))
 }
 
+fn parse_positive_number(value: &OsStr, flag: &str, allow_zero: bool) -> Result<f64, String> {
+    let raw = value
+        .to_str()
+        .ok_or_else(|| format!("{flag} value is not valid UTF-8"))?;
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} expects a number"))?;
+    let in_range = parsed.is_finite() && (parsed > 0.0 || (allow_zero && parsed == 0.0));
+    if in_range {
+        Ok(parsed)
+    } else if allow_zero {
+        Err(format!("{flag} expects a non-negative number"))
+    } else {
+        Err(format!("{flag} expects a positive number"))
+    }
+}
+
 fn print_help() {
     println!(
         "Shift converts files and URLs through the same modules as the native app.\n\n\
@@ -1140,7 +1209,13 @@ fn print_help() {
          --docling-ocr / --no-docling-ocr\n  \
          --ocr-lang <CODE>       OCR language(s), e.g. eng or eng+deu\n  \
          --docling-tables / --no-docling-tables\n  \
-         --docling-table-mode fast|accurate\n\n\
+         --docling-table-mode fast|accurate\n  \
+         --docling-asr-model tiny|base|small|medium|large|turbo\n  \
+         --docling-video-sampling fixed|scene\n  \
+         --docling-video-frame-interval <SEC>\n  \
+         --docling-video-cuts-per-minute <N>  0 = auto scene sensitivity\n  \
+         --docling-video-prominence <N>       0 = auto scene sensitivity\n  \
+         --docling-video-diarization / --no-docling-video-diarization\n\n\
          Image options (sips, macOS only):\n  \
          --sips-max-dimension <PX>  Fit inside PX x PX, preserving aspect\n  \
          --sips-quality balanced|high|small\n  \
@@ -2640,6 +2715,34 @@ mod tests {
         assert_eq!(combo.docling.ocr_lang.as_deref(), Some("eng+fra"));
         assert_eq!(combo.target, "plain".parse::<OutputFormat>().unwrap());
 
+        let asr_and_video = parse_convert_args(&args(&[
+            "clip.mp4",
+            "-t",
+            "transcript",
+            "--docling-asr-model",
+            "turbo",
+            "--docling-video-sampling",
+            "scene",
+            "--docling-video-frame-interval",
+            "2.5",
+            "--docling-video-cuts-per-minute",
+            "4",
+            "--docling-video-prominence",
+            "0.02",
+            "--docling-video-diarization",
+        ]))
+        .unwrap();
+        assert_eq!(asr_and_video.target, OutputFormat::TRANSCRIPT);
+        assert_eq!(asr_and_video.docling.asr_model, DoclingAsrModel::Turbo);
+        assert_eq!(
+            asr_and_video.docling.video_sampling_mode,
+            DoclingVideoSamplingMode::Scene
+        );
+        assert_eq!(asr_and_video.docling.video_frame_interval_secs, 2.5);
+        assert_eq!(asr_and_video.docling.video_cuts_per_minute, 4.0);
+        assert_eq!(asr_and_video.docling.video_prominence, 0.02);
+        assert!(asr_and_video.docling.video_diarization);
+
         let bad_images =
             parse_convert_args(&args(&["scan.pdf", "--docling-images", "huge"])).unwrap_err();
         assert!(
@@ -2652,6 +2755,14 @@ mod tests {
             bad_table_mode.contains("table mode") || bad_table_mode.contains("turbo"),
             "{bad_table_mode}"
         );
+        for (flag, value) in [
+            ("--docling-video-frame-interval", "0"),
+            ("--docling-video-cuts-per-minute", "-1"),
+            ("--docling-video-prominence", "NaN"),
+        ] {
+            let error = parse_convert_args(&args(&["clip.mp4", flag, value])).unwrap_err();
+            assert!(error.contains("expects"), "{flag}: {error}");
+        }
     }
 
     #[test]

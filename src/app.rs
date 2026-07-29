@@ -298,6 +298,12 @@ pub(crate) struct Shift {
     pub(crate) docling_tables: bool,
     pub(crate) docling_table_mode: DoclingTableMode,
     pub(crate) docling_ocr_lang_input: Entity<TextInput>,
+    pub(crate) docling_asr_model: DoclingAsrModel,
+    pub(crate) docling_video_sampling_mode: DoclingVideoSamplingMode,
+    pub(crate) docling_video_frame_interval_input: Entity<TextInput>,
+    pub(crate) docling_video_cuts_per_minute_input: Entity<TextInput>,
+    pub(crate) docling_video_prominence_input: Entity<TextInput>,
+    pub(crate) docling_video_diarization: bool,
     pub(crate) sips_quality: SipsQuality,
     pub(crate) sips_max_dimension: Option<u32>,
     pub(crate) sips_rotate_degrees: Option<u32>,
@@ -412,6 +418,22 @@ impl Shift {
                 options.docling.ocr_lang.clone().unwrap_or_default(),
             )
         });
+        let docling_video_frame_interval_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "10",
+                options.docling.video_frame_interval_secs.to_string(),
+            )
+        });
+        let docling_video_cuts_per_minute_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "0 = auto",
+                options.docling.video_cuts_per_minute.to_string(),
+            )
+        });
+        let docling_video_prominence_input = cx
+            .new(|cx| TextInput::new(cx, "0 = auto", options.docling.video_prominence.to_string()));
         let defuddle_lang_input = cx.new(|cx| {
             TextInput::new(
                 cx,
@@ -573,6 +595,12 @@ impl Shift {
             docling_tables: options.docling.tables,
             docling_table_mode: options.docling.table_mode,
             docling_ocr_lang_input,
+            docling_asr_model: options.docling.asr_model,
+            docling_video_sampling_mode: options.docling.video_sampling_mode,
+            docling_video_frame_interval_input,
+            docling_video_cuts_per_minute_input,
+            docling_video_prominence_input,
+            docling_video_diarization: options.docling.video_diarization,
             sips_quality: options.sips.quality,
             sips_max_dimension: options.sips.max_dimension,
             sips_rotate_degrees: options.sips.rotate_degrees,
@@ -1639,6 +1667,19 @@ impl Shift {
                 .to_owned();
             if value.is_empty() { None } else { Some(value) }
         };
+        let docling_defaults = DoclingOptions::default();
+        let docling_video_frame_interval_secs =
+            parse_optional_secs(self.docling_video_frame_interval_input.read(cx).content())?
+                .unwrap_or(docling_defaults.video_frame_interval_secs);
+        if docling_video_frame_interval_secs <= 0.0 {
+            return Err("Docling video frame interval must be greater than zero".into());
+        }
+        let docling_video_cuts_per_minute =
+            parse_optional_secs(self.docling_video_cuts_per_minute_input.read(cx).content())?
+                .unwrap_or(docling_defaults.video_cuts_per_minute);
+        let docling_video_prominence =
+            parse_optional_secs(self.docling_video_prominence_input.read(cx).content())?
+                .unwrap_or(docling_defaults.video_prominence);
         Ok(ConversionOptions {
             ffmpeg: FfmpegOptions {
                 start_secs,
@@ -1677,6 +1718,12 @@ impl Shift {
                 ocr_lang,
                 tables: self.docling_tables,
                 table_mode: self.docling_table_mode,
+                asr_model: self.docling_asr_model,
+                video_sampling_mode: self.docling_video_sampling_mode,
+                video_frame_interval_secs: docling_video_frame_interval_secs,
+                video_cuts_per_minute: docling_video_cuts_per_minute,
+                video_prominence: docling_video_prominence,
+                video_diarization: self.docling_video_diarization,
             },
             sips: SipsOptions {
                 max_dimension: self.sips_max_dimension,
@@ -2946,6 +2993,20 @@ impl Render for Shift {
         let docling_tables = self.docling_tables;
         let docling_table_mode = self.docling_table_mode;
         let docling_ocr_lang_input = self.docling_ocr_lang_input.clone();
+        let docling_asr_model = self.docling_asr_model;
+        let docling_video_sampling_mode = self.docling_video_sampling_mode;
+        let docling_video_frame_interval_input = self.docling_video_frame_interval_input.clone();
+        let docling_video_cuts_per_minute_input = self.docling_video_cuts_per_minute_input.clone();
+        let docling_video_prominence_input = self.docling_video_prominence_input.clone();
+        let docling_video_diarization = self.docling_video_diarization;
+        let docling_video_input = self
+            .selected_file
+            .as_deref()
+            .is_some_and(is_docling_video_input);
+        let docling_timed_input = self
+            .selected_file
+            .as_deref()
+            .is_some_and(is_docling_timed_input);
         let sips_quality = self.sips_quality;
         let sips_max_dimension = self.sips_max_dimension;
         let sips_rotate_degrees = self.sips_rotate_degrees;
@@ -3131,6 +3192,14 @@ impl Render for Shift {
                                     docling_tables,
                                     docling_table_mode,
                                     docling_ocr_lang_input,
+                                    docling_asr_model,
+                                    docling_video_sampling_mode,
+                                    docling_video_frame_interval_input,
+                                    docling_video_cuts_per_minute_input,
+                                    docling_video_prominence_input,
+                                    docling_video_diarization,
+                                    docling_video_input,
+                                    docling_timed_input,
                                     sips_quality,
                                     sips_max_dimension,
                                     sips_rotate_degrees,
@@ -3379,6 +3448,9 @@ impl Render for Shift {
                         docling_ocr,
                         docling_tables,
                         docling_table_mode,
+                        docling_asr_model,
+                        docling_video_sampling_mode,
+                        docling_video_diarization,
                         defuddle_frontmatter,
                         pandoc_standalone,
                         pandoc_toc,

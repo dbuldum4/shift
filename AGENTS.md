@@ -43,8 +43,14 @@ The MarkItDown adapter converts broad heterogeneous inputs to Markdown. Pandoc
 handles publishing formats and overlaps on some document-to-Markdown paths.
 Defuddle extracts clean article content from `http(s)` URLs and local HTML
 (Markdown or HTML output). Docling reads PDFs and other documents with strong
-layout awareness and exports Markdown, HTML, or plain text (enabling PDF →
-HTML, which MarkItDown and Pandoc cannot do). FFmpeg converts audio and video
+layout awareness and exports Markdown, HTML, plain text, or JSON (enabling
+PDF → HTML, which MarkItDown and Pandoc cannot do). With pinned
+`docling[asr]==2.115.0` plus `docling-slim[format-video]==2.115.0`, it also
+transcribes WAV/MP3/M4A/AAC/OGG/FLAC and MP4/AVI/MOV/MKV/WebM locally via the
+dedicated `transcript` output (Markdown payload, timed-media-only). Docling
+must not own video → Markdown or video → VTT; FFmpeg keeps subtitle-track
+extraction (SRT/VTT) and MarkItDown keeps document Markdown routes.
+FFmpeg converts audio and video
 containers, still frames, subtitle tracks, and PNG sequence ZIPs (for example
 MP4 → MP3, WAV → FLAC, video → PNG, MKV → SRT, video → `png-sequence-zip`).
 The sips adapter (macOS only, `/usr/bin/sips`, no install step) owns still-image
@@ -75,7 +81,7 @@ Optional knobs live on `ConversionOptions`:
 | Nest | Knobs |
 |------|--------|
 | `ffmpeg` | trim, streams, encode mode, quality, mono, sample rate, scale, fps, mute, normalize audio, burn embedded subtitles, frame interval (sequence ZIP) |
-| `docling` | image export mode, OCR, tables, table mode, OCR language; password via `pdf.password` |
+| `docling` | image export mode, OCR, tables, table mode, OCR language, ASR model, video sampling/diarization; password via `pdf.password` |
 | `defuddle` | frontmatter, language |
 | `pandoc` | standalone, TOC, PDF engine override, reference-doc, citations (off by default) |
 | `markitdown` | keep data URIs |

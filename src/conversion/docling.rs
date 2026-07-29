@@ -1,31 +1,62 @@
 use super::{
-    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
-    OutputFormat, TempDirGuard, bundled_runtime_tool, command_argv_parts, format_argv_display,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command_cancellable, unique_temp_dir,
+    ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
+    InvocationRecord, OutputFormat, TempDirGuard, bundled_runtime_tool, command_argv_parts,
+    format_argv_display, map_spawn_error, max_output_bytes, process_timeout, read_file_limited,
+    resolve_tool_executable, run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Document types Docling parses well without optional ASR extras.
-/// See: https://docling-project.github.io/docling/usage/supported_formats/
+/// Inputs exposed by the pinned Docling 2.115 CLI.
+///
+/// Audio/video formats need Docling's optional ASR/video extras and FFmpeg at
+/// conversion time. They remain capabilities even when those optional
+/// dependencies are absent; base Docling readiness must not be downgraded just
+/// because transcription has not been installed yet.
 const EXTENSIONS: &[&str] = &[
-    // Office and publishing
-    "pdf", "docx", "pptx", "xlsx", "odt", "ods", "odp", "epub", // Markup / text
-    "md", "markdown", "adoc", "asciidoc", "tex", "latex", "txt", "html", "htm", "xhtml", "csv",
+    // Office and publishing (including the aliases registered by Docling 2.115).
+    "pdf", "docx", "dotx", "docm", "dotm", "doc", "dot", "pptx", "potx", "ppsx", "pptm", "potm",
+    "ppsm", "ppt", "pot", "pps", "xlsx", "xlsm", "xls", "xlt", "odt", "ott", "ods", "ots", "odp",
+    "otp", "epub", // Markup / text / mail / timed transcripts.
+    "md", "markdown", "qmd", "rmd", "adoc", "asciidoc", "asc", "tex", "latex", "txt", "text",
+    "html", "htm", "xhtml", "csv", "eml", "boxnote", "vtt",
     // Images (layout / OCR pipeline)
-    "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp",
+    "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", // Audio (ASR pipeline)
+    "wav", "mp3", "m4a", "aac", "ogg", "flac",
+    // Video (ASR + representative-frame pipeline, new in Docling 2.115)
+    "mp4", "avi", "mov", "mkv", "webm",
 ];
 
-/// Formats Docling can export that map cleanly onto Shift's `OutputFormat` catalog.
-/// CLI `--to` values: md, html, text (see Docling CLI reference).
+const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "m4a", "aac", "ogg", "flac"];
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "avi", "mov", "mkv", "webm"];
+
+/// Formats Docling 2.115 exports that map cleanly onto Shift's catalog.
+///
+/// The dedicated `transcript` action is the only timed-media output: ASR must
+/// not hijack Markdown (document chains / MarkItDown fallback) or WebVTT
+/// (FFmpeg subtitle-track extraction). Document outputs apply only to untimed
+/// inputs in [`DoclingModule::supports`].
 const OUTPUTS: &[OutputFormat] = &[
+    OutputFormat::MARKDOWN,
+    OutputFormat::TRANSCRIPT,
+    OutputFormat::HTML,
+    OutputFormat("plain"),
+    OutputFormat::JSON,
+];
+
+/// Chain only document-like intermediates (never ASR intent formats).
+const CHAINABLE_OUTPUTS: &[OutputFormat] = &[
     OutputFormat::MARKDOWN,
     OutputFormat::HTML,
     OutputFormat("plain"),
+    OutputFormat::JSON,
 ];
+
+/// Default ASR wall-clock budget when `SHIFT_CONVERSION_TIMEOUT_SECS` is unset.
+/// First Whisper weight download and long interviews routinely exceed 5 minutes.
+const DEFAULT_ASR_TIMEOUT_SECS: u64 = 1_800;
 
 /// How Docling places figures in Markdown/HTML exports.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -118,8 +149,120 @@ impl std::str::FromStr for DoclingTableMode {
     }
 }
 
+/// Auto-selecting Whisper model presets exposed by Docling 2.115.
+///
+/// These choose MLX automatically on Apple Silicon when its optional runtime is
+/// installed, otherwise native Whisper. Backend-forcing and experimental S2T
+/// presets remain available through Docling itself, but Shift deliberately
+/// keeps its stable product surface to the six upstream auto-selecting models.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DoclingAsrModel {
+    #[default]
+    Tiny,
+    Base,
+    Small,
+    Medium,
+    Large,
+    Turbo,
+}
+
+impl DoclingAsrModel {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Tiny => "whisper_tiny",
+            Self::Base => "whisper_base",
+            Self::Small => "whisper_small",
+            Self::Medium => "whisper_medium",
+            Self::Large => "whisper_large",
+            Self::Turbo => "whisper_turbo",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tiny => "Tiny",
+            Self::Base => "Base",
+            Self::Small => "Small",
+            Self::Medium => "Medium",
+            Self::Large => "Large",
+            Self::Turbo => "Turbo",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Tiny,
+            Self::Base,
+            Self::Small,
+            Self::Medium,
+            Self::Large,
+            Self::Turbo,
+        ]
+    }
+}
+
+impl std::str::FromStr for DoclingAsrModel {
+    type Err = ConversionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "tiny" | "whisper_tiny" | "whisper-tiny" => Ok(Self::Tiny),
+            "base" | "whisper_base" | "whisper-base" => Ok(Self::Base),
+            "small" | "whisper_small" | "whisper-small" => Ok(Self::Small),
+            "medium" | "whisper_medium" | "whisper-medium" => Ok(Self::Medium),
+            "large" | "whisper_large" | "whisper-large" => Ok(Self::Large),
+            "turbo" | "whisper_turbo" | "whisper-turbo" => Ok(Self::Turbo),
+            other => Err(ConversionError::new(format!(
+                "unknown Docling ASR model: {other} (try tiny, base, small, medium, large, turbo)"
+            ))),
+        }
+    }
+}
+
+/// Representative-frame selection used by Docling's video pipeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DoclingVideoSamplingMode {
+    #[default]
+    Fixed,
+    Scene,
+}
+
+impl DoclingVideoSamplingMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Scene => "scene",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fixed => "Fixed interval",
+            Self::Scene => "Scene changes",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Fixed, Self::Scene]
+    }
+}
+
+impl std::str::FromStr for DoclingVideoSamplingMode {
+    type Err = ConversionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fixed" | "interval" | "fixed-interval" | "fixed_interval" => Ok(Self::Fixed),
+            "scene" | "scenes" | "scene-change" | "scene_change" => Ok(Self::Scene),
+            other => Err(ConversionError::new(format!(
+                "unknown Docling video sampling mode: {other} (try fixed, scene)"
+            ))),
+        }
+    }
+}
+
 /// Optional knobs for Docling. Defaults keep desktop conversions small/fast.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DoclingOptions {
     pub image_export_mode: DoclingImageExportMode,
     /// Run OCR when the pipeline needs it (`--ocr` / `--no-ocr`).
@@ -129,6 +272,18 @@ pub struct DoclingOptions {
     /// Extract table structure (`--tables` / `--no-tables`).
     pub tables: bool,
     pub table_mode: DoclingTableMode,
+    /// Auto-selecting Whisper preset (`--asr-model`) for audio and video.
+    pub asr_model: DoclingAsrModel,
+    /// Representative-frame selection for video input.
+    pub video_sampling_mode: DoclingVideoSamplingMode,
+    /// Seconds between frames in fixed-interval mode (must be finite and > 0).
+    pub video_frame_interval_secs: f64,
+    /// Target cuts/minute in scene mode. Zero lets Docling auto-calibrate.
+    pub video_cuts_per_minute: f64,
+    /// Scene prominence override. Zero lets Docling auto-calibrate.
+    pub video_prominence: f64,
+    /// Speaker diarization for video (`resemblyzer` optional dependency).
+    pub video_diarization: bool,
 }
 
 impl Default for DoclingOptions {
@@ -141,7 +296,34 @@ impl Default for DoclingOptions {
             ocr_lang: None,
             tables: true,
             table_mode: DoclingTableMode::Fast,
+            asr_model: DoclingAsrModel::Tiny,
+            video_sampling_mode: DoclingVideoSamplingMode::Fixed,
+            video_frame_interval_secs: 10.0,
+            video_cuts_per_minute: 0.0,
+            video_prominence: 0.0,
+            video_diarization: false,
         }
+    }
+}
+
+impl DoclingOptions {
+    pub fn validate(&self) -> Result<(), ConversionError> {
+        if !self.video_frame_interval_secs.is_finite() || self.video_frame_interval_secs <= 0.0 {
+            return Err(ConversionError::new(
+                "Docling video frame interval must be a positive number of seconds",
+            ));
+        }
+        if !self.video_cuts_per_minute.is_finite() || self.video_cuts_per_minute < 0.0 {
+            return Err(ConversionError::new(
+                "Docling video cuts per minute must be a non-negative number",
+            ));
+        }
+        if !self.video_prominence.is_finite() || self.video_prominence < 0.0 {
+            return Err(ConversionError::new(
+                "Docling video prominence must be a non-negative number",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -178,19 +360,21 @@ impl DoclingModule {
 
     fn to_arg(output_format: OutputFormat) -> Option<&'static str> {
         match output_format.id() {
-            "markdown" => Some("md"),
+            "markdown" | "transcript" => Some("md"),
             "html" => Some("html"),
             "plain" => Some("text"),
+            "json" => Some("json"),
             _ => None,
         }
     }
 
     fn output_file_name(stem: &std::ffi::OsStr, output_format: OutputFormat) -> PathBuf {
-        // Docling writes `<stem>.md|html|txt` into `--output`.
+        // Docling writes `<stem>.md|html|txt|json` into `--output`.
         let extension = match output_format.id() {
-            "markdown" => "md",
+            "markdown" | "transcript" => "md",
             "html" => "html",
             "plain" => "txt",
+            "json" => "json",
             other => other,
         };
         let mut output = PathBuf::from(stem);
@@ -247,6 +431,7 @@ impl DoclingModule {
         output_format: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        options.docling.validate()?;
         let to_arg = Self::to_arg(output_format).ok_or_else(|| {
             ConversionError::new(format!(
                 "Docling does not produce {}",
@@ -265,6 +450,8 @@ impl DoclingModule {
         // Docling writes files into --output; it does not stream to stdout.
         // Explicit `convert` keeps the invocation stable if more subcommands are added.
         let knobs = &options.docling;
+        let is_audio = input_has_extension(input, AUDIO_EXTENSIONS);
+        let is_video = input_has_extension(input, VIDEO_EXTENSIONS);
         let mut command = Command::new(&self.executable);
         command
             .arg("convert")
@@ -292,6 +479,34 @@ impl DoclingModule {
         {
             command.arg("--ocr-lang").arg(lang);
         }
+        if is_audio || is_video {
+            command.arg("--asr-model").arg(knobs.asr_model.id());
+        }
+        if is_video {
+            command
+                .arg("--video-sampling-mode")
+                .arg(knobs.video_sampling_mode.id());
+            // Only pass knobs relevant to the selected sampling mode.
+            match knobs.video_sampling_mode {
+                DoclingVideoSamplingMode::Fixed => {
+                    command
+                        .arg("--video-frame-interval")
+                        .arg(knobs.video_frame_interval_secs.to_string());
+                }
+                DoclingVideoSamplingMode::Scene => {
+                    command
+                        .arg("--video-cuts-per-minute")
+                        .arg(knobs.video_cuts_per_minute.to_string())
+                        .arg("--video-prominence")
+                        .arg(knobs.video_prominence.to_string());
+                }
+            }
+            command.arg(if knobs.video_diarization {
+                "--video-diarization"
+            } else {
+                "--no-video-diarization"
+            });
+        }
 
         let display_parts = command_argv_parts(&command);
         let invocation = InvocationRecord {
@@ -299,19 +514,41 @@ impl DoclingModule {
             argv_display: format_argv_display(&display_parts),
         };
 
-        let output = run_command_cancellable(
-            command,
-            process_timeout(),
-            max_output_bytes(),
-            options.cancel.clone(),
-        )
-        .map_err(|error| {
-            map_spawn_error(
-                error,
-                "Docling is not installed. Install it with `pip install docling`, \
-                 or set SHIFT_DOCLING_BIN.",
-            )
-        })?;
+        if let Some(progress) = options.progress.as_ref() {
+            let label = if is_video {
+                "Analyzing and transcribing video with Docling"
+            } else if is_audio {
+                "Transcribing audio with Docling"
+            } else {
+                "Converting document with Docling"
+            };
+            progress(ConversionProgress::Phase(label.to_owned()));
+        }
+
+        let timeout = if is_audio || is_video {
+            asr_timeout()
+        } else {
+            process_timeout()
+        };
+        let output =
+            run_command_cancellable(command, timeout, max_output_bytes(), options.cancel.clone())
+                .map_err(|error| {
+                if error.to_string().to_ascii_lowercase().contains("timeout") {
+                    return ConversionError::new(format!(
+                        "Docling timed out converting {} (limit {}s). First Whisper model \
+                     download and long interviews can exceed the default; raise \
+                     SHIFT_CONVERSION_TIMEOUT_SECS or use a smaller --docling-asr-model.",
+                        input.display(),
+                        timeout.as_secs()
+                    ));
+                }
+                map_spawn_error(
+                    error,
+                    "Docling is not installed. Install it with `pip install 'docling==2.115.0'`. \
+                 For audio/video transcription install `docling[asr]` plus \
+                 `docling-slim[format-video]`, or set SHIFT_DOCLING_BIN.",
+                )
+            })?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -325,8 +562,15 @@ impl DoclingModule {
             } else {
                 detail
             };
+            let transcription_hint = if is_audio || is_video {
+                "\nAudio/video transcription additionally requires FFmpeg and Docling's ASR \
+                 extras (`pip install 'docling[asr]==2.115.0' \
+                 'docling-slim[format-video]==2.115.0'`). Model weights download on first use."
+            } else {
+                ""
+            };
             return Err(ConversionError::new(format!(
-                "Docling could not convert {}: {detail}",
+                "Docling could not convert {}: {detail}{transcription_hint}",
                 input.display()
             )));
         }
@@ -376,7 +620,29 @@ impl ConversionModule for DoclingModule {
     }
 
     fn chainable_output_formats(&self) -> &[OutputFormat] {
-        OUTPUTS
+        CHAINABLE_OUTPUTS
+    }
+
+    fn supports(&self, input: &Path, output: OutputFormat) -> bool {
+        let Some(extension) = input.extension().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        let known_input = EXTENSIONS
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate));
+        if !known_input || !OUTPUTS.contains(&output) {
+            return false;
+        }
+
+        let is_timed_media = input_has_extension(input, AUDIO_EXTENSIONS)
+            || input_has_extension(input, VIDEO_EXTENSIONS);
+        if is_timed_media {
+            // ASR only on the dedicated transcript action. Markdown stays with
+            // MarkItDown/chains; SRT/VTT track extraction stays with FFmpeg.
+            return output == OutputFormat::TRANSCRIPT;
+        }
+        // Untimed documents never claim the ASR-intent transcript action.
+        output != OutputFormat::TRANSCRIPT
     }
 
     fn convert(
@@ -387,12 +653,51 @@ impl ConversionModule for DoclingModule {
     ) -> Result<ConversionArtifact, ConversionError> {
         if !OUTPUTS.contains(&output_format) {
             return Err(ConversionError::new(format!(
-                "Docling only produces Markdown, HTML, or plain text, not {}",
+                "Docling does not produce {}",
                 output_format.label()
+            )));
+        }
+        if !self.supports(input, output_format) {
+            return Err(ConversionError::new(format!(
+                "Docling does not produce {} from {}",
+                output_format.label(),
+                input.display()
             )));
         }
         self.convert_with_cli(input, output_format, options)
     }
+}
+
+fn input_has_extension(input: &Path, extensions: &[&str]) -> bool {
+    input
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extensions
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+pub fn is_docling_audio_input(input: &Path) -> bool {
+    input_has_extension(input, AUDIO_EXTENSIONS)
+}
+
+pub fn is_docling_video_input(input: &Path) -> bool {
+    input_has_extension(input, VIDEO_EXTENSIONS)
+}
+
+pub fn is_docling_timed_input(input: &Path) -> bool {
+    is_docling_audio_input(input) || is_docling_video_input(input)
+}
+
+fn asr_timeout() -> std::time::Duration {
+    std::env::var("SHIFT_CONVERSION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(DEFAULT_ASR_TIMEOUT_SECS))
 }
 
 #[cfg(all(test, unix))]
@@ -416,8 +721,8 @@ while [ "$#" -gt 0 ]; do
     convert) shift; continue ;;
     --to) to="$2"; shift 2; continue ;;
     --output) output="$2"; shift 2; continue ;;
-    --image-export-mode|--table-mode|--ocr-lang|--pdf-password) shift 2; continue ;;
-    --ocr|--no-ocr|--tables|--no-tables|--abort-on-error) shift; continue ;;
+    --image-export-mode|--table-mode|--ocr-lang|--pdf-password|--asr-model|--video-sampling-mode|--video-frame-interval|--video-cuts-per-minute|--video-prominence) shift 2; continue ;;
+    --ocr|--no-ocr|--tables|--no-tables|--abort-on-error|--video-diarization|--no-video-diarization) shift; continue ;;
     --*) shift; continue ;;
     *) input="$1"; shift; continue ;;
   esac
@@ -428,6 +733,8 @@ case "$to" in
   md) ext=md; body='# From Docling' ;;
   html) ext=html; body='<p>From Docling</p>' ;;
   text) ext=txt; body='From Docling' ;;
+  json) ext=json; body='{"text":"From Docling"}' ;;
+  vtt) ext=vtt; body='WEBVTT' ;;
   *) ext=out; body=unknown ;;
 esac
 printf '%s' "$body" > "$output/$stem.$ext"
@@ -494,6 +801,7 @@ printf '%s' "$body" > "$output/$stem.$ext"
                 ocr_lang: Some("eng+deu".into()),
                 tables: false,
                 table_mode: DoclingTableMode::Accurate,
+                ..DoclingOptions::default()
             },
             ..ConversionOptions::default()
         };
@@ -760,9 +1068,15 @@ printf '%s' "$body" > "$output/$stem.$ext"
         );
         let outputs = module.output_formats();
         assert!(outputs.contains(&OutputFormat::MARKDOWN));
+        assert!(outputs.contains(&OutputFormat::TRANSCRIPT));
         assert!(outputs.contains(&OutputFormat::HTML));
         assert!(outputs.contains(&OutputFormat("plain")));
-        assert_eq!(module.chainable_output_formats(), outputs);
+        assert_eq!(module.chainable_output_formats(), CHAINABLE_OUTPUTS);
+        assert!(
+            !module
+                .chainable_output_formats()
+                .contains(&OutputFormat::TRANSCRIPT)
+        );
     }
 
     #[test]
@@ -1096,17 +1410,27 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert_eq!(module.input_extensions(), EXTENSIONS);
 
         let outputs = module.output_formats();
-        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs.len(), 5);
         assert_eq!(outputs, OUTPUTS);
-        assert_eq!(module.chainable_output_formats(), OUTPUTS);
+        assert_eq!(module.chainable_output_formats(), CHAINABLE_OUTPUTS);
+        assert!(
+            !module
+                .chainable_output_formats()
+                .contains(&OutputFormat::TRANSCRIPT)
+        );
         assert_eq!(module.id(), "docling");
         assert_eq!(module.label(), "Docling");
 
-        // supports() follows the extension + output lists.
+        // supports() is non-cartesian: timed media → transcript only.
         assert!(module.supports(Path::new("scan.PDF"), OutputFormat::HTML));
         assert!(module.supports(Path::new("slide.docx"), OutputFormat::MARKDOWN));
         assert!(module.supports(Path::new("scan.png"), OutputFormat("plain")));
         assert!(!module.supports(Path::new("clip.mp4"), OutputFormat::MARKDOWN));
+        assert!(module.supports(Path::new("clip.mp4"), OutputFormat::TRANSCRIPT));
+        assert!(!module.supports(Path::new("clip.mp4"), OutputFormat::VTT));
+        assert!(!module.supports(Path::new("captions.vtt"), OutputFormat::TRANSCRIPT));
+        assert!(module.supports(Path::new("captions.vtt"), OutputFormat::MARKDOWN));
+        assert!(!module.supports(Path::new("scan.pdf"), OutputFormat::TRANSCRIPT));
         assert!(!module.supports(Path::new("scan.pdf"), OutputFormat::DOCX));
     }
 
@@ -1121,6 +1445,135 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert!(defaults.tables);
         assert_eq!(defaults.table_mode, DoclingTableMode::Fast);
         assert_eq!(defaults.ocr_lang, None);
+        assert_eq!(defaults.asr_model, DoclingAsrModel::Tiny);
+        assert_eq!(
+            defaults.video_sampling_mode,
+            DoclingVideoSamplingMode::Fixed
+        );
+        assert_eq!(defaults.video_frame_interval_secs, 10.0);
+    }
+
+    #[test]
+    fn audio_and_video_options_use_pinned_docling_argv() {
+        let directory = std::env::temp_dir();
+        let suffix = unique_suffix("asr-video");
+        let executable = directory.join(format!("shift-docling-test-{suffix}"));
+        let input = directory.join(format!("shift-docling-input-{suffix}.mp4"));
+        write_fake_docling(&executable);
+        fs::write(&input, b"fake video").unwrap();
+
+        let options = ConversionOptions {
+            docling: DoclingOptions {
+                asr_model: DoclingAsrModel::Turbo,
+                video_sampling_mode: DoclingVideoSamplingMode::Scene,
+                video_frame_interval_secs: 2.5,
+                video_cuts_per_minute: 4.0,
+                video_prominence: 0.02,
+                video_diarization: true,
+                ..DoclingOptions::default()
+            },
+            ..ConversionOptions::default()
+        };
+        let artifact = DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::TRANSCRIPT, &options)
+            .unwrap();
+        assert_eq!(artifact.format, OutputFormat::TRANSCRIPT);
+        assert!(artifact.file_name.ends_with(".md"));
+
+        let args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        for expected in [
+            "--asr-model",
+            "whisper_turbo",
+            "--video-sampling-mode",
+            "scene",
+            "--video-cuts-per-minute",
+            "4",
+            "--video-prominence",
+            "0.02",
+            "--video-diarization",
+        ] {
+            assert!(
+                args.contains(expected),
+                "missing {expected:?} from argv: {args}"
+            );
+        }
+        assert!(
+            !args.contains("--video-frame-interval"),
+            "scene mode must not pass fixed-interval knobs: {args}"
+        );
+
+        // Fixed mode should pass interval only (not scene knobs).
+        let fixed = ConversionOptions {
+            docling: DoclingOptions {
+                video_sampling_mode: DoclingVideoSamplingMode::Fixed,
+                video_frame_interval_secs: 3.0,
+                video_cuts_per_minute: 9.0,
+                video_prominence: 0.5,
+                ..DoclingOptions::default()
+            },
+            ..ConversionOptions::default()
+        };
+        DoclingModule::with_executable(&executable)
+            .convert(&input, OutputFormat::TRANSCRIPT, &fixed)
+            .unwrap();
+        let fixed_args = fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(
+            fixed_args.contains("--video-frame-interval") && fixed_args.contains("3"),
+            "{fixed_args}"
+        );
+        assert!(
+            !fixed_args.contains("--video-cuts-per-minute")
+                && !fixed_args.contains("--video-prominence"),
+            "fixed mode must not pass scene knobs: {fixed_args}"
+        );
+
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(format!("{}.args", executable.display()));
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn docling_video_options_reject_invalid_numbers_before_spawn() {
+        let invalid = DoclingOptions {
+            video_frame_interval_secs: 0.0,
+            ..DoclingOptions::default()
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("interval")
+        );
+        let invalid = DoclingOptions {
+            video_cuts_per_minute: -1.0,
+            ..DoclingOptions::default()
+        };
+        assert!(invalid.validate().unwrap_err().to_string().contains("cuts"));
+        let invalid = DoclingOptions {
+            video_prominence: f64::NAN,
+            ..DoclingOptions::default()
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("prominence")
+        );
+    }
+
+    #[test]
+    fn asr_and_video_sampling_values_round_trip() {
+        for model in DoclingAsrModel::all() {
+            assert_eq!(model.id().parse::<DoclingAsrModel>().unwrap(), *model);
+        }
+        for sampling in DoclingVideoSamplingMode::all() {
+            assert_eq!(
+                sampling.id().parse::<DoclingVideoSamplingMode>().unwrap(),
+                *sampling
+            );
+        }
     }
 
     #[test]

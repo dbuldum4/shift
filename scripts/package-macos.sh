@@ -36,7 +36,8 @@ cat > "$contents/Info.plist" <<EOF
 EOF
 
 uv pip install --python 3.11 --prerelease=allow --target "$runtime/python" \
-  "markitdown[all]==0.1.6" "docling==2.115.0"
+  "markitdown[all]==0.1.6" "docling[asr]==2.115.0" \
+  "docling-slim[format-video]==2.115.0"
 npm install --prefix "$runtime/node" --omit=dev --no-package-lock "defuddle@0.19.2"
 
 cat > "$runtime/bin/markitdown" <<'EOF'

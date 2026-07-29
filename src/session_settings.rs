@@ -1,9 +1,10 @@
 //! Versioned session settings shared by the app and CLI (no secrets).
 
 use crate::conversion::{
-    ConversionOptions, DefuddleOptions, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
-    FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MarkItDownOptions, OutputFormat, PandocOptions,
-    PdfInputOptions, SipsFlip, SipsOptions, SpreadsheetOptions,
+    ConversionOptions, DefuddleOptions, DoclingAsrModel, DoclingImageExportMode, DoclingOptions,
+    DoclingTableMode, DoclingVideoSamplingMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
+    MarkItDownOptions, OutputFormat, PandocOptions, PdfInputOptions, SipsFlip, SipsOptions,
+    SpreadsheetOptions,
 };
 use crate::history::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use serde::{Deserialize, Serialize};
@@ -321,6 +322,30 @@ pub struct SessionDoclingOptions {
     pub ocr_lang: Option<String>,
     pub tables: bool,
     pub table_mode: String,
+    #[serde(default = "default_docling_asr_model")]
+    pub asr_model: String,
+    #[serde(default = "default_docling_video_sampling_mode")]
+    pub video_sampling_mode: String,
+    #[serde(default = "default_docling_video_frame_interval")]
+    pub video_frame_interval_secs: f64,
+    #[serde(default)]
+    pub video_cuts_per_minute: f64,
+    #[serde(default)]
+    pub video_prominence: f64,
+    #[serde(default)]
+    pub video_diarization: bool,
+}
+
+fn default_docling_asr_model() -> String {
+    DoclingAsrModel::default().id().to_owned()
+}
+
+fn default_docling_video_sampling_mode() -> String {
+    DoclingVideoSamplingMode::default().id().to_owned()
+}
+
+fn default_docling_video_frame_interval() -> f64 {
+    DoclingOptions::default().video_frame_interval_secs
 }
 
 impl Default for SessionDoclingOptions {
@@ -332,6 +357,12 @@ impl Default for SessionDoclingOptions {
             ocr_lang: defaults.ocr_lang,
             tables: defaults.tables,
             table_mode: defaults.table_mode.id().to_owned(),
+            asr_model: defaults.asr_model.id().to_owned(),
+            video_sampling_mode: defaults.video_sampling_mode.id().to_owned(),
+            video_frame_interval_secs: defaults.video_frame_interval_secs,
+            video_cuts_per_minute: defaults.video_cuts_per_minute,
+            video_prominence: defaults.video_prominence,
+            video_diarization: defaults.video_diarization,
         }
     }
 }
@@ -344,12 +375,19 @@ impl From<&DoclingOptions> for SessionDoclingOptions {
             ocr_lang: value.ocr_lang.clone(),
             tables: value.tables,
             table_mode: value.table_mode.id().to_owned(),
+            asr_model: value.asr_model.id().to_owned(),
+            video_sampling_mode: value.video_sampling_mode.id().to_owned(),
+            video_frame_interval_secs: value.video_frame_interval_secs,
+            video_cuts_per_minute: value.video_cuts_per_minute,
+            video_prominence: value.video_prominence,
+            video_diarization: value.video_diarization,
         }
     }
 }
 
 impl SessionDoclingOptions {
     fn to_docling_options(&self) -> DoclingOptions {
+        let defaults = DoclingOptions::default();
         DoclingOptions {
             image_export_mode: self
                 .image_export_mode
@@ -362,6 +400,31 @@ impl SessionDoclingOptions {
                 .table_mode
                 .parse()
                 .unwrap_or(DoclingTableMode::default()),
+            asr_model: self.asr_model.parse().unwrap_or(DoclingAsrModel::default()),
+            video_sampling_mode: self
+                .video_sampling_mode
+                .parse()
+                .unwrap_or(DoclingVideoSamplingMode::default()),
+            video_frame_interval_secs: if self.video_frame_interval_secs.is_finite()
+                && self.video_frame_interval_secs > 0.0
+            {
+                self.video_frame_interval_secs
+            } else {
+                defaults.video_frame_interval_secs
+            },
+            video_cuts_per_minute: if self.video_cuts_per_minute.is_finite()
+                && self.video_cuts_per_minute >= 0.0
+            {
+                self.video_cuts_per_minute
+            } else {
+                defaults.video_cuts_per_minute
+            },
+            video_prominence: if self.video_prominence.is_finite() && self.video_prominence >= 0.0 {
+                self.video_prominence
+            } else {
+                defaults.video_prominence
+            },
+            video_diarization: self.video_diarization,
         }
     }
 }
@@ -896,6 +959,12 @@ mod tests {
             ocr_lang: Some("fra".into()),
             tables: true,
             table_mode: "accurate".into(),
+            asr_model: "whisper_turbo".into(),
+            video_sampling_mode: "scene".into(),
+            video_frame_interval_secs: 4.5,
+            video_cuts_per_minute: 3.0,
+            video_prominence: 0.02,
+            video_diarization: true,
         };
         settings.options.pdf = SessionPdfInputOptions {
             page_from: Some(3),
@@ -948,6 +1017,15 @@ mod tests {
         assert_eq!(conversion.docling.ocr_lang.as_deref(), Some("fra"));
         assert!(conversion.docling.tables);
         assert_eq!(conversion.docling.table_mode, DoclingTableMode::Accurate);
+        assert_eq!(conversion.docling.asr_model, DoclingAsrModel::Turbo);
+        assert_eq!(
+            conversion.docling.video_sampling_mode,
+            DoclingVideoSamplingMode::Scene
+        );
+        assert_eq!(conversion.docling.video_frame_interval_secs, 4.5);
+        assert_eq!(conversion.docling.video_cuts_per_minute, 3.0);
+        assert_eq!(conversion.docling.video_prominence, 0.02);
+        assert!(conversion.docling.video_diarization);
         assert_eq!(conversion.pdf.page_from, Some(3));
         assert_eq!(conversion.pdf.page_to, Some(7));
         assert_eq!(conversion.pdf.password, None);

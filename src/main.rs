@@ -29,14 +29,16 @@ use gpui::{
 use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchItem, BatchItemId, BatchItemState,
     BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
-    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingImageExportMode, DoclingOptions,
-    DoclingTableMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
+    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingAsrModel,
+    DoclingImageExportMode, DoclingOptions, DoclingTableMode, DoclingVideoSamplingMode,
+    FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MAX_EXPAND_FILES, MagicPaste,
     MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
     Readiness, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, available_ready_outputs,
-    available_ready_url_outputs, expand_input_paths, is_audio_output, is_ffmpeg_output,
-    is_image_output, is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste,
-    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
-    stage_pasted_image, suggested_output_for_path, suggested_output_for_url, url_display_host,
+    available_ready_url_outputs, expand_input_paths, is_audio_output, is_docling_timed_input,
+    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+    looks_like_url, materialize_magic_paste, parse_magic_paste, paths_refer_to_same_file,
+    pdf_engine_candidates, run_batch, stage_pasted_image, suggested_output_for_path,
+    suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -1440,6 +1442,14 @@ pub(crate) struct ConversionPanelView {
     docling_tables: bool,
     docling_table_mode: DoclingTableMode,
     docling_ocr_lang_input: Entity<TextInput>,
+    docling_asr_model: DoclingAsrModel,
+    docling_video_sampling_mode: DoclingVideoSamplingMode,
+    docling_video_frame_interval_input: Entity<TextInput>,
+    docling_video_cuts_per_minute_input: Entity<TextInput>,
+    docling_video_prominence_input: Entity<TextInput>,
+    docling_video_diarization: bool,
+    docling_video_input: bool,
+    docling_timed_input: bool,
     sips_quality: SipsQuality,
     sips_max_dimension: Option<u32>,
     sips_rotate_degrees: Option<u32>,
@@ -1491,6 +1501,14 @@ fn conversion_options_panel(
         docling_tables,
         docling_table_mode,
         docling_ocr_lang_input,
+        docling_asr_model,
+        docling_video_sampling_mode,
+        docling_video_frame_interval_input,
+        docling_video_cuts_per_minute_input,
+        docling_video_prominence_input,
+        docling_video_diarization,
+        docling_video_input,
+        docling_timed_input,
         sips_quality,
         sips_max_dimension,
         sips_rotate_degrees,
@@ -1983,116 +2001,315 @@ fn conversion_options_panel(
                         .text_color(THEME.text_muted)
                         .child("Docling"),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .items_center()
-                        .child(div().text_xs().text_color(THEME.text_muted).child("Images"))
-                        .child(chip(
-                            "docling-images-placeholder",
-                            DoclingImageExportMode::Placeholder.label(),
-                            docling_images == DoclingImageExportMode::Placeholder,
-                            cx,
-                            |this, _cx| {
-                                this.docling_images = DoclingImageExportMode::Placeholder;
-                            },
-                        ))
-                        .child(chip(
-                            "docling-images-embedded",
-                            DoclingImageExportMode::Embedded.label(),
-                            docling_images == DoclingImageExportMode::Embedded,
-                            cx,
-                            |this, _cx| {
-                                this.docling_images = DoclingImageExportMode::Embedded;
-                            },
-                        ))
-                        .child(chip(
-                            "docling-images-referenced",
-                            DoclingImageExportMode::Referenced.label(),
-                            docling_images == DoclingImageExportMode::Referenced,
-                            cx,
-                            |this, _cx| {
-                                this.docling_images = DoclingImageExportMode::Referenced;
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .items_center()
-                        .child(chip(
-                            "docling-ocr",
-                            if docling_ocr { "OCR ✓" } else { "OCR" },
-                            docling_ocr,
-                            cx,
-                            |this, _cx| {
-                                this.docling_ocr = !this.docling_ocr;
-                            },
-                        ))
-                        .child(chip(
-                            "docling-tables",
-                            if docling_tables {
-                                "Tables ✓"
-                            } else {
-                                "Tables"
-                            },
-                            docling_tables,
-                            cx,
-                            |this, _cx| {
-                                this.docling_tables = !this.docling_tables;
-                            },
-                        ))
-                        .child(chip(
-                            "docling-table-fast",
-                            DoclingTableMode::Fast.label(),
-                            docling_table_mode == DoclingTableMode::Fast,
-                            cx,
-                            |this, _cx| {
-                                this.docling_table_mode = DoclingTableMode::Fast;
-                            },
-                        ))
-                        .child(chip(
-                            "docling-table-accurate",
-                            DoclingTableMode::Accurate.label(),
-                            docling_table_mode == DoclingTableMode::Accurate,
-                            cx,
-                            |this, cx| {
-                                this.docling_table_mode = DoclingTableMode::Accurate;
-                                this.persist_session_settings(cx);
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
+                .when(docling_timed_input, |panel| {
+                    panel
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(THEME.text_muted)
-                                .child("OCR language (e.g. eng)"),
+                                .child("Whisper model"),
                         )
                         .child(
                             div()
-                                .h(px(32.0))
-                                .px_2()
-                                .rounded_md()
-                                .bg(THEME.surface)
-                                .border_1()
-                                .border_color(THEME.border)
-                                .child(docling_ocr_lang_input),
-                        ),
-                )
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(chip(
+                                    "docling-asr-tiny",
+                                    DoclingAsrModel::Tiny.label(),
+                                    docling_asr_model == DoclingAsrModel::Tiny,
+                                    cx,
+                                    |this, _cx| this.docling_asr_model = DoclingAsrModel::Tiny,
+                                ))
+                                .child(chip(
+                                    "docling-asr-base",
+                                    DoclingAsrModel::Base.label(),
+                                    docling_asr_model == DoclingAsrModel::Base,
+                                    cx,
+                                    |this, _cx| this.docling_asr_model = DoclingAsrModel::Base,
+                                ))
+                                .child(chip(
+                                    "docling-asr-small",
+                                    DoclingAsrModel::Small.label(),
+                                    docling_asr_model == DoclingAsrModel::Small,
+                                    cx,
+                                    |this, _cx| this.docling_asr_model = DoclingAsrModel::Small,
+                                ))
+                                .child(chip(
+                                    "docling-asr-medium",
+                                    DoclingAsrModel::Medium.label(),
+                                    docling_asr_model == DoclingAsrModel::Medium,
+                                    cx,
+                                    |this, _cx| this.docling_asr_model = DoclingAsrModel::Medium,
+                                ))
+                                .child(chip(
+                                    "docling-asr-large",
+                                    DoclingAsrModel::Large.label(),
+                                    docling_asr_model == DoclingAsrModel::Large,
+                                    cx,
+                                    |this, _cx| this.docling_asr_model = DoclingAsrModel::Large,
+                                ))
+                                .child(chip(
+                                    "docling-asr-turbo",
+                                    DoclingAsrModel::Turbo.label(),
+                                    docling_asr_model == DoclingAsrModel::Turbo,
+                                    cx,
+                                    |this, _cx| this.docling_asr_model = DoclingAsrModel::Turbo,
+                                )),
+                        )
+                })
+                .when(docling_video_input, |panel| {
+                    panel
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child("Frames"),
+                                )
+                                .child(chip(
+                                    "docling-video-fixed",
+                                    DoclingVideoSamplingMode::Fixed.label(),
+                                    docling_video_sampling_mode
+                                        == DoclingVideoSamplingMode::Fixed,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_video_sampling_mode =
+                                            DoclingVideoSamplingMode::Fixed;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-video-scene",
+                                    DoclingVideoSamplingMode::Scene.label(),
+                                    docling_video_sampling_mode
+                                        == DoclingVideoSamplingMode::Scene,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_video_sampling_mode =
+                                            DoclingVideoSamplingMode::Scene;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-video-diarization",
+                                    if docling_video_diarization {
+                                        "Speakers ✓"
+                                    } else {
+                                        "Speakers"
+                                    },
+                                    docling_video_diarization,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_video_diarization =
+                                            !this.docling_video_diarization;
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(THEME.text_muted)
+                                                .child("Frame sec"),
+                                        )
+                                        .child(
+                                            div()
+                                                .h(px(32.0))
+                                                .px_2()
+                                                .rounded_md()
+                                                .bg(THEME.surface)
+                                                .border_1()
+                                                .border_color(THEME.border)
+                                                .child(docling_video_frame_interval_input),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(THEME.text_muted)
+                                                .child("Cuts/min"),
+                                        )
+                                        .child(
+                                            div()
+                                                .h(px(32.0))
+                                                .px_2()
+                                                .rounded_md()
+                                                .bg(THEME.surface)
+                                                .border_1()
+                                                .border_color(THEME.border)
+                                                .child(docling_video_cuts_per_minute_input),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(THEME.text_muted)
+                                                .child("Prominence"),
+                                        )
+                                        .child(
+                                            div()
+                                                .h(px(32.0))
+                                                .px_2()
+                                                .rounded_md()
+                                                .bg(THEME.surface)
+                                                .border_1()
+                                                .border_color(THEME.border)
+                                                .child(docling_video_prominence_input),
+                                        ),
+                                ),
+                        )
+                })
+                .when(!docling_timed_input, |panel| {
+                    panel
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child("Images"),
+                                )
+                                .child(chip(
+                                    "docling-images-placeholder",
+                                    DoclingImageExportMode::Placeholder.label(),
+                                    docling_images == DoclingImageExportMode::Placeholder,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_images =
+                                            DoclingImageExportMode::Placeholder;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-images-embedded",
+                                    DoclingImageExportMode::Embedded.label(),
+                                    docling_images == DoclingImageExportMode::Embedded,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_images = DoclingImageExportMode::Embedded;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-images-referenced",
+                                    DoclingImageExportMode::Referenced.label(),
+                                    docling_images == DoclingImageExportMode::Referenced,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_images = DoclingImageExportMode::Referenced;
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .items_center()
+                                .child(chip(
+                                    "docling-ocr",
+                                    if docling_ocr { "OCR ✓" } else { "OCR" },
+                                    docling_ocr,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_ocr = !this.docling_ocr;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-tables",
+                                    if docling_tables {
+                                        "Tables ✓"
+                                    } else {
+                                        "Tables"
+                                    },
+                                    docling_tables,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_tables = !this.docling_tables;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-table-fast",
+                                    DoclingTableMode::Fast.label(),
+                                    docling_table_mode == DoclingTableMode::Fast,
+                                    cx,
+                                    |this, _cx| {
+                                        this.docling_table_mode = DoclingTableMode::Fast;
+                                    },
+                                ))
+                                .child(chip(
+                                    "docling-table-accurate",
+                                    DoclingTableMode::Accurate.label(),
+                                    docling_table_mode == DoclingTableMode::Accurate,
+                                    cx,
+                                    |this, cx| {
+                                        this.docling_table_mode = DoclingTableMode::Accurate;
+                                        this.persist_session_settings(cx);
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child("OCR language (e.g. eng)"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(32.0))
+                                        .px_2()
+                                        .rounded_md()
+                                        .bg(THEME.surface)
+                                        .border_1()
+                                        .border_color(THEME.border)
+                                        .child(docling_ocr_lang_input),
+                                ),
+                        )
+                })
                 .child(
                     div()
                         .text_xs()
                         .text_color(THEME.text_dim)
-                        .child("Embedded images can produce large artifacts."),
+                        .child(if docling_timed_input {
+                            "Local transcription needs FFmpeg; first use downloads the selected model."
+                        } else {
+                            "Embedded images can produce large artifacts."
+                        }),
                 )
         })
         .when(show_sips, |panel| {
@@ -4668,6 +4885,9 @@ fn settings_options_panel(
     docling_ocr: bool,
     docling_tables: bool,
     docling_table_mode: DoclingTableMode,
+    docling_asr_model: DoclingAsrModel,
+    docling_video_sampling_mode: DoclingVideoSamplingMode,
+    docling_video_diarization: bool,
     defuddle_frontmatter: bool,
     pandoc_standalone: bool,
     pandoc_toc: bool,
@@ -4886,6 +5106,103 @@ fn settings_options_panel(
                             cx,
                             |this, cx| {
                                 this.docling_table_mode = DoclingTableMode::Accurate;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-asr-tiny",
+                            "ASR Tiny",
+                            docling_asr_model == DoclingAsrModel::Tiny,
+                            cx,
+                            |this, cx| {
+                                this.docling_asr_model = DoclingAsrModel::Tiny;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-asr-small",
+                            "ASR Small",
+                            docling_asr_model == DoclingAsrModel::Small,
+                            cx,
+                            |this, cx| {
+                                this.docling_asr_model = DoclingAsrModel::Small;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-asr-base",
+                            "ASR Base",
+                            docling_asr_model == DoclingAsrModel::Base,
+                            cx,
+                            |this, cx| {
+                                this.docling_asr_model = DoclingAsrModel::Base;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-asr-medium",
+                            "ASR Medium",
+                            docling_asr_model == DoclingAsrModel::Medium,
+                            cx,
+                            |this, cx| {
+                                this.docling_asr_model = DoclingAsrModel::Medium;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-asr-large",
+                            "ASR Large",
+                            docling_asr_model == DoclingAsrModel::Large,
+                            cx,
+                            |this, cx| {
+                                this.docling_asr_model = DoclingAsrModel::Large;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-asr-turbo",
+                            "ASR Turbo",
+                            docling_asr_model == DoclingAsrModel::Turbo,
+                            cx,
+                            |this, cx| {
+                                this.docling_asr_model = DoclingAsrModel::Turbo;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-video-fixed",
+                            DoclingVideoSamplingMode::Fixed.label(),
+                            docling_video_sampling_mode == DoclingVideoSamplingMode::Fixed,
+                            cx,
+                            |this, cx| {
+                                this.docling_video_sampling_mode =
+                                    DoclingVideoSamplingMode::Fixed;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-video-scene",
+                            DoclingVideoSamplingMode::Scene.label(),
+                            docling_video_sampling_mode == DoclingVideoSamplingMode::Scene,
+                            cx,
+                            |this, cx| {
+                                this.docling_video_sampling_mode =
+                                    DoclingVideoSamplingMode::Scene;
+                                this.apply_session_option_change(cx);
+                            },
+                        ))
+                        .child(chip(
+                            "settings-docling-video-diarization",
+                            if docling_video_diarization {
+                                "Speakers ✓"
+                            } else {
+                                "Speakers"
+                            },
+                            docling_video_diarization,
+                            cx,
+                            |this, cx| {
+                                this.docling_video_diarization =
+                                    !this.docling_video_diarization;
                                 this.apply_session_option_change(cx);
                             },
                         )),
@@ -5471,6 +5788,9 @@ pub(crate) struct SettingsView {
     docling_ocr: bool,
     docling_tables: bool,
     docling_table_mode: DoclingTableMode,
+    docling_asr_model: DoclingAsrModel,
+    docling_video_sampling_mode: DoclingVideoSamplingMode,
+    docling_video_diarization: bool,
     defuddle_frontmatter: bool,
     pandoc_standalone: bool,
     pandoc_toc: bool,
@@ -5498,6 +5818,9 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         docling_ocr,
         docling_tables,
         docling_table_mode,
+        docling_asr_model,
+        docling_video_sampling_mode,
+        docling_video_diarization,
         defuddle_frontmatter,
         pandoc_standalone,
         pandoc_toc,
@@ -5554,6 +5877,9 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                         *docling_ocr,
                         *docling_tables,
                         *docling_table_mode,
+                        *docling_asr_model,
+                        *docling_video_sampling_mode,
+                        *docling_video_diarization,
                         *defuddle_frontmatter,
                         *pandoc_standalone,
                         *pandoc_toc,

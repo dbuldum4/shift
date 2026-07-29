@@ -63,13 +63,13 @@ fn default_registry_capability_consistency() {
                 total_pairs += 1;
                 let path = PathBuf::from(format!("sample.{ext}"));
 
-                // Advertised input+output ⇒ supports must be true.
-                assert!(
-                    module.supports(&path, output),
-                    "module {} lists .{ext} → {} but supports() is false",
-                    module.id(),
-                    output.id()
-                );
+                // Most adapters expose a cartesian input/output surface.
+                // Modules may override `supports` for semantically constrained
+                // pairs (for example Docling only writes Transcript from
+                // timed audio/video), so only dispatch supported pairs.
+                if !module.supports(&path, output) {
+                    continue;
+                }
                 supports_true += 1;
 
                 // Case-insensitive extension handling.
@@ -137,8 +137,8 @@ fn default_registry_capability_consistency() {
     }
 
     assert!(total_pairs > 0);
-    assert_eq!(supports_true, total_pairs);
-    assert_eq!(module_for_hits, total_pairs);
+    assert!(supports_true <= total_pairs);
+    assert_eq!(module_for_hits, supports_true);
     assert!(
         first_priority_matches > 0,
         "expected at least one first-priority match"
@@ -156,6 +156,48 @@ fn default_registry_capability_consistency() {
         first_priority_matches,
         catalog_probes
     );
+
+    // Docling's non-cartesian surface is an explicit allowlist so accidental
+    // expansion of timed-media Markdown/VTT (or untimed transcript) fails CI.
+    if let Some(docling) = registry.modules().find(|module| module.id() == "docling") {
+        for media in ["clip.mp4", "track.wav", "clip.mov"] {
+            let path = PathBuf::from(media);
+            assert!(
+                docling.supports(&path, OutputFormat::TRANSCRIPT),
+                "docling must support {media} → transcript"
+            );
+            assert!(
+                !docling.supports(&path, OutputFormat::MARKDOWN),
+                "docling must not own {media} → markdown (use transcript)"
+            );
+            assert!(
+                !docling.supports(&path, OutputFormat::VTT),
+                "docling must not own {media} → vtt (FFmpeg track extract)"
+            );
+            assert!(
+                !docling.supports(&path, OutputFormat::HTML),
+                "docling must not own {media} → html"
+            );
+        }
+        assert!(
+            !docling.supports(
+                PathBuf::from("scan.pdf").as_path(),
+                OutputFormat::TRANSCRIPT
+            ),
+            "docling must not advertise untimed → transcript"
+        );
+        assert!(
+            docling.supports(PathBuf::from("scan.pdf").as_path(), OutputFormat::MARKDOWN),
+            "docling must still support document → markdown"
+        );
+        for chainable in docling.chainable_output_formats() {
+            assert_ne!(
+                *chainable,
+                OutputFormat::TRANSCRIPT,
+                "transcript must not be chainable"
+            );
+        }
+    }
 }
 
 #[test]
