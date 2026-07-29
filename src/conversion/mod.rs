@@ -16,6 +16,7 @@ mod sips;
 mod sources;
 mod spreadsheet;
 mod suggest;
+mod watch;
 
 #[cfg(test)]
 mod registry_parity;
@@ -80,6 +81,7 @@ pub use sources::{
 };
 pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};
+pub use watch::{WatchTracker, validate_watch_directories};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OutputFormat(&'static str);

@@ -2,12 +2,13 @@ use shift_core::conversion::{
     BatchEnqueueOptions, BatchEvent, BatchInput, BatchNamingTemplate, BatchQueue, BatchSource,
     ConversionArtifact, ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions,
     DiagnosticsReport, DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
-    DoclingVideoSamplingMode, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality, MagicPaste,
-    MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
-    SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, default_output_path,
-    ensure_public_url_fetch_allowed, expand_input_paths_preserving_roots, looks_like_url,
-    materialize_paste_token, parse_magic_paste, prepare_batch_destination,
+    DoclingVideoSamplingMode, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
+    MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression,
+    PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, WatchTracker,
+    default_output_path, ensure_public_url_fetch_allowed, expand_input_paths_preserving_roots,
+    looks_like_url, materialize_paste_token, parse_magic_paste, prepare_batch_destination,
     resolve_destination_with_policy, run_batch, url_display_host, validate_batch_output_formats,
+    validate_watch_directories,
 };
 use shift_core::preferences::load_module_priority;
 use shift_core::recipes::{
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 fn main() -> ExitCode {
     match run(std::env::args_os().skip(1).collect()) {
@@ -54,6 +56,16 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     if arguments.first().is_some_and(|value| value == "formats") {
         print_formats();
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if arguments.first().is_some_and(|value| value == "watch") {
+        if arguments.get(1).is_some_and(|value| {
+            matches!(value.to_string_lossy().as_ref(), "-h" | "--help" | "help")
+        }) {
+            print_watch_help();
+            return Ok(ExitCode::SUCCESS);
+        }
+        return run_watch(&arguments);
     }
 
     if arguments
@@ -215,6 +227,288 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// CLI-only watched-folder configuration. The native app intentionally does
+/// not start background monitors: an open document is always user-visible,
+/// while automation belongs to an explicit, cancellable terminal process.
+#[derive(Clone, Debug, PartialEq)]
+struct WatchArgs {
+    input_dir: PathBuf,
+    conversion: ParsedConvertArgs,
+    poll_interval: Duration,
+    debounce: Duration,
+    once: bool,
+}
+
+fn parse_watch_args(arguments: &[OsString]) -> Result<WatchArgs, String> {
+    debug_assert!(arguments.first().is_some_and(|value| value == "watch"));
+    let mut forwarded = Vec::new();
+    let mut poll_interval = Duration::from_secs(2);
+    let mut debounce = Duration::from_secs(2);
+    let mut once = false;
+    let mut cursor = 1;
+    while cursor < arguments.len() {
+        match arguments[cursor].to_string_lossy().as_ref() {
+            "--poll" => {
+                cursor += 1;
+                poll_interval = parse_watch_duration(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--poll requires seconds".to_owned())?,
+                    "--poll",
+                )?;
+            }
+            "--debounce" => {
+                cursor += 1;
+                debounce = parse_watch_duration(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "--debounce requires seconds".to_owned())?,
+                    "--debounce",
+                )?;
+            }
+            "--once" => once = true,
+            "--allow-output-inside" => {
+                return Err(
+                    "--allow-output-inside is intentionally unsupported: watched-folder output must stay outside the input tree to prevent conversion loops".to_owned(),
+                );
+            }
+            _ => forwarded.push(arguments[cursor].clone()),
+        }
+        cursor += 1;
+    }
+
+    // Resolve --recipe the same way convert/batch do so watch can reuse saved
+    // knobs, naming templates, and destinations without a parallel parser.
+    let conversion = parse_convert_args_resolving_recipe(&forwarded)?;
+    if conversion.inputs.len() != 1 {
+        return Err("watch requires exactly one local input folder".to_owned());
+    }
+    if conversion.stdout || conversion.output.is_some() {
+        return Err("watch requires -O/--output-dir, not --stdout or -o/--output".to_owned());
+    }
+    if conversion.output_dir.is_none() {
+        return Err("watch requires -O/--output-dir outside the watched folder".to_owned());
+    }
+    if is_network_or_file_url_input(&conversion.inputs[0]) {
+        return Err("watch accepts a local directory, not a URL".to_owned());
+    }
+    let input_dir = PathBuf::from(&conversion.inputs[0]);
+    if !input_dir.is_dir() {
+        return Err(format!(
+            "watch requires a local directory (got {})",
+            input_dir.display()
+        ));
+    }
+    Ok(WatchArgs {
+        input_dir,
+        conversion,
+        poll_interval,
+        debounce,
+        once,
+    })
+}
+
+fn parse_watch_duration(value: &OsStr, flag: &str) -> Result<Duration, String> {
+    let seconds = parse_secs(value, flag)?;
+    if !seconds.is_finite() || !(0.1..=3600.0).contains(&seconds) {
+        return Err(format!("{flag} must be between 0.1 and 3600 seconds"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn print_watch_help() {
+    println!(
+        "Usage: shift-cli watch <FOLDER> -O <OUTPUT_DIR> [-t <FORMAT>] [OPTIONS]\n\n\
+         Watches one local folder and delegates every ready file to the shared\n\
+         BatchQueue / run_batch workflow. Nested sources keep their relative\n\
+         hierarchy under the output directory. The output directory must be\n\
+         outside FOLDER; this prevents Shift from consuming its own converted\n\
+         files.\n\n\
+         Watch options:\n  \
+         --poll <SEC>        Scan interval, 0.1–3600 seconds (default: 2)\n  \
+         --debounce <SEC>    Wait for unchanged files, 0.1–3600 seconds (default: 2)\n  \
+         --once              Convert the current snapshot and exit\n\n\
+         All batch converter options are accepted, including --to, --also-to,\n\
+         --recipe, --name-template, --module, --target-size, --force, OCR,\n\
+         media, PDF, and spreadsheet options. Artifact paths are the only\n\
+         stdout output, making watch --once suitable for Shortcuts."
+    );
+}
+
+fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let watch = parse_watch_args(arguments)?;
+    let output_dir = watch
+        .conversion
+        .output_dir
+        .clone()
+        .expect("validated above");
+    validate_watch_directories(&watch.input_dir, &output_dir).map_err(|error| error.to_string())?;
+    if watch.conversion.allow_private_urls {
+        // SAFETY: single-threaded CLI entry; set before any fetch.
+        unsafe {
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
+    }
+    let registry = build_registry(watch.conversion.preferred_module.as_deref())?;
+    let cancel = install_ctrl_c_handler();
+    let mut options = parsed_conversion_options(&watch.conversion);
+    options.cancel = Some(Arc::clone(&cancel));
+    if watch.conversion.progress {
+        options.progress = Some(Arc::new(|progress| match progress {
+            ConversionProgress::Phase(label) => {
+                eprintln!("  {label}");
+            }
+            ConversionProgress::Fraction { fraction, label } => {
+                eprint!("\r  {label} ({:.0}%)", fraction * 100.0);
+            }
+        }));
+    }
+    let mut enqueue = BatchEnqueueOptions::new(watch.conversion.target);
+    enqueue.conversion = options;
+    enqueue.output_dir = Some(output_dir);
+    enqueue.force = watch.conversion.force;
+    enqueue.naming_template = watch.conversion.naming_template.clone();
+
+    let mut tracker = WatchTracker::new();
+    if watch.once {
+        let paths = tracker
+            .snapshot(&watch.input_dir)
+            .map_err(|error| error.to_string())?;
+        if paths.is_empty() {
+            eprintln!(
+                "shift-cli: no convertible files in {}",
+                watch.input_dir.display()
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Ok(run_watch_batch(
+            paths,
+            &watch.conversion.also_to,
+            &enqueue,
+            &registry,
+            &cancel,
+            watch.conversion.verbose,
+            watch.conversion.preferred_module.as_deref(),
+        ));
+    }
+
+    eprintln!(
+        "shift-cli: watching {} (poll {:.1}s, debounce {:.1}s; Ctrl-C to stop)",
+        watch.input_dir.display(),
+        watch.poll_interval.as_secs_f64(),
+        watch.debounce.as_secs_f64()
+    );
+    while !cancel.load(Ordering::SeqCst) {
+        let paths = tracker
+            .poll(&watch.input_dir, SystemTime::now(), watch.debounce)
+            .map_err(|error| error.to_string())?;
+        if !paths.is_empty() {
+            let _ = run_watch_batch(
+                paths,
+                &watch.conversion.also_to,
+                &enqueue,
+                &registry,
+                &cancel,
+                watch.conversion.verbose,
+                watch.conversion.preferred_module.as_deref(),
+            );
+        }
+        let mut slept = Duration::ZERO;
+        while slept < watch.poll_interval && !cancel.load(Ordering::SeqCst) {
+            let step = watch
+                .poll_interval
+                .saturating_sub(slept)
+                .min(Duration::from_millis(200));
+            std::thread::sleep(step);
+            slept += step;
+        }
+    }
+    Ok(ExitCode::from(130))
+}
+
+fn run_watch_batch(
+    paths: Vec<ExpandedInputPath>,
+    also_to: &[OutputFormat],
+    enqueue: &BatchEnqueueOptions,
+    registry: &ConversionRegistry,
+    cancel: &Arc<AtomicBool>,
+    verbose: bool,
+    preferred_module: Option<&str>,
+) -> ExitCode {
+    let mut queue = BatchQueue::new();
+    for expanded in paths {
+        let input = if let Some(relative_parent) = expanded.relative_parent() {
+            match BatchInput::with_relative_parent(
+                BatchSource::File(expanded.path.clone()),
+                relative_parent,
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
+                    continue;
+                }
+            }
+        } else {
+            BatchInput::new(BatchSource::File(expanded.path.clone()))
+        };
+        let mut formats = Vec::with_capacity(also_to.len() + 1);
+        formats.push(enqueue.output_format);
+        formats.extend(also_to.iter().copied());
+        if let Err(error) = validate_batch_output_formats(registry, &input.source, &formats) {
+            eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
+            continue;
+        }
+        let ids = queue.enqueue_fan_out(input, also_to, enqueue);
+        if let Some(module) = preferred_module {
+            for id in ids {
+                if let Some(item) = queue.get_mut(id) {
+                    item.preferred_module = Some(module.to_owned());
+                }
+            }
+        }
+    }
+    if queue.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let summary = run_batch(&mut queue, registry, cancel, |event| match event {
+        BatchEvent::ItemStarted {
+            source_name,
+            destination,
+            ..
+        } => eprintln!("… {source_name} → {}", destination.display()),
+        BatchEvent::ItemSucceeded {
+            path, module_id, ..
+        } => {
+            if verbose {
+                eprintln!("# module {module_id}");
+            }
+            // The sole stdout payload is an artifact path: ideal for Shortcuts,
+            // Automator, and shell pipelines.
+            println!("{}", path.display());
+        }
+        BatchEvent::ItemFailed {
+            source_name, error, ..
+        } => eprintln!("shift-cli: failed {source_name}: {error}"),
+        BatchEvent::ItemCancelled { source_name, .. } => {
+            eprintln!("shift-cli: cancelled {source_name}")
+        }
+        BatchEvent::ItemProgress {
+            fraction, label, ..
+        } => match fraction {
+            Some(fraction) => eprint!("\r  {label} ({:.0}%)", fraction * 100.0),
+            None => eprint!("\r  {label}"),
+        },
+        BatchEvent::Progress(_) => {}
+    });
+    if queue.len() > 1 {
+        eprintln!(
+            "watch batch complete: {} succeeded, {} failed, {} cancelled",
+            summary.succeeded, summary.failed, summary.cancelled
+        );
+    }
+    ExitCode::from(summary.exit_code())
 }
 
 /// Parsed convert/batch arguments (engine knobs + I/O flags). Extracted for unit tests.
@@ -1632,6 +1926,7 @@ fn print_help() {
          Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force] [--module <ID>]\n  \
          shift-cli convert <INPUT|URL> …\n  \
          shift-cli batch <INPUT|URL>… [-t <FORMAT>] [--also-to <FORMAT>]… [-O <DIR>] [--force]\n  \
+         shift-cli watch <FOLDER> -O <DIR> [-t <FORMAT>] [--once]\n  \
          shift-cli <INPUT>… -O <DIR> [-t <FORMAT>]   # multi-file batch (shared queue)\n  \
          shift-cli formats\n  \
          shift-cli doctor [--script] [--quiet]\n  \
@@ -1656,6 +1951,12 @@ fn print_help() {
          Ctrl-C                  Cancel the active batch item and remaining queue\n\n\
          For saved optional values, matching --no-* flags clear the recipe value\n\
          (for example --no-output-dir, --no-start, --no-pages, --no-toc).\n\n\
+         Watched-folder options:\n  \
+         watch <FOLDER> -O <DIR> Monitor one local folder via the shared batch queue\n  \
+         --poll <SEC>            Folder scan interval (default: 2; minimum: 0.1)\n  \
+         --debounce <SEC>        Wait for unchanged files before conversion (default: 2)\n  \
+         --once                  Convert the current folder snapshot, then exit\n  \
+         (output must be outside the watched folder; prevents conversion loops)\n\n\
          Media (FFmpeg) options:\n  \
          --start <SEC>           Seek to timestamp before converting\n  \
          --duration <SEC>        Limit output length\n  \
@@ -4105,5 +4406,87 @@ mod tests {
             "{err}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watch_parses_converter_options_and_safe_defaults() {
+        let inbox = std::env::temp_dir().join(format!(
+            "shift-watch-parse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let out = inbox.with_file_name(format!(
+            "{}-out",
+            inbox.file_name().unwrap().to_string_lossy()
+        ));
+        let parsed = parse_watch_args(&args(&[
+            "watch",
+            inbox.to_str().unwrap(),
+            "-O",
+            out.to_str().unwrap(),
+            "-t",
+            "html",
+            "--poll",
+            "1.5",
+            "--debounce",
+            "3",
+            "--once",
+            "--force",
+            "--also-to",
+            "markdown",
+            "--name-template",
+            "{stem}-watched.{ext}",
+            "--target-size",
+            "10MB",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.input_dir, inbox);
+        assert_eq!(parsed.conversion.target, OutputFormat::HTML);
+        assert_eq!(parsed.conversion.also_to, vec![OutputFormat::MARKDOWN]);
+        assert_eq!(
+            parsed.conversion.naming_template.as_str(),
+            "{stem}-watched.{ext}"
+        );
+        assert_eq!(parsed.conversion.target_size_bytes, Some(10_000_000));
+        assert_eq!(parsed.poll_interval, Duration::from_millis(1500));
+        assert_eq!(parsed.debounce, Duration::from_secs(3));
+        assert!(parsed.once);
+        assert!(parsed.conversion.force);
+        let _ = std::fs::remove_dir_all(inbox);
+    }
+
+    #[test]
+    fn watch_requires_one_local_folder_and_an_output_dir() {
+        let err = parse_watch_args(&args(&["watch", "/tmp/inbox", "-t", "html"])).unwrap_err();
+        assert!(err.contains("--output-dir"));
+        let err = parse_watch_args(&args(&["watch", "https://example.com", "-O", "/tmp/out"]))
+            .unwrap_err();
+        assert!(err.contains("local directory"));
+        let err = parse_watch_args(&args(&[
+            "watch",
+            "/tmp/inbox",
+            "-O",
+            "/tmp/out",
+            "--allow-output-inside",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("conversion loops"));
+        let file = std::env::temp_dir().join(format!(
+            "shift-watch-not-dir-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&file, "not a folder").unwrap();
+        let err = parse_watch_args(&args(&["watch", file.to_str().unwrap(), "-O", "/tmp/out"]))
+            .unwrap_err();
+        assert!(err.contains("local directory"));
+        let _ = std::fs::remove_file(file);
     }
 }

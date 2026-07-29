@@ -4,6 +4,7 @@ use futures::channel::{mpsc, oneshot};
 use shift_core::conversion::PdfCompression;
 use std::io;
 use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ConversionState {
@@ -4279,8 +4280,50 @@ impl Render for Shift {
     }
 }
 
+/// Finder's `Open With` and `open -a Shift file1 file2` hand local paths to
+/// the app process. Ignore launch-services bookkeeping flags and only accept
+/// paths that currently exist; normal UI selection still handles errors.
+fn startup_file_paths() -> Vec<PathBuf> {
+    startup_file_paths_from(std::env::args_os().skip(1))
+}
+
+fn startup_file_paths_from(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    arguments
+        .into_iter()
+        .filter_map(|argument| {
+            let text = argument.to_string_lossy();
+            if text.starts_with('-') || text.starts_with("psn_") {
+                return None;
+            }
+            let path = PathBuf::from(argument);
+            path.exists().then_some(path)
+        })
+        .collect()
+}
+
+/// Convert LaunchServices `application:openURLs:` payloads into existing local
+/// paths. Remote URLs continue to require an intentional paste/CLI action.
+fn file_paths_from_open_urls(urls: impl IntoIterator<Item = String>) -> Vec<PathBuf> {
+    urls.into_iter()
+        .filter_map(|url| url::Url::parse(&url).ok()?.to_file_path().ok())
+        .filter(|path| path.exists())
+        .collect()
+}
+
 pub(crate) fn main() {
-    Application::new().run(|cx: &mut App| {
+    let startup_paths = startup_file_paths();
+    // GPUI forwards macOS `application:openURLs:` events here. A channel
+    // buffers events which arrive during startup until the window entity is
+    // available below; the small polling task then uses the same ingestion
+    // path as Finder launch arguments and drag/drop.
+    let (open_url_tx, open_url_rx) = std::sync::mpsc::channel::<Vec<String>>();
+    let application = Application::new();
+    application.on_open_urls(move |urls| {
+        let _ = open_url_tx.send(urls);
+    });
+    application.run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
@@ -4325,7 +4368,7 @@ pub(crate) fn main() {
                 window_min_size: Some(size(px(900.0), px(520.0))),
                 ..Default::default()
             },
-            |window, cx| {
+            move |window, cx| {
                 let shift_entity = cx.new(|cx| Shift::new(cx, initial_window_width));
 
                 window.focus(&shift_entity.read(cx).focus_handle);
@@ -4389,6 +4432,43 @@ pub(crate) fn main() {
                         });
                         true
                     });
+                });
+
+                // One file follows the normal preview route; multiple files
+                // enter the existing queue. This is intentionally the same
+                // entrypoint used by drag/drop and the Open panel.
+                if !startup_paths.is_empty() {
+                    shift_entity.update(cx, |this, cx| {
+                        this.ingest_paths(startup_paths.clone(), cx);
+                    });
+                }
+
+                shift_entity.update(cx, |_, entity_cx| {
+                    entity_cx
+                        .spawn(async move |open_target, cx| {
+                            loop {
+                                let mut received = false;
+                                while let Ok(urls) = open_url_rx.try_recv() {
+                                    received = true;
+                                    let paths = file_paths_from_open_urls(urls);
+                                    if paths.is_empty() {
+                                        continue;
+                                    }
+                                    let _ = open_target.update(cx, |this, cx| {
+                                        this.ingest_paths(paths, cx);
+                                    });
+                                }
+                                if open_target.upgrade().is_none() {
+                                    break;
+                                }
+                                if !received {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(40))
+                                        .await;
+                                }
+                            }
+                        })
+                        .detach();
                 });
 
                 shift_entity
@@ -5354,5 +5434,46 @@ mod tests {
                 .ready_artifact()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn startup_file_handoff_ignores_launch_flags_and_missing_paths() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-open-with-test-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "opened by Finder").unwrap();
+        let paths = startup_file_paths_from(vec![
+            std::ffi::OsString::from("-psn_0_123"),
+            path.clone().into_os_string(),
+            std::ffi::OsString::from("/definitely/missing/shift-file.md"),
+        ]);
+        assert_eq!(paths, vec![path.clone()]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn launch_services_open_urls_accepts_existing_file_urls_only() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-open-url-test-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "opened via LaunchServices").unwrap();
+        let file_url = url::Url::from_file_path(&path).unwrap().to_string();
+        let paths = file_paths_from_open_urls(vec![
+            file_url,
+            "https://example.com/page".to_owned(),
+            "not a URL".to_owned(),
+        ]);
+        assert_eq!(paths, vec![path.clone()]);
+        let _ = std::fs::remove_file(path);
     }
 }

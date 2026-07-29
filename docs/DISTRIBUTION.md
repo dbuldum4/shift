@@ -15,3 +15,9 @@ Docling after first use.
 
 The 0.1.x releases are ad-hoc signed and cannot be notarized without an Apple
 Developer ID certificate. The release and website disclose this limitation.
+
+The bundle declares Shift as an alternate Finder viewer for its supported input
+extensions. It does not claim default ownership of those files. Finder's **Open
+With → Shift** supports one or many files; the latter appears as the app's
+normal batch queue. This metadata is local-only and does not require signing or
+notarization to test during development.
