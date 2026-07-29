@@ -254,9 +254,10 @@ impl OutputFormat {
 
     /// User-facing actions whose destination is owned exclusively by Docling.
     ///
-    /// Docling also writes formats in `PANDOC`/`MEDIA` (Markdown, HTML, JSON,
-    /// plain text, and VTT); this slice contains only its non-overlapping
-    /// transcript-intent alias.
+    /// Docling also writes formats in `PANDOC` (Markdown, HTML, JSON, plain
+    /// text); this slice contains only its non-overlapping transcript-intent
+    /// alias. Timed-media ASR is limited to `TRANSCRIPT` so FFmpeg keeps
+    /// subtitle-track VTT/SRT and document Markdown routes stay free of ASR.
     pub const DOCLING: &'static [Self] = &[Self::TRANSCRIPT];
 
     /// Full UI/parse catalog: publishing formats first, then media.
@@ -2246,14 +2247,30 @@ mod tests {
         let video_outputs = registry.available_outputs(Path::new("clip.mov"));
         assert!(video_outputs.contains(&OutputFormat::MP4));
         assert!(video_outputs.contains(&OutputFormat::MP3));
-        // Docling owns direct audio/video transcription to Markdown; the older
-        // FFmpeg → MarkItDown chain remains a fallback when Docling is absent.
-        assert!(video_outputs.contains(&OutputFormat::MARKDOWN));
+        // ASR lives on the dedicated transcript action so MarkItDown/FFmpeg
+        // chains keep video → Markdown and FFmpeg keeps subtitle-track VTT/SRT.
+        assert!(video_outputs.contains(&OutputFormat::TRANSCRIPT));
+        assert!(
+            registry
+                .module_for(Path::new("clip.mov"), OutputFormat::TRANSCRIPT)
+                .is_some_and(|module| module.id() == "docling"),
+            "Docling should own video → Transcript (ASR)"
+        );
         assert!(
             registry
                 .module_for(Path::new("clip.mov"), OutputFormat::MARKDOWN)
-                .is_some_and(|module| module.id() == "docling"),
-            "Docling should own the direct video → Markdown transcript route"
+                .is_none()
+                || registry
+                    .module_for(Path::new("clip.mov"), OutputFormat::MARKDOWN)
+                    .is_some_and(|module| module.id() != "docling"),
+            "Docling must not own video → Markdown (use transcript)"
+        );
+        assert_eq!(
+            registry
+                .module_for(Path::new("clip.mov"), OutputFormat::VTT)
+                .map(|module| module.id()),
+            Some("ffmpeg"),
+            "FFmpeg owns video → WebVTT track extraction"
         );
     }
 
@@ -3768,11 +3785,17 @@ mod tests {
     fn two_step_url_and_file_route_ids_cover_common_chains() {
         let registry = ConversionRegistry::default();
 
-        // Video → Markdown is a direct Docling ASR route.
+        // Video → Transcript is the direct Docling ASR route.
         let ids = registry
-            .route_module_ids(Path::new("clip.mp4"), OutputFormat::MARKDOWN)
-            .expect("video→md route");
+            .route_module_ids(Path::new("clip.mp4"), OutputFormat::TRANSCRIPT)
+            .expect("video→transcript route");
         assert_eq!(ids, vec!["docling"]);
+        // Video → Markdown should not be a Docling direct route (ASR is transcript).
+        if let Some(md_ids) =
+            registry.route_module_ids(Path::new("clip.mp4"), OutputFormat::MARKDOWN)
+        {
+            assert_ne!(md_ids, vec!["docling"]);
+        }
 
         // Local HTML → DOCX: defuddle/markitdown chain or pandoc direct.
         let html_docx = registry.route_module_ids(Path::new("page.html"), OutputFormat::DOCX);
@@ -3900,13 +3923,15 @@ mod tests {
                 );
                 continue;
             };
-            let expected = if *format == OutputFormat::VTT {
-                vec!["docling"]
-            } else {
-                vec!["ffmpeg"]
-            };
-            assert_eq!(ids, expected, "route for {}", format.id());
+            assert_eq!(ids, vec!["ffmpeg"], "route for {}", format.id());
         }
+        // ASR is a dedicated action outside the MEDIA partition.
+        assert_eq!(
+            registry
+                .route_module_ids(input, OutputFormat::TRANSCRIPT)
+                .expect("video→transcript"),
+            vec!["docling"]
+        );
     }
 
     #[test]

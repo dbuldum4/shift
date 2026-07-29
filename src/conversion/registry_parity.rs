@@ -65,8 +65,8 @@ fn default_registry_capability_consistency() {
 
                 // Most adapters expose a cartesian input/output surface.
                 // Modules may override `supports` for semantically constrained
-                // pairs (for example Docling only writes timed WebVTT from
-                // audio/video/VTT inputs), so only dispatch supported pairs.
+                // pairs (for example Docling only writes Transcript from
+                // timed audio/video), so only dispatch supported pairs.
                 if !module.supports(&path, output) {
                     continue;
                 }
@@ -156,6 +156,48 @@ fn default_registry_capability_consistency() {
         first_priority_matches,
         catalog_probes
     );
+
+    // Docling's non-cartesian surface is an explicit allowlist so accidental
+    // expansion of timed-media Markdown/VTT (or untimed transcript) fails CI.
+    if let Some(docling) = registry.modules().find(|module| module.id() == "docling") {
+        for media in ["clip.mp4", "track.wav", "clip.mov"] {
+            let path = PathBuf::from(media);
+            assert!(
+                docling.supports(&path, OutputFormat::TRANSCRIPT),
+                "docling must support {media} → transcript"
+            );
+            assert!(
+                !docling.supports(&path, OutputFormat::MARKDOWN),
+                "docling must not own {media} → markdown (use transcript)"
+            );
+            assert!(
+                !docling.supports(&path, OutputFormat::VTT),
+                "docling must not own {media} → vtt (FFmpeg track extract)"
+            );
+            assert!(
+                !docling.supports(&path, OutputFormat::HTML),
+                "docling must not own {media} → html"
+            );
+        }
+        assert!(
+            !docling.supports(
+                PathBuf::from("scan.pdf").as_path(),
+                OutputFormat::TRANSCRIPT
+            ),
+            "docling must not advertise untimed → transcript"
+        );
+        assert!(
+            docling.supports(PathBuf::from("scan.pdf").as_path(), OutputFormat::MARKDOWN),
+            "docling must still support document → markdown"
+        );
+        for chainable in docling.chainable_output_formats() {
+            assert_ne!(
+                *chainable,
+                OutputFormat::TRANSCRIPT,
+                "transcript must not be chainable"
+            );
+        }
+    }
 }
 
 #[test]

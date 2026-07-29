@@ -43,11 +43,13 @@ The MarkItDown adapter converts broad heterogeneous inputs to Markdown. Pandoc
 handles publishing formats and overlaps on some document-to-Markdown paths.
 Defuddle extracts clean article content from `http(s)` URLs and local HTML
 (Markdown or HTML output). Docling reads PDFs and other documents with strong
-layout awareness and exports Markdown, HTML, plain text, JSON, and WebVTT
-(enabling PDF → HTML, which MarkItDown and Pandoc cannot do). With pinned
+layout awareness and exports Markdown, HTML, plain text, or JSON (enabling
+PDF → HTML, which MarkItDown and Pandoc cannot do). With pinned
 `docling[asr]==2.115.0` plus `docling-slim[format-video]==2.115.0`, it also
-transcribes WAV/MP3/M4A/AAC/OGG/FLAC and MP4/AVI/MOV/MKV/WebM locally; the
-dedicated `transcript` output is Markdown and must remain timed-media-only.
+transcribes WAV/MP3/M4A/AAC/OGG/FLAC and MP4/AVI/MOV/MKV/WebM locally via the
+dedicated `transcript` output (Markdown payload, timed-media-only). Docling
+must not own video → Markdown or video → VTT; FFmpeg keeps subtitle-track
+extraction (SRT/VTT) and MarkItDown keeps document Markdown routes.
 FFmpeg converts audio and video
 containers, still frames, subtitle tracks, and PNG sequence ZIPs (for example
 MP4 → MP3, WAV → FLAC, video → PNG, MKV → SRT, video → `png-sequence-zip`).

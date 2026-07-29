@@ -12,9 +12,10 @@ module uses [Pandoc](https://pandoc.org/) for its complete reader/writer format
 set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle),
 which removes clutter and returns clean Markdown or HTML.
 [Docling](https://github.com/docling-project/docling) reads PDFs and other
-documents with layout-aware parsing and exports Markdown, HTML, plain text,
-JSON, or WebVTT (including PDF → HTML). Its local ASR pipeline can also turn
-audio and video into a dedicated transcript. [qpdf](https://qpdf.sourceforge.io/)
+documents with layout-aware parsing and exports Markdown, HTML, plain text, or
+JSON (including PDF → HTML). Its local ASR pipeline turns audio and video into
+a dedicated `transcript` output (FFmpeg keeps subtitle-track SRT/VTT).
+[qpdf](https://qpdf.sourceforge.io/)
 provides PDF page extraction, rotation, compression (lossless Flate or smaller
 lossy image recompress), linearization, and page splitting.
 [FFmpeg](https://ffmpeg.org/) converts audio and video containers, extracts
@@ -84,8 +85,9 @@ Node is resolved from `PATH`, Homebrew, nvm, fnm, volta, asdf, and mise. Set
 `SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle` to override the Defuddle CLI.
 
 - [Docling](https://github.com/docling-project/docling) for layout-aware PDF and
-  office conversion to Markdown, HTML, plain text, JSON, or WebVTT. Install its
-  pinned ASR/video extras to transcribe audio and video locally:
+  office conversion to Markdown, HTML, plain text, or JSON. Install its pinned
+  ASR/video extras to transcribe audio and video to the dedicated `transcript`
+  output:
 
 ```sh
 # into the project venv used by MarkItDown, or any environment on PATH
@@ -238,11 +240,14 @@ cargo run --bin shift-cli -- scan.pdf --to html --module docling
 # Prefer Docling for PDF → Markdown quality
 cargo run --bin shift-cli -- scan.pdf --module docling
 
-# Local audio/video transcription (Markdown), or timed WebVTT
+# Local audio/video transcription (dedicated transcript action)
 cargo run --bin shift-cli -- interview.m4a --to transcript --module docling \
   --docling-asr-model turbo
-cargo run --bin shift-cli -- recording.mp4 --to vtt --module docling \
+cargo run --bin shift-cli -- recording.mp4 --to transcript --module docling \
   --docling-video-sampling scene --docling-video-diarization
+
+# Extract embedded captions with FFmpeg (track demux, not ASR)
+cargo run --bin shift-cli -- clip.mkv --to vtt
 
 # Extract audio from a video with FFmpeg
 cargo run --bin shift-cli -- clip.mp4 --to mp3
