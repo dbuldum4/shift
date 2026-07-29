@@ -89,15 +89,14 @@ pub fn inspect_binary(format: OutputFormat, bytes: &[u8]) -> ArtifactInspection 
         };
     }
 
-    if let Some((name, facts)) = inspect_media(signature_scan, suffix, bytes.len()) {
+    // Media parsers use the full inspection prefix (1 MiB) so ID3 tags and
+    // late container headers remain reachable; only JPEG marker walks stay on
+    // the short signature window above.
+    if let Some((name, facts)) = inspect_media(prefix, suffix, bytes.len()) {
         let mut facts = facts;
         facts.push(format!("Size: {size}"));
         return ArtifactInspection {
-            kind: if is_video_format(format) {
-                "Video"
-            } else {
-                "Audio"
-            },
+            kind: media_kind(format),
             headline: format!("Media preview · {name}"),
             facts,
             note: "Container headers inspected locally — Open to play with your default app."
@@ -182,15 +181,37 @@ fn inspect_image(bytes: &[u8]) -> Option<(&'static str, u32, u32, Option<String>
             return Some(("BMP", width as u32, height, None));
         }
     }
-    if bytes.len() >= 30
-        && &bytes[..4] == b"RIFF"
-        && &bytes[8..12] == b"WEBP"
-        && &bytes[12..16] == b"VP8X"
-    {
-        let width = le_u24(bytes, 24)?.checked_add(1)?;
-        let height = le_u24(bytes, 27)?.checked_add(1)?;
-        if width > 0 && height > 0 {
-            return Some(("WebP", width, height, None));
+    if bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        match &bytes[12..16] {
+            b"VP8X" if bytes.len() >= 30 => {
+                let width = le_u24(bytes, 24)?.checked_add(1)?;
+                let height = le_u24(bytes, 27)?.checked_add(1)?;
+                if width > 0 && height > 0 {
+                    return Some(("WebP", width, height, None));
+                }
+            }
+            // Lossy VP8 bitstream: 3-byte frame tag, then start code 0x9d012a,
+            // then 14-bit little-endian width/height. Header-only; no decode.
+            b"VP8 " if bytes.len() >= 30 && bytes.get(23..26) == Some(&[0x9d, 0x01, 0x2a]) => {
+                let width = (le_u16(bytes, 26)? & 0x3fff) as u32;
+                let height = (le_u16(bytes, 28)? & 0x3fff) as u32;
+                if width > 0 && height > 0 {
+                    return Some(("WebP", width, height, None));
+                }
+            }
+            // Lossless VP8L: signature 0x2f then packed 14-bit width-1/height-1.
+            b"VP8L" if bytes.len() >= 25 && bytes.get(20) == Some(&0x2f) => {
+                let b0 = u32::from(bytes[21]);
+                let b1 = u32::from(bytes[22]);
+                let b2 = u32::from(bytes[23]);
+                let b3 = u32::from(bytes[24]);
+                let width = 1 + (b0 | ((b1 & 0x3f) << 8));
+                let height = 1 + ((b1 >> 6) | (b2 << 2) | ((b3 & 0xf) << 10));
+                if width > 0 && height > 0 {
+                    return Some(("WebP", width, height, None));
+                }
+            }
+            _ => {}
         }
     }
     inspect_jpeg(bytes)
@@ -242,12 +263,11 @@ fn inspect_pdf(bytes: &[u8]) -> Option<(String, Option<usize>, bool)> {
         .ok()?
         .trim_matches(|c: char| !c.is_ascii_digit() && c != '.')
         .to_owned();
-    let pages = count_pdf_page_objects(bytes);
-    Some((
-        version,
-        Some(pages),
-        find_bytes(bytes, b"/Encrypt").is_some(),
-    ))
+    let page_count = count_pdf_page_objects(bytes);
+    // Omit a zero count so compressed/object-stream PDFs without plain
+    // `/Type /Page` markers still show version/size without a misleading zero.
+    let pages = (page_count > 0).then_some(page_count);
+    Some((version, pages, find_bytes(bytes, b"/Encrypt").is_some()))
 }
 
 fn count_pdf_page_objects(bytes: &[u8]) -> usize {
@@ -273,7 +293,7 @@ fn inspect_media(
         .or_else(|| inspect_flac(prefix))
         .or_else(|| inspect_mp3(prefix))
         .or_else(|| inspect_ogg(prefix))
-        .or_else(|| inspect_mp4(prefix).or_else(|| inspect_mp4(suffix)))
+        .or_else(|| inspect_mp4(prefix, suffix))
         .or_else(|| inspect_ebml(prefix))
         .or_else(|| inspect_avi(prefix))
         .map(|(name, mut facts)| {
@@ -347,7 +367,8 @@ fn inspect_flac(bytes: &[u8]) -> Option<(&'static str, Vec<String>)> {
     let packed = u64::from_be_bytes(bytes[18..26].try_into().ok()?);
     let sample_rate = ((packed >> 44) & 0xfffff) as u32;
     let channels = ((packed >> 41) & 0x7) as u16 + 1;
-    let total_samples = packed & 0x0fff_fffff;
+    // STREAMINFO total samples is a 36-bit field (not 32).
+    let total_samples = packed & ((1u64 << 36) - 1);
     let mut facts = Vec::new();
     if sample_rate > 0 {
         facts.push(format_hz(sample_rate));
@@ -438,13 +459,27 @@ fn inspect_ogg(bytes: &[u8]) -> Option<(&'static str, Vec<String>)> {
     Some((name, Vec::new()))
 }
 
-fn inspect_mp4(bytes: &[u8]) -> Option<(&'static str, Vec<String>)> {
-    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+fn inspect_mp4(prefix: &[u8], suffix: &[u8]) -> Option<(&'static str, Vec<String>)> {
+    // Identity lives at the start of a normal MP4; duration (`mvhd`) is often
+    // written in a trailing `moov`. Search both slices independently so a
+    // successful prefix `ftyp` match does not skip the suffix duration probe.
+    let brand_bytes = if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
+        &prefix[8..12]
+    } else if suffix.len() >= 12 && &suffix[4..8] == b"ftyp" {
+        &suffix[8..12]
+    } else {
+        return None;
+    };
+    // Still-image ISO BMFF brands are not audio/video containers for this UI.
+    if matches!(
+        brand_bytes,
+        b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif" | b"avis"
+    ) {
         return None;
     }
-    let brand = std::str::from_utf8(&bytes[8..12]).ok().unwrap_or("MP4");
+    let brand = std::str::from_utf8(brand_bytes).ok().unwrap_or("MP4");
     let mut facts = vec![format!("Brand: {brand}")];
-    if let Some(duration) = find_mp4_duration(bytes) {
+    if let Some(duration) = find_mp4_duration(prefix).or_else(|| find_mp4_duration(suffix)) {
         facts.push(format!("Duration: {}", format_duration(duration)));
     }
     Some(("MP4 container", facts))
@@ -546,6 +581,18 @@ fn is_video_format(format: OutputFormat) -> bool {
         "mp4" | "webm" | "mkv" | "mov" | "avi" | "m4v" | "mpeg" | "ts" | "3gp"
     )
 }
+/// Prefer the declared output family so HEIC/AVIF (ftyp) never show as Audio.
+fn media_kind(format: OutputFormat) -> &'static str {
+    if is_image_format(format) {
+        "Image"
+    } else if is_video_format(format) {
+        "Video"
+    } else if is_audio_format(format) {
+        "Audio"
+    } else {
+        "Media"
+    }
+}
 fn plural(value: usize) -> &'static str {
     if value == 1 { "" } else { "s" }
 }
@@ -579,7 +626,14 @@ fn format_duration(seconds: f64) -> String {
         return "unknown".into();
     }
     let rounded = seconds.round() as u64;
-    format!("{}:{:02}", rounded / 60, rounded % 60)
+    let hours = rounded / 3600;
+    let minutes = (rounded % 3600) / 60;
+    let secs = rounded % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes}:{secs:02}")
+    }
 }
 fn format_byte_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
@@ -656,5 +710,147 @@ mod tests {
         let preview = inspect_binary(OutputFormat::MP4, &bytes);
         assert_eq!(preview.kind, "Video");
         assert!(preview.summary().contains("Inspected first"));
+        assert!(preview.note.contains("Open") || preview.note.contains("Download"));
+    }
+
+    #[test]
+    fn mp4_reads_duration_from_trailing_moov() {
+        // ftyp at head; mvhd only in the trailing suffix (common FFmpeg layout).
+        let mut bytes = vec![0u8; 80_000];
+        bytes[4..8].copy_from_slice(b"ftyp");
+        bytes[8..12].copy_from_slice(b"isom");
+        let mvhd_at = bytes.len() - 40;
+        bytes[mvhd_at..mvhd_at + 4].copy_from_slice(b"mvhd");
+        bytes[mvhd_at + 4] = 0; // version 0
+        // timescale @ +16, duration @ +20
+        bytes[mvhd_at + 16..mvhd_at + 20].copy_from_slice(&1000u32.to_be_bytes());
+        bytes[mvhd_at + 20..mvhd_at + 24].copy_from_slice(&5_000u32.to_be_bytes());
+        let preview = inspect_binary(OutputFormat::MP4, &bytes);
+        assert_eq!(preview.kind, "Video");
+        assert!(
+            preview
+                .facts
+                .iter()
+                .any(|fact| fact.contains("Duration: 0:05")),
+            "{:?}",
+            preview.facts
+        );
+    }
+
+    #[test]
+    fn heic_ftyp_is_not_labeled_audio() {
+        let mut bytes = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic".to_vec();
+        bytes.resize(64, 0);
+        let preview = inspect_binary(OutputFormat::HEIC, &bytes);
+        assert_eq!(preview.kind, "Image", "{preview:?}");
+        assert!(!preview.headline.contains("MP4"));
+    }
+
+    #[test]
+    fn flac_uses_full_36bit_total_samples() {
+        // STREAMINFO with total_samples = 2^32 + 1000 at 1000 Hz → ~1:11:46? wait
+        // duration = total_samples / sample_rate.
+        // Pack bits: sample_rate (20) | channels-1 (3) | bits-1 (5) | total (36)
+        // at bytes[18..26] of a minimal fLaC STREAMINFO block.
+        let mut bytes = vec![0u8; 42];
+        bytes[..4].copy_from_slice(b"fLaC");
+        bytes[4] = 0; // last-metadata=0, type=STREAMINFO
+        bytes[5..8].copy_from_slice(&[0, 0, 34]);
+        let sample_rate: u64 = 1_000;
+        let channels_m1: u64 = 1; // stereo
+        let bits_m1: u64 = 15;
+        let total_samples: u64 = (1u64 << 32) + 1_000; // needs full 36-bit mask
+        let packed = (sample_rate << 44)
+            | (channels_m1 << 41)
+            | (bits_m1 << 36)
+            | (total_samples & ((1u64 << 36) - 1));
+        bytes[18..26].copy_from_slice(&packed.to_be_bytes());
+        let preview = inspect_binary(OutputFormat::FLAC, &bytes);
+        assert_eq!(preview.kind, "Audio");
+        // (2^32 + 1000) / 1000 ≈ 1_193_hours… use exact format_duration of that seconds value.
+        let expected_secs = total_samples as f64 / sample_rate as f64;
+        let expected = format!("Duration: {}", {
+            let rounded = expected_secs.round() as u64;
+            format!(
+                "{}:{:02}:{:02}",
+                rounded / 3600,
+                (rounded % 3600) / 60,
+                rounded % 60
+            )
+        });
+        assert!(
+            preview.facts.iter().any(|fact| fact == &expected),
+            "expected {expected}, facts={:?}",
+            preview.facts
+        );
+    }
+
+    #[test]
+    fn mp3_skips_large_id3_tag_within_prefix() {
+        // 12 KiB ID3 so an 8 KiB-only scan would miss the frame; 1 MiB prefix must not.
+        let tag_size = 12 * 1024;
+        let mut bytes = vec![0u8; 10 + tag_size + 4];
+        bytes[..3].copy_from_slice(b"ID3");
+        bytes[3] = 3; // v2.3
+        // synchsafe size of tag body (excludes 10-byte header)
+        let ss = tag_size;
+        bytes[6] = ((ss >> 21) & 0x7f) as u8;
+        bytes[7] = ((ss >> 14) & 0x7f) as u8;
+        bytes[8] = ((ss >> 7) & 0x7f) as u8;
+        bytes[9] = (ss & 0x7f) as u8;
+        // MPEG1 Layer III, 128 kbps, 44.1 kHz, stereo frame header.
+        // sync=0x7ff, version=3, layer=1 (Layer III), bitrate_idx=9, sample_idx=0.
+        let header: u32 = (0x7ff << 21) | (3 << 19) | (1 << 17) | (9 << 12);
+        bytes[10 + tag_size..10 + tag_size + 4].copy_from_slice(&header.to_be_bytes());
+        let preview = inspect_binary(OutputFormat::MP3, &bytes);
+        assert_eq!(preview.kind, "Audio");
+        assert!(
+            preview.facts.iter().any(|f| f.contains("kbps")),
+            "{:?}",
+            preview.facts
+        );
+    }
+
+    #[test]
+    fn webp_vp8_lossy_reports_dimensions() {
+        let mut bytes = b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0".to_vec();
+        // Pad to offset 30: data at 20, frame tag 3 bytes, start code, dims
+        bytes.resize(30, 0);
+        bytes[20..23].copy_from_slice(&[0, 0, 0]); // frame tag
+        bytes[23..26].copy_from_slice(&[0x9d, 0x01, 0x2a]);
+        bytes[26..28].copy_from_slice(&320u16.to_le_bytes());
+        bytes[28..30].copy_from_slice(&240u16.to_le_bytes());
+        let preview = inspect_binary(OutputFormat::WEBP, &bytes);
+        assert_eq!(preview.kind, "Image");
+        assert!(
+            preview.facts.iter().any(|f| f.contains("320 × 240")),
+            "{:?}",
+            preview.facts
+        );
+    }
+
+    #[test]
+    fn pdf_omits_zero_page_object_count() {
+        let pdf = b"%PDF-1.7\n% no page markers\n";
+        let preview = inspect_binary(OutputFormat::PDF, pdf);
+        assert_eq!(preview.kind, "PDF");
+        assert!(
+            !preview.facts.iter().any(|f| f.contains("page object")),
+            "{:?}",
+            preview.facts
+        );
+    }
+
+    #[test]
+    fn format_duration_uses_hours_when_needed() {
+        assert_eq!(format_duration(65.0), "1:05");
+        assert_eq!(format_duration(3661.0), "1:01:01");
+    }
+
+    #[test]
+    fn empty_input_does_not_panic() {
+        let preview = inspect_binary(OutputFormat::PNG, &[]);
+        assert_eq!(preview.kind, "Image");
+        assert!(preview.facts.iter().any(|f| f.contains("Size:")));
     }
 }

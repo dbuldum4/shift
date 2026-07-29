@@ -2881,9 +2881,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
             let file_name_full = artifact.file_name.clone();
             let file_name_display = ellipsize_chars(&artifact.file_name, 42);
             let size = format_file_size(artifact.bytes.len() as u64);
-            let excerpt = artifact_preview(artifact.as_ref());
             let is_text = artifact.format.is_text_previewable();
+            // Inspect binaries once per Ready paint; skip text-path preview work
+            // for binary results (excerpt is only mounted when is_text).
             let inspection = (!is_text).then(|| artifact.inspection());
+            let excerpt = if is_text {
+                artifact_preview(artifact.as_ref())
+            } else {
+                SharedString::default()
+            };
             let pipeline_badge: SharedString = if artifact.pipeline.is_empty() {
                 module_label(artifact.module_id).into()
             } else {

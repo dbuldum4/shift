@@ -2099,6 +2099,10 @@ mod tests {
             "{summary}"
         );
         assert!(summary.contains("preview"), "{summary}");
+        assert!(
+            summary.contains("Open") || summary.contains("Download"),
+            "binary notes should steer to Open/Download: {summary}"
+        );
         assert!(!summary.contains("player widget"), "{summary}");
     }
 
@@ -2436,6 +2440,14 @@ mod tests {
             bin_preview.contains("Video") || bin_preview.contains("MP4"),
             "{bin_preview}"
         );
+        assert!(
+            bin_preview.contains("Size:") || bin_preview.contains("Size "),
+            "expected a size fact: {bin_preview}"
+        );
+        assert!(
+            bin_preview.contains("Open") || bin_preview.contains("Download"),
+            "{bin_preview}"
+        );
     }
 
     #[test]
@@ -2688,6 +2700,10 @@ mod tests {
             assert!(text_preview.contains("Title") || text_preview.contains("truncated"));
             let binary_preview = binary.preview_summary();
             assert!(binary_preview.contains("preview"));
+            assert!(
+                binary_preview.contains("Open") || binary_preview.contains("Download"),
+                "{binary_preview}"
+            );
         }
 
         #[test]
@@ -3627,6 +3643,11 @@ mod tests {
                     "expected binary inspection for {}: {preview}",
                     format.id()
                 );
+                assert!(
+                    preview.contains("Open") || preview.contains("Download"),
+                    "binary notes should steer to Open/Download for {}: {preview}",
+                    format.id()
+                );
             }
         }
 
@@ -3932,18 +3953,27 @@ mod tests {
         let artifact = ConversionArtifact {
             file_name: "subs.srt".into(),
             media_type: "application/x-subrip",
-            bytes: b"1\n".to_vec(),
+            bytes: b"1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_vec(),
             format: OutputFormat::SRT,
             module_id: "ffmpeg",
             pipeline: Vec::new(),
             invocations: Vec::new(),
         };
+        // SRT is text-previewable — the normal Ready path uses text excerpts.
+        assert!(artifact.format.is_text_previewable());
+        let text_preview = artifact.preview_summary();
+        assert!(
+            text_preview.contains("Hi") || text_preview.contains("00:00:01"),
+            "expected text excerpt for SRT, got: {text_preview}"
+        );
+        // Direct inspection still labels the format without implying a player.
         let summary = artifact.inspection().summary();
         assert!(
             summary.contains("preview"),
             "expected inspection, got: {summary}"
         );
         assert!(summary.contains("SRT") || summary.contains("SubRip"));
+        assert!(summary.contains("Open") || summary.contains("Download"));
     }
 
     #[test]
