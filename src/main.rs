@@ -49,7 +49,8 @@ use shift_core::history::{
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
-    cache_artifact_bytes, export_matches_bytes, load_default_session_settings,
+    ConversionRecipe, RecipeDestination, cache_artifact_bytes, export_matches_bytes,
+    load_default_recipe_store, load_default_session_settings, save_default_recipe_store,
     save_default_session_settings, stage_export_file,
 };
 use std::borrow::Cow;
@@ -151,6 +152,7 @@ fn clamp_output_panel_width(width: f32, window_width: f32, history_sidebar_width
 pub(crate) enum SettingsSection {
     Converters,
     General,
+    Recipes,
     Theme,
     Options,
     Paths,
@@ -163,6 +165,7 @@ impl SettingsSection {
         match self {
             Self::Converters => "Converters",
             Self::General => "General",
+            Self::Recipes => "Recipes",
             Self::Theme => "Theme",
             Self::Options => "Options",
             Self::Paths => "Paths",
@@ -175,6 +178,7 @@ impl SettingsSection {
         match self {
             Self::Converters => "Choose which engine runs first when several support a conversion.",
             Self::General => "Session output format and retained conversion history.",
+            Self::Recipes => "Save and apply reusable conversion setups.",
             Self::Theme => "UI appearance — font family for the native app chrome.",
             Self::Options => {
                 "Session conversion knobs for FFmpeg, Docling, Defuddle, Pandoc, and MarkItDown."
@@ -3330,6 +3334,7 @@ pub(crate) struct OutputPanelView {
     available_outputs: Vec<OutputFormat>,
     /// Formats whose engines are installed and ready (subset of available when diagnostics known).
     ready_outputs: Option<Vec<OutputFormat>>,
+    active_recipe: Option<(String, bool)>,
     show_conversion_options: bool,
     conversion_options: ConversionPanelView,
     conversion_progress: Option<(Option<f32>, SharedString)>,
@@ -3357,6 +3362,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
         format_filter,
         available_outputs,
         ready_outputs,
+        active_recipe,
         show_conversion_options,
         conversion_options,
         conversion_progress,
@@ -4018,6 +4024,32 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                 .absolute()
                 .top(px(28.0))
                 .right(px(72.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .when_some(active_recipe, |bar, (name, modified)| {
+                    bar.child(
+                        div()
+                            .id("active-recipe")
+                            .max_w(px(180.0))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(THEME.elevated)
+                            .border_1()
+                            .border_color(THEME.border)
+                            .text_xs()
+                            .text_color(THEME.text_secondary)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .line_clamp(1)
+                            .child(if modified {
+                                format!("{name} · modified")
+                            } else {
+                                format!("Recipe · {name}")
+                            }),
+                    )
+                })
                 .child(selector),
         )
 }
@@ -5069,6 +5101,297 @@ fn settings_general_panel(
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn settings_recipes_panel(
+    recipes: &[ConversionRecipe],
+    active_recipe: Option<&str>,
+    recipe_modified: bool,
+    preferred_module: Option<&str>,
+    recipe_name_input: Entity<TextInput>,
+    recipe_naming_input: Entity<TextInput>,
+    recipe_status: Option<SharedString>,
+    output_dir: Option<&Path>,
+    overwrite: bool,
+    modules: &[String],
+    cx: &mut Context<Shift>,
+) -> impl IntoElement + use<> {
+    let current_label = active_recipe
+        .map(|name| {
+            if recipe_modified {
+                format!("{name} · modified")
+            } else {
+                name.to_owned()
+            }
+        })
+        .unwrap_or_else(|| "Custom setup".to_owned());
+    let destination_label = output_dir
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Beside each source".to_owned());
+    let mut module_chips = Vec::with_capacity(modules.len());
+    for (index, module) in modules.iter().enumerate() {
+        let selected = preferred_module == Some(module.as_str());
+        let value = module.clone();
+        module_chips.push(
+            chip(
+                ("recipe-module", index),
+                module_label(module).to_owned(),
+                selected,
+                cx,
+                move |this, cx| this.set_recipe_preferred_module(Some(value.clone()), cx),
+            )
+            .into_any_element(),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .w_full()
+        .min_w_0()
+        .child(settings_section_header(
+            "Recipes",
+            "Save a complete conversion setup, then apply it to one file or the shared batch queue.",
+        ))
+        .child(settings_card(
+            "Current setup",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .w_full()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(THEME.text_primary)
+                                .child(current_label),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child(if overwrite {
+                                    "Overwrite on"
+                                } else {
+                                    "Overwrite off"
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(THEME.text_secondary)
+                        .child(format!("Destination: {destination_label}")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child("Recipe name"),
+                        )
+                        .child(
+                            div()
+                                .h(px(36.0))
+                                .w_full()
+                                .rounded_lg()
+                                .bg(THEME.elevated)
+                                .border_1()
+                                .border_color(THEME.border)
+                                .overflow_hidden()
+                                .child(recipe_name_input),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child("File-name template (optional)"),
+                        )
+                        .child(
+                            div()
+                                .h(px(36.0))
+                                .w_full()
+                                .rounded_lg()
+                                .bg(THEME.elevated)
+                                .border_1()
+                                .border_color(THEME.border)
+                                .overflow_hidden()
+                                .child(recipe_naming_input),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child(
+                                    "Placeholders: {stem}, {name}, {format}, {ext}. Output folder and Overwrite come from the current batch controls.",
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child("Preferred converter"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(chip(
+                                    "recipe-module-auto",
+                                    "Auto",
+                                    preferred_module.is_none(),
+                                    cx,
+                                    |this, cx| this.set_recipe_preferred_module(None, cx),
+                                ))
+                                .children(module_chips),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("recipe-save")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(36.0))
+                        .px_4()
+                        .rounded_lg()
+                        .bg(THEME.text)
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(THEME.text_inverse)
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.9))
+                        .active(|style| style.opacity(THEME.active_opacity))
+                        .child("Save current setup")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.save_recipe_from_input(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+                .when_some(recipe_status, |card, status| {
+                    card.child(
+                        div()
+                            .text_xs()
+                            .text_color(THEME.text_secondary)
+                            .child(status),
+                    )
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(THEME.text_muted)
+                        .child("PDF passwords are never included in a recipe."),
+                ),
+        ))
+        .child(settings_card(
+            "Saved recipes",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .when(recipes.is_empty(), |list| {
+                    list.child(
+                        div()
+                            .text_sm()
+                            .text_color(THEME.text_muted)
+                            .child("No recipes saved yet."),
+                    )
+                })
+                .children(recipes.iter().enumerate().map(|(index, recipe)| {
+                    let apply_name = recipe.name.clone();
+                    let delete_name = recipe.name.clone();
+                    let is_active = active_recipe
+                        .is_some_and(|active| active.eq_ignore_ascii_case(&recipe.name));
+                    let detail = format!(
+                        "{} · {}",
+                        recipe
+                            .parsed_output_format()
+                            .map(|format| format.label())
+                            .unwrap_or("Unknown format"),
+                        recipe.preferred_module.as_deref().unwrap_or("Automatic converter")
+                    );
+                    div()
+                        .id(("recipe-row", index))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .w_full()
+                        .min_w_0()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(if is_active {
+                            THEME.active
+                        } else {
+                            THEME.elevated
+                        })
+                        .border_1()
+                        .border_color(if is_active {
+                            THEME.border_focused
+                        } else {
+                            THEME.border
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(THEME.text_primary)
+                                        .child(recipe.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(THEME.text_muted)
+                                        .child(detail),
+                                ),
+                        )
+                        .child(action_chip(
+                            ("recipe-apply", index),
+                            if is_active { "Reapply" } else { "Apply" },
+                            cx,
+                            move |this, cx| this.apply_recipe(&apply_name, cx),
+                        ))
+                        .child(action_chip(
+                            ("recipe-delete", index),
+                            "Delete",
+                            cx,
+                            move |this, cx| this.delete_recipe(&delete_name, cx),
+                        ))
+                })),
+        ))
+}
+
 fn settings_theme_panel(ui_font_family: &str, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
     let selected = ui_font_family.to_owned();
     let preview_family: SharedString = selected.clone().into();
@@ -6082,6 +6405,15 @@ pub(crate) struct SettingsView {
     priority: Vec<String>,
     preference_error: Option<SharedString>,
     output_format: OutputFormat,
+    recipes: Vec<ConversionRecipe>,
+    active_recipe: Option<String>,
+    recipe_modified: bool,
+    recipe_preferred_module: Option<String>,
+    recipe_name_input: Entity<TextInput>,
+    recipe_naming_input: Entity<TextInput>,
+    recipe_status: Option<SharedString>,
+    batch_output_dir: Option<PathBuf>,
+    batch_force: bool,
     history_count: usize,
     history_limit: usize,
     history_limit_input: Entity<TextInput>,
@@ -6112,6 +6444,15 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         priority,
         preference_error,
         output_format,
+        recipes,
+        active_recipe,
+        recipe_modified,
+        recipe_preferred_module,
+        recipe_name_input,
+        recipe_naming_input,
+        recipe_status,
+        batch_output_dir,
+        batch_force,
         history_count,
         history_limit,
         history_limit_input,
@@ -6169,6 +6510,20 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                         *history_limit,
                         history_limit_input.clone(),
                         *show_archived,
+                        cx,
+                    )
+                    .into_any_element(),
+                    SettingsSection::Recipes => settings_recipes_panel(
+                        recipes,
+                        active_recipe.as_deref(),
+                        *recipe_modified,
+                        recipe_preferred_module.as_deref(),
+                        recipe_name_input.clone(),
+                        recipe_naming_input.clone(),
+                        recipe_status.clone(),
+                        batch_output_dir.as_deref(),
+                        *batch_force,
+                        priority,
                         cx,
                     )
                     .into_any_element(),
@@ -6308,16 +6663,17 @@ fn settings_screen(view: SettingsView, cx: &mut Context<Shift>) -> impl IntoElem
                             cx,
                         ))
                         .child(settings_nav_item(SettingsSection::General, section, 1, cx))
-                        .child(settings_nav_item(SettingsSection::Theme, section, 2, cx))
-                        .child(settings_nav_item(SettingsSection::Options, section, 3, cx))
-                        .child(settings_nav_item(SettingsSection::Paths, section, 4, cx))
+                        .child(settings_nav_item(SettingsSection::Recipes, section, 2, cx))
+                        .child(settings_nav_item(SettingsSection::Theme, section, 3, cx))
+                        .child(settings_nav_item(SettingsSection::Options, section, 4, cx))
+                        .child(settings_nav_item(SettingsSection::Paths, section, 5, cx))
                         .child(settings_nav_item(
                             SettingsSection::Diagnostics,
                             section,
-                            5,
+                            6,
                             cx,
                         ))
-                        .child(settings_nav_item(SettingsSection::About, section, 6, cx)),
+                        .child(settings_nav_item(SettingsSection::About, section, 7, cx)),
                 )
                 .child(settings_content(&view, cx)),
         )
@@ -6397,6 +6753,7 @@ mod ui_perf {
             format_selection: BatchFormatSelection::Inherit,
             options: ConversionOptions::default(),
             naming_template: BatchNamingTemplate::default(),
+            preferred_module: None,
             destination: PathBuf::from(format!("/tmp/out{id}.md")),
             force: false,
             state,
@@ -6684,6 +7041,7 @@ mod ui_perf {
         let sections = [
             SettingsSection::Converters,
             SettingsSection::General,
+            SettingsSection::Recipes,
             SettingsSection::Theme,
             SettingsSection::Options,
             SettingsSection::Paths,
@@ -7039,6 +7397,7 @@ mod pure_ui_helpers {
             format_selection: BatchFormatSelection::Inherit,
             options: ConversionOptions::default(),
             naming_template: BatchNamingTemplate::default(),
+            preferred_module: None,
             destination: PathBuf::from(format!("/tmp/out{id}.md")),
             force: false,
             state,
@@ -8617,6 +8976,7 @@ mod pure_ui_helpers {
         let sections = [
             (SettingsSection::Converters, "Converters"),
             (SettingsSection::General, "General"),
+            (SettingsSection::Recipes, "Recipes"),
             (SettingsSection::Theme, "Theme"),
             (SettingsSection::Options, "Options"),
             (SettingsSection::Paths, "Paths"),
@@ -8635,6 +8995,7 @@ mod pure_ui_helpers {
         // Spot-check description content.
         assert!(SettingsSection::Converters.description().contains("engine"));
         assert!(SettingsSection::General.description().contains("history"));
+        assert!(SettingsSection::Recipes.description().contains("reusable"));
         assert!(SettingsSection::Theme.description().contains("font"));
         assert!(SettingsSection::Options.description().contains("FFmpeg"));
         assert!(SettingsSection::Paths.description().contains("tools"));
@@ -8654,6 +9015,7 @@ mod pure_ui_helpers {
         for section in [
             SettingsSection::Converters,
             SettingsSection::General,
+            SettingsSection::Recipes,
             SettingsSection::Theme,
             SettingsSection::Options,
             SettingsSection::Paths,

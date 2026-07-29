@@ -151,6 +151,16 @@ Settings → Options holds core session knobs. Use **Apply** after editing text
 fields; chips reconvert immediately. Session format and options (except secrets)
 persist under Application Support (`session-settings.json`).
 
+**Recipes:** Settings → Recipes saves the current output format, preferred
+converter, every non-secret conversion option, optional output folder,
+overwrite policy, and a file-name template. Applying a recipe updates the
+current conversion and snapshots the resolved setup into still-queued batch
+items; running and finished items are unchanged. The active recipe is shown
+beside the output selector, with a `modified` marker after local edits. PDF
+passwords, cancellation flags, and progress callbacks are never written.
+Recipes are shared with `shift-cli` through the versioned, atomically-written
+`conversion-recipes.json` file under Application Support.
+
 **Result actions:** Download, Copy (text to clipboard, or path for binary),
 Reveal in Finder, Open, engine pipeline badge, Show command (redacted argv).
 Binary results also show a local, bounded header inspection: image dimensions,
@@ -207,7 +217,7 @@ file is never modified; Download refuses to overwrite the selected source. Use t
 output dropdown (with search) on the right to choose a format (formats whose
 engines are missing are labeled). Multi-file queue supports **Overwrite** (CLI
 `--force` parity). The settings button opens a full-screen settings view with a
-left sidebar (Converters, General, Options, Paths, Diagnostics, About). On
+left sidebar (Converters, General, Recipes, Options, Paths, Diagnostics, About). On
 Converters, drag a module above another to make it the preferred engine for
 overlapping conversions; status badges show whether each engine is installed.
 The Diagnostics page reports versions, install hints, and distinguishes
@@ -310,18 +320,31 @@ cargo run --bin shift-cli -- batch report.pdf notes.docx -t markdown -O ./out --
 # Multi-input without the `batch` subcommand also enters batch mode when -O is set:
 cargo run --bin shift-cli -- a.pdf b.docx -O ./out -t html
 
+# Save, inspect, apply, and delete named recipes
+cargo run --bin shift-cli -- recipes save web-video --to mp4 --module ffmpeg \
+  --quality high --scale-width 1280 -O ./exports \
+  --name-template '{stem}-web.{ext}'
+cargo run --bin shift-cli -- recipes list
+cargo run --bin shift-cli -- recipes show web-video
+cargo run --bin shift-cli -- clip.mov --recipe web-video
+cargo run --bin shift-cli -- clip.mov --recipe web-video --quality small --no-force
+cargo run --bin shift-cli -- recipes delete web-video
+
 # Inspect the registered formats
 cargo run --bin shift-cli -- formats
 ```
 
 After `cargo install --path . --bin shift-cli`, use `shift-cli` directly in the
 same forms. `shift-cli convert <INPUT>` is also accepted for explicit scripts.
+When `--recipe NAME` is present, saved values are loaded first and every
+explicit CLI flag wins, regardless of whether it appears before or after the
+input. Recipe commands are `recipes list`, `show`, `save`, and `delete`.
 In the native app, multi-select or multi-drop opens the queue panel. Each queued
 output has a capability-filtered **Format** picker, **+ output** adds
 another output for the same source, and **Remove** drops a queued output. Choose
-an output folder, optionally apply a naming template, then press Start (or
-Cancel) and Retry failed items. Files are only queued on drop — conversion does
-not auto-start. Progress, retry, and cancellation use the same `run_batch`
+an output folder, optionally apply a naming template or recipe, then press Start
+(or Cancel) and Retry failed items. Files are only queued on drop — conversion
+does not auto-start. Progress, retry, and cancellation use the same `run_batch`
 runner as the CLI (Ctrl-C cancels).
 
 Overwrite policy matches single-file and batch: an existing destination fails
