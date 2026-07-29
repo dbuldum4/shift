@@ -1608,10 +1608,17 @@ impl Shift {
             parse_optional_u32(self.ffmpeg_subtitle_stream_input.read(cx).content())?;
         let page_from = parse_optional_u32(self.pdf_page_from_input.read(cx).content())?;
         let page_to = parse_optional_u32(self.pdf_page_to_input.read(cx).content())?;
-        let split_pages = parse_optional_u32(self.pdf_split_pages_input.read(cx).content())?;
-        if split_pages == Some(0) {
-            return Err("PDF split group must be at least 1 page".into());
-        }
+        // Only send split_pages for ZIP output so a leftover field from a prior
+        // PDF Pages (ZIP) conversion (or session restore) cannot brick PDF rewrites.
+        let split_pages = if self.output_format == OutputFormat::PDF_PAGES_ZIP {
+            let split_pages = parse_optional_u32(self.pdf_split_pages_input.read(cx).content())?;
+            if split_pages == Some(0) {
+                return Err("PDF split group must be at least 1 page".into());
+            }
+            split_pages
+        } else {
+            None
+        };
         let password = {
             let value = self.pdf_password_input.read(cx).content().trim().to_owned();
             if value.is_empty() { None } else { Some(value) }

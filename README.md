@@ -13,8 +13,9 @@ set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle)
 which removes clutter and returns clean Markdown or HTML.
 [Docling](https://github.com/docling-project/docling) reads PDFs and other
 documents with layout-aware parsing and exports Markdown, HTML, or plain text
-(including PDF → HTML). [qpdf](https://qpdf.sourceforge.io/) provides lossless
-PDF extraction, rotation, compression, linearization, and page splitting.
+(including PDF → HTML). [qpdf](https://qpdf.sourceforge.io/) provides PDF page
+extraction, rotation, compression (lossless Flate or smaller lossy image
+recompress), linearization, and page splitting.
 [FFmpeg](https://ffmpeg.org/) converts audio and video containers, extracts
 still frames and subtitles, and exposes trim/quality/stream options in the app
 and CLI. The output menu ranks mainstream formats first, followed by authoring,
@@ -94,15 +95,17 @@ Set `SHIFT_DOCLING_BIN=/absolute/path/to/docling` when it is not available on
 `PATH`. First runs may download model weights. Prefer Docling above MarkItDown
 in Settings when you want higher-quality PDF → Markdown.
 
-- [qpdf](https://qpdf.sourceforge.io/) for lossless PDF tools:
+- [qpdf](https://qpdf.sourceforge.io/) for PDF toolkit operations:
 
 ```sh
 brew install qpdf
 ```
 
 Set `SHIFT_QPDF_BIN=/absolute/path/to/qpdf` when it is not available on `PATH`.
-PDF passwords are passed through restrictive temporary files and never appear
-in converter command lines or persisted session settings.
+Page extract/rotate and Flate recompress are lossless; **Smaller** compression
+re-encodes suitable images with JPEG (lossy) for size. PDF passwords are passed
+through restrictive temporary files and never appear in converter command lines
+or persisted session settings.
 
 - [FFmpeg](https://ffmpeg.org/) for audio and video conversion:
 
@@ -123,7 +126,8 @@ with sections for engines on the active route:
   interval for **PNG Sequence (ZIP)**
 - **Docling** — image export mode, OCR, OCR language, tables, table mode
 - **PDF toolkit** — page range, password (session only), 90° rotation,
-  lossless/smaller compression, web linearization, and split-page ZIP output
+  preserve/lossless/smaller compression, web linearization, and split-page ZIP
+  output
 - **Defuddle** — frontmatter, language
 - **Pandoc** — standalone, TOC, PDF engine, reference DOCX/PPTX
 - **MarkItDown** — keep data URIs

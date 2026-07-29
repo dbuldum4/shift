@@ -1,4 +1,7 @@
-//! qpdf adapter for lossless PDF page operations and optimization.
+//! qpdf adapter for PDF page operations and optimization.
+//!
+//! Page extract, rotate, and Flate recompress (`Lossless`) are lossless.
+//! `Smaller` also JPEG-recompresses suitable images (lossy).
 
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
@@ -100,6 +103,9 @@ impl QpdfModule {
         };
 
         let mut command = Command::new(&self.executable);
+        // Warnings-only runs (exit 3 by default) still write output; treat them
+        // as success so ordinary real-world PDFs do not fail the toolkit.
+        command.arg("--warning-exit-0");
         command.arg(input);
         add_password_file(&mut command, &work_dir, options.pdf.password.as_deref())?;
         if options
@@ -217,11 +223,6 @@ fn validate_options(
             output_format.label()
         )));
     }
-    if output_format != OutputFormat::PDF_PAGES_ZIP && options.split_pages.is_some() {
-        return Err(ConversionError::new(
-            "PDF split pages can only be used with PDF Pages (ZIP) output",
-        ));
-    }
     if options.page_from == Some(0) || options.page_to == Some(0) {
         return Err(ConversionError::new(
             "PDF pages are 1-based and must be at least 1",
@@ -241,7 +242,11 @@ fn validate_options(
             "PDF rotation must be 90, 180, or 270 degrees",
         ));
     }
-    if let Some(group) = options.split_pages
+    // Stale split_pages from session/UI ZIP state is ignored for PDF rewrites.
+    // Callers that intend ZIP should select PDF_PAGES_ZIP; the CLI rejects
+    // --pdf-split-pages without that target at parse time.
+    if output_format == OutputFormat::PDF_PAGES_ZIP
+        && let Some(group) = options.split_pages
         && !(1..=MAX_SPLIT_GROUP).contains(&group)
     {
         return Err(ConversionError::new(format!(
@@ -468,7 +473,8 @@ esac
         options.split_pages = Some(0);
         assert!(validate_options(OutputFormat::PDF_PAGES_ZIP, &options).is_err());
         options.split_pages = Some(2);
-        assert!(validate_options(OutputFormat::PDF, &options).is_err());
+        // Stale split_pages is ignored for plain PDF rewrites.
+        assert!(validate_options(OutputFormat::PDF, &options).is_ok());
         assert!(validate_options(OutputFormat::PDF_PAGES_ZIP, &options).is_ok());
     }
 
@@ -556,7 +562,29 @@ esac
         assert_eq!(pdf.pipeline, vec!["qpdf"]);
         assert!(pdf.invocations[0].argv_display.contains("--password-file="));
         assert!(pdf.invocations[0].argv_display.contains("--decrypt"));
+        assert!(pdf.invocations[0].argv_display.contains("--warning-exit-0"));
         assert!(!pdf.invocations[0].argv_display.contains("not-on-argv"));
+
+        // Stale split_pages from a prior ZIP session must not brick PDF rewrite.
+        let pdf_stale_split = module
+            .convert(
+                &input,
+                OutputFormat::PDF,
+                &ConversionOptions {
+                    pdf: super::super::PdfInputOptions {
+                        split_pages: Some(2),
+                        ..super::super::PdfInputOptions::default()
+                    },
+                    ..ConversionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(pdf_stale_split.bytes, b"%PDF-1.4 rewritten");
+        assert!(
+            !pdf_stale_split.invocations[0]
+                .argv_display
+                .contains("--split-pages")
+        );
 
         let pages = module
             .convert(

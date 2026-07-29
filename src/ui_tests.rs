@@ -3872,6 +3872,8 @@ async fn build_conversion_options_with_many_session_knobs(cx: &mut TestAppContex
             .update(cx, |input, cx| input.set_content("2", cx));
 
         this.set_selected_file(path, cx);
+        // split_pages is only included for PDF Pages (ZIP); leave default format
+        // first so a leftover field does not leak into non-ZIP options.
         let options = this
             .build_conversion_options(cx)
             .expect("build_conversion_options should succeed");
@@ -3899,7 +3901,13 @@ async fn build_conversion_options_with_many_session_knobs(cx: &mut TestAppContex
             shift_core::conversion::PdfCompression::Lossless
         );
         assert!(options.pdf.linearize);
-        assert_eq!(options.pdf.split_pages, Some(2));
+        assert_eq!(options.pdf.split_pages, None);
+
+        this.output_format = OutputFormat::PDF_PAGES_ZIP;
+        let zip_options = this
+            .build_conversion_options(cx)
+            .expect("ZIP options should include split_pages");
+        assert_eq!(zip_options.pdf.split_pages, Some(2));
     });
 }
 

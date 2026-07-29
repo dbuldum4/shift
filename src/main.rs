@@ -2358,7 +2358,7 @@ fn conversion_options_panel(
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(THEME.text_muted)
-                        .child("PDF pages"),
+                        .child(if show_qpdf { "PDF input" } else { "PDF pages" }),
                 )
                 .child(
                     div()

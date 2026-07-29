@@ -1148,8 +1148,9 @@ impl ConversionRegistry {
     /// Markdown/HTML, so MarkItDown and Docling keep document → text routes.
     /// CSV chainable output allows a second hop into those engines when needed.
     ///
-    /// qpdf owns lossless PDF → PDF rewrites and PDF page ZIPs. It is a direct
-    /// route and does not compete with document extraction engines.
+    /// qpdf owns PDF → PDF rewrites and PDF page ZIPs (extract, rotate, compress,
+    /// linearize, split). It is a direct route and does not compete with
+    /// document extraction engines.
     ///
     /// sips is registered immediately before FFmpeg, which is the only module
     /// it overlaps: both accept still images (`png`, `jpg`, `tiff`, `bmp`,

@@ -642,6 +642,11 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
             return Err("--page-from must be <= --page-to".to_owned());
         }
     }
+    if parsed.pdf.split_pages.is_some() && parsed.target != OutputFormat::PDF_PAGES_ZIP {
+        return Err(
+            "--pdf-split-pages requires --to pdf-pages-zip (not plain PDF rewrite)".to_owned(),
+        );
+    }
 
     if parsed.inputs.is_empty() {
         return Err("missing input file or URL (try `shift-cli --help`)".to_owned());
@@ -1940,6 +1945,18 @@ mod tests {
         assert!(error.contains("compression"), "{error}");
         let error = parse_convert_args(&args(&["scan.pdf", "--pdf-split-pages", "0"])).unwrap_err();
         assert!(error.contains("at least 1"), "{error}");
+        let error = parse_convert_args(&args(&[
+            "scan.pdf",
+            "--to",
+            "pdf",
+            "--pdf-split-pages",
+            "2",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("pdf-pages-zip"),
+            "split pages without ZIP target: {error}"
+        );
     }
 
     #[test]

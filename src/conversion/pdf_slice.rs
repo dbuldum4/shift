@@ -44,6 +44,8 @@ pub fn extract_pdf_pages(
         None => format!("{from}-z"),
     };
     let mut command = Command::new(&executable);
+    // Match the toolkit module: warnings-only (default exit 3) still write output.
+    command.arg("--warning-exit-0");
     command.arg(input);
     if let Some(password) = password.map(str::trim).filter(|value| !value.is_empty()) {
         let password_file = work_dir.join("password.txt");

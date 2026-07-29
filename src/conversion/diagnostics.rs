@@ -667,7 +667,10 @@ fn probe_qpdf() -> EngineDiagnostic {
         env_override,
         install_hint,
         &["--version"],
-        Some("Lossless PDF rewrite, rotation, optimization, and page splitting.".into()),
+        Some(
+            "PDF rewrite, rotation, compression (lossless Flate or smaller/lossy images), and page splitting."
+                .into(),
+        ),
     )
 }
 
