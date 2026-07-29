@@ -17,8 +17,8 @@ dependency correctness and rebase cost.
 | **5** | **#8** | Add fit-to-size conversion goals | Cross-cutting `ConversionOptions` + FFmpeg/sips behavior. Core capability; recipes should be able to capture `target_size`. | **Merged** (Wave C, 2026-07-29) |
 | **6** | **#10** | Complete batch folder workflows | Completes shared batch/folder orchestration (hierarchy, naming templates, per-item formats). Foundation for multi-file UX and for anything that applies settings across a queue. | **Merged** (Wave D, 2026-07-29) |
 | **7** | **#9** | Add reusable conversion recipes | Snapshots options + wires CLI/app/batch. **Should come after** the option surface (#15, #11, #8) and batch plumbing (#10) stabilize, or recipes will immediately need a follow-up for missing knobs. | **Merged** (Wave E, 2026-07-29) |
-| **8** | **#14** | Add macOS workflow integrations | Finder open-with + `shift-cli watch`. Ingestion/automation layer; benefits from solid batch/path handling first. Least entangled with conversion engines. | Open — **next** |
-| **9** | **#16** | Prepare Shift 1.0 release hardening | Version bump, packaging, release docs/preflight. **Last** so 1.0 metadata and notes match what actually shipped. | Open |
+| **8** | **#14** | Add macOS workflow integrations | Finder open-with + `shift-cli watch`. Ingestion/automation layer; benefits from solid batch/path handling first. Least entangled with conversion engines. | **Merged** (Wave F, 2026-07-29) |
+| **9** | **#16** | Prepare Shift 1.0 release hardening | Version bump, packaging, release docs/preflight. **Last** so 1.0 metadata and notes match what actually shipped. | Open — **next** |
 
 ## Review waves
 
@@ -32,8 +32,8 @@ lands and later PRs rebase.
 | **C** | #8 | **Done** (merged 2026-07-29; review fixes for hop-1 target-size + PreferCopy coverage) |
 | **D** | #10 | **Done** (merged 2026-07-29; rebased onto Waves A–C, hierarchy/templates/fan-out) |
 | **E** | #9 | **Done** (merged 2026-07-29; unified on BatchNamingTemplate, dropped dual naming + tmpdir commit) |
-| **F** | #14 | Merge F ← **next** |
-| **G** | #16 | Merge G → cut 1.0 |
+| **F** | #14 | **Done** (merged 2026-07-29; rebased onto Waves A–E with recipes/target-size/hierarchy/fan-out) |
+| **G** | #16 | Merge G ← **next** → cut 1.0 |
 
 ## Notes
 
@@ -49,3 +49,7 @@ lands and later PRs rebase.
   should stay as above. (**#13** already merged in Wave A.)
 - Rebase **#14** (and **#16**) onto current `main` before review so they pick up
   Waves A–E (fit-to-size, batch hierarchy/templates/fan-out, and recipes).
+  (**#14** done — watch reuses `parse_convert_args_resolving_recipe`,
+  hierarchy via `ExpandedInputPath`, naming/`also-to`/`target-size`.)
+- Rebase **#16** onto current `main` before review so release notes/metadata
+  include macOS Finder open-with and `shift-cli watch`.
