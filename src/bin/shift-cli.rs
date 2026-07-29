@@ -6,10 +6,13 @@ use shift_core::conversion::{
     MarkItDownOptions, OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions,
     SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions, default_output_path,
     ensure_public_url_fetch_allowed, expand_input_paths_preserving_roots, looks_like_url,
-    materialize_paste_token, parse_magic_paste, prepare_batch_destination, run_batch,
-    url_display_host, validate_batch_output_formats,
+    materialize_paste_token, parse_magic_paste, prepare_batch_destination,
+    resolve_destination_with_policy, run_batch, url_display_host, validate_batch_output_formats,
 };
 use shift_core::preferences::load_module_priority;
+use shift_core::recipes::{
+    ConversionRecipe, RecipeDestination, load_default_recipe_store, save_default_recipe_store,
+};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -60,7 +63,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         return run_doctor(&arguments[1..]);
     }
 
-    let parsed = parse_convert_args(&arguments)?;
+    if arguments
+        .first()
+        .is_some_and(|value| value == "recipes" || value == "recipe")
+    {
+        return run_recipes_command(&arguments[1..]);
+    }
+
+    let parsed = parse_convert_args_resolving_recipe(&arguments)?;
+    let resolved_options = parsed_conversion_options(&parsed);
     let inputs = resolve_cli_inputs_with_layout(parsed.inputs, parsed.recursive)?;
 
     if inputs.is_empty() {
@@ -106,19 +117,8 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
 
     let registry = build_registry(parsed.preferred_module.as_deref())?;
     let cancel = install_ctrl_c_handler();
-    let mut options = ConversionOptions {
-        ffmpeg: parsed.ffmpeg,
-        markitdown: parsed.markitdown,
-        pandoc: parsed.pandoc,
-        defuddle: parsed.defuddle,
-        docling: parsed.docling,
-        sips: parsed.sips,
-        spreadsheet: parsed.spreadsheet,
-        pdf: parsed.pdf,
-        target_size_bytes: parsed.target_size_bytes,
-        cancel: Some(Arc::clone(&cancel)),
-        progress: None,
-    };
+    let mut options = resolved_options;
+    options.cancel = Some(Arc::clone(&cancel));
     if parsed.progress {
         options.progress = Some(Arc::new(|progress| match progress {
             ConversionProgress::Phase(label) => {
@@ -143,6 +143,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             parsed.yes,
             &registry,
             parsed.verbose,
+            parsed.preferred_module.as_deref(),
         );
     }
 
@@ -180,9 +181,27 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             .write_all(&artifact.bytes)
             .map_err(|error| format!("could not write output: {error}"))?;
     } else {
-        let destination = parsed.output.unwrap_or_else(|| match &source {
-            BatchSource::Url(_) => PathBuf::from(&artifact.file_name),
-            BatchSource::File(path) => default_output_path(path.as_path(), parsed.target),
+        let destination = parsed.output.unwrap_or_else(|| {
+            if parsed.output_dir.is_some()
+                || parsed.naming_template.as_str() != BatchNamingTemplate::DEFAULT
+            {
+                resolve_destination_with_policy(
+                    &source,
+                    parsed.target,
+                    parsed.output_dir.as_deref(),
+                    None,
+                    &parsed.naming_template,
+                )
+                .unwrap_or_else(|_| match &source {
+                    BatchSource::Url(_) => PathBuf::from(&artifact.file_name),
+                    BatchSource::File(path) => default_output_path(path.as_path(), parsed.target),
+                })
+            } else {
+                match &source {
+                    BatchSource::Url(_) => PathBuf::from(&artifact.file_name),
+                    BatchSource::File(path) => default_output_path(path.as_path(), parsed.target),
+                }
+            }
         });
         let source_path = source.as_file().map(|path| path.to_path_buf());
         // Shared with batch: refuse source overwrite, honor --force, create parents.
@@ -215,6 +234,7 @@ struct ParsedConvertArgs {
     also_to: Vec<OutputFormat>,
     naming_template: BatchNamingTemplate,
     preferred_module: Option<String>,
+    recipe: Option<String>,
     ffmpeg: FfmpegOptions,
     markitdown: MarkItDownOptions,
     pandoc: PandocOptions,
@@ -244,6 +264,7 @@ impl Default for ParsedConvertArgs {
             also_to: Vec::new(),
             naming_template: BatchNamingTemplate::default(),
             preferred_module: None,
+            recipe: None,
             ffmpeg: FfmpegOptions::default(),
             markitdown: MarkItDownOptions::default(),
             pandoc: PandocOptions::default(),
@@ -261,9 +282,94 @@ impl Default for ParsedConvertArgs {
     }
 }
 
+#[cfg(test)]
 fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, String> {
+    parse_convert_args_with_defaults(arguments, ParsedConvertArgs::default(), true)
+}
+
+impl ParsedConvertArgs {
+    fn from_recipe(recipe: &ConversionRecipe) -> Result<Self, String> {
+        let options = recipe.to_conversion_options();
+        let destination = recipe.destination.clone().unwrap_or_default();
+        Ok(Self {
+            target: recipe
+                .parsed_output_format()
+                .map_err(|error| error.to_string())?,
+            preferred_module: recipe.preferred_module.clone(),
+            recipe: Some(recipe.name.clone()),
+            naming_template: destination
+                .naming_template
+                .as_deref()
+                .unwrap_or(BatchNamingTemplate::DEFAULT)
+                .parse()
+                .unwrap_or_default(),
+            output_dir: destination.output_dir,
+            force: destination.overwrite,
+            ffmpeg: options.ffmpeg,
+            markitdown: options.markitdown,
+            pandoc: options.pandoc,
+            defuddle: options.defuddle,
+            docling: options.docling,
+            sips: options.sips,
+            spreadsheet: options.spreadsheet,
+            pdf: options.pdf,
+            target_size_bytes: options.target_size_bytes,
+            ..Self::default()
+        })
+    }
+}
+
+fn scan_recipe_name(arguments: &[OsString]) -> Result<Option<String>, String> {
+    let mut found = None;
     let mut cursor = 0;
-    let mut parsed = ParsedConvertArgs::default();
+    while cursor < arguments.len() {
+        if arguments[cursor] == "--" {
+            break;
+        }
+        if arguments[cursor] == "--recipe" {
+            cursor += 1;
+            let name = arguments
+                .get(cursor)
+                .ok_or_else(|| "--recipe requires a name".to_owned())?
+                .to_string_lossy()
+                .trim()
+                .to_owned();
+            if name.is_empty() {
+                return Err("--recipe requires a non-empty name".to_owned());
+            }
+            if found.replace(name).is_some() {
+                return Err("--recipe may only be specified once".to_owned());
+            }
+        }
+        cursor += 1;
+    }
+    Ok(found)
+}
+
+fn parse_convert_args_resolving_recipe(
+    arguments: &[OsString],
+) -> Result<ParsedConvertArgs, String> {
+    let defaults = if let Some(name) = scan_recipe_name(arguments)? {
+        let store = load_default_recipe_store().map_err(|error| error.to_string())?;
+        let recipe = store.get(&name).ok_or_else(|| {
+            format!("recipe `{name}` was not found (try `shift-cli recipes list`)")
+        })?;
+        ParsedConvertArgs::from_recipe(recipe)?
+    } else {
+        ParsedConvertArgs::default()
+    };
+    parse_convert_args_with_defaults(arguments, defaults, true)
+}
+
+fn parse_convert_args_with_defaults(
+    arguments: &[OsString],
+    mut parsed: ParsedConvertArgs,
+    require_input: bool,
+) -> Result<ParsedConvertArgs, String> {
+    let mut cursor = 0;
+    let mut output_explicit = false;
+    let mut output_dir_explicit = false;
+    let mut stdout_explicit = false;
 
     if arguments.first().is_some_and(|value| value == "convert") {
         cursor += 1;
@@ -277,24 +383,46 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
         match arg.as_ref() {
             "-o" | "--output" => {
                 cursor += 1;
+                if !output_dir_explicit && !stdout_explicit {
+                    parsed.output_dir = None;
+                    parsed.stdout = false;
+                }
                 parsed.output = Some(
                     arguments
                         .get(cursor)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--output requires a path".to_owned())?,
                 );
+                output_explicit = true;
             }
             "-O" | "--output-dir" => {
                 cursor += 1;
+                if !output_explicit && !stdout_explicit {
+                    parsed.output = None;
+                    parsed.stdout = false;
+                }
                 parsed.output_dir = Some(
                     arguments
                         .get(cursor)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--output-dir requires a directory".to_owned())?,
                 );
+                output_dir_explicit = true;
             }
-            "--stdout" => parsed.stdout = true,
+            "--no-output-dir" => {
+                parsed.output_dir = None;
+                output_dir_explicit = true;
+            }
+            "--stdout" => {
+                if !output_explicit && !output_dir_explicit {
+                    parsed.output = None;
+                    parsed.output_dir = None;
+                }
+                parsed.stdout = true;
+                stdout_explicit = true;
+            }
             "--force" => parsed.force = true,
+            "--no-force" => parsed.force = false,
             "--yes" | "-y" => parsed.yes = true,
             "--allow-private-urls" => parsed.allow_private_urls = true,
             "--recursive" => parsed.recursive = true,
@@ -340,6 +468,23 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .into_owned(),
                 );
             }
+            "--no-module" => parsed.preferred_module = None,
+            "--recipe" => {
+                cursor += 1;
+                let name = arguments
+                    .get(cursor)
+                    .ok_or_else(|| "--recipe requires a name".to_owned())?
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned();
+                if name.is_empty() {
+                    return Err("--recipe requires a non-empty name".to_owned());
+                }
+                parsed.recipe = Some(name);
+            }
+            "--no-name-template" => {
+                parsed.naming_template = BatchNamingTemplate::default();
+            }
             "--start" => {
                 cursor += 1;
                 parsed.ffmpeg.start_secs = Some(parse_secs(
@@ -349,6 +494,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--start",
                 )?);
             }
+            "--no-start" => parsed.ffmpeg.start_secs = None,
             "--duration" => {
                 cursor += 1;
                 parsed.ffmpeg.duration_secs = Some(parse_secs(
@@ -358,6 +504,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--duration",
                 )?);
             }
+            "--no-duration" => parsed.ffmpeg.duration_secs = None,
             "--frame" => {
                 cursor += 1;
                 parsed.ffmpeg.frame_secs = Some(parse_secs(
@@ -367,6 +514,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--frame",
                 )?);
             }
+            "--no-frame" => parsed.ffmpeg.frame_secs = None,
             "--frame-interval" => {
                 cursor += 1;
                 parsed.ffmpeg.frame_interval_secs = Some(parse_secs(
@@ -376,6 +524,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--frame-interval",
                 )?);
             }
+            "--no-frame-interval" => parsed.ffmpeg.frame_interval_secs = None,
             "--audio-stream" => {
                 cursor += 1;
                 parsed.ffmpeg.audio_stream = Some(parse_u32(
@@ -385,6 +534,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--audio-stream",
                 )?);
             }
+            "--no-audio-stream" => parsed.ffmpeg.audio_stream = None,
             "--subtitle-stream" => {
                 cursor += 1;
                 parsed.ffmpeg.subtitle_stream = Some(parse_u32(
@@ -394,6 +544,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--subtitle-stream",
                 )?);
             }
+            "--no-subtitle-stream" => parsed.ffmpeg.subtitle_stream = None,
             "--encode" => {
                 cursor += 1;
                 parsed.ffmpeg.encode_mode = arguments
@@ -413,9 +564,13 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     .map_err(|error| error.to_string())?;
             }
             "--mono" => parsed.ffmpeg.mono = true,
+            "--no-mono" => parsed.ffmpeg.mono = false,
             "--mute" => parsed.ffmpeg.mute = true,
+            "--no-mute" => parsed.ffmpeg.mute = false,
             "--normalize-audio" => parsed.ffmpeg.normalize_audio = true,
+            "--no-normalize-audio" => parsed.ffmpeg.normalize_audio = false,
             "--burn-subtitles" => parsed.ffmpeg.burn_subtitles = true,
+            "--no-burn-subtitles" => parsed.ffmpeg.burn_subtitles = false,
             "--fps" => {
                 cursor += 1;
                 parsed.ffmpeg.fps = Some(parse_secs(
@@ -425,6 +580,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--fps",
                 )?);
             }
+            "--no-fps" => parsed.ffmpeg.fps = None,
             "--sample-rate" => {
                 cursor += 1;
                 parsed.ffmpeg.sample_rate_hz = Some(parse_u32(
@@ -434,6 +590,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--sample-rate",
                 )?);
             }
+            "--no-sample-rate" => parsed.ffmpeg.sample_rate_hz = None,
             "--scale-width" => {
                 cursor += 1;
                 parsed.ffmpeg.scale_width = Some(parse_u32(
@@ -452,10 +609,15 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--target-size",
                 )?);
             }
+            "--no-scale-width" => parsed.ffmpeg.scale_width = None,
             "--keep-data-uris" => parsed.markitdown.keep_data_uris = true,
+            "--no-keep-data-uris" => parsed.markitdown.keep_data_uris = false,
             "--standalone" => parsed.pandoc.standalone = true,
+            "--no-standalone" => parsed.pandoc.standalone = false,
             "--toc" => parsed.pandoc.toc = true,
+            "--no-toc" => parsed.pandoc.toc = false,
             "--citations" => parsed.pandoc.citations = true,
+            "--no-citations" => parsed.pandoc.citations = false,
             "--pdf-engine" => {
                 cursor += 1;
                 parsed.pandoc.pdf_engine = Some(
@@ -466,6 +628,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .into_owned(),
                 );
             }
+            "--no-pdf-engine" => parsed.pandoc.pdf_engine = None,
             "--reference-doc" => {
                 cursor += 1;
                 parsed.pandoc.reference_doc = Some(
@@ -475,7 +638,9 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .ok_or_else(|| "--reference-doc requires a path".to_owned())?,
                 );
             }
+            "--no-reference-doc" => parsed.pandoc.reference_doc = None,
             "--frontmatter" => parsed.defuddle.frontmatter = true,
+            "--no-frontmatter" => parsed.defuddle.frontmatter = false,
             "--lang" => {
                 cursor += 1;
                 parsed.defuddle.lang = Some(
@@ -486,6 +651,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .into_owned(),
                 );
             }
+            "--no-lang" => parsed.defuddle.lang = None,
             "--docling-images" => {
                 cursor += 1;
                 parsed.docling.image_export_mode = arguments
@@ -571,6 +737,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--sips-max-dimension",
                 )?);
             }
+            "--no-sips-max-dimension" => parsed.sips.max_dimension = None,
             "--sips-quality" => {
                 cursor += 1;
                 parsed.sips.quality = arguments
@@ -589,6 +756,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                     "--sips-rotate",
                 )?);
             }
+            "--no-sips-rotate" => parsed.sips.rotate_degrees = None,
             "--sips-flip" => {
                 cursor += 1;
                 parsed.sips.flip = Some(
@@ -600,7 +768,9 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .map_err(|error| error.to_string())?,
                 );
             }
+            "--no-sips-flip" => parsed.sips.flip = None,
             "--sips-strip-profile" => parsed.sips.strip_color_profile = true,
+            "--no-sips-strip-profile" => parsed.sips.strip_color_profile = false,
             "--sheet" | "--sheet-name" => {
                 cursor += 1;
                 let name = arguments
@@ -614,6 +784,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                 }
                 parsed.spreadsheet.sheet_name = Some(name);
             }
+            "--no-sheet" | "--no-sheet-name" => parsed.spreadsheet.sheet_name = None,
             "--sheet-index" => {
                 cursor += 1;
                 let raw = arguments
@@ -628,6 +799,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                 }
                 parsed.spreadsheet.sheet_index = Some(index);
             }
+            "--no-sheet-index" => parsed.spreadsheet.sheet_index = None,
             "--ocr-lang" => {
                 cursor += 1;
                 parsed.docling.ocr_lang = Some(
@@ -638,6 +810,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .into_owned(),
                 );
             }
+            "--no-ocr-lang" => parsed.docling.ocr_lang = None,
             "--pdf-password" => {
                 cursor += 1;
                 parsed.pdf.password = Some(
@@ -648,6 +821,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                         .into_owned(),
                 );
             }
+            "--no-pdf-password" => parsed.pdf.password = None,
             "--page-from" => {
                 cursor += 1;
                 parsed.pdf.page_from = Some(parse_u32(
@@ -713,6 +887,10 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
                 }
                 parsed.pdf.split_pages = Some(pages);
             }
+            "--no-pages" => {
+                parsed.pdf.page_from = None;
+                parsed.pdf.page_to = None;
+            }
             "--" => {
                 cursor += 1;
                 while cursor < arguments.len() {
@@ -750,7 +928,7 @@ fn parse_convert_args(arguments: &[OsString]) -> Result<ParsedConvertArgs, Strin
         );
     }
 
-    if parsed.inputs.is_empty() {
+    if require_input && parsed.inputs.is_empty() {
         return Err("missing input file or URL (try `shift-cli --help`)".to_owned());
     }
 
@@ -942,6 +1120,157 @@ fn parse_pages_range(value: &OsStr, flag: &str) -> Result<(Option<u32>, Option<u
     Ok((Some(from), Some(to)))
 }
 
+fn parsed_conversion_options(parsed: &ParsedConvertArgs) -> ConversionOptions {
+    ConversionOptions {
+        ffmpeg: parsed.ffmpeg.clone(),
+        markitdown: parsed.markitdown.clone(),
+        pandoc: parsed.pandoc.clone(),
+        defuddle: parsed.defuddle.clone(),
+        docling: parsed.docling.clone(),
+        sips: parsed.sips.clone(),
+        spreadsheet: parsed.spreadsheet.clone(),
+        pdf: parsed.pdf.clone(),
+        target_size_bytes: parsed.target_size_bytes,
+        cancel: None,
+        progress: None,
+    }
+}
+
+fn run_recipes_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let command = arguments
+        .first()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "list".into());
+    match command.as_ref() {
+        "list" => {
+            if arguments.len() != 1 && !arguments.is_empty() {
+                return Err("usage: shift-cli recipes list".to_owned());
+            }
+            let store = load_default_recipe_store().map_err(|error| error.to_string())?;
+            if store.recipes.is_empty() {
+                println!("No saved recipes.");
+            } else {
+                for recipe in store.recipes {
+                    let module = recipe.preferred_module.as_deref().unwrap_or("auto");
+                    println!("{}\t{}\t{}", recipe.name, recipe.output_format, module);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "show" => {
+            let name = recipe_command_name(arguments, "show")?;
+            let store = load_default_recipe_store().map_err(|error| error.to_string())?;
+            let recipe = store
+                .get(name)
+                .ok_or_else(|| format!("recipe `{name}` was not found"))?;
+            let json = serde_json::to_string_pretty(recipe)
+                .map_err(|error| format!("could not serialize recipe: {error}"))?;
+            println!("{json}");
+            Ok(ExitCode::SUCCESS)
+        }
+        "delete" | "remove" => {
+            let name = recipe_command_name(arguments, "delete")?;
+            let mut store = load_default_recipe_store().map_err(|error| error.to_string())?;
+            if !store.delete(name) {
+                return Err(format!("recipe `{name}` was not found"));
+            }
+            save_default_recipe_store(&store).map_err(|error| error.to_string())?;
+            println!("Deleted recipe `{name}`.");
+            Ok(ExitCode::SUCCESS)
+        }
+        "save" => {
+            let name = arguments
+                .get(1)
+                .ok_or_else(|| {
+                    "usage: shift-cli recipes save <NAME> [conversion options]".to_owned()
+                })?
+                .to_string_lossy()
+                .trim()
+                .to_owned();
+            let parsed = parse_convert_args_with_defaults(
+                arguments.get(2..).unwrap_or_default(),
+                ParsedConvertArgs::default(),
+                false,
+            )?;
+            if !parsed.inputs.is_empty() {
+                return Err(
+                    "`recipes save` accepts settings, not input files (remove the input path)"
+                        .to_owned(),
+                );
+            }
+            if parsed.output.is_some() || parsed.stdout {
+                return Err(
+                    "recipes can store --output-dir and --name-template, but not a one-off --output/--stdout"
+                        .to_owned(),
+                );
+            }
+            // Validate the module now so a typo cannot create a recipe that
+            // fails only when it is later applied.
+            let _ = build_registry(parsed.preferred_module.as_deref())?;
+            if parsed.pdf.password.is_some() {
+                eprintln!("shift-cli: PDF passwords are never saved in recipes");
+            }
+            let destination = RecipeDestination {
+                output_dir: parsed.output_dir.clone(),
+                naming_template: Some(parsed.naming_template.to_string()),
+                overwrite: parsed.force,
+            };
+            let recipe = ConversionRecipe::new(
+                name.clone(),
+                parsed.target,
+                parsed.preferred_module.clone(),
+                &parsed_conversion_options(&parsed),
+                Some(destination),
+            )
+            .map_err(|error| error.to_string())?;
+            let mut store = load_default_recipe_store().map_err(|error| error.to_string())?;
+            let replaced = store.upsert(recipe).map_err(|error| error.to_string())?;
+            save_default_recipe_store(&store).map_err(|error| error.to_string())?;
+            println!(
+                "{} recipe `{name}`.",
+                if replaced { "Updated" } else { "Saved" }
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "help" | "-h" | "--help" => {
+            print_recipes_help();
+            Ok(ExitCode::SUCCESS)
+        }
+        other => Err(format!(
+            "unknown recipes command `{other}` (try `shift-cli recipes --help`)"
+        )),
+    }
+}
+
+fn recipe_command_name<'a>(arguments: &'a [OsString], command: &str) -> Result<&'a str, String> {
+    if arguments.len() != 2 {
+        return Err(format!("usage: shift-cli recipes {command} <NAME>"));
+    }
+    let name = arguments[1]
+        .to_str()
+        .ok_or_else(|| "recipe name must be valid UTF-8".to_owned())?
+        .trim();
+    if name.is_empty() {
+        return Err("recipe name cannot be empty".to_owned());
+    }
+    Ok(name)
+}
+
+fn print_recipes_help() {
+    println!(
+        "Usage:\n  \
+         shift-cli recipes list\n  \
+         shift-cli recipes show <NAME>\n  \
+         shift-cli recipes save <NAME> [conversion options]\n  \
+         shift-cli recipes delete <NAME>\n  \
+         shift-cli <INPUT> --recipe <NAME> [overrides]\n\n\
+         Saving captures the output format, preferred module, all non-secret\n\
+         conversion options, optional --output-dir / --name-template, and\n\
+         overwrite policy. PDF passwords are never persisted. Explicit flags\n\
+         supplied with --recipe override the saved values."
+    );
+}
+
 fn build_registry(preferred_module: Option<&str>) -> Result<ConversionRegistry, String> {
     let registry = ConversionRegistry::default();
     if let Some(module) = preferred_module {
@@ -974,6 +1303,7 @@ fn run_batch_cli(
     yes: bool,
     registry: &ConversionRegistry,
     verbose: bool,
+    preferred_module: Option<&str>,
 ) -> Result<ExitCode, String> {
     let mut queue = BatchQueue::new();
     let mut enqueue = BatchEnqueueOptions::new(target);
@@ -1016,7 +1346,14 @@ fn run_batch_cli(
         formats.extend(also_to.iter().copied());
         validate_batch_output_formats(registry, &input.source, &formats)
             .map_err(|error| error.to_string())?;
-        queue.enqueue_fan_out(input, &also_to, &enqueue);
+        let ids = queue.enqueue_fan_out(input, &also_to, &enqueue);
+        if let Some(module) = preferred_module {
+            for id in ids {
+                if let Some(item) = queue.get_mut(id) {
+                    item.preferred_module = Some(module.to_owned());
+                }
+            }
+        }
     }
 
     // Single input + -o path: pin the destination for that one item.
@@ -1297,8 +1634,10 @@ fn print_help() {
          shift-cli batch <INPUT|URL>… [-t <FORMAT>] [--also-to <FORMAT>]… [-O <DIR>] [--force]\n  \
          shift-cli <INPUT>… -O <DIR> [-t <FORMAT>]   # multi-file batch (shared queue)\n  \
          shift-cli formats\n  \
-         shift-cli doctor [--script] [--quiet]\n\n\
+         shift-cli doctor [--script] [--quiet]\n  \
+         shift-cli recipes list|show|save|delete …\n\n\
          General options:\n  \
+         --recipe <NAME>         Start from a saved recipe; later flags override it\n  \
          -t, --to <FORMAT>       Output format id (default: markdown)\n  \
          --also-to <FORMAT>      Also create this output (repeatable; shared fan-out queue)\n  \
          -o, --output <PATH>     Write a single output to PATH\n  \
@@ -1306,13 +1645,17 @@ fn print_help() {
          --name-template <TEXT>  Batch name; {{stem}}, {{parent}}, {{format}}, {{ext}}\n  \
          --stdout                Write bytes to stdout (single input only)\n  \
          --force                 Overwrite existing outputs\n  \
+         --no-force              Disable a recipe's overwrite policy\n  \
          --yes, -y               Skip interactive confirms (network fetch); scripts\n  \
          --allow-private-urls    Allow localhost/LAN URL fetches (default: public only)\n  \
          --module <ID>           Prefer a conversion module (see `formats`)\n  \
+         --no-module             Restore automatic module priority from a recipe\n  \
          --recursive             Expand directory inputs into convertible files\n  \
          --verbose, -v           Print redacted converter invocations on stderr\n  \
          --progress              Print per-conversion progress on stderr\n  \
          Ctrl-C                  Cancel the active batch item and remaining queue\n\n\
+         For saved optional values, matching --no-* flags clear the recipe value\n\
+         (for example --no-output-dir, --no-start, --no-pages, --no-toc).\n\n\
          Media (FFmpeg) options:\n  \
          --start <SEC>           Seek to timestamp before converting\n  \
          --duration <SEC>        Limit output length\n  \
@@ -1327,6 +1670,7 @@ fn print_help() {
          --encode auto|copy|reencode\n  \
          --quality balanced|high|small\n  \
          --mono                  Downmix to mono when re-encoding\n  \
+         --no-mono               Disable mono from a recipe\n  \
          --sample-rate <HZ>      Audio sample rate when re-encoding\n  \
          --scale-width <PX>      Scale video/image width (height auto)\n\n\
          Fit to size (FFmpeg lossy media and sips JPG/JP2):\n  \
@@ -1485,6 +1829,192 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    struct AppSupportGuard {
+        previous: Option<OsString>,
+    }
+
+    impl AppSupportGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("SHIFT_APP_SUPPORT_DIR");
+            // SAFETY: recipe tests hold ENV_LOCK for the full mutation window.
+            unsafe {
+                std::env::set_var("SHIFT_APP_SUPPORT_DIR", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for AppSupportGuard {
+        fn drop(&mut self) {
+            // SAFETY: recipe tests hold ENV_LOCK until after this guard drops.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var("SHIFT_APP_SUPPORT_DIR", previous);
+                } else {
+                    std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recipe_defaults_are_overridden_by_explicit_flags() {
+        let mut options = ConversionOptions::default();
+        options.ffmpeg.quality = FfmpegQuality::High;
+        options.ffmpeg.mono = true;
+        options.pandoc.toc = true;
+        let recipe = ConversionRecipe::new(
+            "Web",
+            OutputFormat::MP4,
+            Some("ffmpeg".into()),
+            &options,
+            Some(RecipeDestination {
+                output_dir: Some(PathBuf::from("/recipe-output")),
+                naming_template: Some("{stem}-web.{ext}".into()),
+                overwrite: true,
+            }),
+        )
+        .unwrap();
+        let defaults = ParsedConvertArgs::from_recipe(&recipe).unwrap();
+        let parsed = parse_convert_args_with_defaults(
+            &args(&[
+                "--to",
+                "webm",
+                "clip.mov",
+                "--quality",
+                "small",
+                "--no-mono",
+                "--no-toc",
+                "--no-force",
+                "--name-template",
+                "{stem}-tiny.{ext}",
+            ]),
+            defaults,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.target, OutputFormat::WEBM);
+        assert_eq!(parsed.preferred_module.as_deref(), Some("ffmpeg"));
+        assert_eq!(parsed.ffmpeg.quality, FfmpegQuality::Small);
+        assert!(!parsed.ffmpeg.mono);
+        assert!(!parsed.pandoc.toc);
+        assert!(!parsed.force);
+        assert_eq!(parsed.output_dir, Some(PathBuf::from("/recipe-output")));
+        assert_eq!(parsed.naming_template.as_str(), "{stem}-tiny.{ext}");
+    }
+
+    #[test]
+    fn explicit_stdout_clears_recipe_destination_without_masking_cli_conflicts() {
+        let defaults = ParsedConvertArgs {
+            output_dir: Some(PathBuf::from("/recipe-output")),
+            ..ParsedConvertArgs::default()
+        };
+        let stdout = parse_convert_args_with_defaults(
+            &args(&["notes.md", "--stdout"]),
+            defaults.clone(),
+            true,
+        )
+        .unwrap();
+        assert!(stdout.stdout);
+        assert!(stdout.output_dir.is_none());
+
+        let conflicting = parse_convert_args_with_defaults(
+            &args(&["notes.md", "--stdout", "-o", "out.md"]),
+            defaults,
+            true,
+        )
+        .unwrap();
+        assert!(conflicting.stdout);
+        assert!(conflicting.output.is_some());
+    }
+
+    #[test]
+    fn recipe_commands_round_trip_and_never_store_pdf_passwords() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let directory = unique_temp("recipes-command");
+        std::fs::create_dir_all(&directory).unwrap();
+        let _support = AppSupportGuard::set(&directory);
+
+        assert_eq!(
+            run(args(&[
+                "recipes",
+                "save",
+                "Styled PDF",
+                "--to",
+                "pdf",
+                "--module",
+                "pandoc",
+                "--toc",
+                "--pdf-password",
+                "never-write-me",
+                "--output-dir",
+                "/tmp/exports",
+                "--name-template",
+                "{stem}-styled.{ext}",
+                "--force",
+            ]))
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(run(args(&["recipes", "list"])).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            run(args(&["recipes", "show", "styled pdf"])).unwrap(),
+            ExitCode::SUCCESS
+        );
+
+        let raw = std::fs::read_to_string(directory.join("conversion-recipes.json")).unwrap();
+        assert!(!raw.contains("never-write-me"));
+        let parsed = parse_convert_args_resolving_recipe(&args(&[
+            "notes.md",
+            "--recipe",
+            "STYLED PDF",
+            "--no-toc",
+            "--no-force",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.target, OutputFormat::PDF);
+        assert_eq!(parsed.preferred_module.as_deref(), Some("pandoc"));
+        assert!(!parsed.pandoc.toc);
+        assert!(!parsed.force);
+        assert_eq!(parsed.naming_template.as_str(), "{stem}-styled.{ext}");
+
+        assert_eq!(
+            run(args(&["recipes", "delete", "Styled PDF"])).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(
+            load_default_recipe_store()
+                .unwrap()
+                .get("Styled PDF")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn recipe_cli_reports_missing_names_and_invalid_templates() {
+        let missing = parse_convert_args_with_defaults(
+            &args(&["a.md", "--recipe"]),
+            Default::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(missing.contains("--recipe requires"));
+
+        let invalid = parse_convert_args_with_defaults(
+            &args(&["a.md", "--name-template", "../{stem}"]),
+            Default::default(),
+            true,
+        )
+        .unwrap_err();
+        // Shared BatchNamingTemplate rejects path separators as unsafe file-name chars.
+        assert!(
+            invalid.contains("unsafe") || invalid.contains("file name"),
+            "{invalid}"
+        );
     }
 
     #[cfg(unix)]

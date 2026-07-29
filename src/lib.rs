@@ -4,6 +4,7 @@ pub mod artifact_cache;
 pub mod conversion;
 pub mod history;
 pub mod preferences;
+pub mod recipes;
 pub mod session_settings;
 
 pub use artifact_cache::{
@@ -11,6 +12,11 @@ pub use artifact_cache::{
     cache_artifact_bytes, cache_artifact_file, default_paste_staging_dir,
     ensure_artifact_cache_dir, export_matches_bytes, purge_artifact_cache,
     purge_artifact_cache_defaults, purge_paste_staging, stage_export_bytes, stage_export_file,
+};
+pub use recipes::{
+    ConversionRecipe, RecipeDestination, RecipeError, RecipeStore, default_recipe_store_path,
+    load_default_recipe_store, load_recipe_store, save_default_recipe_store, save_recipe_store,
+    validate_naming_template, validate_recipe_name,
 };
 pub use session_settings::{
     SessionConversionOptions, SessionSettings, application_support_dir,

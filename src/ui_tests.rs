@@ -24,10 +24,11 @@ use crate::{
 };
 use shift_core::conversion::{
     BatchEvent, BatchFormatSelection, BatchItemId, BatchItemState, BatchProgress, BatchSource,
-    ConversionArtifact, DiagnosticsReport, EngineDiagnostic, FfmpegQuality, OutputFormat,
-    Readiness, available_outputs_for_batch_source,
+    ConversionArtifact, ConversionOptions, DiagnosticsReport, EngineDiagnostic, FfmpegQuality,
+    OutputFormat, Readiness, available_outputs_for_batch_source,
 };
 use shift_core::history::{MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
+use shift_core::recipes::{ConversionRecipe, RecipeDestination, RecipeStore};
 use std::sync::Arc;
 
 // Binary-wide lock shared with `file_picker` tests (see `crate::ENV_LOCK` in main.rs).
@@ -270,6 +271,10 @@ impl TestEnv {
 
     fn module_priority_path(&self) -> PathBuf {
         self.support().join("module-priority")
+    }
+
+    fn recipes_path(&self) -> PathBuf {
+        self.support().join("conversion-recipes.json")
     }
 
     fn override_tool(&self, name: &str, script: &str) -> PathBuf {
@@ -816,6 +821,59 @@ async fn batch_format_cycle_and_extra_output_use_capability_filtered_jobs(cx: &m
 }
 
 #[gpui::test]
+async fn toggling_batch_item_format_reapplies_recipe_snapshot(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let output_dir = env.temp.join("recipe-output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let path = write_input(&env, "recipe item.txt", b"text");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.set_batch_output_dir(output_dir.clone(), cx);
+        this.recipe_naming_input.update(cx, |input, cx| {
+            input.set_content("{stem}-published.{ext}", cx);
+        });
+        this.batch_force = true;
+        this.recipe_preferred_module = Some("markitdown".to_owned());
+        this.enqueue_paths(vec![path], false, cx);
+    });
+    let id = shift.read_with(cx, |this, _| this.batch_queue.items()[0].id);
+
+    shift.update(cx, |this, cx| this.toggle_batch_item_format(id, cx));
+    cx.run_until_parked();
+
+    let item = shift.read_with(cx, |this, _| this.batch_queue.items()[0].clone());
+    assert_eq!(
+        item.format_selection,
+        BatchFormatSelection::Override(OutputFormat::MARKDOWN)
+    );
+    assert_eq!(
+        item.destination,
+        output_dir.join("recipe item-published.md")
+    );
+    assert!(item.force);
+    assert_eq!(item.preferred_module.as_deref(), Some("markitdown"));
+}
+
+#[gpui::test]
+async fn preferred_recipe_module_updates_queued_batch_snapshot(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "module preference.txt", b"text");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| this.enqueue_paths(vec![path], false, cx));
+    shift.update(cx, |this, cx| {
+        this.set_recipe_preferred_module(Some("markitdown".to_owned()), cx)
+    });
+    cx.run_until_parked();
+
+    let preferred = shift.read_with(cx, |this, _| {
+        this.batch_queue.items()[0].preferred_module.clone()
+    });
+    assert_eq!(preferred.as_deref(), Some("markitdown"));
+}
+
+#[gpui::test]
 async fn folder_expand_queues_nested_files(cx: &mut TestAppContext) {
     let env = TestEnv::new();
     let dir = env.inputs().join("nested");
@@ -880,6 +938,145 @@ async fn session_settings_persist(cx: &mut TestAppContext) {
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["output_format"].as_str().unwrap(), "html");
     assert!(value["batch_force"].as_bool().unwrap());
+}
+
+#[gpui::test]
+async fn native_recipe_save_is_visible_and_redacts_password(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.output_format = OutputFormat::HTML;
+        this.pandoc_toc = true;
+        this.recipe_preferred_module = Some("pandoc".into());
+        this.recipe_name_input
+            .update(cx, |input, cx| input.set_content("Publish", cx));
+        this.recipe_naming_input.update(cx, |input, cx| {
+            input.set_content("{stem}-publish.{ext}", cx)
+        });
+        this.pdf_password_input
+            .update(cx, |input, cx| input.set_content("never-persist", cx));
+        this.save_recipe_from_input(cx);
+    });
+    cx.run_until_parked();
+
+    let (active, modified, count) = shift.read_with(cx, |this, _| {
+        (
+            this.active_recipe.clone(),
+            this.recipe_modified,
+            this.recipes.len(),
+        )
+    });
+    assert_eq!(active.as_deref(), Some("Publish"));
+    assert!(!modified);
+    assert_eq!(count, 1);
+    let raw = fs::read_to_string(env.recipes_path()).unwrap();
+    assert!(!raw.contains("never-persist"));
+    let stored = shift_core::load_recipe_store(env.recipes_path()).unwrap();
+    let recipe = stored.get("publish").unwrap();
+    assert_eq!(recipe.parsed_output_format().unwrap(), OutputFormat::HTML);
+    assert_eq!(recipe.preferred_module.as_deref(), Some("pandoc"));
+    assert!(recipe.to_conversion_options().pandoc.toc);
+}
+
+#[gpui::test]
+async fn applying_recipe_snapshots_queued_items_and_delete_clears_current(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let output = env.temp.join("recipe-output");
+    let mut options = ConversionOptions::default();
+    options.pandoc.toc = true;
+    options.pdf.password = Some("must-be-dropped".into());
+    let recipe = ConversionRecipe::new(
+        "Batch publish",
+        OutputFormat::HTML,
+        Some("pandoc".into()),
+        &options,
+        Some(RecipeDestination {
+            output_dir: Some(output.clone()),
+            naming_template: Some("{stem}-published.{ext}".into()),
+            overwrite: true,
+        }),
+    )
+    .unwrap();
+    let mut store = RecipeStore::default();
+    store.upsert(recipe).unwrap();
+    shift_core::save_recipe_store(env.recipes_path(), &store).unwrap();
+
+    let first = write_input(&env, "first.md", b"# first");
+    let second = write_input(&env, "second.md", b"# second");
+    let shift = create_shift(cx);
+    shift.update(cx, |this, cx| {
+        this.enqueue_paths(vec![first, second], false, cx);
+        this.apply_recipe("batch PUBLISH", cx);
+    });
+    cx.run_until_parked();
+
+    shift.read_with(cx, |this, _| {
+        assert_eq!(this.active_recipe.as_deref(), Some("Batch publish"));
+        assert!(!this.recipe_modified);
+        assert_eq!(this.output_format, OutputFormat::HTML);
+        assert_eq!(this.recipe_preferred_module.as_deref(), Some("pandoc"));
+        assert_eq!(this.batch_output_dir.as_ref(), Some(&output));
+        assert!(this.batch_force);
+        for item in this.batch_queue.items() {
+            assert_eq!(item.output_format, OutputFormat::HTML);
+            assert!(item.options.pandoc.toc);
+            assert_eq!(item.preferred_module.as_deref(), Some("pandoc"));
+            assert!(item.options.pdf.password.is_none());
+            assert!(item.force);
+            assert!(
+                item.destination
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-published.html")
+            );
+        }
+    });
+
+    shift.update(cx, |this, cx| {
+        this.set_output_format(OutputFormat::PDF, cx);
+        assert!(this.recipe_modified);
+        this.delete_recipe("Batch publish", cx);
+    });
+    cx.run_until_parked();
+    shift.read_with(cx, |this, _| {
+        assert!(this.active_recipe.is_none());
+        assert!(!this.recipe_modified);
+        assert!(this.recipe_preferred_module.is_none());
+        assert!(this.recipes.is_empty());
+    });
+    assert!(
+        shift_core::load_recipe_store(env.recipes_path())
+            .unwrap()
+            .recipes
+            .is_empty()
+    );
+}
+
+#[gpui::test]
+async fn applying_recipe_with_unknown_module_is_atomic(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+    let recipe = ConversionRecipe {
+        name: "Broken".into(),
+        output_format: "html".into(),
+        preferred_module: Some("not-installed-module".into()),
+        options: Default::default(),
+        destination: None,
+    };
+    shift.update(cx, |this, cx| {
+        this.recipes.push(recipe);
+        let before = this.output_format;
+        this.apply_recipe("Broken", cx);
+        assert_eq!(this.output_format, before);
+        assert!(this.active_recipe.is_none());
+        assert!(
+            this.recipe_status
+                .as_ref()
+                .is_some_and(|status| status.contains("unknown module"))
+        );
+    });
 }
 
 #[gpui::test]

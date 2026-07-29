@@ -433,6 +433,8 @@ pub struct BatchItem {
     pub format_selection: BatchFormatSelection,
     pub options: ConversionOptions,
     pub naming_template: BatchNamingTemplate,
+    /// Per-item module preference snapshotted from a recipe, if any.
+    pub preferred_module: Option<String>,
     /// Planned destination (may be adjusted on write for collisions).
     pub destination: PathBuf,
     pub force: bool,
@@ -689,6 +691,7 @@ impl BatchQueue {
             format_selection,
             options: opts.conversion.clone(),
             naming_template: opts.naming_template.clone(),
+            preferred_module: None,
             destination,
             force: opts.force,
             state: BatchItemState::Queued,
@@ -735,7 +738,8 @@ impl BatchQueue {
             naming_template: template.naming_template.clone(),
             force: template.force,
         };
-        Some(self.push_job(
+        let preferred_module = template.preferred_module.clone();
+        let id = self.push_job(
             BatchInput {
                 source: template.source,
                 relative_parent: template.relative_parent,
@@ -744,7 +748,11 @@ impl BatchQueue {
             format,
             BatchFormatSelection::Override(format),
             &opts,
-        ))
+        );
+        if let Some(item) = self.get_mut(id) {
+            item.preferred_module = preferred_module;
+        }
+        Some(id)
     }
 
     /// Effective formats already represented in one source fan-out group.
@@ -756,6 +764,47 @@ impl BatchQueue {
             .iter()
             .filter(|item| item.group_id == group_id)
             .map(BatchItem::resolved_format)
+            .collect()
+    }
+
+    /// Enqueue one source with a resolved recipe module preference.
+    ///
+    /// Destination naming uses [`BatchEnqueueOptions::naming_template`] (the
+    /// shared batch template). The preferred module is snapshotted on the item
+    /// so later recipe edits cannot change a running batch.
+    pub fn enqueue_with_recipe(
+        &mut self,
+        source: BatchSource,
+        opts: &BatchEnqueueOptions,
+        preferred_module: Option<&str>,
+    ) -> BatchItemId {
+        self.enqueue_input_with_recipe(BatchInput::new(source), opts, preferred_module)
+    }
+
+    /// Enqueue one hierarchical source with a resolved recipe module preference.
+    pub fn enqueue_input_with_recipe(
+        &mut self,
+        input: BatchInput,
+        opts: &BatchEnqueueOptions,
+        preferred_module: Option<&str>,
+    ) -> BatchItemId {
+        let id = self.enqueue_input(input, opts);
+        if let Some(item) = self.get_mut(id) {
+            item.preferred_module = preferred_module.map(str::to_owned);
+        }
+        id
+    }
+
+    /// Enqueue many sources with a resolved recipe module preference.
+    pub fn enqueue_many_with_recipe(
+        &mut self,
+        sources: impl IntoIterator<Item = BatchSource>,
+        opts: &BatchEnqueueOptions,
+        preferred_module: Option<&str>,
+    ) -> Vec<BatchItemId> {
+        sources
+            .into_iter()
+            .map(|source| self.enqueue_with_recipe(source, opts, preferred_module))
             .collect()
     }
 
@@ -900,6 +949,41 @@ impl BatchQueue {
                 output_dir,
                 item.relative_parent.as_deref(),
                 &item.naming_template,
+            )
+            .unwrap_or_else(|_| resolve_destination(&item.source, format, output_dir));
+        }
+    }
+
+    /// Snapshot a resolved recipe/session setup onto every queued item.
+    ///
+    /// Per-item format overrides remain pinned, while shared options, overwrite
+    /// policy, and destination naming are updated together. Running and terminal
+    /// items are immutable.
+    pub fn apply_snapshot_to_queued(
+        &mut self,
+        inherited: OutputFormat,
+        options: &ConversionOptions,
+        output_dir: Option<&Path>,
+        force: bool,
+        naming_template: &BatchNamingTemplate,
+        preferred_module: Option<&str>,
+    ) {
+        for item in &mut self.items {
+            if !matches!(item.state, BatchItemState::Queued) {
+                continue;
+            }
+            let format = item.format_selection.resolve(inherited);
+            item.output_format = format;
+            item.options = options.clone();
+            item.preferred_module = preferred_module.map(str::to_owned);
+            item.force = force;
+            item.naming_template = naming_template.clone();
+            item.destination = resolve_destination_with_policy(
+                &item.source,
+                format,
+                output_dir,
+                item.relative_parent.as_deref(),
+                naming_template,
             )
             .unwrap_or_else(|_| resolve_destination(&item.source, format, output_dir));
         }
@@ -1228,6 +1312,7 @@ struct BatchTask {
     source: BatchSource,
     format: OutputFormat,
     options: ConversionOptions,
+    preferred_module: Option<String>,
     destination: PathBuf,
     force: bool,
 }
@@ -1292,8 +1377,13 @@ fn run_task(
     });
     options.progress = Some(sink);
 
+    let prioritized_registry = task
+        .preferred_module
+        .as_deref()
+        .map(|module| registry.clone().with_priority(&[module]));
+    let task_registry = prioritized_registry.as_ref().unwrap_or(registry);
     let result =
-        convert_source(registry, &task.source, task.format, &options).and_then(|artifact| {
+        convert_source(task_registry, &task.source, task.format, &options).and_then(|artifact| {
             if cancel.load(Ordering::SeqCst) {
                 return Err(ConversionError::cancelled());
             }
@@ -1362,6 +1452,7 @@ pub fn run_batch(
             source: item.source.clone(),
             format: item.resolved_format(),
             options: item.options.clone(),
+            preferred_module: item.preferred_module.clone(),
             destination: item.destination.clone(),
             force: item.force,
         })
@@ -2746,6 +2837,7 @@ mod tests {
             format_selection: BatchFormatSelection::Override(OutputFormat::HTML),
             options: ConversionOptions::default(),
             naming_template: BatchNamingTemplate::default(),
+            preferred_module: None,
             destination: PathBuf::from("/tmp/x.html"),
             force: false,
             state: BatchItemState::Queued,
@@ -3611,5 +3703,127 @@ mod tests {
         );
         assert_eq!(summary.failed, 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recipe_naming_template_is_shared_by_file_and_url_destinations() {
+        let directory = Path::new("/exports");
+        let template: BatchNamingTemplate = "{stem}-{format}.{ext}".parse().unwrap();
+        assert_eq!(
+            resolve_destination_with_policy(
+                &BatchSource::File(PathBuf::from("/inputs/Quarterly Report.docx")),
+                OutputFormat::PDF,
+                Some(directory),
+                None,
+                &template,
+            )
+            .unwrap(),
+            PathBuf::from("/exports/Quarterly Report-pdf.pdf")
+        );
+        // Shared renderer appends the format extension when the template omits it.
+        let template: BatchNamingTemplate = "{stem}-clean.{ext}".parse().unwrap();
+        assert_eq!(
+            resolve_destination_with_policy(
+                &BatchSource::Url("https://example.com/posts/launch.html".into()),
+                OutputFormat::MARKDOWN,
+                Some(directory),
+                None,
+                &template,
+            )
+            .unwrap(),
+            PathBuf::from("/exports/launch-clean.md")
+        );
+    }
+
+    #[test]
+    fn recipe_snapshot_updates_only_queued_items_and_keeps_format_override() {
+        let mut queue = BatchQueue::new();
+        let defaults = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        let queued = queue.enqueue(BatchSource::File(PathBuf::from("/inputs/a.txt")), &defaults);
+        let terminal = queue.enqueue(BatchSource::File(PathBuf::from("/inputs/b.txt")), &defaults);
+        assert!(queue.set_item_format_selection(
+            queued,
+            BatchFormatSelection::Override(OutputFormat::HTML),
+            OutputFormat::MARKDOWN,
+            None,
+        ));
+        queue.get_mut(terminal).unwrap().state = BatchItemState::Cancelled;
+
+        let mut recipe_options = ConversionOptions::default();
+        recipe_options.pandoc.toc = true;
+        let template: BatchNamingTemplate = "{stem}-recipe.{ext}".parse().unwrap();
+        queue.apply_snapshot_to_queued(
+            OutputFormat::PDF,
+            &recipe_options,
+            Some(Path::new("/exports")),
+            true,
+            &template,
+            Some("pandoc"),
+        );
+
+        let item = queue.get(queued).unwrap();
+        assert_eq!(item.output_format, OutputFormat::HTML);
+        assert!(item.options.pandoc.toc);
+        assert_eq!(item.preferred_module.as_deref(), Some("pandoc"));
+        assert!(item.force);
+        assert_eq!(item.destination, PathBuf::from("/exports/a-recipe.html"));
+
+        let untouched = queue.get(terminal).unwrap();
+        assert_eq!(untouched.output_format, OutputFormat::MARKDOWN);
+        assert!(!untouched.options.pandoc.toc);
+        assert!(!untouched.force);
+    }
+
+    #[test]
+    fn per_item_recipe_module_preference_controls_batch_dispatch() {
+        let directory = unique_dir("recipe-module");
+        let input = directory.join("input.txt");
+        let output = directory.join("out");
+        std::fs::write(&input, b"x").unwrap();
+        let registry = ConversionRegistry::new()
+            .with_module(CountingModule {
+                label: "first",
+                inputs: &["txt"],
+                outputs: &[OutputFormat::MARKDOWN],
+                payload: b"first",
+                fail_once: None,
+                delay_ms: 0,
+                in_flight: None,
+                peak: None,
+            })
+            .with_module(CountingModule {
+                label: "preferred",
+                inputs: &["txt"],
+                outputs: &[OutputFormat::MARKDOWN],
+                payload: b"preferred",
+                fail_once: None,
+                delay_ms: 0,
+                in_flight: None,
+                peak: None,
+            });
+        let mut options = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        options.output_dir = Some(output);
+        options.force = true;
+        let mut queue = BatchQueue::new();
+        let id = queue.enqueue_with_recipe(BatchSource::File(input), &options, Some("preferred"));
+        let summary = run_batch(
+            &mut queue,
+            &registry,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert_eq!(summary.succeeded, 1);
+        match &queue.get(id).unwrap().state {
+            BatchItemState::Succeeded {
+                written_path,
+                module_id,
+                ..
+            } => {
+                assert_eq!(module_id, "preferred");
+                assert_eq!(std::fs::read(written_path).unwrap(), b"preferred");
+            }
+            state => panic!("expected success, got {state:?}"),
+        }
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

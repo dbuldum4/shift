@@ -211,6 +211,15 @@ pub(crate) struct Shift {
     pub(crate) format_filter_input: Entity<TextInput>,
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
+    /// Saved conversion setups shared with `shift-cli`.
+    pub(crate) recipes: Vec<ConversionRecipe>,
+    /// Applied recipe name; remains visible when subsequently modified.
+    pub(crate) active_recipe: Option<String>,
+    pub(crate) recipe_modified: bool,
+    pub(crate) recipe_preferred_module: Option<String>,
+    pub(crate) recipe_name_input: Entity<TextInput>,
+    pub(crate) recipe_naming_input: Entity<TextInput>,
+    pub(crate) recipe_status: Option<SharedString>,
     /// `None` once the first-run guide has been dismissed or completed.
     pub(crate) onboarding_step: Option<OnboardingStep>,
     /// Last onboarding navigation direction (for direction-aware step motion).
@@ -519,6 +528,15 @@ impl Shift {
             .to_string();
         let batch_naming_template_input =
             cx.new(|cx| TextInput::new(cx, "{stem}.{ext}", batch_naming_template));
+        let recipe_name_input = cx.new(|cx| TextInput::new(cx, "Recipe name", ""));
+        let recipe_naming_input = cx.new(|cx| TextInput::new(cx, "{stem}-{format}.{ext}", ""));
+        let (recipes, recipe_status) = match load_default_recipe_store() {
+            Ok(store) => (store.recipes, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("Could not load recipes: {error}").into()),
+            ),
+        };
         let (history, next_history_id) = history_from_store(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
@@ -557,6 +575,13 @@ impl Shift {
             format_filter_input,
             settings_open: false,
             settings_section: SettingsSection::Converters,
+            recipes,
+            active_recipe: None,
+            recipe_modified: false,
+            recipe_preferred_module: None,
+            recipe_name_input,
+            recipe_naming_input,
+            recipe_status,
             onboarding_step: (!session.onboarding_completed).then_some(OnboardingStep::Welcome),
             onboarding_nav: crate::ui::animation::OnboardingNavDirection::Enter,
             ui_font_family: session.resolved_ui_font_family().to_owned(),
@@ -723,8 +748,7 @@ impl Shift {
         cx.spawn(async move |this, cx| {
             let report = task.await;
             let _ = this.update(cx, |this, cx| {
-                this.registry =
-                    Arc::new(ConversionRegistry::default().with_priority(&this.module_priority));
+                let _ = this.rebuild_registry_with_recipe_preference();
                 this.diagnostics = Some(Arc::new(report));
                 this.diagnostics_loading = false;
                 this.rebuild_output_caches();
@@ -802,7 +826,22 @@ impl Shift {
         }
         file_picker::remember_directory(&path);
         self.batch_output_dir = Some(path.clone());
-        self.batch_queue.set_output_dir(Some(path.as_path()));
+        self.mark_recipe_modified();
+        if let (Ok(options), Ok(naming_template)) = (
+            self.build_conversion_options(cx),
+            self.current_recipe_naming_template(cx),
+        ) {
+            self.batch_queue.apply_snapshot_to_queued(
+                self.output_format,
+                &options,
+                Some(path.as_path()),
+                self.batch_force,
+                &naming_template,
+                self.recipe_preferred_module.as_deref(),
+            );
+        } else {
+            self.batch_queue.set_output_dir(Some(path.as_path()));
+        }
         self.batch_status = Some(format!("Output folder: {}", path.display()).into());
         self.persist_session_settings(cx);
         cx.notify();
@@ -935,6 +974,25 @@ impl Shift {
         if self.batch_running {
             return;
         }
+        // Format changes also re-resolve a recipe naming template. Capture the
+        // complete current snapshot before mutating the item so invalid custom
+        // templates do not leave a partially-updated batch behind.
+        let options = match self.build_conversion_options(cx) {
+            Ok(options) => options,
+            Err(error) => {
+                self.batch_status = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        let naming_template = match self.current_recipe_naming_template(cx) {
+            Ok(template) => template,
+            Err(error) => {
+                self.batch_status = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
         let Some(item) = self.batch_queue.get(id) else {
             return;
         };
@@ -948,6 +1006,24 @@ impl Shift {
             self.output_format,
             self.batch_output_dir.as_deref(),
         ) {
+            // `set_item_format_selection` intentionally has no recipe
+            // knowledge. Reapply the complete snapshot here so a format
+            // override keeps the saved naming policy, conversion options,
+            // overwrite behavior, and preferred module intact.
+            self.batch_queue.apply_snapshot_to_queued(
+                self.output_format,
+                &options,
+                self.batch_output_dir.as_deref(),
+                self.batch_force,
+                &naming_template,
+                self.recipe_preferred_module.as_deref(),
+            );
+            self.batch_status = Some(match selection {
+                BatchFormatSelection::Inherit => "Item format: inherit global.".into(),
+                BatchFormatSelection::Override(format) => {
+                    format!("Item format pinned to {}.", format.label()).into()
+                }
+            });
             cx.notify();
         }
     }
@@ -1151,7 +1227,11 @@ impl Shift {
         };
         let count = inputs.len();
         for input in inputs {
-            self.batch_queue.enqueue_input(input, &enqueue);
+            self.batch_queue.enqueue_input_with_recipe(
+                input,
+                &enqueue,
+                self.recipe_preferred_module.as_deref(),
+            );
         }
         // Focus first file for the drop-zone card when entering batch mode.
         if let Some(item) = self.batch_queue.items().first() {
@@ -1203,16 +1283,14 @@ impl Shift {
                 return;
             }
         };
-        self.batch_queue
-            .set_naming_template_for_queued(naming_template, self.batch_output_dir.as_deref());
-        self.batch_queue
-            .refresh_inherited_formats(self.output_format, self.batch_output_dir.as_deref());
-        for item in self.batch_queue.items_mut() {
-            if matches!(item.state, BatchItemState::Queued) {
-                item.options = options.clone();
-                item.force = self.batch_force;
-            }
-        }
+        self.batch_queue.apply_snapshot_to_queued(
+            self.output_format,
+            &options,
+            self.batch_output_dir.as_deref(),
+            self.batch_force,
+            &naming_template,
+            self.recipe_preferred_module.as_deref(),
+        );
         self.batch_item_progress.clear();
         self.batch_format_menu = None;
 
@@ -1326,6 +1404,7 @@ impl Shift {
             return;
         }
         self.batch_force = !self.batch_force;
+        self.mark_recipe_modified();
         // Keep already-queued items in sync with the toggle.
         for item in self.batch_queue.items_mut() {
             if matches!(item.state, BatchItemState::Queued) {
@@ -2003,6 +2082,428 @@ impl Shift {
         })
     }
 
+    /// Resolve the active file-name template for batch/recipe work.
+    ///
+    /// Non-empty recipe naming input wins (so a saved recipe can diverge from the
+    /// session default while editing). Otherwise the shared batch template is
+    /// used. Both paths go through [`BatchNamingTemplate`] so recipes cannot
+    /// persist a pattern the queue cannot render.
+    pub(crate) fn current_recipe_naming_template(
+        &self,
+        cx: &App,
+    ) -> Result<BatchNamingTemplate, String> {
+        let recipe = self
+            .recipe_naming_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
+        let source = if recipe.is_empty() {
+            self.batch_naming_template_input
+                .read(cx)
+                .content()
+                .to_owned()
+        } else {
+            recipe
+        };
+        source
+            .parse::<BatchNamingTemplate>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn mark_recipe_modified(&mut self) {
+        if self.active_recipe.is_some() {
+            self.recipe_modified = true;
+        }
+    }
+
+    fn rebuild_registry_with_recipe_preference(&mut self) -> Result<(), String> {
+        let mut priority = self.module_priority.clone();
+        if let Some(preferred) = self.recipe_preferred_module.as_deref() {
+            let registry = ConversionRegistry::default();
+            if !registry.has_module(preferred) {
+                return Err(format!("Recipe prefers unknown module `{preferred}`."));
+            }
+            priority.retain(|module| module != preferred);
+            priority.insert(0, preferred.to_owned());
+        }
+        self.registry = Arc::new(ConversionRegistry::default().with_priority(&priority));
+        Ok(())
+    }
+
+    fn populate_conversion_options(&mut self, options: &ConversionOptions, cx: &mut Context<Self>) {
+        let update_text = |input: &Entity<TextInput>, value: String, cx: &mut Context<Self>| {
+            input.update(cx, |input, cx| input.set_content(value, cx));
+        };
+        update_text(
+            &self.ffmpeg_start_input,
+            options
+                .ffmpeg
+                .start_secs
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.ffmpeg_duration_input,
+            options
+                .ffmpeg
+                .duration_secs
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.ffmpeg_frame_input,
+            options
+                .ffmpeg
+                .frame_secs
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.ffmpeg_frame_interval_input,
+            options
+                .ffmpeg
+                .frame_interval_secs
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.ffmpeg_fps_input,
+            options
+                .ffmpeg
+                .fps
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.ffmpeg_audio_stream_input,
+            options
+                .ffmpeg
+                .audio_stream
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.ffmpeg_subtitle_stream_input,
+            options
+                .ffmpeg
+                .subtitle_stream
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.docling_ocr_lang_input,
+            options.docling.ocr_lang.clone().unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.defuddle_lang_input,
+            options.defuddle.lang.clone().unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.spreadsheet_sheet_name_input,
+            options.spreadsheet.sheet_name.clone().unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.spreadsheet_sheet_index_input,
+            options
+                .spreadsheet
+                .sheet_index
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.pdf_page_from_input,
+            options
+                .pdf
+                .page_from
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        update_text(
+            &self.pdf_page_to_input,
+            options
+                .pdf
+                .page_to
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            cx,
+        );
+        // A recipe never supplies a password; clear any previous source secret
+        // so it cannot leak into a conversion started by applying the recipe.
+        update_text(&self.pdf_password_input, String::new(), cx);
+
+        self.ffmpeg_quality = options.ffmpeg.quality;
+        self.ffmpeg_encode_mode = options.ffmpeg.encode_mode;
+        self.ffmpeg_mono = options.ffmpeg.mono;
+        self.ffmpeg_mute = options.ffmpeg.mute;
+        self.ffmpeg_normalize = options.ffmpeg.normalize_audio;
+        self.ffmpeg_burn_subs = options.ffmpeg.burn_subtitles;
+        self.ffmpeg_sample_rate_hz = options.ffmpeg.sample_rate_hz;
+        self.ffmpeg_scale_width = options.ffmpeg.scale_width;
+        self.docling_images = options.docling.image_export_mode;
+        self.docling_ocr = options.docling.ocr;
+        self.docling_tables = options.docling.tables;
+        self.docling_table_mode = options.docling.table_mode;
+        self.sips_quality = options.sips.quality;
+        self.sips_max_dimension = options.sips.max_dimension;
+        self.sips_rotate_degrees = options.sips.rotate_degrees;
+        self.sips_flip = options.sips.flip;
+        self.sips_strip_color_profile = options.sips.strip_color_profile;
+        self.defuddle_frontmatter = options.defuddle.frontmatter;
+        self.pandoc_standalone = options.pandoc.standalone;
+        self.pandoc_toc = options.pandoc.toc;
+        self.pandoc_citations = options.pandoc.citations;
+        self.pandoc_pdf_engine = options.pandoc.pdf_engine.clone();
+        self.pandoc_reference_doc = options.pandoc.reference_doc.clone();
+        self.markitdown_keep_data_uris = options.markitdown.keep_data_uris;
+    }
+
+    pub(crate) fn save_recipe_from_input(&mut self, cx: &mut Context<Self>) {
+        let name = self.recipe_name_input.read(cx).content().trim().to_owned();
+        let options = match self.build_conversion_options(cx) {
+            Ok(options) => options,
+            Err(error) => {
+                self.recipe_status = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        let naming_template = match self.current_recipe_naming_template(cx) {
+            Ok(template) => template,
+            Err(error) => {
+                self.recipe_status = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        let destination = RecipeDestination {
+            output_dir: self.batch_output_dir.clone(),
+            naming_template: Some(naming_template.to_string()),
+            overwrite: self.batch_force,
+        };
+        let recipe = match ConversionRecipe::new(
+            name.clone(),
+            self.output_format,
+            self.recipe_preferred_module.clone(),
+            &options,
+            Some(destination),
+        ) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                self.recipe_status = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let mut store = match load_default_recipe_store() {
+            Ok(store) => store,
+            Err(error) => {
+                self.recipe_status = Some(format!("Could not load recipes: {error}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let replaced = match store.upsert(recipe) {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                self.recipe_status = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        if let Err(error) = save_default_recipe_store(&store) {
+            self.recipe_status = Some(format!("Could not save recipe: {error}").into());
+            cx.notify();
+            return;
+        }
+        self.recipes = store.recipes;
+        self.active_recipe = Some(name.clone());
+        self.recipe_modified = false;
+        self.recipe_status = Some(
+            format!(
+                "{} recipe “{name}”.",
+                if replaced { "Updated" } else { "Saved" }
+            )
+            .into(),
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn apply_recipe(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.batch_running {
+            self.recipe_status = Some("Cannot apply a recipe while a batch is running.".into());
+            cx.notify();
+            return;
+        }
+        let Some(recipe) = self
+            .recipes
+            .iter()
+            .find(|recipe| recipe.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            self.recipe_status = Some(format!("Recipe “{name}” was not found.").into());
+            cx.notify();
+            return;
+        };
+        let output_format = match recipe.parsed_output_format() {
+            Ok(format) => format,
+            Err(error) => {
+                self.recipe_status = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(preferred) = recipe.preferred_module.as_deref()
+            && !ConversionRegistry::default().has_module(preferred)
+        {
+            self.recipe_status =
+                Some(format!("Recipe prefers unknown module `{preferred}`.").into());
+            cx.notify();
+            return;
+        }
+        let options = recipe.to_conversion_options();
+        self.populate_conversion_options(&options, cx);
+        self.output_format = output_format;
+        self.user_chose_format = true;
+        self.output_menu_open = false;
+        self.recipe_preferred_module = recipe.preferred_module.clone();
+        if let Err(error) = self.rebuild_registry_with_recipe_preference() {
+            self.recipe_status = Some(error.into());
+            cx.notify();
+            return;
+        }
+        let destination = recipe.destination.clone().unwrap_or_default();
+        self.batch_output_dir = destination.output_dir.clone();
+        self.batch_force = destination.overwrite;
+        self.recipe_naming_input.update(cx, |input, cx| {
+            input.set_content(destination.naming_template.clone().unwrap_or_default(), cx);
+        });
+        let naming_template = destination
+            .naming_template
+            .as_deref()
+            .unwrap_or(BatchNamingTemplate::DEFAULT)
+            .parse::<BatchNamingTemplate>()
+            .unwrap_or_default();
+        self.batch_naming_template_input.update(cx, |input, cx| {
+            input.set_content(naming_template.to_string(), cx);
+        });
+        self.recipe_name_input.update(cx, |input, cx| {
+            input.set_content(recipe.name.clone(), cx);
+        });
+        self.active_recipe = Some(recipe.name.clone());
+        self.recipe_modified = false;
+        self.recipe_status = Some(format!("Applied recipe “{}”.", recipe.name).into());
+        self.rebuild_output_caches();
+        self.batch_queue.apply_snapshot_to_queued(
+            output_format,
+            &options,
+            destination.output_dir.as_deref(),
+            destination.overwrite,
+            &naming_template,
+            recipe.preferred_module.as_deref(),
+        );
+        self.persist_session_settings(cx);
+        if self.batch_queue.is_empty() {
+            self.start_conversion(cx);
+        } else {
+            self.batch_status =
+                Some(format!("Queued items updated from recipe “{}”.", recipe.name).into());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn delete_recipe(&mut self, name: &str, cx: &mut Context<Self>) {
+        let mut store = match load_default_recipe_store() {
+            Ok(store) => store,
+            Err(error) => {
+                self.recipe_status = Some(format!("Could not load recipes: {error}").into());
+                cx.notify();
+                return;
+            }
+        };
+        if !store.delete(name) {
+            self.recipe_status = Some(format!("Recipe “{name}” was not found.").into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = save_default_recipe_store(&store) {
+            self.recipe_status = Some(format!("Could not delete recipe: {error}").into());
+            cx.notify();
+            return;
+        }
+        self.recipes = store.recipes;
+        if self
+            .active_recipe
+            .as_deref()
+            .is_some_and(|active| active.eq_ignore_ascii_case(name))
+        {
+            self.active_recipe = None;
+            self.recipe_modified = false;
+            self.recipe_preferred_module = None;
+            let _ = self.rebuild_registry_with_recipe_preference();
+            self.rebuild_output_caches();
+        }
+        self.recipe_status = Some(format!("Deleted recipe “{name}”.").into());
+        cx.notify();
+    }
+
+    pub(crate) fn set_recipe_preferred_module(
+        &mut self,
+        module: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.recipe_preferred_module = module;
+        self.mark_recipe_modified();
+        match self.rebuild_registry_with_recipe_preference() {
+            Ok(()) => {
+                self.recipe_status = None;
+                self.rebuild_output_caches();
+                // A batch owns a snapshot of dispatch settings. Keep queued
+                // work aligned when the recipe's preferred engine changes;
+                // running and terminal entries remain untouched.
+                if !self.batch_queue.is_empty() {
+                    match (
+                        self.build_conversion_options(cx),
+                        self.current_recipe_naming_template(cx),
+                    ) {
+                        (Ok(options), Ok(naming_template)) => {
+                            self.batch_queue.apply_snapshot_to_queued(
+                                self.output_format,
+                                &options,
+                                self.batch_output_dir.as_deref(),
+                                self.batch_force,
+                                &naming_template,
+                                self.recipe_preferred_module.as_deref(),
+                            );
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            self.recipe_status = Some(error.into());
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+                self.start_conversion(cx);
+            }
+            Err(error) => {
+                self.recipe_status = Some(error.into());
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn persist_session_settings(&self, cx: &App) {
         let mut settings = load_default_session_settings();
         settings.set_output_format(self.output_format);
@@ -2338,12 +2839,14 @@ impl Shift {
     }
 
     pub(crate) fn apply_conversion_options(&mut self, cx: &mut Context<Self>) {
+        self.mark_recipe_modified();
         self.persist_session_settings(cx);
         self.start_conversion(cx);
     }
 
     /// Apply a session option change from Settings (reconvert only when relevant).
     pub(crate) fn apply_session_option_change(&mut self, cx: &mut Context<Self>) {
+        self.mark_recipe_modified();
         self.persist_session_settings(cx);
         if self.conversion_options_visible() {
             self.start_conversion(cx);
@@ -2488,10 +2991,33 @@ impl Shift {
             return;
         }
         self.output_format = format;
+        self.mark_recipe_modified();
         self.persist_session_settings(cx);
         if !self.batch_queue.is_empty() {
-            self.batch_queue
-                .set_output_format_for_queued(format, self.batch_output_dir.as_deref());
+            let options = match self.build_conversion_options(cx) {
+                Ok(options) => options,
+                Err(error) => {
+                    self.batch_status = Some(error.into());
+                    cx.notify();
+                    return;
+                }
+            };
+            let naming_template = match self.current_recipe_naming_template(cx) {
+                Ok(template) => template,
+                Err(error) => {
+                    self.batch_status = Some(error.into());
+                    cx.notify();
+                    return;
+                }
+            };
+            self.batch_queue.apply_snapshot_to_queued(
+                format,
+                &options,
+                self.batch_output_dir.as_deref(),
+                self.batch_force,
+                &naming_template,
+                self.recipe_preferred_module.as_deref(),
+            );
             self.batch_status = Some(format!("Queued items updated to {}.", format.label()).into());
             cx.notify();
             // Multi-file mode uses Start / run_batch, not single-file conversion.
@@ -2506,8 +3032,9 @@ impl Shift {
         }
         let module = self.module_priority.remove(from);
         self.module_priority.insert(to, module);
-        self.registry =
-            Arc::new(ConversionRegistry::default().with_priority(&self.module_priority));
+        self.recipe_preferred_module = None;
+        self.mark_recipe_modified();
+        let _ = self.rebuild_registry_with_recipe_preference();
         self.rebuild_output_caches();
         // Apply the new order for this session even if persistence fails, but
         // surface the write error so the next launch is not silently different.
@@ -3179,6 +3706,13 @@ impl Render for Shift {
         let format_filter = self.format_filter_input.read(cx).content().to_owned();
         let settings_open = self.settings_open;
         let ui_font_family = self.ui_font_family.clone();
+        let recipes = self.recipes.clone();
+        let active_recipe = self.active_recipe.clone();
+        let recipe_modified = self.recipe_modified;
+        let recipe_preferred_module = self.recipe_preferred_module.clone();
+        let recipe_name_input = self.recipe_name_input.clone();
+        let recipe_naming_input = self.recipe_naming_input.clone();
+        let recipe_status = self.recipe_status.clone();
         let shortcuts_help_open = self.shortcuts_help_open;
         let show_command_inspect = self.show_command_inspect;
         let conversion_progress = self.conversion_progress.clone();
@@ -3431,6 +3965,9 @@ impl Render for Shift {
                                 format_filter,
                                 available_outputs,
                                 ready_outputs,
+                                active_recipe: active_recipe
+                                    .clone()
+                                    .map(|name| (name, recipe_modified)),
                                 show_conversion_options,
                                 cached_ready_path,
                                 conversion_options: ConversionPanelView {
@@ -3701,6 +4238,15 @@ impl Render for Shift {
                         priority: module_priority,
                         preference_error,
                         output_format,
+                        recipes,
+                        active_recipe,
+                        recipe_modified,
+                        recipe_preferred_module,
+                        recipe_name_input,
+                        recipe_naming_input,
+                        recipe_status,
+                        batch_output_dir: batch_output_dir.clone(),
+                        batch_force,
                         history_count,
                         history_limit,
                         history_limit_input,
