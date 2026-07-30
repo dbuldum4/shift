@@ -7094,6 +7094,8 @@ mod ui_perf {
                     let loaded = LoadedHistory {
                         entries: stored,
                         next_id: MAX_HISTORY_ENTRIES as u64 + 1,
+                        load_error: None,
+                        load_incomplete: false,
                     };
                     let (restored, next_id) = history_from_store(loaded);
                     black_box((restored.len(), next_id));
@@ -7127,6 +7129,7 @@ mod ui_perf {
                 },
                 outcome: StoredOutcome::Failed("nope".into()),
                 archived: false,
+                artifact_deferred: false,
             });
         }
         assert_within(Duration::from_secs(1), "history_from_store filter", || {
@@ -7134,6 +7137,8 @@ mod ui_perf {
                 let loaded = LoadedHistory {
                     entries: entries.clone(),
                     next_id: 201,
+                    load_error: None,
+                    load_incomplete: false,
                 };
                 let (restored, next_id) = history_from_store(loaded);
                 assert_eq!(next_id, 201);
