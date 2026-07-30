@@ -76,7 +76,8 @@ locally where the upstream converter supports it.
 
 - macOS with Xcode and its command-line tools
 - Rust stable (selected automatically by `rust-toolchain.toml`)
-- Python 3.10 or newer
+- Python 3.11 (packaged launchers and release packaging resolve `python3.11`;
+  Homebrew `python@3.11` is the documented path)
 - MarkItDown with its format dependencies:
 
 ```sh

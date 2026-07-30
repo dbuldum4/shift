@@ -54,7 +54,11 @@ cat > "$contents/Info.plist" <<EOF
   <key>CFBundleVersion</key><string>${version#0.}</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <!-- Finder advertises Shift as an alternate viewer, never the default. The
-       executable also accepts one or many local paths for `open -a Shift …`. -->
+       executable also accepts one or many local paths for `open -a Shift …`.
+       Keep this list in parity with conversion module input extensions
+       (MarkItDown / Pandoc / Docling / FFmpeg / sips / spreadsheet / qpdf /
+       Defuddle). scripts/test-release-preflight.sh asserts core extensions
+       remain present; expand here when a module gains a mainstream input. -->
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
@@ -64,18 +68,25 @@ cat > "$contents/Info.plist" <<EOF
       <key>CFBundleTypeExtensions</key>
       <array>
         <string>pdf</string><string>txt</string><string>md</string><string>markdown</string>
-        <string>html</string><string>htm</string><string>doc</string><string>docx</string>
-        <string>ppt</string><string>pptx</string><string>odt</string><string>rtf</string>
-        <string>epub</string><string>csv</string><string>tsv</string><string>xls</string>
-        <string>xlsx</string><string>xlsm</string><string>xlsb</string><string>ods</string>
+        <string>html</string><string>htm</string><string>xhtml</string>
+        <string>doc</string><string>docx</string><string>dot</string><string>dotx</string>
+        <string>ppt</string><string>pptx</string><string>odt</string><string>ods</string>
+        <string>odp</string><string>rtf</string><string>epub</string><string>tex</string>
+        <string>latex</string><string>ipynb</string>
+        <string>csv</string><string>tsv</string><string>json</string><string>xml</string>
+        <string>zip</string>
+        <string>xls</string><string>xlsx</string><string>xlsm</string><string>xlsb</string>
         <string>mp3</string><string>wav</string><string>flac</string><string>m4a</string>
-        <string>aac</string><string>ogg</string><string>opus</string><string>mp4</string>
-        <string>mov</string><string>mkv</string><string>webm</string><string>avi</string>
-        <string>m4v</string><string>mpeg</string><string>mpg</string><string>ts</string>
-        <string>3gp</string><string>png</string><string>jpg</string><string>jpeg</string>
+        <string>aac</string><string>ogg</string><string>opus</string><string>ac3</string>
+        <string>wma</string><string>aiff</string><string>aif</string><string>caf</string>
+        <string>mp4</string><string>mov</string><string>mkv</string><string>webm</string>
+        <string>avi</string><string>m4v</string><string>mpeg</string><string>mpg</string>
+        <string>ts</string><string>m2ts</string><string>3gp</string>
+        <string>png</string><string>jpg</string><string>jpeg</string>
         <string>gif</string><string>webp</string><string>heic</string><string>heif</string>
         <string>avif</string><string>svg</string><string>tiff</string><string>tif</string>
         <string>bmp</string><string>jxl</string><string>ico</string><string>jp2</string>
+        <string>psd</string>
         <string>dng</string><string>cr2</string><string>cr3</string><string>nef</string>
         <string>arw</string><string>orf</string><string>raf</string><string>rw2</string>
         <string>srt</string><string>vtt</string>
@@ -201,21 +212,32 @@ SHIFT_NODE_BIN="$(command -v node)" "$runtime/bin/defuddle" --help >/dev/null
 # is not available for 0.1.x.
 codesign --force --deep --sign - "$app"
 
-archive="$output_dir/shift-${version}-macos-${arch}.zip"
+archive_name="shift-${version}-macos-${arch}.zip"
+archive="$output_dir/$archive_name"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
-shasum -a 256 "$archive" > "$archive.sha256"
+# Checksums must record basenames only so `shasum -c` works after `cd dist`
+# (and after users download just the artifact + sidecar into one folder).
+# Writing `shasum path/to/file` embeds the path prefix and breaks verify.
+(
+  cd "$output_dir"
+  shasum -a 256 "$archive_name" > "${archive_name}.sha256"
+)
 
 dmg_root="$(mktemp -d "${TMPDIR:-/tmp}/shift-dmg.XXXXXX")"
 trap 'rm -rf "$dmg_root"' EXIT
 cp -R "$app" "$dmg_root/Shift.app"
 ln -s /Applications "$dmg_root/Applications"
-dmg="$output_dir/shift-${version}-macos-${arch}.dmg"
+dmg_name="shift-${version}-macos-${arch}.dmg"
+dmg="$output_dir/$dmg_name"
 hdiutil create \
   -volname "Shift ${version}" \
   -srcfolder "$dmg_root" \
   -ov \
   -format UDZO \
   "$dmg"
-shasum -a 256 "$dmg" > "$dmg.sha256"
+(
+  cd "$output_dir"
+  shasum -a 256 "$dmg_name" > "${dmg_name}.sha256"
+)
 
 printf '%s\n%s\n' "$archive" "$dmg"
