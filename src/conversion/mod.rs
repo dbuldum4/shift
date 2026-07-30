@@ -24,6 +24,8 @@ mod registry_parity;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,9 +33,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use batch::{
-    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput, BatchItem, BatchItemId,
-    BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance, BatchQueue, BatchSource,
-    BatchSummary, available_outputs_for_batch_source, prepare_batch_destination,
+    BATCH_WORKERS_ENV, BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput,
+    BatchItem, BatchItemId, BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance,
+    BatchQueue, BatchSource, BatchSummary, DEFAULT_BATCH_WORKER_CAP,
+    available_outputs_for_batch_source, batch_worker_count, prepare_batch_destination,
     resolve_destination, resolve_destination_with_policy, run_batch, suggested_url_file_name,
     uniquify_destination, validate_batch_output_formats,
 };
@@ -75,9 +78,11 @@ pub use process::{
 pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};
 pub use sources::{
-    ExpandedInputPath, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths,
-    expand_input_paths_preserving_roots, expand_input_paths_preserving_roots_with_extensions,
-    expand_input_paths_with_extensions, supported_input_extensions,
+    ExpandBudget, ExpandedInputPath, MAX_BATCH_ADMISSION, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES,
+    enforce_admission_limit, expand_input_paths, expand_input_paths_preserving_roots,
+    expand_input_paths_preserving_roots_with_budget,
+    expand_input_paths_preserving_roots_with_extensions, expand_input_paths_soft,
+    expand_input_paths_with_budget, expand_input_paths_with_extensions, supported_input_extensions,
 };
 pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};
@@ -822,8 +827,19 @@ impl ConversionArtifact {
 
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), ConversionError> {
         // Atomic: write a sibling partial, then rename into place so cancel /
-        // crash never leaves a half-written final path.
+        // crash never leaves a half-written final path. Replace existing files
+        // (force semantics) — callers that must refuse clobber use
+        // [`Self::write_to_with_replace`].
         write_bytes_atomically(path.as_ref(), &self.bytes)
+    }
+
+    /// Write the artifact, optionally refusing to replace an existing file.
+    pub fn write_to_with_replace(
+        &self,
+        path: impl AsRef<Path>,
+        replace: bool,
+    ) -> Result<(), ConversionError> {
+        write_bytes_atomically_with_replace(path.as_ref(), &self.bytes, replace)
     }
 
     /// Human-readable result summary for UI previews (text excerpt or binary facts).
@@ -883,6 +899,16 @@ fn unique_temp_file_name(stem: &str, suffix: &str) -> String {
 /// On failure the partial file is removed. The final path appears only after a
 /// complete write so cancelled conversions do not leave truncated destinations.
 pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
+    write_bytes_atomically_with_replace(path, bytes, true)
+}
+
+/// Like [`write_bytes_atomically`], but when `replace` is false the destination
+/// is published with an exclusive create.
+pub fn write_bytes_atomically_with_replace(
+    path: &Path,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<(), ConversionError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
     let stem = file_stem_for_temp(path);
@@ -894,6 +920,10 @@ pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), Conversio
             "could not write {}: {error}",
             path.display()
         )));
+    }
+
+    if !replace {
+        return publish_exclusive(&partial, path);
     }
 
     if let Err(error) = std::fs::rename(&partial, path) {
@@ -933,6 +963,63 @@ pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), Conversio
             path.display()
         )));
     }
+    Ok(())
+}
+
+/// Publish `partial` to `path` only if `path` does not already exist.
+fn publish_exclusive(partial: &Path, path: &Path) -> Result<(), ConversionError> {
+    match std::fs::hard_link(partial, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(partial);
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(partial);
+            return Err(ConversionError::new(format!(
+                "output already exists: {} (pass --force / enable Overwrite to replace)",
+                path.display()
+            )));
+        }
+        Err(_) => {}
+    }
+
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(partial);
+            return Err(ConversionError::new(format!(
+                "output already exists: {} (pass --force / enable Overwrite to replace)",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(partial);
+            return Err(ConversionError::new(format!(
+                "could not finalize {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let bytes = match std::fs::read(partial) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(partial);
+            return Err(ConversionError::new(format!(
+                "could not finalize {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(partial);
+        return Err(ConversionError::new(format!(
+            "could not finalize {}: {error}",
+            path.display()
+        )));
+    }
+    let _ = std::fs::remove_file(partial);
     Ok(())
 }
 

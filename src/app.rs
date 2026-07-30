@@ -859,34 +859,56 @@ impl Shift {
             self.finish_onboarding(cx);
         }
         if has_dir {
-            match expand_input_paths_preserving_roots(&paths, true) {
-                Ok(expanded) => {
-                    if expanded.is_empty() {
-                        self.batch_status =
-                            Some("No convertible files found in the selected folder(s).".into());
-                        self.folder_confirm = None;
-                        cx.notify();
-                        return;
+            // Folder expansion can walk large trees; never block the UI thread.
+            self.folder_confirm = None;
+            self.batch_status = Some("Expanding folders…".into());
+            cx.notify();
+            let task = cx
+                .background_executor()
+                .spawn(async move { expand_input_paths_preserving_roots(&paths, true) });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(expanded) => {
+                            if expanded.is_empty() {
+                                this.batch_status = Some(
+                                    "No convertible files found in the selected folder(s).".into(),
+                                );
+                                this.folder_confirm = None;
+                            } else {
+                                this.folder_confirm = Some(FolderExpandConfirm {
+                                    expanded: expanded.clone(),
+                                });
+                                this.batch_status = Some(
+                                    format!(
+                                        "Expand folders? {} file(s) (cap {}). Confirm to queue or dismiss.",
+                                        expanded.len(),
+                                        MAX_EXPAND_FILES
+                                    )
+                                    .into(),
+                                );
+                            }
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            this.folder_confirm = None;
+                            this.batch_status = Some(error.to_string().into());
+                            cx.notify();
+                        }
                     }
-                    self.folder_confirm = Some(FolderExpandConfirm {
-                        expanded: expanded.clone(),
-                    });
-                    self.batch_status = Some(
-                        format!(
-                            "Expand folders? {} file(s) (cap {}). Confirm to queue or dismiss.",
-                            expanded.len(),
-                            MAX_EXPAND_FILES
-                        )
-                        .into(),
-                    );
-                    cx.notify();
-                }
-                Err(error) => {
-                    self.folder_confirm = None;
-                    self.batch_status = Some(error.to_string().into());
-                    cx.notify();
-                }
-            }
+                });
+            })
+            .detach();
+            return;
+        }
+        // Global admission for multi-file drops (not only recursive expand).
+        if paths.len() > MAX_EXPAND_FILES {
+            self.batch_status = Some(
+                format!("Too many files (limit is {MAX_EXPAND_FILES}); narrow the selection.")
+                    .into(),
+            );
+            cx.notify();
             return;
         }
         if paths.len() == 1 && self.batch_queue.is_empty() {
@@ -1190,6 +1212,11 @@ impl Shift {
         if self.batch_running {
             self.batch_status =
                 Some("Cannot add files while a batch is running. Wait or Cancel first.".into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.batch_queue.check_admission(inputs.len()) {
+            self.batch_status = Some(error.to_string().into());
             cx.notify();
             return;
         }

@@ -1,12 +1,8 @@
 //! Safe, polling watched-folder discovery shared by workflow surfaces.
 //!
-//! This module deliberately does *not* convert files. It only discovers files
-//! which have remained unchanged for a debounce interval. Callers enqueue the
-//! returned paths in [`super::BatchQueue`] and invoke [`super::run_batch`], so
-//! watched folders retain the same destination, cancellation, retry, hierarchy,
-//! and overwrite semantics as every other multi-file conversion.
+//! Dispatched state is updated only after the conversion outcome is known.
 
-use super::{ConversionError, ExpandedInputPath, expand_input_paths_preserving_roots};
+use super::{ConversionError, ExpandedInputPath, expand_input_paths_soft};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -17,18 +13,20 @@ struct FileFingerprint {
     modified: Option<SystemTime>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackedState {
+    Pending,
+    InFlight,
+    Done,
+}
+
 #[derive(Clone, Debug)]
 struct TrackedFile {
     fingerprint: FileFingerprint,
     observed_at: SystemTime,
-    dispatched: bool,
+    state: TrackedState,
 }
 
-/// Debounces changes in a convertible folder before it is handed to a batch.
-///
-/// A file is yielded once for each distinct size/mtime fingerprint. Failed
-/// conversions are not retried in a tight loop; changing or replacing the
-/// source creates a new fingerprint and makes it eligible again.
 #[derive(Clone, Debug, Default)]
 pub struct WatchTracker {
     files: HashMap<PathBuf, TrackedFile>,
@@ -39,62 +37,65 @@ impl WatchTracker {
         Self::default()
     }
 
-    /// Return all convertible files in a deliberate one-shot snapshot.
-    ///
-    /// `watch --once` uses this instead of waiting out a debounce interval.
     pub fn snapshot(
         &mut self,
         input_dir: &Path,
     ) -> Result<Vec<ExpandedInputPath>, ConversionError> {
-        let paths = expand_input_paths_preserving_roots(&[input_dir], true)?;
+        let paths = expand_input_paths_soft(&[input_dir], true)?;
         let now = SystemTime::now();
         self.files.clear();
-        for expanded in &paths {
-            let fingerprint = fingerprint(&expanded.path)?;
+        let mut ready = Vec::new();
+        for expanded in paths {
+            let Some(fingerprint) = fingerprint_soft(&expanded.path)? else {
+                continue;
+            };
             self.files.insert(
                 watch_identity(&expanded.path),
                 TrackedFile {
                     fingerprint,
                     observed_at: now,
-                    dispatched: true,
+                    state: TrackedState::InFlight,
                 },
             );
+            ready.push(expanded);
         }
-        Ok(paths)
+        Ok(ready)
     }
 
-    /// Discover files that have stayed unchanged for `debounce`.
     pub fn poll(
         &mut self,
         input_dir: &Path,
         now: SystemTime,
         debounce: Duration,
     ) -> Result<Vec<ExpandedInputPath>, ConversionError> {
-        let paths = expand_input_paths_preserving_roots(&[input_dir], true)?;
+        let paths = expand_input_paths_soft(&[input_dir], true)?;
         let mut present = HashMap::with_capacity(paths.len());
         let mut ready = Vec::new();
 
         for expanded in paths {
             let identity = watch_identity(&expanded.path);
-            let current = fingerprint(&expanded.path)?;
+            let Some(current) = fingerprint_soft(&expanded.path)? else {
+                continue;
+            };
             present.insert(identity.clone(), current.clone());
 
             match self.files.get_mut(&identity) {
-                Some(entry) if entry.fingerprint == current => {
-                    if !entry.dispatched
-                        && now
+                Some(entry) if entry.fingerprint == current => match entry.state {
+                    TrackedState::Pending
+                        if now
                             .duration_since(entry.observed_at)
                             .unwrap_or(Duration::ZERO)
-                            >= debounce
+                            >= debounce =>
                     {
-                        entry.dispatched = true;
+                        entry.state = TrackedState::InFlight;
                         ready.push(expanded);
                     }
-                }
+                    TrackedState::InFlight | TrackedState::Done | TrackedState::Pending => {}
+                },
                 Some(entry) => {
                     entry.fingerprint = current;
                     entry.observed_at = now;
-                    entry.dispatched = false;
+                    entry.state = TrackedState::Pending;
                 }
                 None => {
                     self.files.insert(
@@ -102,7 +103,7 @@ impl WatchTracker {
                         TrackedFile {
                             fingerprint: current,
                             observed_at: now,
-                            dispatched: false,
+                            state: TrackedState::Pending,
                         },
                     );
                 }
@@ -112,12 +113,25 @@ impl WatchTracker {
         self.files.retain(|path, _| present.contains_key(path));
         Ok(ready)
     }
+
+    pub fn report_outcome(&mut self, path: &Path, success: bool) {
+        let identity = watch_identity(path);
+        if let Some(entry) = self.files.get_mut(&identity) {
+            entry.state = if success {
+                TrackedState::Done
+            } else {
+                TrackedState::Pending
+            };
+        }
+    }
+
+    pub fn report_outcomes(&mut self, results: impl IntoIterator<Item = (PathBuf, bool)>) {
+        for (path, success) in results {
+            self.report_outcome(&path, success);
+        }
+    }
 }
 
-/// Validate the loop-prevention boundary for a watched-folder setup.
-///
-/// Writing inside the watched tree is rejected even when formats differ: a
-/// later registry update could otherwise make Shift consume its own artifacts.
 pub fn validate_watch_directories(
     input_dir: &Path,
     output_dir: &Path,
@@ -135,8 +149,6 @@ pub fn validate_watch_directories(
         )));
     }
 
-    // `output_dir` may be created later by BatchQueue. Canonicalize the
-    // nearest existing ancestor so this remains safe before the first run.
     let output = canonicalize_future_path(output_dir)?;
     if output == input || output.starts_with(&input) {
         return Err(ConversionError::new(format!(
@@ -148,17 +160,18 @@ pub fn validate_watch_directories(
     Ok(())
 }
 
-fn fingerprint(path: &Path) -> Result<FileFingerprint, ConversionError> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        ConversionError::new(format!(
+fn fingerprint_soft(path: &Path) -> Result<Option<FileFingerprint>, ConversionError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(FileFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConversionError::new(format!(
             "could not inspect watched file {}: {error}",
             path.display()
-        ))
-    })?;
-    Ok(FileFingerprint {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
+        ))),
+    }
 }
 
 fn watch_identity(path: &Path) -> PathBuf {
@@ -249,6 +262,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        watcher.report_outcome(&file, true);
+        assert!(
+            watcher
+                .poll(
+                    &dir,
+                    start + Duration::from_secs(20),
+                    Duration::from_secs(2)
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_conversion_is_retried_on_next_poll() {
+        let dir = unique_dir("retry");
+        let file = dir.join("note.md");
+        fs::write(&file, "first").unwrap();
+        let start = SystemTime::now();
+        let mut watcher = WatchTracker::new();
+        let _ = watcher.poll(&dir, start, Duration::ZERO).unwrap();
+        assert_eq!(
+            ready_paths(&watcher.poll(&dir, start, Duration::ZERO).unwrap()),
+            vec![file.clone()]
+        );
+        watcher.report_outcome(&file, false);
+        assert_eq!(
+            ready_paths(
+                &watcher
+                    .poll(&dir, start + Duration::from_secs(1), Duration::ZERO)
+                    .unwrap()
+            ),
+            vec![file]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -264,6 +312,7 @@ mod tests {
             ready_paths(&watcher.poll(&dir, start, Duration::ZERO).unwrap()),
             vec![file.clone()]
         );
+        watcher.report_outcome(&file, true);
         fs::write(&file, "changed content").unwrap();
         assert!(
             watcher
@@ -307,5 +356,11 @@ mod tests {
         assert!(err.to_string().contains("prevent a conversion loop"));
         assert!(validate_watch_directories(&dir, &unique_dir("outside")).is_ok());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn soft_fingerprint_skips_missing_files() {
+        let missing = PathBuf::from("/definitely-missing-watch-file-12345.md");
+        assert!(fingerprint_soft(&missing).unwrap().is_none());
     }
 }
