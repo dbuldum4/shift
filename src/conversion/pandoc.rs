@@ -170,8 +170,10 @@ impl ConversionModule for PandocModule {
             .map(|extension| pandoc_input_format(extension, options.pandoc.citations))
             .unwrap_or_else(|| pandoc_markdown_from(options.pandoc.citations));
         let mut command = Command::new(&self.executable);
+        // Absolute input first so it cannot be parsed as a flag, and so simple
+        // shims (`cat "$1"`) keep working.
+        super::push_operand_path(&mut command, input)?;
         command
-            .arg(input)
             .arg("--from")
             .arg(&input_format)
             .arg("--to")
@@ -187,7 +189,7 @@ impl ConversionModule for PandocModule {
         }
         if let Some(reference) = options.pandoc.reference_doc.as_ref() {
             let reference = validate_reference_doc(reference)?;
-            command.arg("--reference-doc").arg(reference);
+            super::push_flag_path(&mut command, "--reference-doc", reference.as_path());
         }
 
         // Pandoc's PDF writer always shells out to an external engine. Default

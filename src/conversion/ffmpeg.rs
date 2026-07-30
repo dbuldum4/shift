@@ -3,8 +3,9 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
     InvocationRecord, OutputFormat, TempDirGuard, command_argv_parts, format_argv_display,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command, run_command_cancellable, unique_temp_dir,
+    map_spawn_error, max_output_bytes, process_timeout, push_flag_path, push_path_arg,
+    read_file_limited, resolve_tool_executable, run_command, run_command_cancellable,
+    run_command_cancellable_with_output_paths, unique_temp_dir,
 };
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -410,11 +411,12 @@ impl FfmpegModule {
                 },
             );
             let progress_stop = spawn_progress_watcher(progress_path, options);
-            let output = run_command_cancellable(
+            let output = run_command_cancellable_with_output_paths(
                 command,
                 process_timeout(),
                 max_output_bytes(),
                 options.cancel.clone(),
+                std::slice::from_ref(&produced),
             );
             stop_progress_watcher(progress_stop);
             let output = output.map_err(|error| {
@@ -539,7 +541,7 @@ impl FfmpegModule {
         if let Some(secs) = options.ffmpeg.start_secs {
             command.arg("-ss").arg(format_timestamp(secs));
         }
-        command.arg("-i").arg(input);
+        push_flag_path(&mut command, "-i", input);
         if let Some(secs) = options.ffmpeg.duration_secs {
             command.arg("-t").arg(format_timestamp(secs));
         }
@@ -553,7 +555,7 @@ impl FfmpegModule {
         command
             .arg("-frames:v")
             .arg(MAX_SEQUENCE_FRAMES.to_string());
-        command.arg(&pattern);
+        push_path_arg(&mut command, &pattern)?;
 
         let invocation = InvocationRecord {
             module_id: self.id(),
@@ -656,7 +658,7 @@ impl FfmpegModule {
             }
         }
 
-        command.arg("-i").arg(input);
+        push_flag_path(&mut command, "-i", input);
 
         if is_image_output(output_format) {
             if let Some(secs) = options.frame_secs.or(options.start_secs) {
@@ -673,7 +675,8 @@ impl FfmpegModule {
         apply_stream_maps(&mut command, output_format, options);
         apply_encode_settings(&mut command, input, output_format, options, target_bitrates)?;
 
-        command.arg(produced);
+        // Trailing output path: absolute, rejected if option-like as a bare arg.
+        push_path_arg(&mut command, produced)?;
         Ok(command)
     }
 
@@ -743,8 +746,8 @@ impl FfmpegModule {
             .arg("-show_entries")
             .arg("format=duration")
             .arg("-of")
-            .arg("default=noprint_wrappers=1:nokey=1")
-            .arg(input);
+            .arg("default=noprint_wrappers=1:nokey=1");
+        push_path_arg(&mut command, input)?;
         let output = run_command_cancellable(
             command,
             Duration::from_secs(15),
@@ -2738,7 +2741,9 @@ dd if=/dev/zero of="$output" bs=1 count="$size" 2>/dev/null
                 format.id()
             );
             assert!(
-                args.iter().any(|a| a == out_name),
+                args.iter().any(|a| a == out_name
+                    || a.ends_with(out_name)
+                    || a.ends_with(&format!("/{out_name}"))),
                 "{} missing output path: {joined}",
                 format.id()
             );

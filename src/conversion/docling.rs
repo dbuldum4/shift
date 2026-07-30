@@ -453,13 +453,14 @@ impl DoclingModule {
         let is_audio = input_has_extension(input, AUDIO_EXTENSIONS);
         let is_video = input_has_extension(input, VIDEO_EXTENSIONS);
         let mut command = Command::new(&self.executable);
+        // `convert <input> --to …` — absolute input right after the subcommand.
+        command.arg("convert");
+        super::push_operand_path(&mut command, input)?;
         command
-            .arg("convert")
-            .arg(input)
             .arg("--to")
             .arg(to_arg)
             .arg("--output")
-            .arg(&work_dir)
+            .arg(super::absolute_command_path(&work_dir))
             .arg("--image-export-mode")
             .arg(knobs.image_export_mode.id())
             .arg(if knobs.ocr { "--ocr" } else { "--no-ocr" })

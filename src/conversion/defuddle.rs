@@ -75,7 +75,23 @@ impl DefuddleModule {
                 command.env("SHIFT_NODE_BIN", node);
             }
         }
-        command.arg("parse").arg(source);
+        // `parse <source> [options]` — keep source as argv[2] for Defuddle and
+        // the UI test shim (`SOURCE="$2"`).
+        command.arg("parse");
+        // Local paths are absolutized (cannot look like flags). URLs must not
+        // start with `-` so Defuddle never treats them as options.
+        let argv_source = if looks_like_url(source) {
+            if source.starts_with('-') {
+                return Err(ConversionError::new(
+                    "refusing URL/source operand that looks like a CLI option",
+                ));
+            }
+            command.arg(source);
+            source.to_owned()
+        } else {
+            let absolute = super::push_operand_path(&mut command, Path::new(source))?;
+            absolute.to_string_lossy().into_owned()
+        };
         if markdown {
             command.arg("--markdown");
         }
@@ -94,7 +110,7 @@ impl DefuddleModule {
 
         let mut display_parts = command_argv_parts(&command);
         for part in &mut display_parts {
-            if part == source {
+            if part == source || part == &argv_source {
                 *part = display_source.to_owned();
             }
         }

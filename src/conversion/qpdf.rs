@@ -5,9 +5,10 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
-    OutputFormat, TempDirGuard, command_argv_parts, format_argv_display, map_spawn_error,
-    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command_cancellable, unique_temp_dir,
+    OutputFormat, TempDirGuard, absolute_command_path, command_argv_parts, format_argv_display,
+    map_spawn_error, max_output_bytes, process_timeout, push_path_arg, read_file_limited,
+    resolve_tool_executable, run_command_cancellable_with_output_paths, unique_temp_dir,
+    write_secret_file,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -106,7 +107,7 @@ impl QpdfModule {
         // Warnings-only runs (exit 3 by default) still write output; treat them
         // as success so ordinary real-world PDFs do not fail the toolkit.
         command.arg("--warning-exit-0");
-        command.arg(input);
+        push_path_arg(&mut command, input)?;
         add_password_file(&mut command, &work_dir, options.pdf.password.as_deref())?;
         if options
             .pdf
@@ -126,7 +127,8 @@ impl QpdfModule {
                 options.pdf.split_pages.unwrap_or(1)
             ));
         }
-        command.arg(&produced);
+        // Absolute produced path after options (page selection may already emit `--`).
+        let produced_abs = push_path_arg(&mut command, &produced)?;
 
         let invocation = InvocationRecord {
             module_id: self.id(),
@@ -142,11 +144,18 @@ impl QpdfModule {
                 .into(),
             ));
         }
-        let output = run_command_cancellable(
+        // Watch the produced PDF (ZIP path is a pattern for split — skip pattern).
+        let watch = if output_format == OutputFormat::PDF_PAGES_ZIP {
+            Vec::new()
+        } else {
+            vec![produced_abs]
+        };
+        let output = run_command_cancellable_with_output_paths(
             command,
             process_timeout(),
             max_output_bytes(),
             options.cancel.clone(),
+            &watch,
         )
         .map_err(|error| {
             map_spawn_error(
@@ -265,20 +274,11 @@ fn add_password_file(
         return Ok(());
     };
     let password_file = work_dir.join("password.txt");
-    fs::write(&password_file, password.as_bytes())
+    // Mode 0600 applied at open — never write secrets under the default umask.
+    write_secret_file(&password_file, password.as_bytes())
         .map_err(|error| ConversionError::new(format!("could not write PDF password: {error}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&password_file)
-            .map_err(|error| ConversionError::new(format!("could not stat PDF password: {error}")))?
-            .permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&password_file, permissions).map_err(|error| {
-            ConversionError::new(format!("could not restrict PDF password file: {error}"))
-        })?;
-    }
-    command.arg(format!("--password-file={}", password_file.display()));
+    let absolute = absolute_command_path(&password_file);
+    command.arg(format!("--password-file={}", absolute.display()));
     Ok(())
 }
 

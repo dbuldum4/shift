@@ -217,10 +217,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         });
         let source_path = source.as_file().map(|path| path.to_path_buf());
         // Shared with batch: refuse source overwrite, honor --force, create parents.
+        // Exclusive create when !force closes the exists-check/write TOCTOU.
         prepare_batch_destination(&destination, source_path.as_deref(), parsed.force)
             .map_err(|error| error.to_string())?;
         artifact
-            .write_to(&destination)
+            .write_to_with_replace(&destination, parsed.force)
             .map_err(|error| error.to_string())?;
         // Full path on stdout so scripts and humans know where the file landed.
         println!("{}", destination.display());

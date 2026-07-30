@@ -2,9 +2,8 @@
 
 use super::{
     ConversionError, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command_cancellable, unique_temp_dir,
+    run_command_cancellable_with_output_paths, unique_temp_dir,
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -46,49 +45,38 @@ pub fn extract_pdf_pages(
     let mut command = Command::new(&executable);
     // Match the toolkit module: warnings-only (default exit 3) still write output.
     command.arg("--warning-exit-0");
-    command.arg(input);
+    super::push_path_arg(&mut command, input)?;
     if let Some(password) = password.map(str::trim).filter(|value| !value.is_empty()) {
         let password_file = work_dir.join("password.txt");
-        fs::write(&password_file, password.as_bytes()).map_err(|error| {
+        // Mode 0600 applied at open — never write secrets under the default umask.
+        super::write_secret_file(&password_file, password.as_bytes()).map_err(|error| {
             ConversionError::new(format!("could not write PDF password file: {error}"))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&password_file)
-                .map_err(|error| {
-                    ConversionError::new(format!("could not stat password file: {error}"))
-                })?
-                .permissions();
-            permissions.set_mode(0o600);
-            fs::set_permissions(&password_file, permissions).map_err(|error| {
-                ConversionError::new(format!(
-                    "could not restrict password file permissions: {error}"
-                ))
-            })?;
-        }
+        let absolute = super::absolute_command_path(&password_file);
         command
-            .arg(format!("--password-file={}", password_file.display()))
+            .arg(format!("--password-file={}", absolute.display()))
             .arg("--decrypt");
     }
-    command
-        .arg("--pages")
-        .arg(".")
-        .arg(&range)
-        .arg("--")
-        .arg(&output);
+    command.arg("--pages").arg(".").arg(&range).arg("--");
+    super::push_path_arg(&mut command, &output)?;
 
-    let result = run_command_cancellable(command, process_timeout(), max_output_bytes(), cancel)
-        .map_err(|error| {
-            if error.is_executable_not_found() {
-                ConversionError::new(
-                    "qpdf is not installed (needed for PDF page ranges and password-protected PDFs). \
+    let result = run_command_cancellable_with_output_paths(
+        command,
+        process_timeout(),
+        max_output_bytes(),
+        cancel,
+        std::slice::from_ref(&output),
+    )
+    .map_err(|error| {
+        if error.is_executable_not_found() {
+            ConversionError::new(
+                "qpdf is not installed (needed for PDF page ranges and password-protected PDFs). \
                  Install it with `brew install qpdf`, or set SHIFT_QPDF_BIN.",
-                )
-            } else {
-                error
-            }
-        })?;
+            )
+        } else {
+            error
+        }
+    })?;
 
     if !result.status.success() {
         let detail = String::from_utf8_lossy(&result.stderr).trim().to_owned();
