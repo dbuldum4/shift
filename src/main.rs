@@ -3393,7 +3393,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .text_sm()
                     .text_color(THEME.text_muted)
                     .child(
-                        "Choose a document, media file, or paste a URL, path, or image — Shift converts it automatically.",
+                        "Choose a document, media file, or paste a URL, path, or image — then press Convert when you are ready.",
                     ),
             ),
         ConversionState::Converting => {

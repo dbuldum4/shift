@@ -18,6 +18,10 @@ use std::process::Command;
 const INPUTS: &[&str] = &["pdf"];
 const OUTPUTS: &[OutputFormat] = &[OutputFormat::PDF, OutputFormat::PDF_PAGES_ZIP];
 const MAX_SPLIT_GROUP: u32 = 10_000;
+/// Maximum split page files admitted into a page ZIP.
+pub const MAX_PDF_ZIP_PAGES: usize = 500;
+/// Cap on intermediate split PDFs on disk before / while archiving.
+pub const MAX_PDF_ZIP_INTERMEDIATE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PdfCompression {
@@ -253,7 +257,25 @@ fn validate_options(
             "PDF split group must be between 1 and {MAX_SPLIT_GROUP} pages"
         )));
     }
+    if output_format == OutputFormat::PDF_PAGES_ZIP
+        && let Some(estimate) = estimate_selected_page_count(options)
+        && estimate > MAX_PDF_ZIP_PAGES
+    {
+        return Err(ConversionError::new(format!(
+            "PDF page selection would produce about {estimate} files (limit is {MAX_PDF_ZIP_PAGES}); narrow the page range"
+        )));
+    }
     Ok(())
+}
+
+/// Best-effort page count from an inclusive from/to range (unknown upper bound → None).
+fn estimate_selected_page_count(options: &super::PdfInputOptions) -> Option<usize> {
+    let from = options.page_from.unwrap_or(1) as usize;
+    let to = options.page_to? as usize;
+    if to < from {
+        return None;
+    }
+    Some(to - from + 1)
 }
 
 fn add_password_file(
@@ -337,16 +359,36 @@ fn zip_split_pdfs(directory: &Path, archive: &Path) -> Result<(), ConversionErro
             "qpdf did not produce any pages for the PDF archive",
         ));
     }
+    if pages.len() > MAX_PDF_ZIP_PAGES {
+        return Err(ConversionError::new(format!(
+            "qpdf produced {} page files (limit is {MAX_PDF_ZIP_PAGES}); narrow the page range or increase split group size",
+            pages.len()
+        )));
+    }
 
+    let mut intermediate_bytes = 0u64;
+    for page in &pages {
+        let len = fs::metadata(page).map(|meta| meta.len()).unwrap_or(0);
+        intermediate_bytes = intermediate_bytes.saturating_add(len);
+        if intermediate_bytes > MAX_PDF_ZIP_INTERMEDIATE_BYTES {
+            return Err(ConversionError::new(format!(
+                "split PDF intermediates exceed the {MAX_PDF_ZIP_INTERMEDIATE_BYTES} byte disk budget"
+            )));
+        }
+    }
+
+    let output_limit = max_output_bytes() as u64;
     let file = fs::File::create(archive).map_err(|error| {
         ConversionError::new(format!(
             "could not create PDF page ZIP {}: {error}",
             archive.display()
         ))
     })?;
+    // Stream each split PDF into the archive without buffering whole pages.
     let mut zip = zip::ZipWriter::new(file);
     let zip_options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    let mut written_uncompressed = 0u64;
     for page in pages {
         let name = page
             .file_name()
@@ -361,12 +403,31 @@ fn zip_split_pdfs(directory: &Path, archive: &Path) -> Result<(), ConversionErro
                 page.display()
             ))
         })?);
-        std::io::copy(&mut reader, &mut zip).map_err(|error| {
+        let copied = std::io::copy(&mut reader, &mut zip).map_err(|error| {
             ConversionError::new(format!("could not write {name} to PDF page ZIP: {error}"))
         })?;
+        written_uncompressed = written_uncompressed.saturating_add(copied);
+        // Compressed size is usually smaller, but reject runaway archives early.
+        if written_uncompressed
+            > output_limit
+                .saturating_mul(4)
+                .max(MAX_PDF_ZIP_INTERMEDIATE_BYTES)
+        {
+            return Err(ConversionError::new(
+                "PDF page ZIP is growing beyond the allowed intermediate budget",
+            ));
+        }
     }
     zip.finish()
         .map_err(|error| ConversionError::new(format!("could not finish PDF page ZIP: {error}")))?;
+    if let Ok(meta) = fs::metadata(archive)
+        && meta.len() > output_limit
+    {
+        return Err(ConversionError::new(format!(
+            "PDF page ZIP exceeds the {} byte output limit",
+            output_limit
+        )));
+    }
     Ok(())
 }
 
@@ -476,6 +537,52 @@ esac
         // Stale split_pages is ignored for plain PDF rewrites.
         assert!(validate_options(OutputFormat::PDF, &options).is_ok());
         assert!(validate_options(OutputFormat::PDF_PAGES_ZIP, &options).is_ok());
+    }
+
+    #[test]
+    fn rejects_page_zip_when_selected_range_exceeds_page_budget() {
+        let options = super::super::PdfInputOptions {
+            page_from: Some(1),
+            page_to: Some((MAX_PDF_ZIP_PAGES as u32) + 1),
+            split_pages: Some(1),
+            ..super::super::PdfInputOptions::default()
+        };
+        let err = validate_options(OutputFormat::PDF_PAGES_ZIP, &options).unwrap_err();
+        assert!(
+            err.to_string().contains("limit") || err.to_string().contains("files"),
+            "{err}"
+        );
+        // Unknown upper bound (to open-ended) is not estimated.
+        let open_ended = super::super::PdfInputOptions {
+            page_from: Some(1),
+            page_to: None,
+            split_pages: Some(1),
+            ..super::super::PdfInputOptions::default()
+        };
+        assert!(validate_options(OutputFormat::PDF_PAGES_ZIP, &open_ended).is_ok());
+    }
+
+    #[test]
+    fn zip_split_pdfs_rejects_too_many_intermediate_pages() {
+        let directory = std::env::temp_dir().join(format!(
+            "shift-qpdf-zip-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        for i in 0..(MAX_PDF_ZIP_PAGES + 1) {
+            fs::write(directory.join(format!("page-{i:04}.pdf")), b"%PDF tiny").unwrap();
+        }
+        let archive = directory.join("pages.zip");
+        let err = zip_split_pdfs(&directory, &archive).unwrap_err();
+        assert!(
+            err.to_string().contains("limit") || err.to_string().contains("page"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

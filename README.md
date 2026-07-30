@@ -237,11 +237,13 @@ Use `cargo new-user -- --dry-run` to verify the isolated profile setup without
 launching the app.
 
 The first build downloads and compiles GPUI and may take a few minutes. Dropping
-or choosing a supported file starts conversion automatically and may suggest an
-output format (video → MP4, audio → MP3, documents → Markdown) until you pick
-one yourself. Paste an `http(s)` URL into the bar above the drop zone and press
-Enter or Convert to extract the page with Defuddle (this performs an outbound
-fetch to the given host). URL fetches are **public internet only** by default
+or choosing a supported file selects the source and may suggest an output format
+(video → MP4, audio → MP3, documents → Markdown) until you pick one yourself —
+conversion does **not** auto-start on drop; press Convert (or Enter in the paste
+bar) when you are ready. Multi-file drops only queue work until you press Start.
+Paste an `http(s)` URL into the bar above the drop zone and press Enter or
+Convert to extract the page with Defuddle (this performs an outbound fetch to
+the given host). URL fetches are **public internet only** by default
 (no localhost/LAN); use the file picker for local files, or set
 `SHIFT_ALLOW_PRIVATE_URLS=1` / CLI `--allow-private-urls` to opt in. The source
 file is never modified; Download refuses to overwrite the selected source. Use the
