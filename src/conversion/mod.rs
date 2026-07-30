@@ -16,6 +16,7 @@ mod sips;
 mod sources;
 mod spreadsheet;
 mod suggest;
+mod url_fetch;
 mod watch;
 
 #[cfg(test)]

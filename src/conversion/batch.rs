@@ -8,7 +8,7 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
     InvocationRecord, MAX_BATCH_ADMISSION, OutputFormat, ProgressSink, default_output_path,
-    looks_like_url, normalize_path, paths_refer_to_same_file,
+    is_paste_staging_path, looks_like_url, normalize_path, paths_refer_to_same_file,
 };
 use std::collections::HashSet;
 use std::ffi::OsStr;
