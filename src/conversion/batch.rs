@@ -1295,9 +1295,11 @@ fn write_artifact(
 ) -> Result<PathBuf, ConversionError> {
     // Align with single-file CLI: refuse existing outputs unless force.
     // In-queue name clashes are resolved earlier via uniquify_planned_destinations.
+    // `prepare_batch_destination` is a best-effort early check; exclusive create
+    // in write_to_with_replace closes the TOCTOU when force is false.
     prepare_batch_destination(planned, source, force)?;
-    // Atomic write: partial sibling then rename. On failure scrub any leftovers.
-    match artifact.write_to(planned) {
+    // Atomic write: partial sibling then exclusive/replace publish.
+    match artifact.write_to_with_replace(planned, force) {
         Ok(()) => Ok(planned.to_path_buf()),
         Err(error) => {
             let _ = super::remove_partial_outputs(planned);
