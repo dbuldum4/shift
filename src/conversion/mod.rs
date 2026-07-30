@@ -16,6 +16,7 @@ mod sips;
 mod sources;
 mod spreadsheet;
 mod suggest;
+mod url_fetch;
 mod watch;
 
 #[cfg(test)]
@@ -39,7 +40,8 @@ pub use batch::{
 };
 pub use defuddle::{
     DefuddleModule, DefuddleOptions, block_private_urls, ensure_public_url_fetch_allowed,
-    looks_like_url, redact_url_credentials, url_display_host, url_targets_non_public_host,
+    looks_like_url, redact_credentials_in_text, redact_url_credentials, url_display_host,
+    url_resolves_to_non_public_host, url_targets_non_public_host,
 };
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
@@ -59,9 +61,8 @@ pub use inspection::{
     ArtifactInspection, MAX_INSPECTION_PREFIX_BYTES, MAX_INSPECTION_SUFFIX_BYTES, inspect_binary,
 };
 pub use magic_paste::{
-    MAX_REMOTE_FILE_BYTES, MagicPaste, PasteToken, REMOTE_DOWNLOAD_TIMEOUT,
-    materialize_magic_paste, materialize_paste_token, parse_magic_paste, stage_pasted_image,
-    url_looks_like_remote_file,
+    MagicPaste, PasteToken, materialize_magic_paste, materialize_paste_token, parse_magic_paste,
+    stage_pasted_image, url_looks_like_remote_file,
 };
 pub use markitdown::{MarkItDownModule, MarkItDownOptions};
 pub use pandoc::{PandocModule, PandocOptions, pdf_engine_candidates, resolve_pdf_engine};
@@ -81,6 +82,10 @@ pub use sources::{
 };
 pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};
+pub use url_fetch::{
+    DownloadOptions, MAX_PAGE_HTML_BYTES, MAX_REMOTE_FILE_BYTES, REMOTE_DOWNLOAD_TIMEOUT,
+    download_url_to_path, trusted_curl_path,
+};
 pub use watch::{WatchTracker, validate_watch_directories};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
