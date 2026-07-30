@@ -776,6 +776,10 @@ impl FfmpegModule {
     }
 }
 
+pub fn validate_ffmpeg_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
+    validate_options(options)
+}
+
 fn validate_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
     for (label, value) in [("start", options.start_secs), ("frame", options.frame_secs)] {
         if let Some(secs) = value {

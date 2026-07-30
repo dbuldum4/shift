@@ -7,8 +7,8 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
-    InvocationRecord, OutputFormat, ProgressSink, default_output_path, looks_like_url,
-    normalize_path, paths_refer_to_same_file,
+    InvocationRecord, OutputFormat, ProgressSink, default_output_path, is_paste_staging_path,
+    looks_like_url, normalize_path, paths_refer_to_same_file,
 };
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -1102,6 +1102,7 @@ pub fn resolve_destination_with_policy(
                 dir.to_path_buf()
             }
         }
+        (BatchSource::File(path), None) if is_paste_staging_path(path) => PathBuf::new(),
         (BatchSource::File(path), None) => path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

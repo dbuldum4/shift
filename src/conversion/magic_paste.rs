@@ -19,8 +19,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use url::Url;
 
-/// Soft cap for remote file downloads (512 MiB).
+/// Soft cap for a single remote file download (512 MiB).
 pub const MAX_REMOTE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Aggregate download budget across one multi-token materialize call (512 MiB).
+pub const MAX_AGGREGATE_DOWNLOAD_BYTES: u64 = MAX_REMOTE_FILE_BYTES;
+
+/// Max whitespace-separated tokens accepted in one magic-paste string.
+pub const MAX_PASTE_TOKENS: usize = 64;
+
+/// Max clipboard image payload accepted for staging (50 MiB).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
 /// Wall-clock budget for remote downloads (allows large files on moderate links).
 pub const REMOTE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -65,27 +74,147 @@ impl MagicPaste {
 ///
 /// Supports whitespace-separated items and double/single-quoted paths with spaces.
 /// Does not hit the network; remote file URLs are only classified.
-pub fn parse_magic_paste(input: &str) -> MagicPaste {
-    let tokens: Vec<PasteToken> = tokenize_paste(input)
+///
+/// Rejects pastes with more than [`MAX_PASTE_TOKENS`] whitespace tokens (fail closed).
+pub fn parse_magic_paste(input: &str) -> Result<MagicPaste, ConversionError> {
+    let raw_tokens = tokenize_paste(input);
+    if raw_tokens.len() > MAX_PASTE_TOKENS {
+        return Err(ConversionError::new(format!(
+            "too many paste tokens (limit is {MAX_PASTE_TOKENS}); split into smaller batches"
+        )));
+    }
+    let tokens: Vec<PasteToken> = raw_tokens
         .into_iter()
         .filter_map(|raw| classify_token(&raw))
         .collect();
-    match tokens.len() {
+    Ok(match tokens.len() {
         0 => MagicPaste::Empty,
         1 => MagicPaste::Single(tokens.into_iter().next().expect("len checked")),
         _ => MagicPaste::Multiple(tokens),
+    })
+}
+
+/// A materialized conversion source that may own a temporary staged input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedSource {
+    pub source: BatchSource,
+    pub staged_path: Option<PathBuf>,
+    pub origin_url: Option<String>,
+}
+
+impl MaterializedSource {
+    pub fn local(path: PathBuf) -> Self {
+        Self {
+            source: BatchSource::File(path),
+            staged_path: None,
+            origin_url: None,
+        }
+    }
+    pub fn page_url(url: String) -> Self {
+        Self {
+            source: BatchSource::Url(url),
+            staged_path: None,
+            origin_url: None,
+        }
+    }
+    pub fn staged_download(path: PathBuf, origin_url: String) -> Self {
+        Self {
+            source: BatchSource::File(path.clone()),
+            staged_path: Some(path),
+            origin_url: Some(origin_url),
+        }
+    }
+    pub fn staged_clipboard(path: PathBuf) -> Self {
+        Self {
+            source: BatchSource::File(path.clone()),
+            staged_path: Some(path),
+            origin_url: None,
+        }
+    }
+    pub fn cleanup(&mut self) {
+        if let Some(path) = self.staged_path.take() {
+            cleanup_staged_path(&path);
+        }
+    }
+    pub fn take_staged_path(&mut self) -> Option<PathBuf> {
+        self.staged_path.take()
     }
 }
 
-/// Resolve a classified token into a [`BatchSource`], downloading remote files when needed.
-///
-/// `cancel` may be `None` for short-lived callers; when supplied, it is polled
-/// before each network fetch and passed to curl so a running download can be
-/// aborted.
-pub fn materialize_paste_token(
+impl Drop for MaterializedSource {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Collection of Shift-owned staged input paths.
+#[derive(Clone, Debug, Default)]
+pub struct StagedInputs {
+    paths: Vec<PathBuf>,
+}
+
+impl StagedInputs {
+    pub fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+    pub fn track(&mut self, path: PathBuf) {
+        if !self.paths.iter().any(|e| e == &path) {
+            self.paths.push(path);
+        }
+    }
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+    pub fn cleanup(&mut self) {
+        for path in self.paths.drain(..) {
+            cleanup_staged_path(&path);
+        }
+    }
+}
+
+impl Drop for StagedInputs {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// True when `path` lives under the paste staging directory Shift owns.
+pub fn is_paste_staging_path(path: &Path) -> bool {
+    let Ok(staging) = paste_staging_dir() else {
+        return false;
+    };
+    let staging = normalize_existing_prefix(&staging);
+    let candidate = normalize_existing_prefix(path);
+    candidate.starts_with(&staging)
+}
+
+/// Delete a staged input file and its unique parent directory when empty.
+pub fn cleanup_staged_path(path: &Path) {
+    if !is_paste_staging_path(path) {
+        return;
+    }
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        if is_paste_staging_path(parent) {
+            if let Ok(staging) = paste_staging_dir() {
+                let staging = normalize_existing_prefix(&staging);
+                let parent_norm = normalize_existing_prefix(parent);
+                if parent_norm != staging {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a classified token into a [`MaterializedSource`].
+pub fn materialize_paste_token_detailed(
     token: &PasteToken,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<BatchSource, ConversionError> {
+) -> Result<MaterializedSource, ConversionError> {
     if cancel
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -107,18 +236,28 @@ pub fn materialize_paste_token(
                     path.display()
                 )));
             }
-            Ok(BatchSource::File(path))
+            Ok(MaterializedSource::local(path))
         }
         PasteToken::PageUrl(url) => {
             ensure_url_fetch_allowed(url)?;
-            Ok(BatchSource::Url(url.clone()))
+            Ok(MaterializedSource::page_url(url.clone()))
         }
         PasteToken::RemoteFileUrl(url) => {
             ensure_url_fetch_allowed(url)?;
             let path = download_remote_file(url, cancel)?;
-            Ok(BatchSource::File(path))
+            Ok(MaterializedSource::staged_download(path, url.clone()))
         }
     }
+}
+
+/// Resolve a classified token into a [`BatchSource`].
+pub fn materialize_paste_token(
+    token: &PasteToken,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<BatchSource, ConversionError> {
+    let mut detailed = materialize_paste_token_detailed(token, cancel)?;
+    let _ = detailed.take_staged_path();
+    Ok(detailed.source.clone())
 }
 
 /// Materialize every token in a magic-paste parse result.
@@ -126,22 +265,59 @@ pub fn materialize_magic_paste(
     paste: &MagicPaste,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<Vec<BatchSource>, ConversionError> {
-    paste
-        .tokens()
-        .iter()
-        .map(|token| materialize_paste_token(token, cancel.clone()))
-        .collect()
+    let detailed = materialize_magic_paste_detailed(paste, cancel)?;
+    Ok(detailed
+        .into_iter()
+        .map(|mut item| {
+            let _ = item.take_staged_path();
+            item.source.clone()
+        })
+        .collect())
+}
+
+/// Materialize every token, retaining staged ownership and origin URLs.
+pub fn materialize_magic_paste_detailed(
+    paste: &MagicPaste,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Vec<MaterializedSource>, ConversionError> {
+    let mut out = Vec::with_capacity(paste.tokens().len());
+    let mut aggregate_bytes: u64 = 0;
+    for token in paste.tokens() {
+        match materialize_paste_token_detailed(token, cancel.clone()) {
+            Ok(item) => {
+                if let Some(path) = item.staged_path.as_ref() {
+                    let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    aggregate_bytes = aggregate_bytes.saturating_add(len);
+                    if aggregate_bytes > MAX_AGGREGATE_DOWNLOAD_BYTES {
+                        drop(item);
+                        drop(out);
+                        return Err(ConversionError::new(format!(
+                            "aggregate remote downloads exceeded size limit ({} bytes)",
+                            MAX_AGGREGATE_DOWNLOAD_BYTES
+                        )));
+                    }
+                }
+                out.push(item);
+            }
+            Err(error) => {
+                drop(out);
+                return Err(error);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Stage raw image bytes from the clipboard as a temporary source file.
-///
-/// `extension` should be a lowercase extension without the leading dot (e.g. `png`).
-/// Rejects formats that no conversion module accepts as input. The accepted set
-/// follows the registry, so it widens as modules are added (SVG, for example,
-/// became stageable with the macOS sips adapter).
 pub fn stage_pasted_image(bytes: &[u8], extension: &str) -> Result<PathBuf, ConversionError> {
     if bytes.is_empty() {
         return Err(ConversionError::new("clipboard image is empty"));
+    }
+    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(ConversionError::new(format!(
+            "clipboard image exceeds size limit ({} bytes)",
+            MAX_CLIPBOARD_IMAGE_BYTES
+        )));
     }
     let ext = extension
         .trim()
@@ -155,11 +331,11 @@ pub fn stage_pasted_image(bytes: &[u8], extension: &str) -> Result<PathBuf, Conv
             "clipboard image format .{ext} is not a supported conversion input"
         )));
     }
-    let dir = paste_staging_dir()?;
-    let stamp = unique_stamp();
-    let path = dir.join(format!("clipboard-image-{stamp}.{ext}"));
+    let work = unique_staging_workdir()?;
+    let path = work.join(format!("clipboard-image.{ext}"));
     if let Err(error) = fs::write(&path, bytes) {
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&work);
         return Err(ConversionError::new(format!(
             "could not stage clipboard image {}: {error}",
             path.display()
@@ -329,10 +505,9 @@ fn download_remote_file(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, ConversionError> {
     let display_url = redact_url_credentials(url);
-    let dir = paste_staging_dir()?;
+    let work = unique_staging_workdir()?;
     let name = remote_file_name(url);
-    let stamp = unique_stamp();
-    let path = dir.join(format!("{stamp}-{name}"));
+    let path = work.join(name);
 
     let result = if block_private_urls() {
         // Re-validate every hop so a public URL cannot redirect into private space.
@@ -342,27 +517,27 @@ fn download_remote_file(
     };
 
     if let Err(error) = result {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         return Err(ConversionError::new(
             error.to_string().replace(url, &display_url),
         ));
     }
 
     let meta = fs::metadata(&path).map_err(|error| {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         ConversionError::new(format!(
             "download succeeded but could not read {}: {error}",
             path.display()
         ))
     })?;
     if meta.len() == 0 {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         return Err(ConversionError::new(format!(
             "download of {display_url} produced an empty file"
         )));
     }
     if meta.len() > MAX_REMOTE_FILE_BYTES {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         return Err(ConversionError::new(format!(
             "download of {display_url} exceeded size limit ({} bytes)",
             MAX_REMOTE_FILE_BYTES
@@ -644,12 +819,27 @@ fn paste_staging_dir() -> Result<PathBuf, ConversionError> {
     Ok(dir)
 }
 
+fn unique_staging_workdir() -> Result<PathBuf, ConversionError> {
+    let dir = paste_staging_dir()?.join(unique_stamp());
+    fs::create_dir_all(&dir).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create paste staging work directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
 fn unique_stamp() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}-{nanos}", std::process::id())
+}
+
+fn normalize_existing_prefix(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -683,7 +873,7 @@ mod tests {
 
     #[test]
     fn parses_page_urls() {
-        let paste = parse_magic_paste("https://example.com/article");
+        let paste = parse_magic_paste("https://example.com/article").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::PageUrl("https://example.com/article".into()))
@@ -692,7 +882,7 @@ mod tests {
 
     #[test]
     fn parses_remote_file_urls() {
-        let paste = parse_magic_paste("https://cdn.example.com/docs/report.pdf");
+        let paste = parse_magic_paste("https://cdn.example.com/docs/report.pdf").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::RemoteFileUrl(
@@ -700,7 +890,7 @@ mod tests {
             ))
         );
         // Query string still classifies from path extension.
-        let paste = parse_magic_paste("https://cdn.example.com/f/doc.docx?dl=1");
+        let paste = parse_magic_paste("https://cdn.example.com/f/doc.docx?dl=1").unwrap();
         assert!(matches!(
             paste,
             MagicPaste::Single(PasteToken::RemoteFileUrl(_))
@@ -709,7 +899,7 @@ mod tests {
 
     #[test]
     fn html_urls_are_pages_not_files() {
-        let paste = parse_magic_paste("https://example.com/index.html");
+        let paste = parse_magic_paste("https://example.com/index.html").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::PageUrl("https://example.com/index.html".into()))
@@ -718,7 +908,7 @@ mod tests {
 
     #[test]
     fn parses_file_urls() {
-        let paste = parse_magic_paste("file:///tmp/sample.pdf");
+        let paste = parse_magic_paste("file:///tmp/sample.pdf").unwrap();
         match paste {
             MagicPaste::Single(PasteToken::LocalPath(path)) => {
                 assert_eq!(path, PathBuf::from("/tmp/sample.pdf"));
@@ -730,19 +920,19 @@ mod tests {
     #[test]
     fn invalid_file_urls_are_rejected() {
         // Host-form file URLs cannot be converted to a local path on Unix.
-        let paste = parse_magic_paste("file://hostname/only");
+        let paste = parse_magic_paste("file://hostname/only").unwrap();
         assert_eq!(paste, MagicPaste::Empty);
     }
 
     #[test]
     fn parses_absolute_and_quoted_paths() {
-        let paste = parse_magic_paste("/Users/me/report.pdf");
+        let paste = parse_magic_paste("/Users/me/report.pdf").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("/Users/me/report.pdf")))
         );
 
-        let paste = parse_magic_paste("\"/Users/me/My Docs/file.pdf\"");
+        let paste = parse_magic_paste("\"/Users/me/My Docs/file.pdf\"").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -754,7 +944,8 @@ mod tests {
     #[test]
     fn parses_multiple_mixed_tokens() {
         let paste =
-            parse_magic_paste("https://example.com/a /tmp/x.pdf https://cdn.example.com/y.png");
+            parse_magic_paste("https://example.com/a /tmp/x.pdf https://cdn.example.com/y.png")
+                .unwrap();
         match paste {
             MagicPaste::Multiple(tokens) => {
                 assert_eq!(tokens.len(), 3);
@@ -768,9 +959,12 @@ mod tests {
 
     #[test]
     fn empty_and_noise_yield_empty() {
-        assert_eq!(parse_magic_paste(""), MagicPaste::Empty);
-        assert_eq!(parse_magic_paste("   "), MagicPaste::Empty);
-        assert_eq!(parse_magic_paste("not a path or url"), MagicPaste::Empty);
+        assert_eq!(parse_magic_paste("").unwrap(), MagicPaste::Empty);
+        assert_eq!(parse_magic_paste("   ").unwrap(), MagicPaste::Empty);
+        assert_eq!(
+            parse_magic_paste("not a path or url").unwrap(),
+            MagicPaste::Empty
+        );
     }
 
     #[test]
@@ -1003,19 +1197,19 @@ exit 0
     #[test]
     fn looks_like_path_token_branches() {
         assert_eq!(
-            parse_magic_paste("relative/path/file.pdf"),
+            parse_magic_paste("relative/path/file.pdf").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
                 "relative/path/file.pdf"
             )))
         );
         assert_eq!(
-            parse_magic_paste("relative\\path\\file.pdf"),
+            parse_magic_paste("relative\\path\\file.pdf").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
                 "relative\\path\\file.pdf"
             )))
         );
         assert_eq!(
-            parse_magic_paste("document.pdf"),
+            parse_magic_paste("document.pdf").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("document.pdf")))
         );
 
@@ -1024,7 +1218,7 @@ exit 0
         let file = dir.join("note");
         fs::write(&file, b"hi").unwrap();
         assert_eq!(
-            parse_magic_paste(file.to_str().unwrap()),
+            parse_magic_paste(file.to_str().unwrap()).unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(file.clone()))
         );
         let _ = fs::remove_dir_all(&dir);
@@ -1183,7 +1377,12 @@ exit 0
         }
 
         let err = stage_pasted_image(b"\x89PNG", "png").unwrap_err();
-        assert!(err.to_string().contains("could not stage clipboard image"));
+        let message = err.to_string();
+        assert!(
+            message.contains("could not stage clipboard image")
+                || message.contains("could not create paste staging work directory"),
+            "unexpected error: {message}"
+        );
 
         let mut permissions = fs::metadata(&dir).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -1389,7 +1588,7 @@ exit 0
     #[test]
     fn parse_quotes_multiline_and_windows_like_paths() {
         // Single-quoted path with spaces.
-        let paste = parse_magic_paste("'/Users/me/My Docs/file.pdf'");
+        let paste = parse_magic_paste("'/Users/me/My Docs/file.pdf'").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -1398,7 +1597,7 @@ exit 0
         );
 
         // Nested-looking quotes: outer double, inner single kept as content.
-        let paste = parse_magic_paste(r#""/tmp/outer 'inner' still.pdf""#);
+        let paste = parse_magic_paste(r#""/tmp/outer 'inner' still.pdf""#).unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -1407,14 +1606,14 @@ exit 0
         );
 
         // Single outer with double inside.
-        let paste = parse_magic_paste(r#"'"quoted name".pdf'"#);
+        let paste = parse_magic_paste(r#"'"quoted name".pdf'"#).unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(r#""quoted name".pdf"#)))
         );
 
         // Multiline whitespace separation.
-        let paste = parse_magic_paste("/tmp/a.pdf\n/tmp/b.pdf\r\nhttps://example.com/c");
+        let paste = parse_magic_paste("/tmp/a.pdf\n/tmp/b.pdf\r\nhttps://example.com/c").unwrap();
         match paste {
             MagicPaste::Multiple(tokens) => {
                 assert_eq!(tokens.len(), 3);
@@ -1426,7 +1625,7 @@ exit 0
         }
 
         // Windows-like path with backslashes is a local path token.
-        let paste = parse_magic_paste(r"C:\Users\me\report.pdf");
+        let paste = parse_magic_paste(r"C:\Users\me\report.pdf").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -1435,7 +1634,7 @@ exit 0
         );
 
         // Mixed tabs and multiple spaces.
-        let paste = parse_magic_paste("  /tmp/a.pdf\t\t/tmp/b.md  ");
+        let paste = parse_magic_paste("  /tmp/a.pdf\t\t/tmp/b.md  ").unwrap();
         assert!(matches!(paste, MagicPaste::Multiple(ref t) if t.len() == 2));
 
         // Unclosed quote still yields the buffered content as a token.
@@ -1500,7 +1699,7 @@ exit 0
             );
             assert!(
                 matches!(
-                    parse_magic_paste(url),
+                    parse_magic_paste(url).unwrap(),
                     MagicPaste::Single(PasteToken::RemoteFileUrl(_))
                 ),
                 "parse should classify remote file: {url}"
@@ -1570,7 +1769,7 @@ exit 0
     #[test]
     fn file_url_with_and_without_host() {
         // Standard absolute file URL (no host).
-        match parse_magic_paste("file:///Users/me/doc.pdf") {
+        match parse_magic_paste("file:///Users/me/doc.pdf").unwrap() {
             MagicPaste::Single(PasteToken::LocalPath(path)) => {
                 assert_eq!(path, PathBuf::from("/Users/me/doc.pdf"));
             }
@@ -1578,7 +1777,7 @@ exit 0
         }
 
         // Empty / bare file URL must not become a page or remote-file token.
-        let paste = parse_magic_paste("file://");
+        let paste = parse_magic_paste("file://").unwrap();
         assert!(
             matches!(
                 paste,
@@ -1588,10 +1787,13 @@ exit 0
         );
 
         // Non-local host cannot convert to a path on Unix.
-        assert_eq!(parse_magic_paste("file://hostname/only"), MagicPaste::Empty);
+        assert_eq!(
+            parse_magic_paste("file://hostname/only").unwrap(),
+            MagicPaste::Empty
+        );
 
         // `localhost` is accepted by url::Url::to_file_path on Unix.
-        match parse_magic_paste("file://localhost/tmp/x.pdf") {
+        match parse_magic_paste("file://localhost/tmp/x.pdf").unwrap() {
             MagicPaste::Single(PasteToken::LocalPath(path)) => {
                 assert_eq!(path, PathBuf::from("/tmp/x.pdf"));
             }
@@ -1630,11 +1832,11 @@ exit 0
         );
         // Bare ~ is classified as a path token.
         assert_eq!(
-            parse_magic_paste("~"),
+            parse_magic_paste("~").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("~")))
         );
         assert_eq!(
-            parse_magic_paste("~/Docs/note.md"),
+            parse_magic_paste("~/Docs/note.md").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("~/Docs/note.md")))
         );
 
@@ -1937,5 +2139,107 @@ exit 0
         assert!(matches!(token, PasteToken::LocalPath(_)));
         let _ = cwd;
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_too_many_paste_tokens() {
+        let many = (0..=MAX_PASTE_TOKENS)
+            .map(|i| format!("/tmp/file{i}.pdf"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let err = parse_magic_paste(&many).unwrap_err();
+        assert!(
+            err.to_string().contains("too many paste tokens"),
+            "unexpected: {err}"
+        );
+        let ok = (0..MAX_PASTE_TOKENS)
+            .map(|i| format!("/tmp/file{i}.pdf"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(parse_magic_paste(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_clipboard_image() {
+        let oversized = vec![0u8; MAX_CLIPBOARD_IMAGE_BYTES + 1];
+        let err = stage_pasted_image(&oversized, "png").unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds size limit"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn staged_clipboard_stable_basename_and_cleanup() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-stage-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        let path = stage_pasted_image(b"\x89PNG\r\nfake", "png").unwrap();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("clipboard-image.png")
+        );
+        assert!(is_paste_staging_path(&path));
+        cleanup_staged_path(&path);
+        assert!(!path.exists());
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialized_source_drop_cleans_staged_file() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-drop-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        let path = stage_pasted_image(b"\x89PNG", "png").unwrap();
+        {
+            let staged = MaterializedSource::staged_clipboard(path.clone());
+            assert!(path.exists());
+            drop(staged);
+        }
+        assert!(!path.exists());
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_staging_paths_are_not_cleaned() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-not-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user-file.pdf");
+        fs::write(&path, b"keep").unwrap();
+        assert!(!is_paste_staging_path(&path));
+        cleanup_staged_path(&path);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

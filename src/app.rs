@@ -1552,6 +1552,12 @@ impl Shift {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
 
+        if let Some(prev) = self.selected_file.as_ref() {
+            if is_paste_staging_path(prev) {
+                cleanup_staged_path(prev);
+            }
+        }
+
         self.selected_url = None;
         self.url_input
             .update(cx, |input, cx| input.set_content("", cx));
@@ -1614,7 +1620,13 @@ impl Shift {
         if trimmed.is_empty() {
             return;
         }
-        let paste = parse_magic_paste(trimmed);
+        let paste = match parse_magic_paste(trimmed) {
+            Ok(paste) => paste,
+            Err(error) => {
+                self.fail_magic_paste(&error.to_string(), cx);
+                return;
+            }
+        };
         if paste.is_empty() {
             let message = if trimmed.to_ascii_lowercase().starts_with("file:") {
                 "Invalid file:// URL — use a local path or a valid file:// path."
@@ -1633,6 +1645,16 @@ impl Shift {
         extension: &str,
         cx: &mut Context<Self>,
     ) {
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            self.fail_magic_paste(
+                &format!(
+                    "clipboard image exceeds size limit ({} bytes)",
+                    MAX_CLIPBOARD_IMAGE_BYTES
+                ),
+                cx,
+            );
+            return;
+        }
         // Clipboard images can be large, so write to the staging directory on
         // the background executor instead of blocking the UI thread.
         let extension = extension.to_owned();
@@ -1659,6 +1681,11 @@ impl Shift {
         self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
+        if let Some(prev) = self.selected_file.as_ref() {
+            if is_paste_staging_path(prev) {
+                cleanup_staged_path(prev);
+            }
+        }
         self.selected_file = None;
         self.selected_url = None;
         self.file_preview = None;
@@ -3056,6 +3083,11 @@ impl Shift {
     pub(crate) fn clear_selected_file(&mut self, cx: &mut Context<Self>) {
         self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        if let Some(prev) = self.selected_file.as_ref() {
+            if is_paste_staging_path(prev) {
+                cleanup_staged_path(prev);
+            }
+        }
         self.selected_file = None;
         self.selected_url = None;
         self.url_input

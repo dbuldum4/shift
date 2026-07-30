@@ -53,15 +53,17 @@ pub use docling::{
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality,
     ffmpeg_supports_target_size_output, input_looks_like_media, is_audio_output, is_ffmpeg_output,
-    is_image_output, is_subtitle_output, is_video_output,
+    is_image_output, is_subtitle_output, is_video_output, validate_ffmpeg_options,
 };
 pub use inspection::{
     ArtifactInspection, MAX_INSPECTION_PREFIX_BYTES, MAX_INSPECTION_SUFFIX_BYTES, inspect_binary,
 };
 pub use magic_paste::{
-    MAX_REMOTE_FILE_BYTES, MagicPaste, PasteToken, REMOTE_DOWNLOAD_TIMEOUT,
-    materialize_magic_paste, materialize_paste_token, parse_magic_paste, stage_pasted_image,
-    url_looks_like_remote_file,
+    MAX_AGGREGATE_DOWNLOAD_BYTES, MAX_CLIPBOARD_IMAGE_BYTES, MAX_PASTE_TOKENS,
+    MAX_REMOTE_FILE_BYTES, MagicPaste, MaterializedSource, PasteToken, REMOTE_DOWNLOAD_TIMEOUT,
+    StagedInputs, cleanup_staged_path, is_paste_staging_path, materialize_magic_paste,
+    materialize_magic_paste_detailed, materialize_paste_token, materialize_paste_token_detailed,
+    parse_magic_paste, stage_pasted_image, url_looks_like_remote_file,
 };
 pub use markitdown::{MarkItDownModule, MarkItDownOptions};
 pub use pandoc::{PandocModule, PandocOptions, pdf_engine_candidates, resolve_pdf_engine};
@@ -1502,6 +1504,8 @@ impl ConversionRegistry {
         output: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        validate_ffmpeg_options(&options.ffmpeg)?;
+
         let input = input.as_ref();
         if !input.is_file() {
             return Err(ConversionError::new(format!(
@@ -1538,6 +1542,8 @@ impl ConversionRegistry {
         output: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        validate_ffmpeg_options(&options.ffmpeg)?;
+
         let url = url.trim();
         if !looks_like_url(url) {
             return Err(ConversionError::new(format!(
@@ -1728,16 +1734,30 @@ impl Drop for TempDirGuard {
 /// otherwise resolve to the source path and risk overwriting it.
 pub fn default_output_path(input: &Path, output: OutputFormat) -> PathBuf {
     let extension = output.extension();
-    let candidate = input.with_extension(extension);
-    if paths_refer_to_same_file(input, &candidate) {
+    if is_paste_staging_path(input) {
         let stem = input
             .file_stem()
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .unwrap_or("converted");
-        input.with_file_name(format!("{stem}.converted.{extension}"))
+        let candidate = PathBuf::from(format!("{stem}.{extension}"));
+        if paths_refer_to_same_file(input, &candidate) {
+            PathBuf::from(format!("{stem}.converted.{extension}"))
+        } else {
+            candidate
+        }
     } else {
-        candidate
+        let candidate = input.with_extension(extension);
+        if paths_refer_to_same_file(input, &candidate) {
+            let stem = input
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("converted");
+            input.with_file_name(format!("{stem}.converted.{extension}"))
+        } else {
+            candidate
+        }
     }
 }
 
