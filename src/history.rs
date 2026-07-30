@@ -89,6 +89,7 @@ pub struct StoredHistoryEntry {
 
 impl StoredHistoryEntry {
     /// Construct an entry with `artifact_deferred = false` (normal in-memory form).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         source: StoredSource,
@@ -254,10 +255,10 @@ fn path_to_os_encoded(path: &Path) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        return format!(
+        format!(
             "{OS_PATH_PREFIX}{}",
             encode_hex(path.as_os_str().as_bytes())
-        );
+        )
     }
     #[cfg(not(unix))]
     {

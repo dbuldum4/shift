@@ -263,6 +263,7 @@ fn path_is_dir_follow(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_one(
     path: &Path,
     root: Option<&Path>,
@@ -373,6 +374,7 @@ fn path_is_within_root(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_directory(
     path: &Path,
     root: Option<&Path>,
@@ -614,7 +616,7 @@ mod tests {
         let outside = unique_dir("escape-out");
         std::fs::write(outside.join("secret.pdf"), b"%PDF").unwrap();
         let root = unique_dir("escape-root");
-        symlink(&outside, &root.join("outside-link")).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
         let mut exts = HashSet::new();
         exts.insert("pdf".into());
         let err = expand_input_paths_with_extensions(&[root.as_path()], true, &exts).unwrap_err();
@@ -633,7 +635,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let dir = unique_dir("cycle");
         let target = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        symlink(&target, &dir.join("link")).unwrap();
+        symlink(&target, dir.join("link")).unwrap();
         let mut exts = HashSet::new();
         exts.insert("pdf".into());
         let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();

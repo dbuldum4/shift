@@ -228,8 +228,7 @@ fn create_private_dir_all(dir: &Path) -> io::Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        ensure_private_dir_mode(dir)?;
-        return Ok(());
+        ensure_private_dir_mode(dir)
     }
     #[cfg(not(unix))]
     {
@@ -733,9 +732,21 @@ fn make_writable_if_needed(path: &Path) {
         return;
     };
     if meta.permissions().readonly() {
-        let mut perms = meta.permissions();
-        perms.set_readonly(false);
-        let _ = fs::set_permissions(path, perms);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            let mode = perms.mode();
+            perms.set_mode(mode | 0o200);
+            let _ = fs::set_permissions(path, perms);
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
     }
 }
 

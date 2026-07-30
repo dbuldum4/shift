@@ -449,14 +449,12 @@ pub fn resolve_public_url_addresses_with_cancel(
             vec![addr]
         }
         url::Host::Domain(domain) => {
-            if domain_is_non_public(domain) {
-                if block_private_urls() {
-                    return Err(ConversionError::new(format!(
-                        "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
-                    )));
-                }
-                // Opt-in private hosts still need a resolution for optional pin.
+            if domain_is_non_public(domain) && block_private_urls() {
+                return Err(ConversionError::new(format!(
+                    "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
+                )));
             }
+            // Opt-in private hosts still need a resolution for optional pin.
             resolve_domain_with_deadline(domain, port, DNS_PREFLIGHT_TIMEOUT, cancel.as_deref())
                 .map_err(|error| match error {
                     DnsPreflightError::Cancelled => ConversionError::cancelled(),
@@ -614,6 +612,7 @@ pub fn url_targets_non_public_host(value: &str) -> bool {
 /// **DNS failures return true (fail closed)** so policy treats unresolvable names
 /// as blocked when private-URL blocking is on. Prefer
 /// [`resolve_public_url_addresses_with_cancel`] for new call sites.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn url_resolves_to_non_public_host(value: &str) -> bool {
     let Ok(parsed) = Url::parse(value.trim()) else {
         return false;

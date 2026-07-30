@@ -34,7 +34,7 @@ pub fn batch_worker_count(task_len: usize) -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    let default_cap = cpus.min(DEFAULT_BATCH_WORKER_CAP).max(1);
+    let default_cap = cpus.clamp(1, DEFAULT_BATCH_WORKER_CAP);
     let env_cap = std::env::var(BATCH_WORKERS_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())

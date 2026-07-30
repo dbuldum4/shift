@@ -1,15 +1,15 @@
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchInput, BatchItemId, BatchItemState, BatchNamingTemplate,
-    BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
-    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingAsrModel,
-    DoclingImageExportMode, DoclingOptions, DoclingTableMode, DoclingVideoSamplingMode,
-    ExpandBudget, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    MAX_BATCH_ADMISSION, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
-    PdfCompression, PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions,
-    WatchTracker, default_output_path, ensure_public_url_fetch_allowed,
-    expand_input_paths_preserving_roots_with_budget, looks_like_url, materialize_paste_token,
-    parse_magic_paste, prepare_batch_destination, resolve_destination_with_policy, run_batch,
-    url_display_host, validate_batch_output_formats, validate_watch_directories,
+    BatchEnqueueOptions, BatchEvent, BatchInput, BatchNamingTemplate, BatchQueue, BatchSource,
+    ConversionArtifact, ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions,
+    DiagnosticsReport, DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
+    DoclingVideoSamplingMode, ExpandBudget, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions,
+    FfmpegQuality, MAX_BATCH_ADMISSION, MagicPaste, MarkItDownOptions, MaterializedSource,
+    OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, SipsFlip,
+    SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, WatchTracker, default_output_path,
+    ensure_public_url_fetch_allowed, expand_input_paths_preserving_roots_with_budget,
+    looks_like_url, materialize_paste_token_detailed, parse_magic_paste, prepare_batch_destination,
+    resolve_destination_with_policy, run_batch, url_display_host, validate_batch_output_formats,
+    validate_ffmpeg_options, validate_watch_directories,
 };
 use shift_core::preferences::load_module_priority;
 use shift_core::recipes::{
@@ -183,18 +183,20 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     let convert_result = match &source {
         BatchSource::Url(url) => {
             eprintln!("shift-cli: fetching {}", url_display_host(url));
-            registry.convert_url_with_options(url, parsed.target, &options)
+            registry
+                .convert_url_with_options(url, parsed.target, &options)
+                .map_err(|error| error.to_string())
         }
-        BatchSource::File(path) => {
-            registry.convert_to_with_options(path.clone(), parsed.target, &options)
-        }
+        BatchSource::File(path) => registry
+            .convert_to_with_options(path.clone(), parsed.target, &options)
+            .map_err(|error| error.to_string()),
     };
-    let artifact = match artifact {
+    let artifact = match convert_result {
         Ok(artifact) => artifact,
-        Err(error) if error.is_cancelled() || cancel.load(Ordering::SeqCst) => {
-            return Ok(ExitCode::from(130));
+        Err(error) => {
+            materialized.cleanup();
+            return Err(error);
         }
-        Err(error) => return Err(error.to_string()),
     };
 
     if parsed.progress {
@@ -233,16 +235,17 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
         });
         let source_path = source.as_file().map(|path| path.to_path_buf());
-        // Shared with batch: refuse source overwrite, honor --force, create parents.
-        // Exclusive create when !force closes the exists-check/write TOCTOU.
         prepare_batch_destination(&destination, source_path.as_deref(), parsed.force)
-            .map_err(|error| error.to_string())?;
-        artifact
-            .write_to_with_replace(&destination, parsed.force)
-            .map_err(|error| error.to_string())?;
-        // Full path on stdout so scripts and humans know where the file landed.
-        println!("{}", destination.display());
-    }
+            .map_err(|error| error.to_string())
+            .and_then(|_| {
+                artifact
+                    .write_to(&destination)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|_| print_output_path(&destination, parsed.path_print_mode))
+    };
+    materialized.cleanup();
+    write_result?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -421,8 +424,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             );
             return Ok(ExitCode::SUCCESS);
         }
-        let code = run_watch_batch(
-            &mut tracker,
+        return Ok(run_watch_batch(
             paths,
             &watch.conversion.also_to,
             &enqueue,
@@ -430,8 +432,8 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             &cancel,
             watch.conversion.verbose,
             watch.conversion.preferred_module.as_deref(),
-        );
-        return Ok(ExitCode::from(code));
+            watch.conversion.path_print_mode,
+        ));
     }
 
     eprintln!(
@@ -445,8 +447,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             .poll(&watch.input_dir, SystemTime::now(), watch.debounce)
             .map_err(|error| error.to_string())?;
         if !paths.is_empty() {
-            let _code = run_watch_batch(
-                &mut tracker,
+            let _ = run_watch_batch(
                 paths,
                 &watch.conversion.also_to,
                 &enqueue,
@@ -470,8 +471,8 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
     Ok(ExitCode::from(130))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_watch_batch(
-    tracker: &mut WatchTracker,
     paths: Vec<ExpandedInputPath>,
     also_to: &[OutputFormat],
     enqueue: &BatchEnqueueOptions,
@@ -479,11 +480,10 @@ fn run_watch_batch(
     cancel: &Arc<AtomicBool>,
     verbose: bool,
     preferred_module: Option<&str>,
-) -> u8 {
+    path_print_mode: PathPrintMode,
+) -> ExitCode {
     let mut queue = BatchQueue::new();
-    let mut source_by_item: Vec<(BatchItemId, PathBuf)> = Vec::new();
     for expanded in paths {
-        let source_path = expanded.path.clone();
         let input = if let Some(relative_parent) = expanded.relative_parent() {
             match BatchInput::with_relative_parent(
                 BatchSource::File(expanded.path.clone()),
@@ -492,7 +492,6 @@ fn run_watch_batch(
                 Ok(input) => input,
                 Err(error) => {
                     eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
-                    tracker.report_outcome(&source_path, false);
                     continue;
                 }
             }
@@ -504,13 +503,9 @@ fn run_watch_batch(
         formats.extend(also_to.iter().copied());
         if let Err(error) = validate_batch_output_formats(registry, &input.source, &formats) {
             eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
-            tracker.report_outcome(&source_path, false);
             continue;
         }
         let ids = queue.enqueue_fan_out(input, also_to, enqueue);
-        for id in &ids {
-            source_by_item.push((*id, source_path.clone()));
-        }
         if let Some(module) = preferred_module {
             for id in ids {
                 if let Some(item) = queue.get_mut(id) {
@@ -520,7 +515,7 @@ fn run_watch_batch(
         }
     }
     if queue.is_empty() {
-        return 0;
+        return ExitCode::SUCCESS;
     }
     let summary = run_batch(&mut queue, registry, cancel, |event| match event {
         BatchEvent::ItemStarted {
@@ -554,21 +549,13 @@ fn run_watch_batch(
         },
         BatchEvent::Progress(_) => {}
     });
-
-    for (id, source_path) in source_by_item {
-        let success = queue
-            .get(id)
-            .is_some_and(|item| matches!(item.state, BatchItemState::Succeeded { .. }));
-        tracker.report_outcome(&source_path, success);
-    }
-
     if queue.len() > 1 {
         eprintln!(
             "watch batch complete: {} succeeded, {} failed, {} cancelled",
             summary.succeeded, summary.failed, summary.cancelled
         );
     }
-    summary.exit_code()
+    ExitCode::from(summary.exit_code())
 }
 
 /// How output artifact paths are printed on stdout after a successful write.
@@ -1777,12 +1764,6 @@ fn run_batch_cli(
     enqueue.force = force;
     enqueue.output_dir = output_dir;
     enqueue.naming_template = naming_template;
-
-    let fan_out = 1 + also_to.len();
-    let projected = inputs.len().saturating_mul(fan_out.max(1));
-    queue
-        .check_admission(projected)
-        .map_err(|error| error.to_string())?;
 
     // Process-wide cancel flag installed once; each batch call resets it.
     let cancel = install_ctrl_c_handler();

@@ -87,9 +87,8 @@ pub fn trusted_curl_path() -> Result<PathBuf, ConversionError> {
 
     let candidates: &[&str] = if cfg!(target_os = "macos") {
         &["/usr/bin/curl"]
-    } else if cfg!(target_os = "linux") {
-        &["/usr/bin/curl", "/bin/curl"]
     } else {
+        // Linux and other Unix: try both common absolute locations.
         &["/usr/bin/curl", "/bin/curl"]
     };
 
