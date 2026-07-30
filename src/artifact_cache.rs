@@ -1,29 +1,154 @@
 //! On-disk cache for conversion artifacts (binary copies under Application Support).
+//!
+//! # Integrity
+//!
+//! Cached and export-staged files are verified with length + SHA-256 digests stored
+//! in sidecars (never FNV alone). FNV remains only as a non-cryptographic naming
+//! disambiguator in file names.
+//!
+//! Export staging always **copies** into the user-facing export path so edits there
+//! cannot mutate the canonical cache inode via a shared hard link. Canonical cache
+//! files are also marked read-only after write as defense in depth.
+//!
+//! # Leases and purge
+//!
+//! Hold an [`ArtifactLease`] (or call [`acquire_export_lease`]) while a staged path
+//! is in use so [`purge_artifact_cache`] / [`purge_now`] will not delete it.
+//! Purge shares the staging mutex with writers.
+//!
+//! # App integration
+//!
+//! Call [`purge_now`] (or [`purge_artifact_cache_defaults`]) after conversion writes
+//! and periodically from the app (startup is a good hook; idle timers are fine too).
+//! Large-artifact integrity checks that may rehash should run off the UI thread
+//! via [`verify_export_integrity`] / [`export_matches_bytes_strict`]; the fast
+//! [`export_matches_bytes`] path trusts a matching length+mtime+SHA-256 sidecar.
 
 use crate::session_settings::application_support_dir;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_DIR_NAME: &str = "artifact-cache";
 const EXPORT_SUBDIR: &str = "export";
 const PASTE_STAGING_SUBDIR: &str = "paste-staging";
 const VERSION_FILE_NAME: &str = ".version";
-const CACHE_VERSION: &str = "1";
+/// Bumped when sidecar format / integrity scheme changes (invalidates old cache).
+const CACHE_VERSION: &str = "2";
 static STAGING_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Sidecar magic / field keys (line-oriented `key=value`).
+const SIDECAR_SHA256: &str = "sha256";
+const SIDECAR_LEN: &str = "len";
+const SIDECAR_MTIME_NS: &str = "mtime_ns";
 
 fn staging_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
+
+fn lease_map() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static LEASES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Default TTL for cached artifacts (7 days).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Soft cap on total cache size before oldest entries are purged (512 MiB).
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// RAII lease that keeps a staged/cached path alive across purge.
+///
+/// Drop the lease (or call [`ArtifactLease::release`]) when Reveal/Open/drag is done.
+#[derive(Debug)]
+pub struct ArtifactLease {
+    path: Option<PathBuf>,
+}
+
+impl ArtifactLease {
+    /// Path covered by this lease.
+    pub fn path(&self) -> &Path {
+        self.path.as_deref().unwrap_or(Path::new(""))
+    }
+
+    /// Explicitly release early (also happens on drop).
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(path) = self.path.take() {
+            release_export_lease(&path);
+        }
+    }
+}
+
+impl Drop for ArtifactLease {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+/// Acquire a purge-protecting lease on `path` (refcount; multiple leases allowed).
+pub fn acquire_export_lease(path: &Path) -> ArtifactLease {
+    let key = normalize_lease_path(path);
+    let mut map = lease_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *map.entry(key.clone()).or_insert(0) += 1;
+    ArtifactLease { path: Some(key) }
+}
+
+fn release_export_lease(path: &Path) {
+    let key = normalize_lease_path(path);
+    let mut map = lease_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(count) = map.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            map.remove(&key);
+        }
+    }
+}
+
+fn normalize_lease_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_leased(path: &Path) -> bool {
+    if path_is_leased_exact(path) {
+        return true;
+    }
+    // Protect integrity sidecars when their data file is leased so purge cannot
+    // leave a staged artifact without its manifest.
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if let Some(base) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".hash")) {
+            let data = path.parent().unwrap_or_else(|| Path::new("")).join(base);
+            if path_is_leased_exact(&data) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn path_is_leased_exact(path: &Path) -> bool {
+    let key = normalize_lease_path(path);
+    let map = lease_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    map.get(&key).copied().unwrap_or(0) > 0
+        || map
+            .keys()
+            .any(|leased| leased == path || paths_same_file(leased, path))
+}
 
 /// True when `path` is a real directory and not a symbolic link.
 ///
@@ -48,7 +173,7 @@ pub fn default_paste_staging_dir() -> Option<PathBuf> {
     artifact_cache_dir().map(|dir| dir.join(PASTE_STAGING_SUBDIR))
 }
 
-/// Ensure the cache directory exists and return it.
+/// Ensure the cache directory exists (mode `0700` on Unix) and return it.
 ///
 /// If the on-disk cache predates the current `CACHE_VERSION`, stale entries are
 /// removed before the directory is returned so format/layout changes cannot
@@ -76,8 +201,12 @@ pub fn ensure_artifact_cache_dir() -> io::Result<PathBuf> {
                 format!("artifact cache path is not a directory: {}", dir.display()),
             ));
         }
-        Ok(_) => {}
-        Err(_) => fs::create_dir_all(&dir)?,
+        Ok(_) => {
+            ensure_private_dir_mode(&dir)?;
+        }
+        Err(_) => {
+            create_private_dir_all(&dir)?;
+        }
     }
 
     let version_file = dir.join(VERSION_FILE_NAME);
@@ -89,6 +218,39 @@ pub fn ensure_artifact_cache_dir() -> io::Result<PathBuf> {
     }
     fs::write(&version_file, CACHE_VERSION)?;
     Ok(dir)
+}
+
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        ensure_private_dir_mode(dir)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+fn ensure_private_dir_mode(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = fs::metadata(dir)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(dir, perms)?;
+        }
+    }
+    let _ = dir;
+    Ok(())
 }
 
 fn purge_cache_dir(dir: &Path) -> io::Result<()> {
@@ -118,28 +280,43 @@ fn purge_cache_dir(dir: &Path) -> io::Result<()> {
 
 /// Store `bytes` under a stable key derived from `name` + content hash prefix.
 ///
-/// Returns the path of the written cache file.
+/// Returns the path of the written cache file. Canonical entries are made
+/// read-only after write. Callers that need a durable staged path should prefer
+/// [`stage_export_bytes`] / [`stage_export_file`].
 pub fn cache_artifact_bytes(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     let _guard = staging_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let dir = ensure_artifact_cache_dir()?;
     let safe = sanitize_cache_name(name);
-    let hash = simple_hash(bytes);
+    // FNV is naming-only; integrity uses SHA-256 sidecars on export/reuse paths.
+    let name_hash = simple_hash(bytes);
+    let digest = sha256_hex(bytes);
     let safe_path = Path::new(&safe);
     let file_name = match (
         safe_path.file_stem().and_then(|value| value.to_str()),
         safe_path.extension().and_then(|value| value.to_str()),
     ) {
         (Some(stem), Some(extension)) if !stem.is_empty() && !extension.is_empty() => {
-            format!("{stem}-{hash:016x}.{extension}")
+            format!("{stem}-{name_hash:016x}.{extension}")
         }
-        _ => format!("{safe}-{hash:016x}"),
+        _ => format!("{safe}-{name_hash:016x}"),
     };
-    let path = dir.join(file_name);
-    if !path.exists() {
+    let path = dir.join(&file_name);
+    if path.exists() {
+        // Reuse only when length + digest match; never trust existence alone.
+        if cache_file_matches(&path, bytes.len() as u64, &digest) {
+            return Ok(path);
+        }
+        // Collision on FNV name with different content: rewrite under same name
+        // only after verifying we can replace (rare; FNV collision).
+        make_writable_if_needed(&path);
+        write_bytes_via_unique_temp(&path, bytes)?;
+    } else {
         write_bytes_via_unique_temp(&path, bytes)?;
     }
+    write_integrity_sidecar_for_path(&path, &digest)?;
+    make_readonly(&path);
     Ok(path)
 }
 
@@ -164,92 +341,133 @@ pub fn stage_export_bytes(file_name: &str, bytes: &[u8]) -> io::Result<PathBuf> 
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let dir = ensure_artifact_cache_dir()?.join(EXPORT_SUBDIR);
-    fs::create_dir_all(&dir)?;
+    create_private_dir_all(&dir)?;
     let safe = export_file_name(file_name);
-    let hash = simple_hash(bytes);
-    let hash_hex = format!("{hash:016x}");
+    let name_hash = simple_hash(bytes);
+    let digest = sha256_hex(bytes);
 
     let preferred = dir.join(&safe);
-    if export_file_matches(&preferred, bytes, &hash_hex) {
+    if export_file_matches_digest(&preferred, bytes.len() as u64, &digest, /*full*/ false) {
         return Ok(preferred);
     }
 
     // Prefer the clean name when free; otherwise disambiguate so we never clobber
     // a different artifact that Finder may still reference.
     let target_name = if preferred.exists() {
-        disambiguated_export_name(&safe, hash)
+        disambiguated_export_name(&safe, name_hash)
     } else {
         safe.clone()
     };
     let path = dir.join(&target_name);
-    if export_file_matches(&path, bytes, &hash_hex) {
+    if export_file_matches_digest(&path, bytes.len() as u64, &digest, /*full*/ false) {
         return Ok(path);
     }
 
-    write_export_file(&dir, &target_name, bytes, &hash_hex)?;
+    write_export_file(&dir, &target_name, bytes, &digest)?;
     Ok(path)
 }
 
-/// Hard-link or copy an existing cache file into the export staging dir under `file_name`.
+/// Copy an existing cache file into the export staging dir under `file_name`.
 ///
-/// Prefer this when the artifact is already on disk so large media is not rewritten.
-/// Content is hashed by streaming (not loaded fully into RAM).
+/// Always **copies** (never hard-links) so the user-editable export path cannot
+/// mutate the canonical cache entry through a shared inode. Content integrity is
+/// recorded as a SHA-256 + length + mtime sidecar.
 pub fn stage_export_file(file_name: &str, source: &Path) -> io::Result<PathBuf> {
     let _guard = staging_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let dir = ensure_artifact_cache_dir()?.join(EXPORT_SUBDIR);
-    fs::create_dir_all(&dir)?;
+    create_private_dir_all(&dir)?;
     let safe = export_file_name(file_name);
     let source_meta = fs::metadata(source)?;
     let source_len = source_meta.len();
-    let hash = hash_file(source)?;
-    let hash_hex = format!("{hash:016x}");
+    let digest = sha256_file(source)?;
+    let name_hash = simple_hash_file(source)?;
 
     let preferred = dir.join(&safe);
-    if export_file_matches_len(&preferred, source_len, &hash_hex)
-        || paths_same_file(source, &preferred)
-    {
-        let _ = fs::write(hash_sidecar_path(&dir, &safe), &hash_hex);
+    if export_file_matches_digest(&preferred, source_len, &digest, /*full*/ false) {
+        // Refresh sidecar mtime binding after a trusted match.
+        let _ = write_integrity_sidecar_for_path(&preferred, &digest);
         return Ok(preferred);
     }
 
-    let target_name = if preferred.exists() && !paths_same_file(source, &preferred) {
-        disambiguated_export_name(&safe, hash)
+    let target_name = if preferred.exists() {
+        disambiguated_export_name(&safe, name_hash)
     } else {
         safe.clone()
     };
     let path = dir.join(&target_name);
-    if paths_same_file(source, &path) || export_file_matches_len(&path, source_len, &hash_hex) {
-        let _ = fs::write(hash_sidecar_path(&dir, &target_name), &hash_hex);
+    if export_file_matches_digest(&path, source_len, &digest, /*full*/ false) {
+        let _ = write_integrity_sidecar_for_path(&path, &digest);
         return Ok(path);
     }
 
+    // Copy only — never hard_link into the user-facing export path.
     let tmp = unique_staging_path(&path);
-    if fs::hard_link(source, &tmp).is_err() {
-        if let Err(error) = fs::copy(source, &tmp) {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
+    if let Err(error) = fs::copy(source, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
     if let Err(error) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    let _ = fs::write(hash_sidecar_path(&dir, &target_name), &hash_hex);
+    write_integrity_sidecar_for_path(&path, &digest)?;
     Ok(path)
 }
 
-/// True when `path` is an export-staged file whose hash sidecar matches `bytes`.
+/// True when `path` is an export-staged file whose integrity sidecar matches `bytes`.
+///
+/// Fast path: when the sidecar's SHA-256, length, and mtime all match the file
+/// metadata and the expected digest of `bytes`, the file is **not** fully rehashed
+/// (safe for large artifacts on background threads; avoid blocking the UI with
+/// [`export_matches_bytes_strict`] / [`verify_export_integrity`] for cold paths).
 pub fn export_matches_bytes(path: &Path, bytes: &[u8]) -> bool {
-    let hash_hex = format!("{:016x}", simple_hash(bytes));
-    export_file_matches(path, bytes, &hash_hex)
+    let digest = sha256_hex(bytes);
+    export_file_matches_digest(path, bytes.len() as u64, &digest, /*full*/ false)
 }
 
-fn write_export_file(dir: &Path, name: &str, bytes: &[u8], hash_hex: &str) -> io::Result<()> {
+/// Like [`export_matches_bytes`] but always rehashes the file (no mtime trust).
+///
+/// Prefer this (or [`verify_export_integrity`]) off the UI thread when revalidating
+/// large artifacts after long idle periods.
+pub fn export_matches_bytes_strict(path: &Path, bytes: &[u8]) -> bool {
+    let digest = sha256_hex(bytes);
+    export_file_matches_digest(path, bytes.len() as u64, &digest, /*full*/ true)
+}
+
+/// Full integrity check: length + SHA-256 of on-disk content vs sidecar.
+///
+/// Returns `Ok(true)` when the file matches its sidecar, `Ok(false)` on mismatch
+/// or missing sidecar fields, and `Err` on I/O failures. Safe to call from a
+/// background executor for large files.
+pub fn verify_export_integrity(path: &Path) -> io::Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let meta = fs::metadata(path)?;
+    let Some(sidecar) = read_integrity_sidecar(path) else {
+        return Ok(false);
+    };
+    if sidecar.len != meta.len() {
+        return Ok(false);
+    }
+    let actual = sha256_file(path)?;
+    Ok(actual == sidecar.sha256)
+}
+
+/// Async-friendly helper: same as [`verify_export_integrity`] (blocking I/O).
+///
+/// Call from GPUI's background executor / a worker thread — never the UI thread
+/// for multi-megabyte artifacts.
+pub fn verify_export_integrity_blocking(path: &Path) -> io::Result<bool> {
+    verify_export_integrity(path)
+}
+
+fn write_export_file(dir: &Path, name: &str, bytes: &[u8], digest: &str) -> io::Result<()> {
     let path = dir.join(name);
     write_bytes_via_unique_temp(&path, bytes)?;
-    let _ = fs::write(hash_sidecar_path(dir, name), hash_hex);
+    write_integrity_sidecar_for_path(&path, digest)?;
     Ok(())
 }
 
@@ -284,19 +502,117 @@ fn hash_sidecar_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!(".{name}.hash"))
 }
 
-fn export_file_matches(path: &Path, bytes: &[u8], hash_hex: &str) -> bool {
-    export_file_matches_len(path, bytes.len() as u64, hash_hex)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IntegritySidecar {
+    sha256: String,
+    len: u64,
+    mtime_ns: Option<u64>,
 }
 
-fn read_hash_sidecar(path: &Path) -> Option<String> {
+fn read_integrity_sidecar(path: &Path) -> Option<IntegritySidecar> {
     let file_name = path.file_name()?.to_str()?;
     let dir = path.parent().unwrap_or(Path::new(""));
-    fs::read_to_string(hash_sidecar_path(dir, file_name))
-        .ok()
-        .map(|text| text.trim().to_owned())
+    let text = fs::read_to_string(hash_sidecar_path(dir, file_name)).ok()?;
+    parse_integrity_sidecar(&text)
 }
 
-fn export_file_matches_len(path: &Path, len: u64, hash_hex: &str) -> bool {
+fn parse_integrity_sidecar(text: &str) -> Option<IntegritySidecar> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Legacy FNV-only sidecar (single hex token) is never trusted for integrity.
+    if !trimmed.contains('=') && !trimmed.contains(':') {
+        return None;
+    }
+
+    let mut sha256 = None;
+    let mut len = None;
+    let mut mtime_ns = None;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = if let Some((k, v)) = line.split_once('=') {
+            (k.trim(), v.trim())
+        } else if let Some((k, v)) = line.split_once(':') {
+            (k.trim(), v.trim())
+        } else {
+            continue;
+        };
+        match key {
+            SIDECAR_SHA256 | "digest" => {
+                if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+                    sha256 = Some(value.to_ascii_lowercase());
+                }
+            }
+            SIDECAR_LEN | "length" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    len = Some(n);
+                }
+            }
+            SIDECAR_MTIME_NS | "mtime" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    mtime_ns = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(IntegritySidecar {
+        sha256: sha256?,
+        len: len?,
+        mtime_ns,
+    })
+}
+
+fn format_integrity_sidecar(sha256: &str, len: u64, mtime_ns: u64) -> String {
+    format!("{SIDECAR_SHA256}={sha256}\n{SIDECAR_LEN}={len}\n{SIDECAR_MTIME_NS}={mtime_ns}\n")
+}
+
+fn mtime_ns_of(meta: &fs::Metadata) -> Option<u64> {
+    let modified = meta.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(
+        duration
+            .as_secs()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::from(duration.subsec_nanos())),
+    )
+}
+
+fn write_integrity_sidecar_for_path(path: &Path, digest: &str) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "artifact path has no name"))?;
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let meta = fs::metadata(path)?;
+    let mtime_ns = mtime_ns_of(&meta).unwrap_or(0);
+    let body = format_integrity_sidecar(digest, meta.len(), mtime_ns);
+    let sidecar = hash_sidecar_path(dir, file_name);
+    let tmp = unique_staging_path(&sidecar);
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, &sidecar)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Match path against expected length + SHA-256.
+///
+/// When `force_full` is false and the sidecar binds the same length, mtime, and
+/// digest, skip hashing the whole file (large-artifact UI-safe path).
+fn export_file_matches_digest(path: &Path, len: u64, digest: &str, force_full: bool) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -306,20 +622,33 @@ fn export_file_matches_len(path: &Path, len: u64, hash_hex: &str) -> bool {
     if meta.len() != len {
         return false;
     }
-    // A mismatching sidecar is authoritative: we only write it when staging, so
-    // it means the file content is definitely different. A matching sidecar is
-    // not enough by itself (the file may have been edited without updating the
-    // sidecar, or mtimes may have equal resolution), so we always verify by
-    // hashing the actual file content.
-    if let Some(sidecar) = read_hash_sidecar(path) {
-        if sidecar != hash_hex {
-            return false;
+    let Some(sidecar) = read_integrity_sidecar(path) else {
+        // No trustworthy sidecar: fall back to full rehash so we still detect edits,
+        // but never trust bare existence.
+        return match sha256_file(path) {
+            Ok(actual) => actual == digest,
+            Err(_) => false,
+        };
+    };
+    if sidecar.len != len || sidecar.sha256 != digest {
+        return false;
+    }
+    if !force_full {
+        if let (Some(side_m), Some(file_m)) = (sidecar.mtime_ns, mtime_ns_of(&meta)) {
+            if side_m == file_m {
+                // Trusted: length + mtime + digest all agree with sidecar claim.
+                return true;
+            }
         }
     }
-    let Ok(actual) = hash_file(path) else {
-        return false;
-    };
-    format!("{actual:016x}") == hash_hex
+    match sha256_file(path) {
+        Ok(actual) => actual == digest,
+        Err(_) => false,
+    }
+}
+
+fn cache_file_matches(path: &Path, len: u64, digest: &str) -> bool {
+    export_file_matches_digest(path, len, digest, /*full*/ false)
 }
 
 fn disambiguated_export_name(safe: &str, hash: u64) -> String {
@@ -390,12 +719,41 @@ fn paths_same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn make_readonly(path: &Path) {
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let mut perms = meta.permissions();
+    perms.set_readonly(true);
+    let _ = fs::set_permissions(path, perms);
+}
+
+fn make_writable_if_needed(path: &Path) {
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    if meta.permissions().readonly() {
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+
 /// Remove cache entries older than `ttl` and, if still over `max_bytes`,
 /// delete oldest files until under the budget.
 ///
 /// Walks the cache root recursively so `export/` and `paste-staging/` are
 /// included (hash sidecars and staged media would otherwise accumulate forever).
+///
+/// Holds the staging mutex and **skips** paths with an active [`ArtifactLease`].
 pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeStats> {
+    let _guard = staging_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    purge_artifact_cache_locked(ttl, max_bytes)
+}
+
+fn purge_artifact_cache_locked(ttl: Duration, max_bytes: u64) -> io::Result<PurgeStats> {
     let Some(dir) = artifact_cache_dir() else {
         return Ok(PurgeStats::default());
     };
@@ -411,6 +769,9 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
     // Age-based purge.
     entries.retain(|entry| {
         if entry.age > ttl {
+            if path_is_leased(&entry.path) {
+                return true;
+            }
             if remove_cache_path(&entry.path).is_ok() {
                 stats.removed += 1;
                 stats.freed_bytes += entry.len;
@@ -421,13 +782,16 @@ pub fn purge_artifact_cache(ttl: Duration, max_bytes: u64) -> io::Result<PurgeSt
         }
     });
 
-    // Size budget: oldest first. Skip pure hash sidecars when summing? Include all files.
+    // Size budget: oldest first. Skip leased paths.
     let mut total: u64 = entries.iter().map(|e| e.len).sum();
     if total > max_bytes {
         entries.sort_by_key(|e| e.modified);
         for entry in entries {
             if total <= max_bytes {
                 break;
+            }
+            if path_is_leased(&entry.path) {
+                continue;
             }
             if remove_cache_path(&entry.path).is_ok() {
                 total = total.saturating_sub(entry.len);
@@ -463,14 +827,23 @@ pub fn purge_paste_staging(ttl: Duration) -> io::Result<PurgeStats> {
         }
     }
 
+    let _guard = staging_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
     let now = SystemTime::now();
     let mut entries = Vec::new();
     collect_cache_files(&dir, &now, &mut entries)?;
     let mut stats = PurgeStats::default();
     for entry in entries {
-        if entry.age > ttl && remove_cache_path(&entry.path).is_ok() {
-            stats.removed += 1;
-            stats.freed_bytes += entry.len;
+        if entry.age > ttl {
+            if path_is_leased(&entry.path) {
+                continue;
+            }
+            if remove_cache_path(&entry.path).is_ok() {
+                stats.removed += 1;
+                stats.freed_bytes += entry.len;
+            }
         }
     }
     Ok(stats)
@@ -483,6 +856,16 @@ pub fn purge_artifact_cache_defaults() -> io::Result<PurgeStats> {
     stats.removed += paste.removed;
     stats.freed_bytes += paste.freed_bytes;
     Ok(stats)
+}
+
+/// Immediate purge using default budgets — call after conversion writes and
+/// periodically from the app (startup / idle). Alias of
+/// [`purge_artifact_cache_defaults`].
+///
+/// Safe to call from a background executor; holds the staging mutex so it will
+/// not race writers, and skips leased paths.
+pub fn purge_now() -> io::Result<PurgeStats> {
+    purge_artifact_cache_defaults()
 }
 
 fn collect_cache_files(dir: &Path, now: &SystemTime, out: &mut Vec<CacheEntry>) -> io::Result<()> {
@@ -519,6 +902,8 @@ fn collect_cache_files(dir: &Path, now: &SystemTime, out: &mut Vec<CacheEntry>) 
 }
 
 fn remove_cache_path(path: &Path) -> io::Result<()> {
+    // Allow removal even if the file was marked read-only.
+    make_writable_if_needed(path);
     fs::remove_file(path)
 }
 
@@ -572,7 +957,7 @@ fn sanitize_cache_name(name: &str) -> String {
 }
 
 fn simple_hash(bytes: &[u8]) -> u64 {
-    // FNV-1a 64-bit — fine for cache keys, not cryptographic.
+    // FNV-1a 64-bit — naming / disambiguation only, never sole integrity trust.
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -581,8 +966,7 @@ fn simple_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn hash_file(path: &Path) -> io::Result<u64> {
-    use std::io::Read;
+fn simple_hash_file(path: &Path) -> io::Result<u64> {
     let mut file = fs::File::open(path)?;
     let mut buf = [0u8; 64 * 1024];
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -597,6 +981,35 @@ fn hash_file(path: &Path) -> io::Result<u64> {
         }
     }
     Ok(hash)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest)
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -674,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_export_file_hardlinks_or_copies() {
+    fn stage_export_file_copies_not_hardlinks() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("export-file");
         fs::create_dir_all(&dir).unwrap();
@@ -685,11 +1098,28 @@ mod tests {
         let source = cache_artifact_bytes("clip.bin", b"binary-payload").unwrap();
         let export = stage_export_file("clip.bin", &source).unwrap();
         assert_eq!(fs::read(&export).unwrap(), b"binary-payload");
-        assert!(paths_same_file(&source, &export) || export.is_file());
+        // Export must be a distinct inode so editing export cannot mutate cache.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src_ino = fs::metadata(&source).unwrap().ino();
+            let exp_ino = fs::metadata(&export).unwrap().ino();
+            assert_ne!(
+                src_ino, exp_ino,
+                "export staging must copy, not hard-link, the canonical cache file"
+            );
+        }
+        assert!(export.is_file());
 
-        // Second stage with same content reuses the path.
+        // Mutating the export path must not change the cache canonical bytes.
+        make_writable_if_needed(&export);
+        fs::write(&export, b"mutated!!!!!!").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"binary-payload");
+
+        // Second stage with same content reuses the path only if integrity matches;
+        // after mutation, a new stage from source should rewrite / rematch.
         let export2 = stage_export_file("clip.bin", &source).unwrap();
-        assert_eq!(export, export2);
+        assert_eq!(fs::read(&export2).unwrap(), b"binary-payload");
 
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
@@ -754,6 +1184,7 @@ mod tests {
         let path = stage_export_bytes("note.md", b"body").unwrap();
         assert!(export_matches_bytes(&path, b"body"));
         assert!(!export_matches_bytes(&path, b"other"));
+        assert!(verify_export_integrity(&path).unwrap());
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
         }
@@ -771,15 +1202,208 @@ mod tests {
         let path = stage_export_bytes("note.md", b"body").unwrap();
         assert!(export_matches_bytes(&path, b"body"));
         // Same length, different bytes — must not reuse staged file.
+        make_writable_if_needed(&path);
         fs::write(&path, b"xxxx").unwrap();
         assert!(!export_matches_bytes(&path, b"body"));
-        // Even if the sidecar still claims the old hash, content wins.
-        let sidecar = path.with_file_name(format!(
-            ".{}.hash",
-            path.file_name().unwrap().to_str().unwrap()
-        ));
-        assert!(sidecar.is_file() || path.parent().unwrap().join(".note.md.hash").is_file());
+        assert!(!export_matches_bytes_strict(&path, b"body"));
+        // Even if the sidecar still claims the old hash, content wins on full verify
+        // (mtime usually changes on write, forcing rehash; strict always rehashes).
+        let sidecar = path.parent().unwrap().join(".note.md.hash");
+        assert!(sidecar.is_file());
         assert!(!export_matches_bytes(&path, b"body"));
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn digest_mismatch_sidecar_rejects_reuse() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("digest-mismatch");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let path = stage_export_bytes("report.bin", b"good-payload").unwrap();
+        assert!(export_matches_bytes(&path, b"good-payload"));
+
+        // Corrupt the sidecar digest while leaving file bytes intact.
+        let sidecar = path.parent().unwrap().join(".report.bin.hash");
+        assert!(sidecar.is_file());
+        let meta = fs::metadata(&path).unwrap();
+        let mtime = mtime_ns_of(&meta).unwrap_or(0);
+        let bogus = format_integrity_sidecar(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            meta.len(),
+            mtime,
+        );
+        fs::write(&sidecar, bogus).unwrap();
+
+        assert!(
+            !export_matches_bytes(&path, b"good-payload"),
+            "mismatched SHA-256 sidecar must reject reuse"
+        );
+        assert!(!export_matches_bytes_strict(&path, b"good-payload"));
+        assert!(!verify_export_integrity(&path).unwrap());
+
+        // Legacy FNV-only sidecar is never trusted for a match without rehash
+        // that still verifies SHA of expected bytes — existence alone is insufficient.
+        fs::write(&sidecar, "cbf29ce484222325").unwrap();
+        // Without a structured sidecar, code falls back to full rehash of file vs expected.
+        assert!(
+            export_matches_bytes(&path, b"good-payload"),
+            "missing structured sidecar falls back to content rehash"
+        );
+        assert!(!export_matches_bytes(&path, b"other-payload"));
+
+        // Wrong length in sidecar rejects even if digest string were right.
+        let real_digest = sha256_hex(b"good-payload");
+        fs::write(
+            &sidecar,
+            format_integrity_sidecar(&real_digest, meta.len() + 1, mtime),
+        )
+        .unwrap();
+        assert!(!export_matches_bytes(&path, b"good-payload"));
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lease_protects_staged_path_from_purge() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("lease-purge");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let export = stage_export_bytes("leased.md", b"# keep me").unwrap();
+        let sidecar = export.parent().unwrap().join(".leased.md.hash");
+        assert!(export.is_file());
+        assert!(sidecar.is_file());
+
+        let lease = acquire_export_lease(&export);
+        assert_eq!(lease.path(), normalize_lease_path(&export));
+
+        // Zero TTL would remove everything; leased export + its path must survive.
+        let stats = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
+        let _ = stats;
+        assert!(
+            export.exists(),
+            "leased export path must survive purge_now/purge_artifact_cache"
+        );
+
+        // Nested refcount: second lease keeps protection after first drops.
+        let lease2 = acquire_export_lease(&export);
+        drop(lease);
+        let _ = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
+        assert!(export.exists(), "refcount lease must still protect path");
+
+        drop(lease2);
+        let stats = purge_now().unwrap();
+        // Default TTL may keep young files; force zero-TTL purge after lease release.
+        let _ = stats;
+        let stats = purge_artifact_cache(Duration::from_secs(0), DEFAULT_CACHE_MAX_BYTES).unwrap();
+        assert!(
+            stats.removed >= 1 || !export.exists(),
+            "unleased path should be purgeable"
+        );
+        assert!(
+            !export.exists(),
+            "export must be removable after all leases drop"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trusted_sidecar_skips_rehash_when_mtime_matches() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("trusted-mtime");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let path = stage_export_bytes("big.bin", b"payload-for-trust").unwrap();
+        let sidecar = read_integrity_sidecar(&path).expect("sidecar");
+        assert_eq!(sidecar.sha256, sha256_hex(b"payload-for-trust"));
+        assert!(sidecar.mtime_ns.is_some());
+
+        // Fast path accepts matching bytes without needing strict mode.
+        assert!(export_matches_bytes(&path, b"payload-for-trust"));
+        // Strict also accepts (rehashes).
+        assert!(export_matches_bytes_strict(&path, b"payload-for-trust"));
+
+        // Tamper bytes but restore mtime + leave stale sidecar → trusted path would
+        // wrongly accept if it only checked mtime; we bind digest to expected bytes,
+        // so expected digest of "payload-for-trust" won't match if we change expected
+        // OR if we rehash. Change file content, rewrite sidecar mtime to match new
+        // meta but wrong digest already covered; here force mtime match with wrong digest:
+        make_writable_if_needed(&path);
+        // Same length as "payload-for-trust" (17 bytes) so length checks still pass.
+        fs::write(&path, b"XXXXXXXXXXXXXXXXX").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), b"payload-for-trust".len() as u64);
+        let m = mtime_ns_of(&meta).unwrap();
+        // Sidecar still claims old digest + new mtime (attacker-controlled sidecar).
+        fs::write(
+            path.parent().unwrap().join(".big.bin.hash"),
+            format_integrity_sidecar(&sha256_hex(b"payload-for-trust"), meta.len(), m),
+        )
+        .unwrap();
+        // Expected bytes still "payload-for-trust"; trusted path sees matching
+        // sidecar digest+len+mtime and returns true WITHOUT rehash — that is
+        // the trust model: sidecar is written only by us. An attacker who can write
+        // the sidecar can already replace the file. Strict mode rehashes and rejects.
+        assert!(
+            export_matches_bytes(&path, b"payload-for-trust"),
+            "trusted path trusts our sidecar when mtime+len+digest claim matches expected"
+        );
+        assert!(
+            !export_matches_bytes_strict(&path, b"payload-for-trust"),
+            "strict path must rehash and reject tampered content"
+        );
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_dir_created_with_private_mode() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("mode700");
+        // Do not pre-create: ensure_artifact_cache_dir should create with 0700.
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+        let ensured = ensure_artifact_cache_dir().unwrap();
+        assert_eq!(ensured, dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "cache dir mode must be 0700, got {mode:o}");
+        }
+        // Export subdir also private.
+        let _ = stage_export_bytes("x.md", b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let export = dir.join(EXPORT_SUBDIR);
+            let mode = fs::metadata(&export).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "export dir mode must be 0700, got {mode:o}");
+        }
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
         }
@@ -1210,7 +1834,7 @@ mod tests {
             let _ = cache_artifact_bytes(&format!("seed-{i}.bin"), &[i as u8; 64]);
         }
 
-        // Writers tolerate race errors with purge (no shared lock between purge and write).
+        // Writers and purge share the staging mutex; all must complete without panic.
         let writers: Vec<_> = (0..4)
             .map(|i| {
                 std::thread::spawn(move || {
@@ -1233,6 +1857,10 @@ mod tests {
         );
         // At least some writer attempts completed (Ok or Err — no panics).
         assert_eq!(write_results.len(), 4);
+        assert!(
+            write_results.iter().all(|r| r.is_ok()),
+            "writers serialize with purge via staging lock"
+        );
 
         // After the race settles, a serial write must succeed.
         let after = cache_artifact_bytes("after.bin", b"ok").unwrap();
@@ -1371,6 +1999,8 @@ mod tests {
         let stats = purge_artifact_cache_defaults().unwrap();
         // Fresh files may not be purged under default TTL; just ensure the call succeeds.
         let _ = stats;
+        let stats2 = purge_now().unwrap();
+        let _ = stats2;
 
         unsafe {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
@@ -1378,5 +2008,21 @@ mod tests {
         }
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(paste_dir);
+    }
+
+    #[test]
+    fn parse_integrity_sidecar_requires_sha_and_len() {
+        assert!(parse_integrity_sidecar("").is_none());
+        assert!(parse_integrity_sidecar("deadbeef").is_none());
+        assert!(parse_integrity_sidecar("sha256=abcd\nlen=1").is_none()); // short digest
+        let good = format_integrity_sidecar(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            12,
+            99,
+        );
+        let parsed = parse_integrity_sidecar(&good).unwrap();
+        assert_eq!(parsed.len, 12);
+        assert_eq!(parsed.mtime_ns, Some(99));
+        assert_eq!(parsed.sha256.len(), 64);
     }
 }
