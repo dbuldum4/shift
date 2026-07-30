@@ -25,15 +25,17 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub use batch::{
-    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput, BatchItem, BatchItemId,
-    BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance, BatchQueue, BatchSource,
-    BatchSummary, available_outputs_for_batch_source, prepare_batch_destination,
+    BATCH_WORKERS_ENV, BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput,
+    BatchItem, BatchItemId, BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance,
+    BatchQueue, BatchSource, BatchSummary, DEFAULT_BATCH_WORKER_CAP,
+    available_outputs_for_batch_source, batch_worker_count, prepare_batch_destination,
     resolve_destination, resolve_destination_with_policy, run_batch, suggested_url_file_name,
     uniquify_destination, validate_batch_output_formats,
 };
@@ -79,9 +81,11 @@ pub use process::{
 pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};
 pub use sources::{
-    ExpandedInputPath, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths,
-    expand_input_paths_preserving_roots, expand_input_paths_preserving_roots_with_extensions,
-    expand_input_paths_with_extensions, supported_input_extensions,
+    ExpandBudget, ExpandedInputPath, MAX_BATCH_ADMISSION, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES,
+    enforce_admission_limit, expand_input_paths, expand_input_paths_preserving_roots,
+    expand_input_paths_preserving_roots_with_budget,
+    expand_input_paths_preserving_roots_with_extensions, expand_input_paths_soft,
+    expand_input_paths_with_budget, expand_input_paths_with_extensions, supported_input_extensions,
 };
 pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};
@@ -833,9 +837,6 @@ impl ConversionArtifact {
     }
 
     /// Write the artifact, optionally refusing to replace an existing file.
-    ///
-    /// When `replace` is false the final path is published with an exclusive
-    /// create (no TOCTOU between an earlier exists-check and the write).
     pub fn write_to_with_replace(
         &self,
         path: impl AsRef<Path>,
@@ -894,8 +895,7 @@ pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), Conversio
 }
 
 /// Like [`write_bytes_atomically`], but when `replace` is false the destination
-/// is published with an exclusive create so a concurrent creator cannot be
-/// clobbered (closes the TOCTOU between `exists` checks and rename).
+/// is published with an exclusive create.
 pub fn write_bytes_atomically_with_replace(
     path: &Path,
     bytes: &[u8],
@@ -960,10 +960,6 @@ pub fn write_bytes_atomically_with_replace(
 }
 
 /// Publish `partial` to `path` only if `path` does not already exist.
-///
-/// Prefer `hard_link` (fails with AlreadyExists when the destination is taken),
-/// then fall back to `OpenOptions::create_new` + copy. Never uses a plain
-/// `rename`, which would replace an existing file on POSIX.
 fn publish_exclusive(partial: &Path, path: &Path) -> Result<(), ConversionError> {
     match std::fs::hard_link(partial, path) {
         Ok(()) => {
@@ -977,12 +973,9 @@ fn publish_exclusive(partial: &Path, path: &Path) -> Result<(), ConversionError>
                 path.display()
             )));
         }
-        Err(_) => {
-            // hard_link unavailable (some FS) — exclusive create + copy.
-        }
+        Err(_) => {}
     }
 
-    use std::io::Write;
     let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1023,10 +1016,7 @@ fn publish_exclusive(partial: &Path, path: &Path) -> Result<(), ConversionError>
     Ok(())
 }
 
-/// Remove incomplete `*.shift-partial` / `*.shift-bak` siblings for a planned destination.
-///
-/// Matching uses the stable [`short_path_hash`] of the planned basename so long
-/// stems still clean up after bounded temp naming.
+/// Remove incomplete `*.shift-partial` siblings next to a planned destination.
 pub fn remove_partial_outputs(planned: &Path) -> usize {
     let parent = planned
         .parent()
