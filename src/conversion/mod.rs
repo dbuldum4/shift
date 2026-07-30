@@ -16,7 +16,6 @@ mod sips;
 mod sources;
 mod spreadsheet;
 mod suggest;
-mod url_fetch;
 mod watch;
 
 #[cfg(test)]
@@ -25,24 +24,22 @@ mod registry_parity;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use batch::{
-    BATCH_WORKERS_ENV, BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput,
-    BatchItem, BatchItemId, BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance,
-    BatchQueue, BatchSource, BatchSummary, DEFAULT_BATCH_WORKER_CAP,
-    available_outputs_for_batch_source, batch_worker_count, prepare_batch_destination,
+    BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput, BatchItem, BatchItemId,
+    BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance, BatchQueue, BatchSource,
+    BatchSummary, available_outputs_for_batch_source, prepare_batch_destination,
     resolve_destination, resolve_destination_with_policy, run_batch, suggested_url_file_name,
     uniquify_destination, validate_batch_output_formats,
 };
 pub use defuddle::{
     DefuddleModule, DefuddleOptions, block_private_urls, ensure_public_url_fetch_allowed,
-    looks_like_url, redact_credentials_in_text, redact_url_credentials, url_display_host,
-    url_resolves_to_non_public_host, url_targets_non_public_host,
+    looks_like_url, redact_url_credentials, url_display_host, url_targets_non_public_host,
 };
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
@@ -56,41 +53,36 @@ pub use docling::{
 pub use ffmpeg::{
     FfmpegEncodeMode, FfmpegModule, FfmpegOptions, FfmpegQuality,
     ffmpeg_supports_target_size_output, input_looks_like_media, is_audio_output, is_ffmpeg_output,
-    is_image_output, is_subtitle_output, is_video_output,
+    is_image_output, is_subtitle_output, is_video_output, validate_ffmpeg_options,
 };
 pub use inspection::{
     ArtifactInspection, MAX_INSPECTION_PREFIX_BYTES, MAX_INSPECTION_SUFFIX_BYTES, inspect_binary,
 };
 pub use magic_paste::{
-    MagicPaste, PasteToken, materialize_magic_paste, materialize_paste_token, parse_magic_paste,
-    stage_pasted_image, url_looks_like_remote_file,
+    MAX_AGGREGATE_DOWNLOAD_BYTES, MAX_CLIPBOARD_IMAGE_BYTES, MAX_PASTE_TOKENS,
+    MAX_REMOTE_FILE_BYTES, MagicPaste, MaterializedSource, PasteToken, REMOTE_DOWNLOAD_TIMEOUT,
+    StagedInputs, cleanup_staged_path, is_paste_staging_path, materialize_magic_paste,
+    materialize_magic_paste_detailed, materialize_paste_token, materialize_paste_token_detailed,
+    parse_magic_paste, stage_pasted_image, url_looks_like_remote_file,
 };
 pub use markitdown::{MarkItDownModule, MarkItDownOptions};
 pub use pandoc::{PandocModule, PandocOptions, pdf_engine_candidates, resolve_pdf_engine};
 pub use pdf_slice::extract_pdf_pages;
 pub use process::{
-    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, FS_NAME_MAX, LimitedOutput,
-    absolute_command_path, bundled_runtime_tool, create_private_file, find_executable, is_runnable,
-    max_output_bytes, path_looks_like_option, process_timeout, push_flag_path, push_operand_path,
-    push_path_arg, read_file_limited, resolve_tool_executable, resolve_tool_path, run_command,
-    run_command_cancellable, run_command_cancellable_with_output_paths, short_path_hash,
-    unique_temp_dir, unique_temp_file_name, validate_path_operand, write_secret_file,
+    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_PROCESS_TIMEOUT, LimitedOutput, bundled_runtime_tool,
+    find_executable, is_runnable, max_output_bytes, process_timeout, read_file_limited,
+    resolve_tool_executable, resolve_tool_path, run_command, run_command_cancellable,
+    unique_temp_dir,
 };
 pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};
 pub use sources::{
-    ExpandBudget, ExpandedInputPath, MAX_BATCH_ADMISSION, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES,
-    enforce_admission_limit, expand_input_paths, expand_input_paths_preserving_roots,
-    expand_input_paths_preserving_roots_with_budget,
-    expand_input_paths_preserving_roots_with_extensions, expand_input_paths_soft,
-    expand_input_paths_with_budget, expand_input_paths_with_extensions, supported_input_extensions,
+    ExpandedInputPath, MAX_EXPAND_DEPTH, MAX_EXPAND_FILES, expand_input_paths,
+    expand_input_paths_preserving_roots, expand_input_paths_preserving_roots_with_extensions,
+    expand_input_paths_with_extensions, supported_input_extensions,
 };
 pub use spreadsheet::{SpreadsheetModule, SpreadsheetOptions};
 pub use suggest::{suggested_output_for_path, suggested_output_for_url};
-pub use url_fetch::{
-    DownloadOptions, MAX_PAGE_HTML_BYTES, MAX_REMOTE_FILE_BYTES, REMOTE_DOWNLOAD_TIMEOUT,
-    download_url_to_path, trusted_curl_path,
-};
 pub use watch::{WatchTracker, validate_watch_directories};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -832,22 +824,8 @@ impl ConversionArtifact {
 
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), ConversionError> {
         // Atomic: write a sibling partial, then rename into place so cancel /
-        // crash never leaves a half-written final path. Replace existing files
-        // (force semantics) — callers that must refuse clobber use
-        // [`Self::write_to_with_replace`].
+        // crash never leaves a half-written final path.
         write_bytes_atomically(path.as_ref(), &self.bytes)
-    }
-
-    /// Write the artifact, optionally refusing to replace an existing file.
-    ///
-    /// When `replace` is false the final path is published with an exclusive
-    /// create (no TOCTOU between an earlier exists-check and the write).
-    pub fn write_to_with_replace(
-        &self,
-        path: impl AsRef<Path>,
-        replace: bool,
-    ) -> Result<(), ConversionError> {
-        write_bytes_atomically_with_replace(path.as_ref(), &self.bytes, replace)
     }
 
     /// Human-readable result summary for UI previews (text excerpt or binary facts).
@@ -883,6 +861,8 @@ impl ConversionArtifact {
     }
 }
 
+static WRITE_TOKEN: AtomicU64 = AtomicU64::new(0);
+
 fn file_stem_for_temp(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -890,39 +870,32 @@ fn file_stem_for_temp(path: &Path) -> String {
         .unwrap_or_else(|| "output".into())
 }
 
+fn unique_temp_file_name(stem: &str, suffix: &str) -> String {
+    let pid = std::process::id();
+    let count = WRITE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(".{stem}.{pid}-{count}-{nanos}{suffix}")
+}
+
 /// Write `bytes` to `path` via a unique `*.shift-partial` sibling, then rename.
 ///
 /// On failure the partial file is removed. The final path appears only after a
 /// complete write so cancelled conversions do not leave truncated destinations.
-/// Existing destinations are replaced (force / overwrite semantics).
 pub fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
-    write_bytes_atomically_with_replace(path, bytes, true)
-}
-
-/// Like [`write_bytes_atomically`], but when `replace` is false the destination
-/// is published with an exclusive create so a concurrent creator cannot be
-/// clobbered (closes the TOCTOU between `exists` checks and rename).
-pub fn write_bytes_atomically_with_replace(
-    path: &Path,
-    bytes: &[u8],
-    replace: bool,
-) -> Result<(), ConversionError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
     let stem = file_stem_for_temp(path);
     let partial = dir.join(unique_temp_file_name(&stem, ".shift-partial"));
 
-    // Partial is sensitive intermediate content — keep it private on Unix.
-    if let Err(error) = write_secret_file(&partial, bytes) {
+    if let Err(error) = std::fs::write(&partial, bytes) {
         let _ = std::fs::remove_file(&partial);
         return Err(ConversionError::new(format!(
             "could not write {}: {error}",
             path.display()
         )));
-    }
-
-    if !replace {
-        return publish_exclusive(&partial, path);
     }
 
     if let Err(error) = std::fs::rename(&partial, path) {
@@ -965,81 +938,14 @@ pub fn write_bytes_atomically_with_replace(
     Ok(())
 }
 
-/// Publish `partial` to `path` only if `path` does not already exist.
-///
-/// Prefer `hard_link` (fails with AlreadyExists when the destination is taken),
-/// then fall back to `OpenOptions::create_new` + copy. Never uses a plain
-/// `rename`, which would replace an existing file on POSIX.
-fn publish_exclusive(partial: &Path, path: &Path) -> Result<(), ConversionError> {
-    match std::fs::hard_link(partial, path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(partial);
-            return Ok(());
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(partial);
-            return Err(ConversionError::new(format!(
-                "output already exists: {} (pass --force / enable Overwrite to replace)",
-                path.display()
-            )));
-        }
-        Err(_) => {
-            // hard_link unavailable (some FS) — exclusive create + copy.
-        }
-    }
-
-    use std::io::Write;
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(partial);
-            return Err(ConversionError::new(format!(
-                "output already exists: {} (pass --force / enable Overwrite to replace)",
-                path.display()
-            )));
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(partial);
-            return Err(ConversionError::new(format!(
-                "could not finalize {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    let bytes = match std::fs::read(partial) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(partial);
-            return Err(ConversionError::new(format!(
-                "could not finalize {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(partial);
-        return Err(ConversionError::new(format!(
-            "could not finalize {}: {error}",
-            path.display()
-        )));
-    }
-    let _ = std::fs::remove_file(partial);
-    Ok(())
-}
-
-/// Remove incomplete `*.shift-partial` / `*.shift-bak` siblings for a planned destination.
-///
-/// Matching uses the stable [`short_path_hash`] of the planned basename so long
-/// stems still clean up after bounded temp naming.
+/// Remove incomplete `*.shift-partial` siblings next to a planned destination.
 pub fn remove_partial_outputs(planned: &Path) -> usize {
     let parent = planned
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let stem = file_stem_for_temp(planned);
-    let key = format!("{:016x}", short_path_hash(&stem));
+    let prefix = format!(".{stem}.");
     let Ok(entries) = std::fs::read_dir(parent) else {
         return 0;
     };
@@ -1049,12 +955,10 @@ pub fn remove_partial_outputs(planned: &Path) -> usize {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let is_ours = name.contains(&key)
-            && (name.ends_with(".shift-partial") || name.ends_with(".shift-bak"));
-        // Also accept legacy `.{stem}.…` names from older builds.
-        let is_legacy = name.starts_with(&format!(".{stem}."))
-            && (name.ends_with(".shift-partial") || name.ends_with(".shift-bak"));
-        if (is_ours || is_legacy) && std::fs::remove_file(entry.path()).is_ok() {
+        if name.starts_with(&prefix)
+            && (name.ends_with(".shift-partial") || name.ends_with(".shift-bak"))
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
             removed += 1;
         }
     }
@@ -1600,6 +1504,8 @@ impl ConversionRegistry {
         output: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        validate_ffmpeg_options(&options.ffmpeg)?;
+
         let input = input.as_ref();
         if !input.is_file() {
             return Err(ConversionError::new(format!(
@@ -1636,6 +1542,8 @@ impl ConversionRegistry {
         output: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
+        validate_ffmpeg_options(&options.ffmpeg)?;
+
         let url = url.trim();
         if !looks_like_url(url) {
             return Err(ConversionError::new(format!(
@@ -1826,16 +1734,30 @@ impl Drop for TempDirGuard {
 /// otherwise resolve to the source path and risk overwriting it.
 pub fn default_output_path(input: &Path, output: OutputFormat) -> PathBuf {
     let extension = output.extension();
-    let candidate = input.with_extension(extension);
-    if paths_refer_to_same_file(input, &candidate) {
+    if is_paste_staging_path(input) {
         let stem = input
             .file_stem()
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .unwrap_or("converted");
-        input.with_file_name(format!("{stem}.converted.{extension}"))
+        let candidate = PathBuf::from(format!("{stem}.{extension}"));
+        if paths_refer_to_same_file(input, &candidate) {
+            PathBuf::from(format!("{stem}.converted.{extension}"))
+        } else {
+            candidate
+        }
     } else {
-        candidate
+        let candidate = input.with_extension(extension);
+        if paths_refer_to_same_file(input, &candidate) {
+            let stem = input
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("converted");
+            input.with_file_name(format!("{stem}.converted.{extension}"))
+        } else {
+            candidate
+        }
     }
 }
 
@@ -2272,48 +2194,6 @@ mod tests {
     }
 
     #[test]
-    fn write_bytes_atomically_exclusive_refuses_existing_destination() {
-        let dir = std::env::temp_dir().join(format!(
-            "shift-atomic-excl-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("out.md");
-        std::fs::write(&path, b"original").unwrap();
-        let error = write_bytes_atomically_with_replace(&path, b"new", false).unwrap_err();
-        assert!(
-            error.to_string().contains("already exists"),
-            "error: {error}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"original");
-        // Exclusive create succeeds when the path is free.
-        let free = dir.join("fresh.md");
-        write_bytes_atomically_with_replace(&free, b"only", false).unwrap();
-        assert_eq!(std::fs::read(&free).unwrap(), b"only");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn unique_temp_file_name_bounds_length_for_long_stems() {
-        let long_stem = "a".repeat(500);
-        let name = unique_temp_file_name(&long_stem, ".shift-partial");
-        assert!(
-            name.len() <= FS_NAME_MAX,
-            "temp name length {} exceeds FS_NAME_MAX ({FS_NAME_MAX}): {name}",
-            name.len()
-        );
-        assert!(name.ends_with(".shift-partial"), "{name}");
-        assert!(name.starts_with('.'), "{name}");
-        // Hash of the stem is embedded so cleanup can find it without the full stem.
-        let key = format!("{:016x}", short_path_hash(&long_stem));
-        assert!(name.contains(&key), "expected hash {key} in {name}");
-    }
-
-    #[test]
     fn remove_partial_outputs_cleans_siblings() {
         let dir = std::env::temp_dir().join(format!(
             "shift-partial-clean-{}-{}",
@@ -2325,15 +2205,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let planned = dir.join("report.md");
-        // New bounded naming.
-        let partial = dir.join(unique_temp_file_name("report.md", ".shift-partial"));
+        let partial = dir.join(".report.md.123.shift-partial");
         std::fs::write(&partial, b"half").unwrap();
-        // Legacy naming still cleaned.
-        let legacy = dir.join(".report.md.123.shift-partial");
-        std::fs::write(&legacy, b"half").unwrap();
-        assert_eq!(remove_partial_outputs(&planned), 2);
+        assert_eq!(remove_partial_outputs(&planned), 1);
         assert!(!partial.exists());
-        assert!(!legacy.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

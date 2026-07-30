@@ -1,15 +1,15 @@
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchInput, BatchItemId, BatchItemState, BatchNamingTemplate,
-    BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
-    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingAsrModel,
-    DoclingImageExportMode, DoclingOptions, DoclingTableMode, DoclingVideoSamplingMode,
-    ExpandBudget, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    MAX_BATCH_ADMISSION, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
+    BatchEnqueueOptions, BatchEvent, BatchInput, BatchNamingTemplate, BatchQueue, BatchSource,
+    ConversionArtifact, ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions,
+    DiagnosticsReport, DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
+    DoclingVideoSamplingMode, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
+    MagicPaste, MarkItDownOptions, MaterializedSource, OutputFormat, PandocOptions, PasteToken,
     PdfCompression, PdfInputOptions, SipsFlip, SipsOptions, SipsQuality, SpreadsheetOptions,
-    WatchTracker, default_output_path, ensure_public_url_fetch_allowed,
-    expand_input_paths_preserving_roots_with_budget, looks_like_url, materialize_paste_token,
+    StagedInputs, WatchTracker, default_output_path, ensure_public_url_fetch_allowed,
+    expand_input_paths_preserving_roots, looks_like_url, materialize_paste_token_detailed,
     parse_magic_paste, prepare_batch_destination, resolve_destination_with_policy, run_batch,
-    url_display_host, validate_batch_output_formats, validate_watch_directories,
+    url_display_host, validate_batch_output_formats, validate_ffmpeg_options,
+    validate_watch_directories,
 };
 use shift_core::preferences::load_module_priority;
 use shift_core::recipes::{
@@ -38,28 +38,37 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         return Ok(ExitCode::FAILURE);
     }
 
-    if arguments
+    let first_is_existing_path = arguments
         .first()
-        .is_some_and(|value| matches!(value.to_string_lossy().as_ref(), "-h" | "--help" | "help"))
-    {
+        .is_some_and(|value| Path::new(value).exists());
+
+    if arguments.first().is_some_and(|value| {
+        matches!(value.to_string_lossy().as_ref(), "-h" | "--help")
+            || (value == "help" && !first_is_existing_path)
+    }) {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
 
-    if arguments
-        .first()
-        .is_some_and(|value| value == "--version" || value == "version")
-    {
+    if arguments.first().is_some_and(|value| {
+        value == "--version" || (value == "version" && !first_is_existing_path)
+    }) {
         println!("{}", cli_version_string());
         return Ok(ExitCode::SUCCESS);
     }
 
-    if arguments.first().is_some_and(|value| value == "formats") {
+    if arguments
+        .first()
+        .is_some_and(|value| value == "formats" && !first_is_existing_path)
+    {
         print_formats();
         return Ok(ExitCode::SUCCESS);
     }
 
-    if arguments.first().is_some_and(|value| value == "watch") {
+    if arguments
+        .first()
+        .is_some_and(|value| value == "watch" && !first_is_existing_path)
+    {
         if arguments.get(1).is_some_and(|value| {
             matches!(value.to_string_lossy().as_ref(), "-h" | "--help" | "help")
         }) {
@@ -71,19 +80,20 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
 
     if arguments
         .first()
-        .is_some_and(|value| value == "doctor" || value == "--doctor")
+        .is_some_and(|value| value == "--doctor" || (value == "doctor" && !first_is_existing_path))
     {
         return run_doctor(&arguments[1..]);
     }
 
     if arguments
         .first()
-        .is_some_and(|value| value == "recipes" || value == "recipe")
+        .is_some_and(|value| !first_is_existing_path && (value == "recipes" || value == "recipe"))
     {
         return run_recipes_command(&arguments[1..]);
     }
 
     let parsed = parse_convert_args_resolving_recipe(&arguments)?;
+    validate_ffmpeg_options(&parsed.ffmpeg).map_err(|error| error.to_string())?;
     let resolved_options = parsed_conversion_options(&parsed);
     let inputs = resolve_cli_inputs_with_layout(parsed.inputs, parsed.recursive)?;
 
@@ -157,6 +167,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             &registry,
             parsed.verbose,
             parsed.preferred_module.as_deref(),
+            parsed.path_print_mode,
         );
     }
 
@@ -167,39 +178,41 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         network_urls_from_classified(std::slice::from_ref(&classified)),
         parsed.yes,
     )?;
-    let source = materialize_cli_input(classified, Some(Arc::clone(&cancel)))?;
-    let artifact = match &source {
+    let mut materialized = materialize_cli_input(classified, Some(Arc::clone(&cancel)))?;
+    let source = materialized.source.clone();
+    let convert_result = match &source {
         BatchSource::Url(url) => {
             eprintln!("shift-cli: fetching {}", url_display_host(url));
-            registry.convert_url_with_options(url, parsed.target, &options)
+            registry
+                .convert_url_with_options(url, parsed.target, &options)
+                .map_err(|error| error.to_string())
         }
-        BatchSource::File(path) => {
-            registry.convert_to_with_options(path.clone(), parsed.target, &options)
-        }
+        BatchSource::File(path) => registry
+            .convert_to_with_options(path.clone(), parsed.target, &options)
+            .map_err(|error| error.to_string()),
     };
-    let artifact = match artifact {
+    let artifact = match convert_result {
         Ok(artifact) => artifact,
-        Err(error) if error.is_cancelled() || cancel.load(Ordering::SeqCst) => {
-            return Ok(ExitCode::from(130));
+        Err(error) => {
+            materialized.cleanup();
+            return Err(error);
         }
-        Err(error) => return Err(error.to_string()),
     };
 
     if parsed.progress {
-        // Clear any in-progress line before final output.
         eprintln!();
     }
     if parsed.verbose {
         print_invocations(&artifact);
     }
 
-    if parsed.stdout {
+    let write_result = if parsed.stdout {
         use std::io::Write;
         std::io::stdout()
             .write_all(&artifact.bytes)
-            .map_err(|error| format!("could not write output: {error}"))?;
+            .map_err(|error| format!("could not write output: {error}"))
     } else {
-        let destination = parsed.output.unwrap_or_else(|| {
+        let destination = parsed.output.clone().unwrap_or_else(|| {
             if parsed.output_dir.is_some()
                 || parsed.naming_template.as_str() != BatchNamingTemplate::DEFAULT
             {
@@ -222,16 +235,17 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             }
         });
         let source_path = source.as_file().map(|path| path.to_path_buf());
-        // Shared with batch: refuse source overwrite, honor --force, create parents.
-        // Exclusive create when !force closes the exists-check/write TOCTOU.
         prepare_batch_destination(&destination, source_path.as_deref(), parsed.force)
-            .map_err(|error| error.to_string())?;
-        artifact
-            .write_to_with_replace(&destination, parsed.force)
-            .map_err(|error| error.to_string())?;
-        // Full path on stdout so scripts and humans know where the file landed.
-        println!("{}", destination.display());
-    }
+            .map_err(|error| error.to_string())
+            .and_then(|_| {
+                artifact
+                    .write_to(&destination)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|_| print_output_path(&destination, parsed.path_print_mode))
+    };
+    materialized.cleanup();
+    write_result?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -410,8 +424,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             );
             return Ok(ExitCode::SUCCESS);
         }
-        let code = run_watch_batch(
-            &mut tracker,
+        return Ok(run_watch_batch(
             paths,
             &watch.conversion.also_to,
             &enqueue,
@@ -419,8 +432,8 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             &cancel,
             watch.conversion.verbose,
             watch.conversion.preferred_module.as_deref(),
-        );
-        return Ok(ExitCode::from(code));
+            watch.conversion.path_print_mode,
+        ));
     }
 
     eprintln!(
@@ -434,8 +447,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             .poll(&watch.input_dir, SystemTime::now(), watch.debounce)
             .map_err(|error| error.to_string())?;
         if !paths.is_empty() {
-            let _code = run_watch_batch(
-                &mut tracker,
+            let _ = run_watch_batch(
                 paths,
                 &watch.conversion.also_to,
                 &enqueue,
@@ -443,6 +455,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
                 &cancel,
                 watch.conversion.verbose,
                 watch.conversion.preferred_module.as_deref(),
+                watch.conversion.path_print_mode,
             );
         }
         let mut slept = Duration::ZERO;
@@ -459,7 +472,6 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
 }
 
 fn run_watch_batch(
-    tracker: &mut WatchTracker,
     paths: Vec<ExpandedInputPath>,
     also_to: &[OutputFormat],
     enqueue: &BatchEnqueueOptions,
@@ -467,11 +479,10 @@ fn run_watch_batch(
     cancel: &Arc<AtomicBool>,
     verbose: bool,
     preferred_module: Option<&str>,
-) -> u8 {
+    path_print_mode: PathPrintMode,
+) -> ExitCode {
     let mut queue = BatchQueue::new();
-    let mut source_by_item: Vec<(BatchItemId, PathBuf)> = Vec::new();
     for expanded in paths {
-        let source_path = expanded.path.clone();
         let input = if let Some(relative_parent) = expanded.relative_parent() {
             match BatchInput::with_relative_parent(
                 BatchSource::File(expanded.path.clone()),
@@ -480,7 +491,6 @@ fn run_watch_batch(
                 Ok(input) => input,
                 Err(error) => {
                     eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
-                    tracker.report_outcome(&source_path, false);
                     continue;
                 }
             }
@@ -492,13 +502,9 @@ fn run_watch_batch(
         formats.extend(also_to.iter().copied());
         if let Err(error) = validate_batch_output_formats(registry, &input.source, &formats) {
             eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
-            tracker.report_outcome(&source_path, false);
             continue;
         }
         let ids = queue.enqueue_fan_out(input, also_to, enqueue);
-        for id in &ids {
-            source_by_item.push((*id, source_path.clone()));
-        }
         if let Some(module) = preferred_module {
             for id in ids {
                 if let Some(item) = queue.get_mut(id) {
@@ -508,7 +514,7 @@ fn run_watch_batch(
         }
     }
     if queue.is_empty() {
-        return 0;
+        return ExitCode::SUCCESS;
     }
     let summary = run_batch(&mut queue, registry, cancel, |event| match event {
         BatchEvent::ItemStarted {
@@ -524,7 +530,9 @@ fn run_watch_batch(
             }
             // The sole stdout payload is an artifact path: ideal for Shortcuts,
             // Automator, and shell pipelines.
-            println!("{}", path.display());
+            if let Err(error) = print_output_path(&path, path_print_mode) {
+                eprintln!("shift-cli: {error}");
+            }
         }
         BatchEvent::ItemFailed {
             source_name, error, ..
@@ -540,21 +548,21 @@ fn run_watch_batch(
         },
         BatchEvent::Progress(_) => {}
     });
-
-    for (id, source_path) in source_by_item {
-        let success = queue
-            .get(id)
-            .is_some_and(|item| matches!(item.state, BatchItemState::Succeeded { .. }));
-        tracker.report_outcome(&source_path, success);
-    }
-
     if queue.len() > 1 {
         eprintln!(
             "watch batch complete: {} succeeded, {} failed, {} cancelled",
             summary.succeeded, summary.failed, summary.cancelled
         );
     }
-    summary.exit_code()
+    ExitCode::from(summary.exit_code())
+}
+
+/// How output artifact paths are printed on stdout after a successful write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathPrintMode {
+    Line,
+    Nul,
+    Json,
 }
 
 /// Parsed convert/batch arguments (engine knobs + I/O flags). Extracted for unit tests.
@@ -588,6 +596,7 @@ struct ParsedConvertArgs {
     verbose: bool,
     progress: bool,
     batch_explicit: bool,
+    path_print_mode: PathPrintMode,
 }
 
 impl Default for ParsedConvertArgs {
@@ -618,6 +627,7 @@ impl Default for ParsedConvertArgs {
             verbose: false,
             progress: false,
             batch_explicit: false,
+            path_print_mode: PathPrintMode::Line,
         }
     }
 }
@@ -768,6 +778,9 @@ fn parse_convert_args_with_defaults(
             "--recursive" => parsed.recursive = true,
             "--verbose" | "-v" => parsed.verbose = true,
             "--progress" => parsed.progress = true,
+            "--print0" => parsed.path_print_mode = PathPrintMode::Nul,
+            "--print-json" | "--json-path" => parsed.path_print_mode = PathPrintMode::Json,
+            "--print-path" => parsed.path_print_mode = PathPrintMode::Line,
             "-t" | "--to" => {
                 cursor += 1;
                 parsed.target = arguments
@@ -1153,13 +1166,28 @@ fn parse_convert_args_with_defaults(
             "--no-ocr-lang" => parsed.docling.ocr_lang = None,
             "--pdf-password" => {
                 cursor += 1;
-                parsed.pdf.password = Some(
-                    arguments
-                        .get(cursor)
-                        .ok_or_else(|| "--pdf-password requires a value".to_owned())?
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let value = arguments
+                    .get(cursor)
+                    .ok_or_else(|| {
+                        "--pdf-password requires a value (use - to read from stdin)".to_owned()
+                    })?
+                    .to_string_lossy();
+                if value == "-" {
+                    parsed.pdf.password = Some(read_secret_from_stdin("--pdf-password")?);
+                } else {
+                    eprintln!(
+                        "shift-cli: warning: --pdf-password on the command line is visible in process listings; prefer `--pdf-password -` (stdin) or `--pdf-password-file`"
+                    );
+                    parsed.pdf.password = Some(value.into_owned());
+                }
+            }
+            "--pdf-password-file" => {
+                cursor += 1;
+                let path = arguments
+                    .get(cursor)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--pdf-password-file requires a path".to_owned())?;
+                parsed.pdf.password = Some(read_secret_from_file(&path, "--pdf-password-file")?);
             }
             "--no-pdf-password" => parsed.pdf.password = None,
             "--page-from" => {
@@ -1298,14 +1326,8 @@ fn resolve_cli_inputs_with_layout(
 ) -> Result<Vec<ResolvedCliInput>, String> {
     if recursive {
         let mut out = Vec::new();
-        let mut budget = ExpandBudget::with_default_limit();
         for input in inputs {
             if is_network_or_file_url_input(&input) {
-                if out.len() >= MAX_BATCH_ADMISSION {
-                    return Err(format!(
-                        "too many inputs (limit is {MAX_BATCH_ADMISSION}); narrow the selection"
-                    ));
-                }
                 out.push(ResolvedCliInput {
                     value: input,
                     relative_parent: None,
@@ -1313,12 +1335,8 @@ fn resolve_cli_inputs_with_layout(
                 continue;
             }
             let path = PathBuf::from(&input);
-            let expanded = expand_input_paths_preserving_roots_with_budget(
-                &[path.as_path()],
-                true,
-                &mut budget,
-            )
-            .map_err(|error| error.to_string())?;
+            let expanded = expand_input_paths_preserving_roots(&[path.as_path()], true)
+                .map_err(|error| error.to_string())?;
             if expanded.is_empty() {
                 // Keep the original path so conversion can report a useful error
                 // (unsupported extension, missing file, etc.).
@@ -1342,18 +1360,8 @@ fn resolve_cli_inputs_with_layout(
         if out.is_empty() {
             return Err("no convertible inputs after expanding directories".to_owned());
         }
-        if out.len() > MAX_BATCH_ADMISSION {
-            return Err(format!(
-                "too many inputs (limit is {MAX_BATCH_ADMISSION}); narrow the selection"
-            ));
-        }
         Ok(out)
     } else {
-        if inputs.len() > MAX_BATCH_ADMISSION {
-            return Err(format!(
-                "too many inputs (limit is {MAX_BATCH_ADMISSION}); narrow the selection"
-            ));
-        }
         for input in &inputs {
             if is_network_or_file_url_input(input) {
                 continue;
@@ -1387,7 +1395,7 @@ enum ClassifiedInput {
 /// Classify one CLI argument without downloading remote files.
 fn classify_cli_input(input: &OsStr) -> Result<ClassifiedInput, String> {
     if let Some(text) = input.to_str() {
-        match parse_magic_paste(text) {
+        match parse_magic_paste(text).map_err(|error| error.to_string())? {
             MagicPaste::Single(token) => return Ok(ClassifiedInput::Token(token)),
             MagicPaste::Multiple(_) => {
                 return Err(format!(
@@ -1424,12 +1432,75 @@ fn network_urls_from_classified(items: &[ClassifiedInput]) -> Vec<&str> {
 fn materialize_cli_input(
     input: ClassifiedInput,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<BatchSource, String> {
+) -> Result<MaterializedSource, String> {
     match input {
         ClassifiedInput::Token(token) => {
-            materialize_paste_token(&token, cancel).map_err(|error| error.to_string())
+            materialize_paste_token_detailed(&token, cancel).map_err(|error| error.to_string())
         }
-        ClassifiedInput::Path(path) => Ok(BatchSource::File(path)),
+        ClassifiedInput::Path(path) => Ok(MaterializedSource::local(path)),
+    }
+}
+
+fn print_output_path(path: &Path, mode: PathPrintMode) -> Result<(), String> {
+    use std::io::Write;
+    match mode {
+        PathPrintMode::Line => {
+            if let Some(text) = path.to_str() {
+                println!("{text}");
+                Ok(())
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut out = std::io::stdout();
+                    out.write_all(path.as_os_str().as_bytes())
+                        .and_then(|_| out.write_all(b"\n"))
+                        .map_err(|e| format!("could not write output path: {e}"))
+                }
+                #[cfg(not(unix))]
+                {
+                    print_output_path(path, PathPrintMode::Json)
+                }
+            }
+        }
+        PathPrintMode::Nul => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let mut out = std::io::stdout();
+                out.write_all(path.as_os_str().as_bytes())
+                    .and_then(|_| out.write_all(b"\0"))
+                    .map_err(|e| format!("could not write output path: {e}"))
+            }
+            #[cfg(not(unix))]
+            {
+                let mut out = std::io::stdout();
+                out.write_all(path.to_string_lossy().as_bytes())
+                    .and_then(|_| out.write_all(b"\0"))
+                    .map_err(|e| format!("could not write output path: {e}"))
+            }
+        }
+        PathPrintMode::Json => {
+            let value = if let Some(text) = path.to_str() {
+                serde_json::Value::String(text.to_owned())
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    serde_json::json!({ "bytes": path.as_os_str().as_bytes() })
+                }
+                #[cfg(not(unix))]
+                {
+                    serde_json::Value::String(path.to_string_lossy().into_owned())
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&value)
+                    .map_err(|e| format!("could not encode output path as JSON: {e}"))?
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1664,6 +1735,7 @@ fn run_batch_cli(
     registry: &ConversionRegistry,
     verbose: bool,
     preferred_module: Option<&str>,
+    path_print_mode: PathPrintMode,
 ) -> Result<ExitCode, String> {
     let mut queue = BatchQueue::new();
     let mut enqueue = BatchEnqueueOptions::new(target);
@@ -1671,12 +1743,6 @@ fn run_batch_cli(
     enqueue.force = force;
     enqueue.output_dir = output_dir;
     enqueue.naming_template = naming_template;
-
-    let fan_out = 1 + also_to.len();
-    let projected = inputs.len().saturating_mul(fan_out.max(1));
-    queue
-        .check_admission(projected)
-        .map_err(|error| error.to_string())?;
 
     // Process-wide cancel flag installed once; each batch call resets it.
     let cancel = install_ctrl_c_handler();
@@ -1699,8 +1765,14 @@ fn run_batch_cli(
         })
         .collect();
     confirm_network_urls(urls, yes)?;
+    let mut staged = StagedInputs::new();
     for (item, relative_parent) in classified {
-        let source = materialize_cli_input(item, Some(Arc::clone(&cancel)))?;
+        let mut materialized = materialize_cli_input(item, Some(Arc::clone(&cancel)))?;
+        if let Some(path) = materialized.take_staged_path() {
+            staged.track(path);
+        }
+        let source = materialized.source.clone();
+        drop(materialized);
         let input = if let Some(relative_parent) = relative_parent {
             BatchInput::with_relative_parent(source, relative_parent)
                 .map_err(|error| error.to_string())?
@@ -1710,8 +1782,10 @@ fn run_batch_cli(
         let mut formats = Vec::with_capacity(also_to.len() + 1);
         formats.push(target);
         formats.extend(also_to.iter().copied());
-        validate_batch_output_formats(registry, &input.source, &formats)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = validate_batch_output_formats(registry, &input.source, &formats) {
+            staged.cleanup();
+            return Err(error.to_string());
+        }
         let ids = queue.enqueue_fan_out(input, &also_to, &enqueue);
         if let Some(module) = preferred_module {
             for id in ids {
@@ -1743,7 +1817,9 @@ fn run_batch_cli(
             if verbose {
                 eprintln!("# module {module_id}");
             }
-            println!("{}", path.display());
+            if let Err(error) = print_output_path(&path, path_print_mode) {
+                eprintln!("shift-cli: {error}");
+            }
         }
         BatchEvent::ItemFailed {
             source_name, error, ..
@@ -1778,6 +1854,8 @@ fn run_batch_cli(
             }
         }
     });
+
+    staged.cleanup();
 
     if queue.len() > 1 {
         eprintln!(
@@ -1927,11 +2005,7 @@ fn print_formats() {
 }
 
 fn parse_secs(value: &OsStr, flag: &str) -> Result<f64, String> {
-    value
-        .to_str()
-        .ok_or_else(|| format!("{flag} value is not valid UTF-8"))?
-        .parse::<f64>()
-        .map_err(|_| format!("{flag} expects a number of seconds"))
+    parse_positive_number(value, flag, true)
 }
 
 fn parse_u32(value: &OsStr, flag: &str) -> Result<u32, String> {
@@ -2015,6 +2089,8 @@ fn print_help() {
          -O, --output-dir <DIR>  Write every batch output into DIR\n  \
          --name-template <TEXT>  Batch name; {{stem}}, {{parent}}, {{format}}, {{ext}}\n  \
          --stdout                Write bytes to stdout (single input only)\n  \
+         --print0                Print output path(s) NUL-terminated (machine-safe)\n  \
+         --print-json            Print each output path as a JSON string\n  \
          --force                 Overwrite existing outputs\n  \
          --no-force              Disable a recipe's overwrite policy\n  \
          --yes, -y               Skip interactive confirms (network fetch); scripts\n  \
@@ -2054,7 +2130,8 @@ fn print_help() {
          --target-size <SIZE>    Fit supported output under SIZE (10MB, 750KiB;\n  \
                                  bare values are interpreted as MB)\n\n\
          PDF toolkit options (qpdf):\n  \
-         --pdf-password <SECRET> Password for encrypted PDFs\n  \
+         --pdf-password <SECRET> Password for encrypted PDFs (`-` = read stdin)\n  \
+         --pdf-password-file <PATH>  Read password from file (Unix: require 0600)\n  \
          --pages <FROM-TO>       1-based inclusive page range (e.g. 2-5)\n  \
          --page-from <N>         1-based start page\n  \
          --page-to <N>           1-based end page\n  \
@@ -2181,6 +2258,51 @@ fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), Str
 fn stdin_is_tty() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
+}
+
+fn read_secret_from_stdin(flag: &str) -> Result<String, String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|error| format!("{flag}: could not read password from stdin: {error}"))?;
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    if line.is_empty() {
+        return Err(format!("{flag}: empty password on stdin"));
+    }
+    Ok(line)
+}
+
+fn read_secret_from_file(path: &Path, flag: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|error| format!("{flag}: could not stat {}: {error}", path.display()))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{flag}: refusing {}: mode {mode:04o} is too open (require 0600)",
+                path.display()
+            ));
+        }
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("{flag}: could not read {}: {error}", path.display()))?;
+    let password = contents.trim_end_matches(['\n', '\r']).to_owned();
+    if password.is_empty() {
+        return Err(format!(
+            "{flag}: password file is empty ({})",
+            path.display()
+        ));
+    }
+    Ok(password)
 }
 
 #[cfg(test)]
@@ -4367,7 +4489,7 @@ mod tests {
         let source =
             materialize_cli_input(ClassifiedInput::Path(PathBuf::from("/tmp/x.pdf")), None)
                 .unwrap();
-        assert_eq!(source.as_file(), Some(Path::new("/tmp/x.pdf")));
+        assert_eq!(source.source.as_file(), Some(Path::new("/tmp/x.pdf")));
 
         let items = [
             classify_cli_input(OsStr::new("https://example.com/a")).unwrap(),
@@ -4568,5 +4690,57 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("local directory"));
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn path_print_mode_flags() {
+        let parsed = parse_convert_args(&args(&["a.md", "--print0"])).unwrap();
+        assert_eq!(parsed.path_print_mode, PathPrintMode::Nul);
+        let parsed = parse_convert_args(&args(&["a.md", "--print-json"])).unwrap();
+        assert_eq!(parsed.path_print_mode, PathPrintMode::Json);
+    }
+
+    #[test]
+    fn rejects_negative_start_at_parse_time() {
+        let err = parse_convert_args(&args(&["a.md", "--start", "-1"])).unwrap_err();
+        assert!(
+            err.contains("non-negative") || err.contains("positive") || err.contains("--start"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_password_file_rejects_world_readable() {
+        let dir = unique_temp("pwd-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        std::fs::write(&path, "s3cret\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        let err = read_secret_from_file(&path, "--pdf-password-file").unwrap_err();
+        assert!(err.contains("too open") || err.contains("0600"), "{err}");
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert_eq!(
+            read_secret_from_file(&path, "--pdf-password-file").unwrap(),
+            "s3cret"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_path_named_like_subcommand_is_not_special_cased_in_parser() {
+        // parse_convert_args itself does not interpret subcommands; run() does.
+        // Ensure convert args accept a path equal to a reserved word.
+        let dir = unique_temp("subcmd-path");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("watch");
+        std::fs::write(&path, b"# hi\n").unwrap();
+        let parsed = parse_convert_args(&[path.as_os_str().to_os_string()]).unwrap();
+        assert_eq!(parsed.inputs.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

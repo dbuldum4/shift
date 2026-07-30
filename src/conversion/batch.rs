@@ -7,11 +7,9 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
-    InvocationRecord, MAX_BATCH_ADMISSION, OutputFormat, ProgressSink, default_output_path,
+    InvocationRecord, OutputFormat, ProgressSink, default_output_path, is_paste_staging_path,
     looks_like_url, normalize_path, paths_refer_to_same_file,
 };
-use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
@@ -19,29 +17,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use url::Url;
-
-/// Default maximum concurrent conversion workers (`min(cpus, 4)`).
-pub const DEFAULT_BATCH_WORKER_CAP: usize = 4;
-
-/// Environment variable overriding the batch worker cap (`SHIFT_BATCH_WORKERS`).
-pub const BATCH_WORKERS_ENV: &str = "SHIFT_BATCH_WORKERS";
-
-/// Resolve how many worker threads `run_batch` should spawn for `task_len` jobs.
-pub fn batch_worker_count(task_len: usize) -> usize {
-    if task_len == 0 {
-        return 0;
-    }
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    let default_cap = cpus.min(DEFAULT_BATCH_WORKER_CAP).max(1);
-    let env_cap = std::env::var(BATCH_WORKERS_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0);
-    let cap = env_cap.unwrap_or(default_cap);
-    cap.min(task_len).max(1)
-}
 
 /// Stable handle for one queue entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -532,13 +507,10 @@ pub struct BatchSummary {
 }
 
 impl BatchSummary {
-    /// - `1` when any item failed
-    /// - `130` when any item was cancelled (including mixed success+cancel)
-    /// - `0` only when every item succeeded (or the queue was empty)
     pub fn exit_code(self) -> u8 {
         if self.failed > 0 {
             1
-        } else if self.cancelled > 0 {
+        } else if self.cancelled > 0 && self.succeeded == 0 {
             130
         } else {
             0
@@ -727,22 +699,6 @@ impl BatchQueue {
             provenance: None,
         });
         id
-    }
-
-    /// Remaining slots under the global multi-file admission cap.
-    pub fn admission_remaining(&self) -> usize {
-        MAX_BATCH_ADMISSION.saturating_sub(self.items.len())
-    }
-
-    /// Reject when adding `additional` items would exceed [`MAX_BATCH_ADMISSION`].
-    pub fn check_admission(&self, additional: usize) -> Result<(), ConversionError> {
-        let total = self.items.len().saturating_add(additional);
-        if total > MAX_BATCH_ADMISSION {
-            return Err(ConversionError::new(format!(
-                "too many queue items (limit is {MAX_BATCH_ADMISSION}); narrow the selection"
-            )));
-        }
-        Ok(())
     }
 
     /// Enqueue many sources (files or URLs).
@@ -1078,15 +1034,17 @@ impl BatchQueue {
     /// Cross-source name clashes (e.g. two `report.pdf` into one folder) become
     /// `report.md`, `report-1.md`, … so both can succeed without overwriting.
     pub fn uniquify_planned_destinations(&mut self) {
-        let mut claimed: HashSet<PathBuf> = HashSet::new();
+        let mut claimed: Vec<PathBuf> = Vec::new();
         for item in &self.items {
             match &item.state {
                 BatchItemState::Succeeded { written_path, .. } => {
-                    claimed.insert(collision_key(written_path));
+                    claimed.push(written_path.clone());
                 }
                 BatchItemState::Queued => {}
                 _ => {
-                    claimed.insert(collision_key(&item.destination));
+                    // Running / failed / cancelled still reserve their planned path
+                    // so a re-queue later can uniquify against them if needed.
+                    claimed.push(item.destination.clone());
                 }
             }
         }
@@ -1095,8 +1053,10 @@ impl BatchQueue {
             if !matches!(item.state, BatchItemState::Queued) {
                 continue;
             }
+            // Only avoid paths claimed by this queue — on-disk existence without
+            // force is enforced at write time (same as single-file).
             let dest = uniquify_against_claimed(&item.destination, &claimed, false);
-            claimed.insert(collision_key(&dest));
+            claimed.push(dest.clone());
             item.destination = dest;
         }
     }
@@ -1142,6 +1102,7 @@ pub fn resolve_destination_with_policy(
                 dir.to_path_buf()
             }
         }
+        (BatchSource::File(path), None) if is_paste_staging_path(path) => PathBuf::new(),
         (BatchSource::File(path), None) => path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1264,49 +1225,18 @@ pub fn uniquify_destination(preferred: &Path, force: bool) -> PathBuf {
     if force || !preferred.exists() {
         return preferred.to_path_buf();
     }
-    let empty = HashSet::new();
-    uniquify_against_claimed(preferred, &empty, true)
-}
-
-fn collision_key(path: &Path) -> PathBuf {
-    let normalized = normalize_path(path);
-    #[cfg(target_os = "macos")]
-    {
-        case_fold_path(&normalized)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        normalized
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn case_fold_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(Component::RootDir.as_os_str()),
-            Component::CurDir => out.push("."),
-            Component::ParentDir => out.push(".."),
-            Component::Normal(part) => {
-                let folded = part.to_string_lossy().to_lowercase();
-                out.push(OsStr::new(folded.as_str()));
-            }
-        }
-    }
-    out
+    uniquify_against_claimed(preferred, &[], true)
 }
 
 /// Pick a path not present in `claimed` (and optionally not already on disk).
-fn uniquify_against_claimed(
-    preferred: &Path,
-    claimed: &HashSet<PathBuf>,
-    check_disk: bool,
-) -> PathBuf {
+///
+/// All paths are lexically normalized first so equivalent forms like
+/// `a/../out/x.md` and `out/x.md` are detected as collisions.
+fn uniquify_against_claimed(preferred: &Path, claimed: &[PathBuf], check_disk: bool) -> PathBuf {
     let preferred = normalize_path(preferred);
+    let claimed: Vec<PathBuf> = claimed.iter().map(|p| normalize_path(p)).collect();
     let is_taken = |path: &Path| -> bool {
-        claimed.contains(&collision_key(path)) || (check_disk && path.exists())
+        claimed.iter().any(|other| other == path) || (check_disk && path.exists())
     };
     if !is_taken(&preferred) {
         return preferred;
@@ -1365,11 +1295,9 @@ fn write_artifact(
 ) -> Result<PathBuf, ConversionError> {
     // Align with single-file CLI: refuse existing outputs unless force.
     // In-queue name clashes are resolved earlier via uniquify_planned_destinations.
-    // `prepare_batch_destination` is a best-effort early check; exclusive create
-    // in write_to_with_replace closes the TOCTOU when force is false.
     prepare_batch_destination(planned, source, force)?;
-    // Atomic write: partial sibling then exclusive/replace publish.
-    match artifact.write_to_with_replace(planned, force) {
+    // Atomic write: partial sibling then rename. On failure scrub any leftovers.
+    match artifact.write_to(planned) {
         Ok(()) => Ok(planned.to_path_buf()),
         Err(error) => {
             let _ = super::remove_partial_outputs(planned);
@@ -1532,7 +1460,10 @@ pub fn run_batch(
         .collect();
 
     if !tasks.is_empty() {
-        let worker_count = batch_worker_count(tasks.len());
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let worker_count = parallelism.min(tasks.len()).max(1);
 
         // Shared cursor: each worker claims the next index with fetch_add.
         let cursor = AtomicUsize::new(0);
@@ -2607,16 +2538,14 @@ mod tests {
     #[test]
     fn uniquify_against_claimed_never_returns_taken_path() {
         let preferred = PathBuf::from("/out/report.md");
-        let mut claimed = HashSet::new();
-        claimed.insert(collision_key(&preferred));
+        // Claim preferred and every numeric suffix the short loop tries.
+        let mut claimed = vec![preferred.clone()];
         for index in 1..10_000 {
-            claimed.insert(collision_key(&PathBuf::from(format!(
-                "/out/report-{index}.md"
-            ))));
+            claimed.push(PathBuf::from(format!("/out/report-{index}.md")));
         }
         let resolved = uniquify_against_claimed(&preferred, &claimed, false);
         assert!(
-            !claimed.contains(&collision_key(&resolved)),
+            !claimed.contains(&resolved),
             "resolved path must not collide with claimed set: {}",
             resolved.display()
         );
@@ -3003,16 +2932,7 @@ mod tests {
                 cancelled: 1
             }
             .exit_code(),
-            130
-        );
-        assert_eq!(
-            BatchSummary {
-                succeeded: 1,
-                failed: 1,
-                cancelled: 1
-            }
-            .exit_code(),
-            1
+            0
         );
     }
 
@@ -3052,13 +2972,13 @@ mod tests {
     #[test]
     fn uniquify_against_claimed_falls_back_to_token() {
         let preferred = PathBuf::from("/out/report.md");
-        let mut claimed: HashSet<PathBuf> = (1..10_000)
-            .map(|i| collision_key(&PathBuf::from(format!("/out/report-{i}.md"))))
+        let mut claimed: Vec<PathBuf> = (1..10_000)
+            .map(|i| PathBuf::from(format!("/out/report-{i}.md")))
             .collect();
-        claimed.insert(collision_key(&preferred));
+        claimed.push(preferred.clone());
 
         let resolved = uniquify_against_claimed(&preferred, &claimed, false);
-        assert!(!claimed.contains(&collision_key(&resolved)));
+        assert!(!claimed.contains(&resolved));
         assert!(
             resolved
                 .file_name()
