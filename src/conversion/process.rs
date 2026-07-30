@@ -1228,6 +1228,10 @@ mod tests {
 
     #[test]
     fn unique_temp_dir_creates_distinct_directories_with_prefix() {
+        // Other process tests temporarily override TMPDIR while exercising
+        // failure paths. Serialize this test with those mutations so the
+        // normal parallel test runner cannot observe their synthetic path.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prefix = format!("shift-utd-{}", std::process::id());
         let a = unique_temp_dir(&prefix).unwrap();
         let b = unique_temp_dir(&prefix).unwrap();

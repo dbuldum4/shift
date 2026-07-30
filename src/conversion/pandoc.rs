@@ -800,6 +800,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reference_doc_relative_path_resolves_against_cwd() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = unique_suffix("ref-rel");
         let work = directory.join(format!("shift-pandoc-ref-work-{suffix}"));

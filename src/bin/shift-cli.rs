@@ -49,7 +49,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         .first()
         .is_some_and(|value| value == "--version" || value == "version")
     {
-        println!("shift-cli {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", cli_version_string());
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -229,6 +229,10 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cli_version_string() -> String {
+    format!("shift-cli {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// CLI-only watched-folder configuration. The native app intentionally does
 /// not start background monitors: an open document is always user-visible,
 /// while automation belongs to an explicit, cancellable terminal process.
@@ -320,19 +324,35 @@ fn parse_watch_duration(value: &OsStr, flag: &str) -> Result<Duration, String> {
 
 fn print_watch_help() {
     println!(
-        "Usage: shift-cli watch <FOLDER> -O <OUTPUT_DIR> [-t <FORMAT>] [OPTIONS]\n\n\
-         Watches one local folder and delegates every ready file to the shared\n\
-         BatchQueue / run_batch workflow. Nested sources keep their relative\n\
-         hierarchy under the output directory. The output directory must be\n\
-         outside FOLDER; this prevents Shift from consuming its own converted\n\
-         files.\n\n\
-         Watch options:\n  \
-         --poll <SEC>        Scan interval, 0.1–3600 seconds (default: 2)\n  \
-         --debounce <SEC>    Wait for unchanged files, 0.1–3600 seconds (default: 2)\n  \
-         --once              Convert the current snapshot and exit\n\n\
-         All batch converter options are accepted, including --to, --also-to,\n\
-         --recipe, --name-template, --module, --target-size, --force, OCR,\n\
-         media, PDF, and spreadsheet options. Artifact paths are the only\n\
+        "Usage: shift-cli watch <FOLDER> -O <OUTPUT_DIR> [-t <FORMAT>] [OPTIONS]
+
+\
+         Watches one local folder and delegates every ready file to the shared
+\
+         BatchQueue / run_batch workflow. Nested sources keep their relative
+\
+         hierarchy under the output directory. The output directory must be
+\
+         outside FOLDER; this prevents Shift from consuming its own converted
+\
+         files.
+
+\
+         Watch options:
+  \
+         --poll <SEC>        Scan interval, 0.1–3600 seconds (default: 2)
+  \
+         --debounce <SEC>    Wait for unchanged files, 0.1–3600 seconds (default: 2)
+  \
+         --once              Convert the current snapshot and exit
+
+\
+         All batch converter options are accepted, including --to, --also-to,
+\
+         --recipe, --name-template, --module, --target-size, --force, OCR,
+\
+         media, PDF, and spreadsheet options. Artifact paths are the only
+\
          stdout output, making watch --once suitable for Shortcuts."
     );
 }
@@ -1930,7 +1950,11 @@ fn print_help() {
          shift-cli <INPUT>… -O <DIR> [-t <FORMAT>]   # multi-file batch (shared queue)\n  \
          shift-cli formats\n  \
          shift-cli doctor [--script] [--quiet]\n  \
-         shift-cli recipes list|show|save|delete …\n\n\
+         shift-cli recipes list|show|save|delete …
+  \
+         shift-cli --version
+
+\
          General options:\n  \
          --recipe <NAME>         Start from a saved recipe; later flags override it\n  \
          -t, --to <FORMAT>       Output format id (default: markdown)\n  \
@@ -3483,6 +3507,10 @@ mod tests {
 
     #[test]
     fn version_and_help_flags() {
+        assert_eq!(
+            cli_version_string(),
+            format!("shift-cli {}", env!("CARGO_PKG_VERSION")),
+        );
         assert!(run(args(&["--version"])).is_ok());
         assert!(run(args(&["version"])).is_ok());
         assert!(run(args(&["--help"])).is_ok());

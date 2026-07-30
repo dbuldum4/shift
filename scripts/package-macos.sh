@@ -9,12 +9,33 @@ contents="$app/Contents"
 resources="$contents/Resources"
 runtime="$resources/runtime"
 
+if ! printf '%s\n' "$version" | awk -F. '
+  NF == 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { ok = 1 }
+  END { exit(ok ? 0 : 1) }
+'; then
+  echo "package-macos: version must be a numeric release version (for example 1.0.0)" >&2
+  exit 2
+fi
+
+manifest_version="$(awk -F'\"' '/^version = \"/ { print $2; exit }' Cargo.toml)"
+if [ "$version" != "$manifest_version" ]; then
+  echo "package-macos: version $version does not match Cargo.toml ($manifest_version)" >&2
+  exit 2
+fi
+
+if [ ! -x target/release/shift ] || [ ! -x target/release/shift-cli ]; then
+  echo "package-macos: release binaries are missing; run cargo build --release --locked first" >&2
+  exit 2
+fi
+
+mkdir -p "$output_dir"
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$resources/bin" "$runtime/bin" "$runtime/python" "$runtime/node"
 
 cp target/release/shift "$contents/MacOS/shift"
 cp target/release/shift-cli "$resources/bin/shift-cli"
 cp LICENSE "$resources/LICENSE"
+cp THIRD_PARTY_NOTICES.md "$resources/THIRD_PARTY_NOTICES.md"
 
 cat > "$contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -28,6 +49,8 @@ cat > "$contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>Shift</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
+  <!-- Bundle build number. For historical 0.x tags ${version#0.} strips a
+       leading "0."; for 1.0.0+ the full semver is used as-is. -->
   <key>CFBundleVersion</key><string>${version#0.}</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <!-- Finder advertises Shift as an alternate viewer, never the default. The

@@ -8,7 +8,7 @@ on:
       tag:
         description: Existing version tag to release
         required: true
-        default: v0.3.0
+        default: v1.0.0
 
 permissions:
   contents: write
@@ -29,6 +29,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Verify release metadata
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
+          scripts/release-preflight.sh "${tag#v}"
       - name: Build Shift
         run: cargo build --release --locked
       - name: Package self-contained converter runtime
@@ -40,6 +45,11 @@ jobs:
           fi
           chmod +x scripts/package-macos.sh
           scripts/package-macos.sh "$version"
+      - name: Validate release artifacts
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
+          scripts/verify-macos-package.sh "${tag#v}" dist
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

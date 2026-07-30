@@ -5,6 +5,37 @@ file on the left, paste a URL into the input bar, inspect the result on the
 right, and download it immediately. The `shift-cli` executable exposes the same
 conversion modules for scripts and terminal workflows.
 
+## Install, upgrade, and uninstall
+
+Shift 1.0 supports macOS 13 (Ventura) and later on Apple Silicon and Intel.
+Download the archive that matches your Mac from [GitHub
+Releases](https://github.com/dbuldum4/shift/releases), then verify its checksum
+before opening it:
+
+```sh
+shasum -a 256 -c shift-1.0.0-macos-<arch>.zip.sha256
+```
+
+Open the DMG and drag `Shift.app` into Applications. The command-line tool is
+bundled at `/Applications/Shift.app/Contents/Resources/bin/shift-cli`; add that
+directory to `PATH` if you want to invoke it directly:
+
+```sh
+echo 'export PATH="/Applications/Shift.app/Contents/Resources/bin:$PATH"' >> ~/.zshrc
+```
+
+To upgrade, quit Shift, replace `Shift.app` with the newer release, and rerun
+`shift-cli --version`. Your preferences, history, and non-secret session options
+are retained under `~/Library/Application Support/Shift`.
+
+To uninstall the app, move `Shift.app` from Applications to the Trash. To also
+remove local history, conversion cache, preferences, and session settings, open
+Finder, choose **Go → Go to Folder…**, enter
+`~/Library/Application Support/Shift`, and move that folder to the Trash. This
+does not remove files you converted or downloaded elsewhere. See [the release
+guide](docs/RELEASE.md) for the maintainer checklist and [third-party
+notices](THIRD_PARTY_NOTICES.md) for bundled and source dependencies.
+
 The ingestion module is powered by
 [Microsoft MarkItDown](https://github.com/microsoft/markitdown), which preserves
 useful document structure such as headings, lists, links, and tables. A second
