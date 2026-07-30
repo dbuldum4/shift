@@ -1,13 +1,23 @@
+use super::url_fetch::{self, DownloadOptions, MAX_PAGE_HTML_BYTES};
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
     LimitedOutput, OutputFormat, bundled_runtime_tool, command_argv_parts, format_argv_display,
     map_spawn_error, max_output_bytes, process_timeout, resolve_tool_executable,
-    run_command_cancellable,
+    run_command_cancellable, unique_temp_dir,
 };
 use std::ffi::OsString;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use url::Url;
+
+/// Wall-clock budget for DNS preflight used by public-URL policy (fail closed).
+pub const DNS_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn looks_like_missing_node(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
@@ -130,7 +140,9 @@ impl DefuddleModule {
         invocation: InvocationRecord,
     ) -> Result<ConversionArtifact, ConversionError> {
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let detail = redact_credentials_in_text(&String::from_utf8_lossy(&output.stderr))
+                .trim()
+                .to_owned();
             let detail = if detail.is_empty() {
                 format!("process exited with {}", output.status)
             } else {
@@ -161,11 +173,11 @@ impl DefuddleModule {
 
     /// Convert a web page URL to a cleaned document via the Defuddle CLI.
     ///
-    /// **Network:** Defuddle performs an outbound HTTP(S) fetch to the given
-    /// address. Only public internet hosts are allowed by default (no
-    /// localhost / LAN). Local files should go through the file picker or a
-    /// path. Opt into private targets with `SHIFT_ALLOW_PRIVATE_URLS=1` or
-    /// `--allow-private-urls`.
+    /// **Network:** Shift downloads the page with hop-validated curl (public
+    /// internet only by default), then feeds the local HTML to Defuddle so the
+    /// extractor never follows redirects itself. Local files should go through
+    /// the file picker or a path. Opt into private targets with
+    /// `SHIFT_ALLOW_PRIVATE_URLS=1` or `--allow-private-urls`.
     pub fn convert_url(
         &self,
         url: &str,
@@ -181,21 +193,61 @@ impl DefuddleModule {
         let url = url.trim();
         if !looks_like_url(url) {
             return Err(ConversionError::new(format!(
-                "not a valid http(s) URL: {url}"
+                "not a valid http(s) URL: {}",
+                redact_url_credentials(url)
             )));
         }
-        ensure_public_url_fetch_allowed(url)?;
+        ensure_public_url_fetch_allowed_with_cancel(url, options.cancel.clone())?;
+
+        let display_url = redact_url_credentials(url);
+        // Download+local path: revalidate every redirect hop, pin DNS, keep
+        // credentials out of Defuddle argv, and never let the extractor fetch.
+        let temp_dir = unique_temp_dir("shift-defuddle-page")?;
+        let html_path = temp_dir.join("page.html");
+        let download_result = url_fetch::download_url_to_path(
+            url,
+            &html_path,
+            DownloadOptions {
+                cancel: options.cancel.clone(),
+                max_bytes: MAX_PAGE_HTML_BYTES,
+                ..DownloadOptions::default()
+            },
+        );
+        if let Err(error) = download_result {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(error);
+        }
+        if !html_path.is_file() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(ConversionError::new(format!(
+                "download of {display_url} produced no HTML file"
+            )));
+        }
 
         let markdown = output_format == OutputFormat::MARKDOWN;
-        let display_url = redact_url_credentials(url);
-        let (output, invocation) = self.run(url, &display_url, markdown, options)?;
-        self.artifact_from_output(
-            &display_url,
-            &url_file_stem(url),
-            output_format,
-            output,
-            invocation,
-        )
+        let source = html_path
+            .to_str()
+            .ok_or_else(|| {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                ConversionError::new("downloaded page path is not valid UTF-8")
+            })?
+            .to_owned();
+        // Never pass the original URL (or userinfo) to Defuddle — only the local HTML.
+        let run_result = self.run(&source, &display_url, markdown, options);
+        let artifact_result = match run_result {
+            Ok((output, invocation)) => self.artifact_from_output(
+                &display_url,
+                &url_file_stem(url),
+                output_format,
+                output,
+                invocation,
+            ),
+            Err(error) => Err(ConversionError::new(redact_credentials_in_text(
+                &error.to_string(),
+            ))),
+        };
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        artifact_result
     }
 }
 
@@ -310,11 +362,22 @@ fn env_flag_truthy(name: &str) -> bool {
 /// Refuse non-public URL hosts when [`block_private_urls`] is active.
 ///
 /// Checks literal host forms (IP / localhost-style names) and, for domain names,
-/// resolves A/AAAA records so names that point at LAN/loopback/metadata ranges
-/// are blocked. Residual DNS-rebinding TOCTOU between resolve and connect is
-/// inherent to separate name lookup; hop revalidation still applies to remote
-/// file downloads.
+/// resolves A/AAAA records with a bounded deadline so names that point at
+/// LAN/loopback/metadata ranges are blocked. **DNS errors fail closed** when
+/// private blocking is on (no fail-open on lookup failure). Callers that connect
+/// should pin the returned addresses (see
+/// [`resolve_public_url_addresses_with_cancel`]) or re-resolve immediately before
+/// each hop.
 pub fn ensure_public_url_fetch_allowed(url: &str) -> Result<(), ConversionError> {
+    ensure_public_url_fetch_allowed_with_cancel(url, None)
+}
+
+/// Same as [`ensure_public_url_fetch_allowed`] but honors cooperative cancellation
+/// during the DNS preflight wait.
+pub fn ensure_public_url_fetch_allowed_with_cancel(
+    url: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(), ConversionError> {
     let display_url = redact_url_credentials(url);
     if !block_private_urls() {
         return Ok(());
@@ -324,12 +387,149 @@ pub fn ensure_public_url_fetch_allowed(url: &str) -> Result<(), ConversionError>
             "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
         )));
     }
-    if url_resolves_to_non_public_host(url) {
+    // Domain resolution: fail closed on errors / private answers / timeout / cancel.
+    let _ = resolve_public_url_addresses_with_cancel(url, cancel)?;
+    Ok(())
+}
+
+/// Resolve and validate addresses for a public-URL fetch.
+///
+/// When private-URL blocking is active, returns only public addresses and errors
+/// on DNS failure, timeout, cancellation, empty answers, or any non-public
+/// record. When blocking is disabled, still resolves with a deadline (for
+/// optional pinning) but does not reject private addresses.
+pub fn resolve_public_url_addresses_with_cancel(
+    url: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Vec<SocketAddr>, ConversionError> {
+    let display_url = redact_url_credentials(url);
+    let parsed = Url::parse(url.trim())
+        .map_err(|error| ConversionError::new(format!("invalid URL {display_url}: {error}")))?;
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+
+    let host = parsed
+        .host()
+        .ok_or_else(|| ConversionError::new(format!("URL has no host: {display_url}")))?;
+
+    let addrs = match host {
+        url::Host::Ipv4(ip) => {
+            let addr = SocketAddr::from((ip, port));
+            if block_private_urls() && ipv4_is_non_public(ip) {
+                return Err(ConversionError::new(format!(
+                    "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
+                )));
+            }
+            vec![addr]
+        }
+        url::Host::Ipv6(ip) => {
+            let addr = SocketAddr::from((ip, port));
+            if block_private_urls() && ipv6_is_non_public(ip) {
+                return Err(ConversionError::new(format!(
+                    "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
+                )));
+            }
+            vec![addr]
+        }
+        url::Host::Domain(domain) => {
+            if domain_is_non_public(domain) {
+                if block_private_urls() {
+                    return Err(ConversionError::new(format!(
+                        "refusing non-public URL host (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
+                    )));
+                }
+                // Opt-in private hosts still need a resolution for optional pin.
+            }
+            resolve_domain_with_deadline(domain, port, DNS_PREFLIGHT_TIMEOUT, cancel.as_deref())
+                .map_err(|error| match error {
+                    DnsPreflightError::Cancelled => ConversionError::cancelled(),
+                    DnsPreflightError::Timeout => ConversionError::new(format!(
+                        "DNS lookup timed out for {display_url} (limit {}s)",
+                        DNS_PREFLIGHT_TIMEOUT.as_secs()
+                    )),
+                    DnsPreflightError::Lookup(detail) => ConversionError::new(format!(
+                        "DNS lookup failed for {display_url}: {detail}"
+                    )),
+                    DnsPreflightError::Empty => ConversionError::new(format!(
+                        "DNS lookup returned no addresses for {display_url}"
+                    )),
+                })?
+        }
+    };
+
+    if addrs.is_empty() {
         return Err(ConversionError::new(format!(
-            "refusing URL whose host resolves to a non-public address (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
+            "DNS lookup returned no addresses for {display_url}"
         )));
     }
-    Ok(())
+
+    if block_private_urls() {
+        for addr in &addrs {
+            let non_public = match addr {
+                SocketAddr::V4(v4) => ipv4_is_non_public(*v4.ip()),
+                SocketAddr::V6(v6) => ipv6_is_non_public(*v6.ip()),
+            };
+            if non_public {
+                return Err(ConversionError::new(format!(
+                    "refusing URL whose host resolves to a non-public address (public internet only; use the file picker for local files, or set SHIFT_ALLOW_PRIVATE_URLS=1 / --allow-private-urls): {display_url}"
+                )));
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+#[derive(Debug)]
+enum DnsPreflightError {
+    Cancelled,
+    Timeout,
+    Lookup(String),
+    Empty,
+}
+
+/// Resolve `host:port` on a helper thread with a wall-clock deadline and cancel poll.
+fn resolve_domain_with_deadline(
+    host: &str,
+    port: u16,
+    deadline: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<SocketAddr>, DnsPreflightError> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(DnsPreflightError::Cancelled);
+    }
+    let host_owned = host.to_owned();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (host_owned.as_str(), port)
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+            .map_err(|error| error.to_string());
+        let _ = tx.send(result);
+    });
+
+    let start = Instant::now();
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err(DnsPreflightError::Cancelled);
+        }
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(DnsPreflightError::Timeout);
+        }
+        let wait = remaining.min(Duration::from_millis(50));
+        match rx.recv_timeout(wait) {
+            Ok(Ok(addrs)) if addrs.is_empty() => return Err(DnsPreflightError::Empty),
+            Ok(Ok(addrs)) => return Ok(addrs),
+            Ok(Err(detail)) => return Err(DnsPreflightError::Lookup(detail)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(DnsPreflightError::Lookup(
+                    "resolver thread exited without a result".into(),
+                ));
+            }
+        }
+    }
 }
 
 /// Display host for progress UI (“Fetching example.com…”).
@@ -350,11 +550,36 @@ pub fn redact_url_credentials(url: &str) -> String {
     url.to_owned()
 }
 
+/// Redact `scheme://user:pass@host` userinfo inside free-form error / stderr text.
+pub fn redact_credentials_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_at) = rest.find("://") {
+        out.push_str(&rest[..scheme_at + 3]);
+        let after_scheme = &rest[scheme_at + 3..];
+        let authority_end = after_scheme
+            .find(|c: char| {
+                c == '/' || c == '?' || c == '#' || c.is_whitespace() || c == '"' || c == '\''
+            })
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            // Drop userinfo; keep host[:port].
+            out.push_str(&authority[at + 1..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &after_scheme[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// True when the URL host is loopback, private, link-local, or a localhost-style name.
 ///
 /// Used so URL fetches stay on the public internet unless explicitly opted in.
-/// Literal IP and special domain checks only — see [`url_resolves_to_non_public_host`]
-/// for DNS-backed policy.
+/// Literal IP and special domain checks only — see
+/// [`resolve_public_url_addresses_with_cancel`] for DNS-backed policy.
 pub fn url_targets_non_public_host(value: &str) -> bool {
     let Ok(parsed) = Url::parse(value.trim()) else {
         return false;
@@ -370,10 +595,10 @@ pub fn url_targets_non_public_host(value: &str) -> bool {
 /// True when a domain name resolves to any non-public address (or mixed public/private).
 ///
 /// IP literals are skipped (already covered by [`url_targets_non_public_host`]).
-/// DNS failures return false so offline / NXDOMAIN cases fail later at the fetcher.
+/// **DNS failures return true (fail closed)** so policy treats unresolvable names
+/// as blocked when private-URL blocking is on. Prefer
+/// [`resolve_public_url_addresses_with_cancel`] for new call sites.
 pub fn url_resolves_to_non_public_host(value: &str) -> bool {
-    use std::net::{SocketAddr, ToSocketAddrs};
-
     let Ok(parsed) = Url::parse(value.trim()) else {
         return false;
     };
@@ -387,17 +612,23 @@ pub fn url_resolves_to_non_public_host(value: &str) -> bool {
     let port = parsed
         .port_or_known_default()
         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    let Ok(addrs) = (domain, port).to_socket_addrs() else {
-        return false;
-    };
-    for addr in addrs {
-        match addr {
-            SocketAddr::V4(v4) if ipv4_is_non_public(*v4.ip()) => return true,
-            SocketAddr::V6(v6) if ipv6_is_non_public(*v6.ip()) => return true,
-            _ => {}
+    match resolve_domain_with_deadline(domain, port, DNS_PREFLIGHT_TIMEOUT, None) {
+        // Fail closed: lookup problems mean we cannot prove the host is public.
+        Err(_) => true,
+        Ok(addrs) => {
+            if addrs.is_empty() {
+                return true;
+            }
+            for addr in addrs {
+                match addr {
+                    SocketAddr::V4(v4) if ipv4_is_non_public(*v4.ip()) => return true,
+                    SocketAddr::V6(v6) if ipv6_is_non_public(*v6.ip()) => return true,
+                    _ => {}
+                }
+            }
+            false
         }
     }
-    false
 }
 
 fn domain_is_non_public(domain: &str) -> bool {
@@ -567,9 +798,17 @@ mod tests {
     fn converts_a_url_source_with_markdown_flag() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir();
-        let suffix = std::process::id();
-        let executable = directory.join(format!("shift-defuddle-test-{suffix}"));
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir().join(format!(
+            "shift-defuddle-url-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("shift-defuddle-test");
         // Echo argv so we can assert the CLI shape, then print fake markdown.
         std::fs::write(
             &executable,
@@ -579,6 +818,39 @@ mod tests {
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
+
+        // Fake curl: download-first path must not put userinfo or bare PATH curl on argv.
+        let fake_curl = directory.join("fake-curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) output="$2"; shift 2;;
+    -D) shift 2;;
+    -w) shift 2;;
+    --netrc-file) shift 2;;
+    --resolve) shift 2;;
+    -*) shift;;
+    *) shift;;
+  esac
+done
+if [ -n "$output" ]; then printf '<html><body><p>hi</p></body></html>' > "$output"; fi
+printf '200'
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_curl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).unwrap();
+
+        unsafe {
+            std::env::set_var("SHIFT_CURL_BIN", &fake_curl);
+            // Skip DNS so this unit test stays offline-friendly.
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
 
         let artifact = DefuddleModule::with_executable(&executable)
             .convert_url(
@@ -595,8 +867,16 @@ mod tests {
 
         let args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
         assert!(args.contains("parse"));
-        assert!(args.contains("https://example.com/hello-world"));
         assert!(args.contains("--markdown"));
+        // Defuddle must receive a local HTML path, never the remote URL.
+        assert!(
+            !args.contains("https://example.com"),
+            "defuddle argv must not contain the remote URL: {args}"
+        );
+        assert!(
+            args.contains("page.html") || args.contains("shift-defuddle-page"),
+            "expected local downloaded HTML path in argv: {args}"
+        );
 
         let credentialed = DefuddleModule::with_executable(&executable)
             .convert_url(
@@ -612,9 +892,17 @@ mod tests {
                 .all(|record| !record.argv_display.contains("user")
                     && !record.argv_display.contains("s3cret"))
         );
+        let cred_args = std::fs::read_to_string(format!("{}.args", executable.display())).unwrap();
+        assert!(
+            !cred_args.contains("s3cret") && !cred_args.contains("user:"),
+            "credentials must not reach defuddle argv: {cred_args}"
+        );
 
-        let _ = std::fs::remove_file(&executable);
-        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        unsafe {
+            std::env::remove_var("SHIFT_CURL_BIN");
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[cfg(unix)]
@@ -660,9 +948,17 @@ mod tests {
     fn honors_frontmatter_and_lang_options() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir();
-        let suffix = format!("{}-opts", std::process::id());
-        let executable = directory.join(format!("shift-defuddle-opts-{suffix}"));
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir().join(format!(
+            "shift-defuddle-opts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("shift-defuddle-opts");
         std::fs::write(
             &executable,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '# Hello\\n'",
@@ -671,6 +967,36 @@ mod tests {
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let fake_curl = directory.join("fake-curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) output="$2"; shift 2;;
+    -D) shift 2;;
+    -w) shift 2;;
+    --netrc-file) shift 2;;
+    --resolve) shift 2;;
+    -*) shift;;
+    *) shift;;
+  esac
+done
+if [ -n "$output" ]; then printf '<html></html>' > "$output"; fi
+printf '200'
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_curl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_CURL_BIN", &fake_curl);
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
 
         let options = ConversionOptions {
             defuddle: DefuddleOptions {
@@ -688,8 +1014,11 @@ mod tests {
         assert!(args.contains("--lang"), "args: {args}");
         assert!(args.contains("en"), "args: {args}");
 
-        let _ = std::fs::remove_file(&executable);
-        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
+        unsafe {
+            std::env::remove_var("SHIFT_CURL_BIN");
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -1015,9 +1344,17 @@ mod tests {
     fn convert_url_html_output_and_failure_status() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir();
-        let suffix = format!("{}-html-url", std::process::id());
-        let executable = directory.join(format!("shift-defuddle-html-url-{suffix}"));
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = std::env::temp_dir().join(format!(
+            "shift-defuddle-html-url-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("shift-defuddle-html-url");
         std::fs::write(
             &executable,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${0}.args\"\nprintf '<article>ok</article>'",
@@ -1026,6 +1363,36 @@ mod tests {
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let fake_curl = directory.join("fake-curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+output=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) output="$2"; shift 2;;
+    -D) shift 2;;
+    -w) shift 2;;
+    --netrc-file) shift 2;;
+    --resolve) shift 2;;
+    -*) shift;;
+    *) shift;;
+  esac
+done
+if [ -n "$output" ]; then printf '<html><body>story</body></html>' > "$output"; fi
+printf '200'
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_curl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, permissions).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_CURL_BIN", &fake_curl);
+            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
+        }
 
         let artifact = DefuddleModule::with_executable(&executable)
             .convert_url(
@@ -1045,7 +1412,7 @@ mod tests {
         );
 
         // Failing process.
-        let fail = directory.join(format!("shift-defuddle-fail-{suffix}"));
+        let fail = directory.join("shift-defuddle-fail");
         std::fs::write(&fail, "#!/bin/sh\necho boom >&2\nexit 2\n").unwrap();
         let mut permissions = std::fs::metadata(&fail).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -1061,10 +1428,14 @@ mod tests {
             err.to_string().contains("boom") || err.to_string().contains("Defuddle"),
             "{err}"
         );
+        // Stderr redaction: credentials in process output must not leak.
+        assert!(!err.to_string().contains("s3cret"));
 
-        let _ = std::fs::remove_file(&executable);
-        let _ = std::fs::remove_file(format!("{}.args", executable.display()));
-        let _ = std::fs::remove_file(&fail);
+        unsafe {
+            std::env::remove_var("SHIFT_CURL_BIN");
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[cfg(unix)]
@@ -1117,5 +1488,68 @@ mod tests {
         let opts = DefuddleOptions::default();
         assert!(!opts.frontmatter);
         assert!(opts.lang.is_none());
+    }
+
+    #[test]
+    fn redact_credentials_in_text_strips_userinfo_substrings() {
+        let raw = "fetch failed for https://user:s3cret@example.com/a and http://onlyuser@host/x";
+        let redacted = redact_credentials_in_text(raw);
+        assert!(!redacted.contains("s3cret"));
+        assert!(!redacted.contains("user:"));
+        assert!(!redacted.contains("onlyuser@"));
+        assert!(redacted.contains("https://example.com/a"));
+        assert!(redacted.contains("http://host/x"));
+        // Non-URL text is preserved.
+        assert_eq!(redact_credentials_in_text("no urls here"), "no urls here");
+    }
+
+    #[test]
+    fn dns_policy_fail_closed_on_nxdomain_when_blocking() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        assert!(block_private_urls());
+        // Unresolvable name: fail closed (no fail-open on lookup Err).
+        let err =
+            ensure_public_url_fetch_allowed("http://this-host-should-not-resolve.invalid./path")
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DNS") || msg.contains("non-public") || msg.contains("public internet"),
+            "expected DNS/policy failure, got: {msg}"
+        );
+        assert!(!msg.contains("s3cret"));
+        // Boolean helper also fails closed.
+        assert!(url_resolves_to_non_public_host(
+            "http://this-host-should-not-resolve.invalid./"
+        ));
+    }
+
+    #[test]
+    fn resolve_public_literal_ip_without_dns() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
+            std::env::remove_var("SHIFT_BLOCK_PRIVATE_URLS");
+        }
+        let addrs = resolve_public_url_addresses_with_cancel("https://8.8.8.8/", None).unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip().to_string(), "8.8.8.8");
+
+        let err = resolve_public_url_addresses_with_cancel("http://127.0.0.1/", None).unwrap_err();
+        assert!(
+            err.to_string().contains("non-public") || err.to_string().contains("public internet"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn dns_preflight_honours_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = resolve_public_url_addresses_with_cancel("https://example.com/", Some(cancel))
+            .unwrap_err();
+        assert!(err.is_cancelled(), "error: {err}");
     }
 }
