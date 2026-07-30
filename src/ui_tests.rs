@@ -1370,8 +1370,11 @@ async fn history_limit_truncates_entries_and_updates_input(cx: &mut TestAppConte
 
     shift.update(cx, |this, cx| {
         this.set_history_limit(100_000, cx);
-        assert_eq!(this.history_limit, 30_000);
-        assert_eq!(this.history_limit_input.read(cx).content(), "30000");
+        assert_eq!(this.history_limit, MAX_HISTORY_LIMIT);
+        assert_eq!(
+            this.history_limit_input.read(cx).content(),
+            MAX_HISTORY_LIMIT.to_string()
+        );
     });
 }
 

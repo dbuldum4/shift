@@ -89,6 +89,9 @@ pub(crate) fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEn
         output_format: entry.output_format.id().to_owned(),
         outcome,
         archived: entry.archived,
+        // In-memory entries always carry their payload (or ReadyLarge); never
+        // mark deferred so a save cannot wipe an on-disk blob by accident.
+        artifact_deferred: false,
     }
 }
 
@@ -151,6 +154,17 @@ pub(crate) fn history_from_store(loaded: LoadedHistory) -> (Vec<ConversionHistor
         .collect();
     let next_id = loaded.next_id.max(max_id.saturating_add(1)).max(1);
     (entries, next_id)
+}
+
+/// Unpack a loaded store into UI state, including load-error flags that block
+/// accidental empty overwrites after a corrupt read.
+pub(crate) fn history_from_store_detailed(
+    loaded: LoadedHistory,
+) -> (Vec<ConversionHistoryEntry>, u64, Option<SharedString>, bool) {
+    let load_error = loaded.load_error.clone().map(Into::into);
+    let load_incomplete = loaded.load_incomplete;
+    let (entries, next_id) = history_from_store(loaded);
+    (entries, next_id, load_error, load_incomplete)
 }
 
 actions!(
@@ -262,6 +276,12 @@ pub(crate) struct Shift {
     pub(crate) history_persist_revision: u64,
     /// True while a background persistence task is in flight (serializes writes).
     pub(crate) history_save_in_flight: bool,
+    /// Consecutive failed history save attempts (drives exponential backoff).
+    pub(crate) history_save_failures: u32,
+    /// When set, a history load was incomplete/corrupt; surface to the user and
+    /// avoid treating an empty in-memory list as authority to wipe the store.
+    pub(crate) history_load_error: Option<SharedString>,
+    pub(crate) history_load_incomplete: bool,
     /// History sidebar width (logical pixels); resizable via left divider.
     pub(crate) history_sidebar_width: f32,
     /// Output panel width (logical pixels); resizable via right divider.
@@ -538,7 +558,8 @@ impl Shift {
                 Some(format!("Could not load recipes: {error}").into()),
             ),
         };
-        let (history, next_history_id) = history_from_store(load_history());
+        let (history, next_history_id, history_load_error, history_load_incomplete) =
+            history_from_store_detailed(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
         let cached_available_outputs = OutputFormat::ALL.to_vec();
@@ -568,7 +589,9 @@ impl Shift {
             selection_generation: 0,
             conversion_generation: 0,
             conversion: ConversionState::Empty,
-            save_status: None,
+            save_status: history_load_error
+                .clone()
+                .map(|err| format!("History load issue: {err}").into()),
             preference_error: None,
             output_format: session.output_format(),
             user_chose_format: false,
@@ -609,6 +632,9 @@ impl Shift {
             history_deleted_ids: HashMap::new(),
             history_persist_revision: 0,
             history_save_in_flight: false,
+            history_save_failures: 0,
+            history_load_error,
+            history_load_incomplete,
             history_sidebar_width,
             output_panel_width,
             panel_resize: None,
@@ -3388,8 +3414,15 @@ impl Shift {
             other => other,
         };
 
-        let id = self.next_history_id;
-        self.next_history_id = self.next_history_id.wrapping_add(1);
+        // Prefer SQLite-backed transactional allocation so concurrent processes
+        // sharing the same store cannot mint the same id. Fall back to the
+        // in-memory counter when the DB path is unavailable.
+        let id = shift_core::history::allocate_history_id_default().unwrap_or_else(|| {
+            let id = self.next_history_id;
+            self.next_history_id = self.next_history_id.wrapping_add(1).max(1);
+            id
+        });
+        self.next_history_id = self.next_history_id.max(id.saturating_add(1)).max(1);
         let mut entry = ConversionHistoryEntry {
             id,
             source,
@@ -3427,6 +3460,15 @@ impl Shift {
             // Another save will be triggered when the current one finishes.
             return;
         }
+        // After a corrupt load, refuse full-reconcile style wipes driven by an
+        // empty in-memory list. Delta upserts of explicit dirty ids still run.
+        if self.history_load_incomplete
+            && self.history.is_empty()
+            && self.history_dirty_ids.is_empty()
+            && !self.history_deleted_ids.is_empty()
+        {
+            // Explicit clear while incomplete: fall through so deleted_ids apply.
+        }
         let Some(db_path) = history_db_path() else {
             return;
         };
@@ -3446,21 +3488,93 @@ impl Shift {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.history_save_in_flight = false;
-                if result.is_ok() {
-                    // Only remove entries whose revision has not been bumped
-                    // since this snapshot was taken. Newer mutations survive.
-                    this.history_dirty_ids
-                        .retain(|_id, rev| *rev > snapshot_revision);
-                    this.history_deleted_ids
-                        .retain(|_id, rev| *rev > snapshot_revision);
-                }
-                // If mutations arrived while we were writing, start another save.
-                if !this.history_dirty_ids.is_empty() || !this.history_deleted_ids.is_empty() {
-                    this.persist_history(cx);
+                match result {
+                    Ok(()) => {
+                        this.history_save_failures = 0;
+                        // Only remove entries whose revision has not been bumped
+                        // since this snapshot was taken. Newer mutations survive.
+                        this.history_dirty_ids
+                            .retain(|_id, rev| *rev > snapshot_revision);
+                        this.history_deleted_ids
+                            .retain(|_id, rev| *rev > snapshot_revision);
+                        // Clear a prior save-error banner on success.
+                        if this
+                            .save_status
+                            .as_ref()
+                            .is_some_and(|s| s.as_ref().starts_with("Could not save history"))
+                        {
+                            this.save_status = None;
+                        }
+                        // If mutations arrived while we were writing, start another save.
+                        if !this.history_dirty_ids.is_empty()
+                            || !this.history_deleted_ids.is_empty()
+                        {
+                            this.persist_history(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.history_save_failures = this.history_save_failures.saturating_add(1);
+                        let failures = this.history_save_failures;
+                        let message = format!("Could not save history: {error}");
+                        this.save_status = Some(message.into());
+                        cx.notify();
+                        // Dirty IDs stay; schedule exponential backoff rather than
+                        // hot-looping immediate retries. Cap retries so a permanent
+                        // failure does not spin forever.
+                        if failures <= shift_core::history::HISTORY_SAVE_MAX_RETRIES {
+                            let shift = failures.saturating_sub(1).min(5);
+                            let delay_ms = shift_core::history::HISTORY_SAVE_BASE_DELAY_MS
+                                .saturating_mul(1u64 << shift);
+                            let delay = Duration::from_millis(delay_ms);
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(delay).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    if !this.history_dirty_ids.is_empty()
+                                        || !this.history_deleted_ids.is_empty()
+                                    {
+                                        this.persist_history(cx);
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        // Beyond max retries: keep dirty, surface error, stop auto-retry.
+                        // A subsequent user mutation bumps revision and restarts saves.
+                    }
                 }
             });
         })
         .detach();
+    }
+
+    /// Synchronously flush pending history writes. Used on quit so dirty
+    /// mutations are not lost when the process exits before the background
+    /// save task completes.
+    pub(crate) fn flush_history_blocking(&mut self) {
+        if self.history_dirty_ids.is_empty() && self.history_deleted_ids.is_empty() {
+            return;
+        }
+        let Some(db_path) = history_db_path() else {
+            return;
+        };
+        let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
+        let changed: Vec<u64> = self.history_dirty_ids.keys().copied().collect();
+        let deleted: Vec<u64> = self.history_deleted_ids.keys().copied().collect();
+        match save_history_delta_to(db_path, &stored, &changed, &deleted) {
+            Ok(()) => {
+                self.history_dirty_ids.clear();
+                self.history_deleted_ids.clear();
+                self.history_save_failures = 0;
+            }
+            Err(error) => {
+                self.save_status = Some(format!("Could not save history on quit: {error}").into());
+            }
+        }
+    }
+
+    pub(crate) fn action_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_history_blocking();
+        cx.quit();
     }
 
     pub(crate) fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -3533,8 +3647,40 @@ impl Shift {
 
         match entry.outcome {
             HistoryOutcome::Ready(artifact) => {
-                self.set_ready_artifact(artifact);
-                cx.notify();
+                // Metadata-first loads leave empty bytes; fetch the BLOB on demand.
+                if artifact.bytes.is_empty() {
+                    let id = entry.id;
+                    let artifact = Arc::clone(&artifact);
+                    let task = cx.background_executor().spawn(async move {
+                        shift_core::history::load_history_artifact_default(id)
+                    });
+                    cx.spawn(async move |this, cx| {
+                        let loaded = task.await.ok().flatten();
+                        let _ = this.update(cx, |this, cx| {
+                            if this.active_history_id != Some(id) {
+                                return;
+                            }
+                            if let Some(bytes) = loaded {
+                                this.set_ready_artifact(Arc::new(ConversionArtifact {
+                                    file_name: artifact.file_name.clone(),
+                                    media_type: artifact.media_type,
+                                    bytes,
+                                    format: artifact.format,
+                                    module_id: artifact.module_id,
+                                    pipeline: artifact.pipeline.clone(),
+                                    invocations: artifact.invocations.clone(),
+                                }));
+                            } else {
+                                this.set_ready_artifact(artifact);
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    self.set_ready_artifact(artifact);
+                    cx.notify();
+                }
             }
             HistoryOutcome::ReadyLarge { .. } => {
                 // Full bytes were not retained; re-run conversion for this source.
@@ -3558,8 +3704,14 @@ impl Shift {
         self.history.clear();
         self.history_dirty_ids.clear();
         self.active_history_id = None;
+        self.history_load_incomplete = false;
+        self.history_load_error = None;
         self.mark_history_cache_dirty();
-        self.persist_history(cx);
+        // Remove SQLite + legacy + legacy.bak immediately so clear is durable
+        // even if a later delta save is skipped; also resets id sequence.
+        let _ = shift_core::history::clear_history_store();
+        self.history_deleted_ids.clear();
+        self.next_history_id = 1;
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -3850,6 +4002,7 @@ impl Render for Shift {
             .on_action(cx.listener(Self::action_zoom))
             .on_action(cx.listener(Self::action_toggle_fullscreen))
             .on_action(cx.listener(Self::action_clear_recent))
+            .on_action(cx.listener(Self::action_quit))
             .relative()
             .flex()
             .size_full()
@@ -4913,6 +5066,7 @@ mod tests {
             output_format: "not-a-real-format".into(),
             outcome: StoredOutcome::Failed("nope".into()),
             archived: false,
+            artifact_deferred: false,
         };
         assert!(from_stored_entry(entry).is_none());
     }
@@ -4936,6 +5090,7 @@ mod tests {
                 bytes: b"# body".to_vec(),
             },
             archived: false,
+            artifact_deferred: false,
         };
         let back = from_stored_entry(entry).expect("output_format is valid");
         assert_eq!(back.output_format, OutputFormat::MARKDOWN);
@@ -4973,6 +5128,7 @@ mod tests {
                 bytes: b"<p>hi</p>".to_vec(),
             },
             archived: false,
+            artifact_deferred: false,
         };
         let back = from_stored_entry(entry).expect("valid");
         assert_eq!(back.output_format, OutputFormat::MARKDOWN);
@@ -5011,6 +5167,7 @@ mod tests {
                     bytes: vec![],
                 },
                 archived: false,
+                artifact_deferred: false,
             };
             let back = from_stored_entry(entry).expect("valid");
             match back.outcome {
@@ -5042,6 +5199,7 @@ mod tests {
                 bytes: vec![],
             },
             archived: false,
+            artifact_deferred: false,
         };
         let back = from_stored_entry(entry).expect("valid");
         match back.outcome {
@@ -5063,6 +5221,8 @@ mod tests {
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: Vec::new(),
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert!(entries.is_empty());
         assert_eq!(next_id, 1, "next_id must be at least 1");
@@ -5085,12 +5245,15 @@ mod tests {
             output_format: "markdown".into(),
             outcome: StoredOutcome::Failed("x".into()),
             archived: false,
+            artifact_deferred: false,
         };
 
         // loaded.next_id already ahead of max entry id.
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: vec![make(1), make(3), make(2)],
             next_id: 10,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 3);
         assert_eq!(next_id, 10);
@@ -5099,6 +5262,8 @@ mod tests {
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: vec![make(1), make(5), make(2)],
             next_id: 2,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 3);
         assert_eq!(next_id, 6); // max_id(5) + 1
@@ -5107,6 +5272,8 @@ mod tests {
         let (_, next_id) = history_from_store(LoadedHistory {
             entries: vec![make(4)],
             next_id: 5,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(next_id, 5);
     }
@@ -5124,6 +5291,7 @@ mod tests {
             output_format: "markdown".into(),
             outcome: StoredOutcome::Failed(format!("fail-{id}")),
             archived: id % 2 == 0,
+            artifact_deferred: false,
         };
         let invalid = |id: u64| StoredHistoryEntry {
             id,
@@ -5136,11 +5304,14 @@ mod tests {
             output_format: "not-a-format".into(),
             outcome: StoredOutcome::Failed("ignored".into()),
             archived: false,
+            artifact_deferred: false,
         };
 
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: vec![valid(1), invalid(2), valid(3), invalid(99), valid(4)],
             next_id: 1,
+            load_error: None,
+            load_incomplete: false,
         });
         // Invalid formats skipped; max_id still considers their ids (99).
         assert_eq!(entries.len(), 3);
@@ -5173,8 +5344,11 @@ mod tests {
                 output_format: "nope".into(),
                 outcome: StoredOutcome::Failed("x".into()),
                 archived: false,
+                artifact_deferred: false,
             }],
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert!(entries.is_empty());
         // max_id = 0 → saturating_add(1) = 1; max(loaded 0, 1).max(1) = 1
@@ -5223,6 +5397,8 @@ mod tests {
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: stored,
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 3);
         assert_eq!(next_id, 4);
@@ -5382,8 +5558,11 @@ mod tests {
                 output_format: "markdown".into(),
                 outcome: StoredOutcome::Failed("x".into()),
                 archived: false,
+                artifact_deferred: false,
             }],
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 0);
