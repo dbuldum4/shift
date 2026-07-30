@@ -2638,11 +2638,18 @@ impl Shift {
 
     /// Cache an in-memory artifact and stage it under a user-facing file name.
     ///
-    /// This writes bytes to disk and may hard-link/copy large files, so it must
-    /// run on the background executor, not the UI thread.
+    /// This writes bytes to disk and **copies** into the export staging path (never
+    /// hard-links the canonical cache entry), so it must run on the background
+    /// executor, not the UI thread. After a successful store, runs [`purge_now`]
+    /// so TTL/size budgets apply promptly; the app also purges on startup and
+    /// should keep calling `purge_now` periodically (idle timer is fine).
     fn stage_ready_artifact(artifact: &ConversionArtifact) -> Result<PathBuf, io::Error> {
         let cache_path = cache_artifact_bytes(&artifact.file_name, &artifact.bytes)?;
-        stage_export_file(&artifact.file_name, &cache_path)
+        let staged = stage_export_file(&artifact.file_name, &cache_path)?;
+        // Best-effort: free expired/oversized cache entries after each write.
+        // Leased paths (if any) are skipped inside purge.
+        let _ = shift_core::purge_now();
+        Ok(staged)
     }
 
     /// Mark conversion Ready. Export staging is lazy (first Reveal / Open / drag)
@@ -2673,7 +2680,7 @@ impl Shift {
         }
 
         // Large binary artifacts are staged on the background executor so the
-        // UI thread does not block on disk writes / hard-links.
+        // UI thread does not block on disk writes / copies.
         let selection_generation = self.selection_generation;
         let conversion_generation = self.conversion_generation;
         let artifact = Arc::clone(artifact);
@@ -4478,7 +4485,10 @@ pub(crate) fn main() {
 
         // Warm the open/save panel service so the first click is fast.
         file_picker::prewarm();
-        let _ = shift_core::purge_artifact_cache_defaults();
+        // Periodic artifact-cache hygiene: startup purge (TTL + size budget).
+        // Also invoked after each staged write via `stage_ready_artifact` → purge_now.
+        // Optional: schedule additional idle `purge_now` calls for long sessions.
+        let _ = shift_core::purge_now();
 
         cx.activate(true);
     });
