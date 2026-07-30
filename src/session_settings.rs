@@ -8,12 +8,16 @@ use crate::conversion::{
 };
 use crate::history::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SETTINGS_VERSION: u32 = 3;
 const SETTINGS_FILE_NAME: &str = "session-settings.json";
+/// Hard ceiling on settings JSON size (protects against hostile/corrupt blobs).
+pub const MAX_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
+const SETTINGS_LOCK_SUFFIX: &str = ".lock";
 
 /// Default history sidebar width in logical pixels (matches app constant).
 pub const DEFAULT_HISTORY_SIDEBAR_WIDTH: f32 = 240.0;
@@ -421,9 +425,14 @@ impl SessionDoclingOptions {
                 .parse()
                 .unwrap_or(DoclingVideoSamplingMode::default()),
             video_frame_interval_secs: if self.video_frame_interval_secs.is_finite()
-                && self.video_frame_interval_secs > 0.0
+                && self.video_frame_interval_secs
+                    >= crate::conversion::MIN_VIDEO_FRAME_INTERVAL_SECS
             {
                 self.video_frame_interval_secs
+            } else if self.video_frame_interval_secs.is_finite()
+                && self.video_frame_interval_secs > 0.0
+            {
+                crate::conversion::MIN_VIDEO_FRAME_INTERVAL_SECS
             } else {
                 defaults.video_frame_interval_secs
             },
@@ -431,6 +440,7 @@ impl SessionDoclingOptions {
                 && self.video_cuts_per_minute >= 0.0
             {
                 self.video_cuts_per_minute
+                    .min(crate::conversion::MAX_VIDEO_CUTS_PER_MINUTE)
             } else {
                 defaults.video_cuts_per_minute
             },
@@ -560,15 +570,110 @@ pub fn application_support_dir() -> Option<PathBuf> {
     }
 }
 
-/// Load session settings from `path`, or defaults when missing / invalid.
-pub fn load_session_settings(path: impl AsRef<Path>) -> SessionSettings {
+/// Outcome of loading session settings from disk.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionSettingsLoad {
+    /// File was absent; caller may use defaults.
+    Missing,
+    /// Parsed successfully (possibly migrated from an older schema version).
+    Loaded(SessionSettings),
+    /// Corrupt / oversized / unreadable file was quarantined to `bad_path`.
+    /// In-memory defaults are returned; the original blob is preserved for recovery.
+    Quarantined {
+        settings: SessionSettings,
+        bad_path: PathBuf,
+    },
+    /// File declared a newer schema than this build understands.
+    /// Known fields were applied; callers must not downgrade-write over the file.
+    FutureVersion {
+        settings: SessionSettings,
+        version: u32,
+    },
+}
+
+impl SessionSettingsLoad {
+    pub fn settings(&self) -> SessionSettings {
+        match self {
+            Self::Missing => SessionSettings::default(),
+            Self::Loaded(settings)
+            | Self::Quarantined { settings, .. }
+            | Self::FutureVersion { settings, .. } => settings.clone(),
+        }
+    }
+
+    /// True when a subsequent save would clobber a newer schema file.
+    pub fn write_blocked(&self) -> bool {
+        matches!(self, Self::FutureVersion { .. })
+    }
+
+    /// True when the prior on-disk payload was moved aside as unreadable.
+    pub fn was_quarantined(&self) -> bool {
+        matches!(self, Self::Quarantined { .. })
+    }
+}
+
+/// Load session settings with full status (quarantine / future version).
+pub fn load_session_settings_detailed(path: impl AsRef<Path>) -> SessionSettingsLoad {
     let path = path.as_ref();
-    let Ok(bytes) = fs::read(path) else {
-        return SessionSettings::default();
+    if !path.exists() {
+        return SessionSettingsLoad::Missing;
+    }
+
+    let metadata = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return SessionSettingsLoad::Quarantined {
+                settings: SessionSettings::default(),
+                bad_path: quarantine_settings_file(path)
+                    .unwrap_or_else(|_| path.with_extension("json.bad")),
+            };
+        }
     };
+    if metadata.len() > MAX_SETTINGS_FILE_BYTES {
+        let bad_path =
+            quarantine_settings_file(path).unwrap_or_else(|_| path.with_extension("json.bad"));
+        return SessionSettingsLoad::Quarantined {
+            settings: SessionSettings::default(),
+            bad_path,
+        };
+    }
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            return SessionSettingsLoad::Quarantined {
+                settings: SessionSettings::default(),
+                bad_path: quarantine_settings_file(path)
+                    .unwrap_or_else(|_| path.with_extension("json.bad")),
+            };
+        }
+    };
+    let mut bytes = Vec::new();
+    // Bound the read even if the file grew after the size check.
+    let limit = (MAX_SETTINGS_FILE_BYTES as usize).saturating_add(1);
+    let mut limited = (&mut file).take(limit as u64);
+    if limited.read_to_end(&mut bytes).is_err() || bytes.len() > MAX_SETTINGS_FILE_BYTES as usize {
+        let bad_path =
+            quarantine_settings_file(path).unwrap_or_else(|_| path.with_extension("json.bad"));
+        return SessionSettingsLoad::Quarantined {
+            settings: SessionSettings::default(),
+            bad_path,
+        };
+    }
+
     match serde_json::from_slice::<SessionSettings>(&bytes) {
         Ok(mut settings) => {
-            if settings.version < SETTINGS_VERSION {
+            let on_disk_version = settings.version;
+            if on_disk_version > SETTINGS_VERSION {
+                settings.history_limit = settings
+                    .history_limit
+                    .clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
+                return SessionSettingsLoad::FutureVersion {
+                    settings,
+                    version: on_disk_version,
+                };
+            }
+            if on_disk_version < SETTINGS_VERSION {
                 // Existing installations have already learned the core workflow;
                 // reserve the first-run guide for genuinely new sessions.
                 settings.onboarding_completed = true;
@@ -577,28 +682,180 @@ pub fn load_session_settings(path: impl AsRef<Path>) -> SessionSettings {
             settings.history_limit = settings
                 .history_limit
                 .clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
-            // Future migrations can branch on version here.
-            settings
+            SessionSettingsLoad::Loaded(settings)
         }
-        Err(_) => SessionSettings::default(),
+        Err(_) => {
+            let bad_path =
+                quarantine_settings_file(path).unwrap_or_else(|_| path.with_extension("json.bad"));
+            SessionSettingsLoad::Quarantined {
+                settings: SessionSettings::default(),
+                bad_path,
+            }
+        }
     }
 }
 
-/// Atomically write session settings to `path`.
+/// Load session settings from `path`, or defaults when missing / quarantined.
+///
+/// Corrupt files are moved to a `.bad` sibling and **not** overwritten with
+/// defaults. Use [`save_session_settings`] only after intentional recovery.
+pub fn load_session_settings(path: impl AsRef<Path>) -> SessionSettings {
+    load_session_settings_detailed(path).settings()
+}
+
+/// Move a bad settings file aside. Returns the quarantine path.
+pub fn quarantine_settings_file(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(SETTINGS_FILE_NAME);
+    let bad_name = format!("{file_name}.bad.{token}");
+    let bad_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(bad_name);
+    match fs::rename(path, &bad_path) {
+        Ok(()) => Ok(bad_path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(bad_path),
+        Err(error) => Err(error),
+    }
+}
+
+/// Read the schema `version` field from an existing settings file, if present.
+fn peek_settings_version(path: &Path) -> io::Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_SETTINGS_FILE_BYTES {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_SETTINGS_FILE_BYTES as usize {
+        return Ok(None);
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(value
+        .get("version")
+        .and_then(|version| version.as_u64())
+        .map(|version| version as u32))
+}
+
+/// Atomically write session settings to `path` (unique temp + rename).
+///
+/// Refuses to overwrite a file whose schema version is higher than this build
+/// supports (no silent downgrade). Uses a short-lived exclusive lock file next
+/// to the destination when possible.
 pub fn save_session_settings(path: impl AsRef<Path>, settings: &SessionSettings) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    if let Some(existing_version) = peek_settings_version(path)?
+        && existing_version > SETTINGS_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to downgrade session settings (on-disk version {existing_version} > {SETTINGS_VERSION})"
+            ),
+        ));
+    }
+
     let mut payload = settings.clone();
+    // Never raise past a future version we loaded and are rewriting only when
+    // the on-disk version was <= current (checked above).
     payload.version = SETTINGS_VERSION;
     // Defensive: never serialize a password even if a caller stuffed one somehow.
     let json = serde_json::to_vec_pretty(&payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(SETTINGS_FILE_NAME);
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), token));
+    let lock_path = parent.join(format!("{file_name}{SETTINGS_LOCK_SUFFIX}"));
+
+    let _lock_guard = SettingsLock::acquire(&lock_path)?;
+
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&temporary, permissions)?;
+        }
+        file.write_all(&json)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+struct SettingsLock {
+    path: PathBuf,
+}
+
+impl SettingsLock {
+    fn acquire(path: &Path) -> io::Result<Option<Self>> {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => {
+                drop(file);
+                Ok(Some(Self {
+                    path: path.to_path_buf(),
+                }))
+            }
+            // Lock is best-effort: if we cannot create it exclusively, still
+            // proceed so a stale lock cannot brick settings forever.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Load from the default path (or defaults).
@@ -606,6 +863,14 @@ pub fn load_default_session_settings() -> SessionSettings {
     match default_session_settings_path() {
         Some(path) => load_session_settings(path),
         None => SessionSettings::default(),
+    }
+}
+
+/// Load defaults with full status from the default path.
+pub fn load_default_session_settings_detailed() -> SessionSettingsLoad {
+    match default_session_settings_path() {
+        Some(path) => load_session_settings_detailed(path),
+        None => SessionSettingsLoad::Missing,
     }
 }
 
@@ -826,12 +1091,84 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_json_returns_defaults() {
+    fn corrupt_json_quarantines_and_does_not_overwrite() {
         let dir = unique_dir("corrupt");
         let path = dir.join("session-settings.json");
-        fs::write(&path, b"{not valid json").unwrap();
-        let loaded = load_session_settings(&path);
-        assert_eq!(loaded, SessionSettings::default());
+        let original = b"{not valid json";
+        fs::write(&path, original).unwrap();
+        let detailed = load_session_settings_detailed(&path);
+        assert!(detailed.was_quarantined(), "{detailed:?}");
+        assert_eq!(detailed.settings(), SessionSettings::default());
+        assert!(!path.exists(), "corrupt file must be moved aside");
+        let SessionSettingsLoad::Quarantined { bad_path, .. } = detailed else {
+            panic!("expected quarantine");
+        };
+        assert!(bad_path.exists());
+        assert_eq!(fs::read(&bad_path).unwrap(), original);
+        // Recovery is an intentional save of good settings — not a silent rewrite.
+        save_session_settings(&path, &SessionSettings::default()).unwrap();
+        assert!(path.exists());
+        assert!(bad_path.exists(), "quarantine evidence must remain");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_settings_file_is_quarantined() {
+        let dir = unique_dir("oversized");
+        let path = dir.join("session-settings.json");
+        let mut blob = Vec::with_capacity((MAX_SETTINGS_FILE_BYTES as usize) + 65);
+        blob.push(b'{');
+        blob.extend(std::iter::repeat_n(
+            b'x',
+            (MAX_SETTINGS_FILE_BYTES as usize) + 64,
+        ));
+        fs::write(&path, &blob).unwrap();
+        let detailed = load_session_settings_detailed(&path);
+        assert!(detailed.was_quarantined());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_uses_unique_temp_and_does_not_leave_tmp() {
+        let dir = unique_dir("atomic-tmp");
+        let path = dir.join("session-settings.json");
+        save_session_settings(&path, &SessionSettings::default()).unwrap();
+        assert!(path.exists());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp") || name.ends_with(".lock"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp/lock files should be cleaned up: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refuse_downgrade_when_on_disk_version_is_newer() {
+        let dir = unique_dir("no-downgrade");
+        let path = dir.join("session-settings.json");
+        let future = SessionSettings {
+            version: SETTINGS_VERSION + 5,
+            show_archived: true,
+            history_limit: 11,
+            ..Default::default()
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+        let loaded = load_session_settings_detailed(&path);
+        assert!(loaded.write_blocked(), "{loaded:?}");
+        assert_eq!(loaded.settings().version, SETTINGS_VERSION + 5);
+
+        let err = save_session_settings(&path, &SessionSettings::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("downgrade"), "{err}");
+        // On-disk future file must be preserved.
+        let still = fs::read_to_string(&path).unwrap();
+        assert!(still.contains(&format!("\"version\": {}", SETTINGS_VERSION + 5)));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1381,7 +1718,9 @@ mod tests {
         // Write raw JSON so save_session_settings does not rewrite the future version.
         fs::write(&path, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
 
-        let loaded = load_session_settings(&path);
+        let detailed = load_session_settings_detailed(&path);
+        assert!(detailed.write_blocked());
+        let loaded = detailed.settings();
         assert_eq!(
             loaded.version,
             SETTINGS_VERSION + 1,

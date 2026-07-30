@@ -49,7 +49,8 @@ pub use diagnostics::{
 };
 pub use docling::{
     DoclingAsrModel, DoclingImageExportMode, DoclingModule, DoclingOptions, DoclingTableMode,
-    DoclingVideoSamplingMode, is_docling_audio_input, is_docling_timed_input,
+    DoclingVideoSamplingMode, MAX_VIDEO_CUTS_PER_MINUTE, MAX_VIDEO_REPRESENTATIVE_FRAMES,
+    MIN_VIDEO_FRAME_INTERVAL_SECS, is_docling_audio_input, is_docling_timed_input,
     is_docling_video_input,
 };
 pub use ffmpeg::{

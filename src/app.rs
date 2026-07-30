@@ -509,7 +509,12 @@ impl Shift {
                     .unwrap_or_default(),
             )
         });
-        let pdf_password_input = cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+        let pdf_password_input = cx.new(|cx| {
+            let mut input = TextInput::new(cx, "password (not saved)", "");
+            input.set_masked(true, cx);
+            debug_assert!(input.is_masked());
+            input
+        });
         let pdf_split_pages_input = cx.new(|cx| {
             TextInput::new(
                 cx,
@@ -1614,6 +1619,9 @@ impl Shift {
         self.selected_url = None;
         self.url_input
             .update(cx, |input, cx| input.set_content("", cx));
+        // Secrets are source-scoped: never reuse a prior PDF password on a new file.
+        self.pdf_password_input
+            .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = Some(build_file_preview_with_size(&path, "…".into()));
         self.selected_file = Some(path.clone());
         self.rebuild_output_caches();
@@ -1900,6 +1908,9 @@ impl Shift {
         self.file_preview = Some(build_url_preview(&url));
         self.url_input
             .update(cx, |input, cx| input.set_content(url.clone(), cx));
+        // Secrets are source-scoped: clear any prior PDF password when the source changes.
+        self.pdf_password_input
+            .update(cx, |input, cx| input.set_content("", cx));
         self.rebuild_output_caches();
 
         let available_outputs = &self.cached_available_outputs;
@@ -2586,7 +2597,12 @@ impl Shift {
     }
 
     pub(crate) fn persist_session_settings(&self, cx: &App) {
-        let mut settings = load_default_session_settings();
+        // Never silently clobber a newer schema or quarantine without recovery.
+        let loaded = shift_core::load_default_session_settings_detailed();
+        if loaded.write_blocked() {
+            return;
+        }
+        let mut settings = loaded.settings();
         settings.set_output_format(self.output_format);
         settings.batch_output_dir = self.batch_output_dir.clone();
         settings.batch_force = self.batch_force;
@@ -3151,6 +3167,8 @@ impl Shift {
         self.selected_file = None;
         self.selected_url = None;
         self.url_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        self.pdf_password_input
             .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = None;
         self.conversion = ConversionState::Empty;

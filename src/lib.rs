@@ -21,9 +21,10 @@ pub use recipes::{
     validate_naming_template, validate_recipe_name,
 };
 pub use session_settings::{
-    SessionConversionOptions, SessionSettings, application_support_dir,
-    default_session_settings_path, load_default_session_settings, load_session_settings,
-    save_default_session_settings, save_session_settings,
+    MAX_SETTINGS_FILE_BYTES, SessionConversionOptions, SessionSettings, SessionSettingsLoad,
+    application_support_dir, default_session_settings_path, load_default_session_settings,
+    load_default_session_settings_detailed, load_session_settings, load_session_settings_detailed,
+    quarantine_settings_file, save_default_session_settings, save_session_settings,
 };
 
 /// Serializes `shift_core` tests that mutate process-global state: env vars
