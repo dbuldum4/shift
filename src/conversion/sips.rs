@@ -9,8 +9,8 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
     OutputFormat, TempDirGuard, command_argv_parts, format_argv_display, map_spawn_error,
-    max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command_cancellable, unique_temp_dir,
+    max_output_bytes, process_timeout, push_flag_path, push_path_arg, read_file_limited,
+    resolve_tool_executable, run_command_cancellable_with_output_paths, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -286,7 +286,9 @@ impl SipsModule {
             if knobs.strip_color_profile {
                 command.arg("--deleteColorManagementProperties");
             }
-            command.arg(input).arg("--out").arg(&produced);
+            // Input as absolute positional operand; `--out` takes the product path.
+            push_path_arg(&mut command, input)?;
+            let produced_abs = push_flag_path(&mut command, "--out", &produced);
 
             invocations.push(InvocationRecord {
                 module_id: self.id(),
@@ -299,11 +301,12 @@ impl SipsModule {
                 )));
             }
 
-            let output = run_command_cancellable(
+            let output = run_command_cancellable_with_output_paths(
                 command,
                 process_timeout(),
                 max_output_bytes(),
                 options.cancel.clone(),
+                std::slice::from_ref(&produced_abs),
             )
             .map_err(|error| {
                 map_spawn_error(

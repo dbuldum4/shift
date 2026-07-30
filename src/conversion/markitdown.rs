@@ -114,7 +114,8 @@ impl ConversionModule for MarkItDownModule {
         }
 
         let mut command = Command::new(&self.executable);
-        command.arg(input);
+        // Absolute path first (CLI / fakes treat $1 as the input file).
+        super::push_operand_path(&mut command, input)?;
         if options.markitdown.keep_data_uris {
             command.arg("--keep-data-uris");
         }
