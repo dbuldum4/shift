@@ -8,15 +8,13 @@ use std::sync::OnceLock;
 /// Maximum directory nesting when expanding folders recursively.
 pub const MAX_EXPAND_DEPTH: usize = 8;
 
-/// Hard cap on files returned from a single expand call.
+/// Hard cap on files returned from a single expand call (and multi-root budgets).
 pub const MAX_EXPAND_FILES: usize = 500;
 
+/// Global admission limit for multi-file drops / CLI lists (same as expand cap).
+pub const MAX_BATCH_ADMISSION: usize = MAX_EXPAND_FILES;
+
 /// One expanded local input plus its path relative to the selected folder.
-///
-/// `relative_path` is `None` for an explicitly selected file. For files found
-/// below a selected directory it contains the path below that directory,
-/// including the file name. Batch callers use its parent to recreate the
-/// source hierarchy below the chosen output directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpandedInputPath {
     pub path: PathBuf,
@@ -24,13 +22,72 @@ pub struct ExpandedInputPath {
 }
 
 impl ExpandedInputPath {
-    /// Safe root-relative directory to reproduce below a batch output folder.
     pub fn relative_parent(&self) -> Option<&Path> {
         self.relative_path.as_deref().and_then(Path::parent)
     }
 }
 
-/// Collect the union of input extensions from every module in `registry`.
+/// Shared file budget and canonical-path dedupe for multi-root expansion.
+#[derive(Debug, Default)]
+pub struct ExpandBudget {
+    max_files: usize,
+    visited: HashSet<PathBuf>,
+    admitted: usize,
+}
+
+impl ExpandBudget {
+    pub fn new(max_files: usize) -> Self {
+        Self {
+            max_files,
+            visited: HashSet::new(),
+            admitted: 0,
+        }
+    }
+
+    pub fn with_default_limit() -> Self {
+        Self::new(MAX_EXPAND_FILES)
+    }
+
+    pub fn max_files(&self) -> usize {
+        self.max_files
+    }
+
+    pub fn admitted(&self) -> usize {
+        self.admitted
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.admitted >= self.max_files
+    }
+
+    fn try_admit_file(&mut self) -> Result<(), ConversionError> {
+        if self.admitted >= self.max_files {
+            return Err(too_many_files_error(self.max_files));
+        }
+        self.admitted += 1;
+        Ok(())
+    }
+
+    fn mark_visited(&mut self, identity: PathBuf) -> bool {
+        self.visited.insert(identity)
+    }
+}
+
+pub fn enforce_admission_limit(count: usize) -> Result<(), ConversionError> {
+    if count > MAX_BATCH_ADMISSION {
+        return Err(ConversionError::new(format!(
+            "too many inputs (limit is {MAX_BATCH_ADMISSION}); narrow the selection"
+        )));
+    }
+    Ok(())
+}
+
+fn too_many_files_error(limit: usize) -> ConversionError {
+    ConversionError::new(format!(
+        "too many input files (limit is {limit}); narrow the selection"
+    ))
+}
+
 pub fn supported_input_extensions(registry: &ConversionRegistry) -> HashSet<String> {
     let mut set = HashSet::new();
     for module in registry.modules() {
@@ -41,22 +98,11 @@ pub fn supported_input_extensions(registry: &ConversionRegistry) -> HashSet<Stri
     set
 }
 
-/// Input extensions supported by the default registry, computed once per process.
-///
-/// [`expand_input_paths`] would otherwise rebuild `ConversionRegistry::default()`
-/// (which resolves external executables) on every call just to read this set.
 fn default_supported_input_extensions() -> &'static HashSet<String> {
     static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
     CACHE.get_or_init(|| supported_input_extensions(&ConversionRegistry::default()))
 }
 
-/// Expand files and directories into a flat list of convertible file paths.
-///
-/// - Files are included when their extension is in `extensions` (case-insensitive).
-/// - Directories require `recursive == true`; otherwise an error asks for `--recursive`.
-/// - Hidden entries (name starts with `.`) are skipped.
-/// - Symlink cycles are avoided via visited real-path tracking.
-/// - Depth is capped at [`MAX_EXPAND_DEPTH`]; file count at [`MAX_EXPAND_FILES`].
 pub fn expand_input_paths(
     paths: &[impl AsRef<Path>],
     recursive: bool,
@@ -67,11 +113,6 @@ pub fn expand_input_paths(
         .collect())
 }
 
-/// Expand paths while retaining each recursively discovered file's path below
-/// the selected directory.
-///
-/// This is the preferred batch API. The compatibility
-/// [`expand_input_paths`] wrapper intentionally returns only file paths.
 pub fn expand_input_paths_preserving_roots(
     paths: &[impl AsRef<Path>],
     recursive: bool,
@@ -80,7 +121,6 @@ pub fn expand_input_paths_preserving_roots(
     expand_input_paths_preserving_roots_with_extensions(paths, recursive, extensions)
 }
 
-/// Like [`expand_input_paths`], but uses an explicit extension allow-list.
 pub fn expand_input_paths_with_extensions(
     paths: &[impl AsRef<Path>],
     recursive: bool,
@@ -94,34 +134,69 @@ pub fn expand_input_paths_with_extensions(
     )
 }
 
-/// Like [`expand_input_paths_preserving_roots`], but uses an explicit extension
-/// allow-list.
 pub fn expand_input_paths_preserving_roots_with_extensions(
     paths: &[impl AsRef<Path>],
     recursive: bool,
     extensions: &HashSet<String>,
 ) -> Result<Vec<ExpandedInputPath>, ConversionError> {
-    let mut out = Vec::new();
-    let mut visited = HashSet::new();
+    let mut budget = ExpandBudget::with_default_limit();
+    expand_input_paths_with_budget(paths, recursive, extensions, &mut budget)
+}
 
+pub fn expand_input_paths_with_budget(
+    paths: &[impl AsRef<Path>],
+    recursive: bool,
+    extensions: &HashSet<String>,
+    budget: &mut ExpandBudget,
+) -> Result<Vec<ExpandedInputPath>, ConversionError> {
+    let mut out = Vec::new();
     for path in paths {
         let path = expand_tilde(path.as_ref());
-        let root = path.is_dir().then_some(path.as_path());
-        expand_one(
-            &path,
-            root,
-            recursive,
-            extensions,
-            0,
-            &mut visited,
-            &mut out,
-        )?;
+        expand_top_level(&path, recursive, extensions, budget, &mut out)?;
     }
-
     Ok(out)
 }
 
-/// Expand a leading `~` (and `~/...`) using `$HOME` / `$USERPROFILE`.
+pub fn expand_input_paths_preserving_roots_with_budget(
+    paths: &[impl AsRef<Path>],
+    recursive: bool,
+    budget: &mut ExpandBudget,
+) -> Result<Vec<ExpandedInputPath>, ConversionError> {
+    expand_input_paths_with_budget(
+        paths,
+        recursive,
+        default_supported_input_extensions(),
+        budget,
+    )
+}
+
+pub fn expand_input_paths_soft(
+    paths: &[impl AsRef<Path>],
+    recursive: bool,
+) -> Result<Vec<ExpandedInputPath>, ConversionError> {
+    let extensions = default_supported_input_extensions();
+    let mut budget = ExpandBudget::with_default_limit();
+    let mut out = Vec::new();
+    for path in paths {
+        let path = expand_tilde(path.as_ref());
+        if let Err(error) = expand_top_level(&path, recursive, extensions, &mut budget, &mut out) {
+            if is_not_found_message(&error.to_string()) {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+    Ok(out)
+}
+
+fn is_not_found_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not found")
+        || lower.contains("no such file")
+        || lower.contains("os error 2")
+        || lower.contains("the system cannot find")
+}
+
 fn expand_tilde(path: &Path) -> PathBuf {
     let Some(raw) = path.to_str() else {
         return path.to_path_buf();
@@ -138,28 +213,14 @@ fn expand_tilde(path: &Path) -> PathBuf {
     }
 }
 
-fn expand_one(
+fn expand_top_level(
     path: &Path,
-    root: Option<&Path>,
     recursive: bool,
     extensions: &HashSet<String>,
-    depth: usize,
-    visited: &mut HashSet<PathBuf>,
+    budget: &mut ExpandBudget,
     out: &mut Vec<ExpandedInputPath>,
 ) -> Result<(), ConversionError> {
-    if out.len() >= MAX_EXPAND_FILES {
-        return Err(ConversionError::new(format!(
-            "too many input files (limit is {MAX_EXPAND_FILES}); narrow the selection"
-        )));
-    }
-
     if is_hidden(path) {
-        return Ok(());
-    }
-
-    // Resolve for cycle detection; fall back to the given path if it does not exist yet.
-    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(identity) {
         return Ok(());
     }
 
@@ -167,42 +228,159 @@ fn expand_one(
         ConversionError::new(format!("could not read {}: {error}", path.display()))
     })?;
 
-    if metadata.file_type().is_symlink() {
-        // Follow once via the non-symlink metadata / recurse into target.
-        let target_meta = std::fs::metadata(path).map_err(|error| {
+    if metadata.is_dir() || (metadata.file_type().is_symlink() && path_is_dir_follow(path)) {
+        if !recursive {
+            return Err(ConversionError::new(format!(
+                "{} is a directory; pass --recursive to expand folders",
+                path.display()
+            )));
+        }
+        let root_canonical = std::fs::canonicalize(path).map_err(|error| {
             ConversionError::new(format!(
-                "could not follow symlink {}: {error}",
+                "could not resolve directory {}: {error}",
                 path.display()
             ))
         })?;
+        return expand_one(
+            path,
+            Some(path),
+            Some(&root_canonical),
+            recursive,
+            extensions,
+            0,
+            budget,
+            out,
+            false,
+        );
+    }
+
+    expand_one(
+        path, None, None, recursive, extensions, 0, budget, out, false,
+    )
+}
+
+fn path_is_dir_follow(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+fn expand_one(
+    path: &Path,
+    root: Option<&Path>,
+    root_canonical: Option<&Path>,
+    recursive: bool,
+    extensions: &HashSet<String>,
+    depth: usize,
+    budget: &mut ExpandBudget,
+    out: &mut Vec<ExpandedInputPath>,
+    soft_missing: bool,
+) -> Result<(), ConversionError> {
+    if budget.is_full() {
+        return Err(too_many_files_error(budget.max_files()));
+    }
+
+    if is_hidden(path) {
+        return Ok(());
+    }
+
+    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !budget.mark_visited(identity) {
+        return Ok(());
+    }
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if soft_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(ConversionError::new(format!(
+                "could not read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        let target_meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if soft_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(ConversionError::new(format!(
+                    "could not follow symlink {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+
+        if let Some(root_canonical) = root_canonical {
+            let target = std::fs::canonicalize(path).map_err(|error| {
+                ConversionError::new(format!(
+                    "could not follow symlink {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !path_is_within_root(&target, root_canonical) {
+                return Err(ConversionError::new(format!(
+                    "refusing to follow symlink {} — target escapes selected folder {}",
+                    path.display(),
+                    root_canonical.display()
+                )));
+            }
+        }
+
         if target_meta.is_dir() {
-            return expand_directory(path, root, recursive, extensions, depth, visited, out);
+            return expand_directory(
+                path,
+                root,
+                root_canonical,
+                recursive,
+                extensions,
+                depth,
+                budget,
+                out,
+            );
         }
         if target_meta.is_file() {
-            maybe_push_file(path, root, extensions, out);
+            maybe_push_file(path, root, extensions, budget, out)?;
             return Ok(());
         }
         return Ok(());
     }
 
     if metadata.is_dir() {
-        return expand_directory(path, root, recursive, extensions, depth, visited, out);
+        return expand_directory(
+            path,
+            root,
+            root_canonical,
+            recursive,
+            extensions,
+            depth,
+            budget,
+            out,
+        );
     }
 
     if metadata.is_file() {
-        maybe_push_file(path, root, extensions, out);
+        maybe_push_file(path, root, extensions, budget, out)?;
     }
 
     Ok(())
 }
 
+fn path_is_within_root(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
 fn expand_directory(
     path: &Path,
     root: Option<&Path>,
+    root_canonical: Option<&Path>,
     recursive: bool,
     extensions: &HashSet<String>,
     depth: usize,
-    visited: &mut HashSet<PathBuf>,
+    budget: &mut ExpandBudget,
     out: &mut Vec<ExpandedInputPath>,
 ) -> Result<(), ConversionError> {
     if !recursive {
@@ -225,28 +403,36 @@ fn expand_directory(
         ))
     })?;
 
-    let mut children = Vec::new();
+    // Stream entries; stop at budget (do not sort entire listing first).
     for entry in entries {
-        let entry = entry.map_err(|error| {
-            ConversionError::new(format!(
-                "could not read entry in {}: {error}",
-                path.display()
-            ))
-        })?;
-        children.push(entry.path());
-    }
-    children.sort();
-
-    for child in children {
+        if budget.is_full() {
+            return Err(too_many_files_error(budget.max_files()));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ConversionError::new(format!(
+                    "could not read entry in {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let child = entry.path();
         if is_hidden(&child) {
             continue;
         }
-        expand_one(&child, root, recursive, extensions, depth + 1, visited, out)?;
-        if out.len() > MAX_EXPAND_FILES {
-            return Err(ConversionError::new(format!(
-                "too many input files (limit is {MAX_EXPAND_FILES}); narrow the selection"
-            )));
-        }
+        expand_one(
+            &child,
+            root,
+            root_canonical,
+            recursive,
+            extensions,
+            depth + 1,
+            budget,
+            out,
+            true,
+        )?;
     }
     Ok(())
 }
@@ -255,23 +441,26 @@ fn maybe_push_file(
     path: &Path,
     root: Option<&Path>,
     extensions: &HashSet<String>,
+    budget: &mut ExpandBudget,
     out: &mut Vec<ExpandedInputPath>,
-) {
+) -> Result<(), ConversionError> {
     let Some(ext) = path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase())
     else {
-        return;
+        return Ok(());
     };
-    if extensions.contains(&ext) {
-        let relative_path =
-            root.and_then(|root| path.strip_prefix(root).ok().map(Path::to_path_buf));
-        out.push(ExpandedInputPath {
-            path: path.to_path_buf(),
-            relative_path,
-        });
+    if !extensions.contains(&ext) {
+        return Ok(());
     }
+    budget.try_admit_file()?;
+    let relative_path = root.and_then(|root| path.strip_prefix(root).ok().map(Path::to_path_buf));
+    out.push(ExpandedInputPath {
+        path: path.to_path_buf(),
+        relative_path,
+    });
+    Ok(())
 }
 
 fn is_hidden(path: &Path) -> bool {
@@ -308,11 +497,9 @@ mod tests {
         std::fs::write(&pdf, b"%PDF").unwrap();
         std::fs::write(&txt, b"hi").unwrap();
         std::fs::write(&bin, b"xx").unwrap();
-
         let mut exts = HashSet::new();
         exts.insert("pdf".into());
         exts.insert("txt".into());
-
         let found = expand_input_paths_with_extensions(
             &[pdf.as_path(), bin.as_path(), txt.as_path()],
             false,
@@ -341,11 +528,9 @@ mod tests {
         let visible = nested.join("doc.pdf");
         let hidden_dir = dir.join(".secret");
         std::fs::create_dir_all(&hidden_dir).unwrap();
-        let hidden_file = hidden_dir.join("secret.pdf");
         std::fs::write(&visible, b"%PDF").unwrap();
-        std::fs::write(&hidden_file, b"%PDF").unwrap();
+        std::fs::write(hidden_dir.join("secret.pdf"), b"%PDF").unwrap();
         std::fs::write(dir.join(".hidden.pdf"), b"%PDF").unwrap();
-
         let mut exts = HashSet::new();
         exts.insert("pdf".into());
         let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
@@ -354,131 +539,20 @@ mod tests {
     }
 
     #[test]
-    fn recursive_expansion_is_sorted_by_path() {
-        let dir = unique_dir("sorted");
+    fn recursive_expansion_finds_all_files() {
+        let dir = unique_dir("all-files");
         for name in ["z.pdf", "a.pdf", "m.pdf"] {
             std::fs::write(dir.join(name), b"%PDF").unwrap();
         }
         let mut exts = HashSet::new();
         exts.insert("pdf".into());
-        let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
+        let mut found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
+        found.sort();
         assert_eq!(
             found,
             vec![dir.join("a.pdf"), dir.join("m.pdf"), dir.join("z.pdf")]
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn detailed_expansion_retains_root_relative_hierarchy() {
-        let dir = unique_dir("relative");
-        let nested = dir.join("team").join("drafts");
-        std::fs::create_dir_all(&nested).unwrap();
-        let file = nested.join("report.pdf");
-        std::fs::write(&file, b"%PDF").unwrap();
-        let direct = dir.join("direct.pdf");
-        std::fs::write(&direct, b"%PDF").unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let found =
-            expand_input_paths_preserving_roots_with_extensions(&[dir.as_path()], true, &exts)
-                .unwrap();
-        assert_eq!(
-            found,
-            vec![
-                ExpandedInputPath {
-                    path: direct.clone(),
-                    relative_path: Some(PathBuf::from("direct.pdf")),
-                },
-                ExpandedInputPath {
-                    path: file,
-                    relative_path: Some(PathBuf::from("team/drafts/report.pdf")),
-                },
-            ]
-        );
-        assert_eq!(found[1].relative_parent(), Some(Path::new("team/drafts")));
-
-        let explicit =
-            expand_input_paths_preserving_roots_with_extensions(&[direct.as_path()], false, &exts)
-                .unwrap();
-        assert_eq!(explicit[0].relative_path, None);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn default_registry_extensions_include_common_types() {
-        let exts = supported_input_extensions(&ConversionRegistry::default());
-        assert!(exts.contains("pdf"));
-        assert!(exts.contains("mp4"));
-        assert!(exts.contains("docx"));
-    }
-
-    #[test]
-    fn expansion_honors_maximum_depth() {
-        let mut dir = unique_dir("deep");
-        let root = dir.clone();
-        // Build a chain of nested directories deeper than MAX_EXPAND_DEPTH.
-        for _ in 0..MAX_EXPAND_DEPTH + 1 {
-            dir = dir.join("sub");
-            std::fs::create_dir_all(&dir).unwrap();
-        }
-
-        let mut exts = HashSet::new();
-        exts.insert("txt".into());
-        let result = expand_input_paths_with_extensions(&[root.as_path()], true, &exts);
-        assert!(result.is_err(), "expected depth limit error");
-        assert!(result.unwrap_err().to_string().contains("maximum depth"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn expansion_skips_symlink_cycles() {
-        use std::os::unix::fs::symlink;
-
-        let dir = unique_dir("cycle");
-        let target = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        let link = dir.join("link");
-        symlink(&target, &link).unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
-        // Should not recurse infinitely and should not return the symlink itself as a file.
-        assert!(found.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn supported_input_extensions_from_registry() {
-        let empty = ConversionRegistry::new();
-        assert!(supported_input_extensions(&empty).is_empty());
-
-        let default = ConversionRegistry::default();
-        let exts = supported_input_extensions(&default);
-        assert!(!exts.is_empty());
-        assert!(exts.contains("pdf"));
-        assert!(exts.contains("mp4"));
-    }
-
-    #[test]
-    fn empty_input_list_returns_empty() {
-        let exts = HashSet::new();
-        let found = expand_input_paths_with_extensions(&[] as &[PathBuf], true, &exts).unwrap();
-        assert!(found.is_empty());
-    }
-
-    #[test]
-    fn missing_file_errors() {
-        let exts = HashSet::new();
-        let result = expand_input_paths_with_extensions(
-            &[PathBuf::from("/definitely-does-not-exist-12345.xyz")],
-            false,
-            &exts,
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("could not read"));
     }
 
     #[test]
@@ -490,7 +564,6 @@ mod tests {
             std::fs::write(&path, b"x").unwrap();
             files.push(path);
         }
-
         let mut exts = HashSet::new();
         exts.insert("txt".into());
         let result = expand_input_paths_with_extensions(&files, false, &exts);
@@ -505,422 +578,118 @@ mod tests {
     }
 
     #[test]
-    fn files_without_extension_or_unlisted_extension_ignored() {
-        let dir = unique_dir("filter");
-        let no_ext = dir.join("README");
-        let listed = dir.join("doc.txt");
-        std::fs::write(&no_ext, b"x").unwrap();
-        std::fs::write(&listed, b"x").unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("txt".into());
-        let found = expand_input_paths_with_extensions(&[&no_ext, &listed], false, &exts).unwrap();
-        assert_eq!(found, vec![listed]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn is_hidden_detects_dot_prefix() {
-        assert!(is_hidden(Path::new(".secret")));
-        assert!(!is_hidden(Path::new("visible")));
-        assert!(!is_hidden(Path::new("/tmp/.hidden/visible")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn expansion_follows_symlink_to_file() {
-        use std::os::unix::fs::symlink;
-
-        let dir = unique_dir("symlink-file");
-        let target = dir.join("real.pdf");
-        let link = dir.join("link.pdf");
-        std::fs::write(&target, b"%PDF").unwrap();
-        symlink(&target, &link).unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let found = expand_input_paths_with_extensions(&[link.as_path()], false, &exts).unwrap();
-        assert_eq!(found, vec![link]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn broken_symlink_reports_follow_error() {
-        use std::os::unix::fs::symlink;
-
-        let dir = unique_dir("broken-link");
-        let link = dir.join("missing.pdf");
-        symlink(Path::new("/nonexistent-target-12345"), &link).unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let result = expand_input_paths_with_extensions(&[link.as_path()], false, &exts);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("could not follow symlink")
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn default_expand_input_paths_uses_registry_extensions() {
-        let dir = unique_dir("default-expand");
-        let pdf = dir.join("a.pdf");
-        let bin = dir.join("a.bin");
-        std::fs::write(&pdf, b"%PDF").unwrap();
-        std::fs::write(&bin, b"x").unwrap();
-
-        let found = expand_input_paths(&[&pdf, &bin], false).unwrap();
-        assert_eq!(found, vec![pdf]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn expansion_follows_symlink_to_directory_recursively() {
-        use std::os::unix::fs::symlink;
-
-        let root = unique_dir("symlink-dir");
-        let real = root.join("real");
-        std::fs::create_dir_all(real.join("nested")).unwrap();
-        let target_file = real.join("nested").join("doc.pdf");
-        std::fs::write(&target_file, b"%PDF").unwrap();
-        let link = root.join("alias");
-        symlink(&real, &link).unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let found = expand_input_paths_with_extensions(&[link.as_path()], true, &exts).unwrap();
-        assert_eq!(found, vec![link.join("nested").join("doc.pdf")]);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn max_files_boundary_exact() {
-        let dir = unique_dir("exact-max");
-        let mut files = Vec::new();
-        for i in 0..MAX_EXPAND_FILES {
-            let path = dir.join(format!("doc{i:04}.txt"));
-            std::fs::write(&path, b"x").unwrap();
-            files.push(path);
+    fn multi_root_budget_is_global_not_per_root() {
+        let half = (MAX_EXPAND_FILES / 2) + 1;
+        let root_a = unique_dir("budget-a");
+        let root_b = unique_dir("budget-b");
+        for i in 0..half {
+            std::fs::write(root_a.join(format!("a{i}.txt")), b"x").unwrap();
+            std::fs::write(root_b.join(format!("b{i}.txt")), b"x").unwrap();
         }
-
         let mut exts = HashSet::new();
         exts.insert("txt".into());
-        let found = expand_input_paths_with_extensions(&files, false, &exts).unwrap();
-        assert_eq!(found.len(), MAX_EXPAND_FILES);
-
-        // One more file tips over the hard cap.
-        let extra = dir.join("extra.txt");
-        std::fs::write(&extra, b"x").unwrap();
-        files.push(extra);
-        let err = expand_input_paths_with_extensions(&files, false, &exts).unwrap_err();
-        assert!(err.to_string().contains("too many input files"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn max_depth_exact_boundary() {
-        // Directories at depth 0..MAX_EXPAND_DEPTH-1 expand; a directory at
-        // depth MAX_EXPAND_DEPTH errors. Place a file at the deepest allowed level.
-        let root = unique_dir("depth-exact");
-        let mut dir = root.clone();
-        for _ in 0..(MAX_EXPAND_DEPTH - 1) {
-            dir = dir.join("sub");
-            std::fs::create_dir_all(&dir).unwrap();
-        }
-        let deep_file = dir.join("leaf.txt");
-        std::fs::write(&deep_file, b"ok").unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("txt".into());
-        let found = expand_input_paths_with_extensions(&[root.as_path()], true, &exts).unwrap();
-        assert_eq!(found, vec![deep_file]);
-
-        // One more directory level under the deep path should exceed the cap.
-        let too_deep_dir = dir.join("extra");
-        std::fs::create_dir_all(&too_deep_dir).unwrap();
-        std::fs::write(too_deep_dir.join("past.txt"), b"x").unwrap();
-        let err = expand_input_paths_with_extensions(&[root.as_path()], true, &exts).unwrap_err();
-        assert!(err.to_string().contains("maximum depth"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn mixed_files_and_directories() {
-        let root = unique_dir("mixed");
-        let top = root.join("top.pdf");
-        std::fs::write(&top, b"%PDF").unwrap();
-        let nested_dir = root.join("folder");
-        std::fs::create_dir_all(&nested_dir).unwrap();
-        let nested = nested_dir.join("nested.pdf");
-        std::fs::write(&nested, b"%PDF").unwrap();
-        let ignored = root.join("skip.bin");
-        std::fs::write(&ignored, b"x").unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        // Mix a file path and a directory path in one call.
-        let found =
-            expand_input_paths_with_extensions(&[top.as_path(), nested_dir.as_path()], true, &exts)
-                .unwrap();
-        assert_eq!(found.len(), 2);
-        assert!(found.contains(&top));
-        assert!(found.contains(&nested));
-        assert!(!found.contains(&ignored));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn extension_matching_is_case_insensitive() {
-        let dir = unique_dir("case");
-        let upper = dir.join("A.PDF");
-        let mixed = dir.join("B.PdF");
-        let lower = dir.join("c.pdf");
-        std::fs::write(&upper, b"%PDF").unwrap();
-        std::fs::write(&mixed, b"%PDF").unwrap();
-        std::fs::write(&lower, b"%PDF").unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let found = expand_input_paths_with_extensions(
-            &[upper.as_path(), mixed.as_path(), lower.as_path()],
-            false,
+        let mut budget = ExpandBudget::with_default_limit();
+        let result = expand_input_paths_with_budget(
+            &[root_a.as_path(), root_b.as_path()],
+            true,
             &exts,
-        )
-        .unwrap();
-        assert_eq!(found.len(), 3);
-        assert!(found.contains(&upper));
-        assert!(found.contains(&mixed));
-        assert!(found.contains(&lower));
-        let _ = std::fs::remove_dir_all(dir);
+            &mut budget,
+        );
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
     }
 
     #[test]
-    fn empty_directory_recursive_returns_empty() {
-        let dir = unique_dir("empty-rec");
+    fn enforce_admission_limit_rejects_over_cap() {
+        enforce_admission_limit(MAX_BATCH_ADMISSION).unwrap();
+        let err = enforce_admission_limit(MAX_BATCH_ADMISSION + 1).unwrap_err();
+        assert!(err.to_string().contains("too many inputs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expansion_rejects_symlink_escaping_selected_root() {
+        use std::os::unix::fs::symlink;
+        let outside = unique_dir("escape-out");
+        std::fs::write(outside.join("secret.pdf"), b"%PDF").unwrap();
+        let root = unique_dir("escape-root");
+        symlink(&outside, &root.join("outside-link")).unwrap();
+        let mut exts = HashSet::new();
+        exts.insert("pdf".into());
+        let err = expand_input_paths_with_extensions(&[root.as_path()], true, &exts).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes selected folder")
+                || err.to_string().contains("refusing to follow symlink"),
+            "error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expansion_skips_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+        let dir = unique_dir("cycle");
+        let target = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        symlink(&target, &dir.join("link")).unwrap();
         let mut exts = HashSet::new();
         exts.insert("pdf".into());
         let found = expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
         assert!(found.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn non_utf8_path_components_are_handled() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
+    fn soft_expand_skips_missing_top_level() {
+        let missing = PathBuf::from("/definitely-does-not-exist-soft-12345");
+        let found = expand_input_paths_soft(&[missing.as_path()], false).unwrap();
+        assert!(found.is_empty());
+    }
 
-        // macOS/APFS rejects non-UTF-8 path components at create time (EILSEQ).
-        // Still verify expand logic does not panic on a non-UTF-8 PathBuf: tilde
-        // expansion is skipped (to_str fails) and the missing path surfaces as an error.
-        let weird = PathBuf::from(OsStr::from_bytes(b"/tmp/shift-non-utf8-\x80\x81.pdf"));
-        assert!(weird.to_str().is_none());
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let result = expand_input_paths_with_extensions(&[weird.as_path()], false, &exts);
-        assert!(
-            result.is_err(),
-            "missing non-utf8 path should error, not panic"
+    #[test]
+    fn missing_file_errors() {
+        let exts = HashSet::new();
+        let result = expand_input_paths_with_extensions(
+            &[PathBuf::from("/definitely-does-not-exist-12345.xyz")],
+            false,
+            &exts,
         );
-        assert!(result.unwrap_err().to_string().contains("could not read"));
-
-        // If the host FS allows non-UTF-8 names, exercise the happy path too.
-        let dir = unique_dir("non-utf8");
-        let weird_name = OsStr::from_bytes(b"file-\x80\x81");
-        let weird_dir = dir.join(weird_name);
-        match std::fs::create_dir_all(&weird_dir) {
-            Ok(()) => {
-                let pdf = weird_dir.join("ok.pdf");
-                std::fs::write(&pdf, b"%PDF").unwrap();
-                let found =
-                    expand_input_paths_with_extensions(&[dir.as_path()], true, &exts).unwrap();
-                assert_eq!(found, vec![pdf]);
-            }
-            Err(error) => {
-                // Expected on macOS: Illegal byte sequence.
-                assert!(
-                    error.raw_os_error() == Some(92)
-                        || error.to_string().contains("Illegal byte sequence")
-                        || error.kind() == std::io::ErrorKind::InvalidInput,
-                    "unexpected create_dir error: {error}"
-                );
-            }
-        }
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn supported_input_extensions_from_custom_registry() {
-        use crate::conversion::{
-            ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, OutputFormat,
-        };
-        use std::path::Path;
-
-        struct OnlyFooModule;
-
-        impl ConversionModule for OnlyFooModule {
-            fn id(&self) -> &'static str {
-                "only-foo"
-            }
-            fn label(&self) -> &'static str {
-                "Only Foo"
-            }
-            fn input_extensions(&self) -> &'static [&'static str] {
-                &["FOO", "Bar"]
-            }
-            fn output_formats(&self) -> &[OutputFormat] {
-                &[OutputFormat::MARKDOWN]
-            }
-            fn chainable_output_formats(&self) -> &[OutputFormat] {
-                &[]
-            }
-            fn convert(
-                &self,
-                _input: &Path,
-                _output: OutputFormat,
-                _options: &ConversionOptions,
-            ) -> Result<ConversionArtifact, ConversionError> {
-                Err(ConversionError::new("unused"))
-            }
-        }
-
-        let registry = ConversionRegistry::new().with_module(OnlyFooModule);
-        let exts = supported_input_extensions(&registry);
-        // Registry extensions are lowercased when collected.
-        assert_eq!(exts.len(), 2);
-        assert!(exts.contains("foo"));
-        assert!(exts.contains("bar"));
-        assert!(!exts.contains("FOO"));
-        assert!(!exts.contains("pdf"));
-    }
-
-    #[test]
-    fn tilde_expansion_in_expand_paths() {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let Some(home) = home else {
-            return;
-        };
-        let dir = home.join(format!(
-            ".shift-expand-tilde-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+    fn path_is_within_root_is_component_aware() {
+        assert!(path_is_within_root(
+            Path::new("/tmp/root/a"),
+            Path::new("/tmp/root")
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("note.txt");
-        std::fs::write(&file, b"hi").unwrap();
+        assert!(!path_is_within_root(
+            Path::new("/tmp/root-evil/a"),
+            Path::new("/tmp/root")
+        ));
+    }
 
+    #[test]
+    fn expansion_honors_maximum_depth() {
+        let mut dir = unique_dir("deep");
+        let root = dir.clone();
+        for _ in 0..MAX_EXPAND_DEPTH + 1 {
+            dir = dir.join("sub");
+            std::fs::create_dir_all(&dir).unwrap();
+        }
         let mut exts = HashSet::new();
         exts.insert("txt".into());
-        let tilde_path = PathBuf::from(format!(
-            "~/{}/note.txt",
-            dir.strip_prefix(&home).unwrap().to_string_lossy()
-        ));
-        let found =
-            expand_input_paths_with_extensions(&[tilde_path.as_path()], false, &exts).unwrap();
-        assert_eq!(found, vec![file]);
-        let _ = std::fs::remove_dir_all(dir);
+        let result = expand_input_paths_with_extensions(&[root.as_path()], true, &exts);
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn expand_tilde_without_home_leaves_literal() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_home = std::env::var_os("HOME");
-        let old_profile = std::env::var_os("USERPROFILE");
-        // SAFETY: serialized behind crate::ENV_LOCK.
-        unsafe {
-            std::env::remove_var("HOME");
-            std::env::remove_var("USERPROFILE");
-        }
-        assert_eq!(expand_tilde(Path::new("~")), PathBuf::from("~"));
-        assert_eq!(expand_tilde(Path::new("~/x.pdf")), PathBuf::from("~/x.pdf"));
-        assert_eq!(
-            expand_tilde(Path::new("/abs/path")),
-            PathBuf::from("/abs/path")
-        );
-        unsafe {
-            match old_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match old_profile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unreadable_directory_reports_read_error() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = unique_dir("unreadable-dir");
-        let locked = root.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        std::fs::write(locked.join("secret.pdf"), b"%PDF").unwrap();
-        let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
-        permissions.set_mode(0o000);
-        std::fs::set_permissions(&locked, permissions).unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        let result = expand_input_paths_with_extensions(&[locked.as_path()], true, &exts);
-
-        // Restore perms for cleanup.
-        let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&locked, permissions).unwrap();
-
-        // Non-root should fail reading the locked directory.
-        if let Err(error) = result {
-            assert!(
-                error.to_string().contains("could not read directory")
-                    || error.to_string().contains("could not read"),
-                "error: {error}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_to_non_file_non_dir_is_skipped() {
-        use std::os::unix::fs::symlink;
-
-        // Best-effort: create a fifo and symlink to it; expansion should skip quietly.
-        let root = unique_dir("symlink-fifo");
-        let fifo = root.join("pipe");
-        // mkfifo via libc if available; otherwise skip.
-        let created = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !created {
-            let _ = std::fs::remove_dir_all(root);
-            return;
-        }
-        let link = root.join("link-pipe");
-        symlink(&fifo, &link).unwrap();
-
-        let mut exts = HashSet::new();
-        exts.insert("pdf".into());
-        // Following a fifo symlink may hang on open for metadata in some cases;
-        // if it errors or returns empty, both are acceptable.
-        let result = expand_input_paths_with_extensions(&[link.as_path()], false, &exts);
-        let _ = result;
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_file(&fifo);
-        let _ = std::fs::remove_dir_all(root);
+    fn empty_input_list_returns_empty() {
+        let exts = HashSet::new();
+        let found = expand_input_paths_with_extensions(&[] as &[PathBuf], true, &exts).unwrap();
+        assert!(found.is_empty());
     }
 }

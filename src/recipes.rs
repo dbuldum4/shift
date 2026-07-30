@@ -7,6 +7,7 @@
 use crate::conversion::{BatchNamingTemplate, ConversionOptions, OutputFormat};
 use crate::session_settings::{SessionConversionOptions, application_support_dir};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,10 @@ pub const RECIPE_STORE_VERSION: u32 = 1;
 pub const RECIPE_STORE_FILE_NAME: &str = "conversion-recipes.json";
 pub const MAX_RECIPE_NAME_CHARS: usize = 80;
 pub const MAX_NAMING_TEMPLATE_CHARS: usize = 160;
+/// Hard cap on recipes in one store.
+pub const MAX_RECIPE_COUNT: usize = 256;
+/// Maximum on-disk recipe store size accepted by the loader (1 MiB).
+pub const MAX_RECIPE_STORE_BYTES: usize = 1_048_576;
 
 /// Optional output location and file-name behavior captured by a recipe.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -174,14 +179,19 @@ impl RecipeStore {
                 supported: RECIPE_STORE_VERSION,
             });
         }
+        if self.recipes.len() > MAX_RECIPE_COUNT {
+            return Err(RecipeError::Invalid(format!(
+                "recipe store has {} recipes (limit is {MAX_RECIPE_COUNT})",
+                self.recipes.len()
+            )));
+        }
         for recipe in &self.recipes {
             recipe.validate()?;
         }
-        for (index, recipe) in self.recipes.iter().enumerate() {
-            if self.recipes[..index]
-                .iter()
-                .any(|other| other.name.eq_ignore_ascii_case(&recipe.name))
-            {
+        let mut seen = HashSet::with_capacity(self.recipes.len());
+        for recipe in &self.recipes {
+            let key = recipe.name.to_ascii_lowercase();
+            if !seen.insert(key) {
                 return Err(RecipeError::Invalid(format!(
                     "duplicate recipe name `{}`",
                     recipe.name
@@ -280,6 +290,13 @@ pub fn load_recipe_store(path: impl AsRef<Path>) -> Result<RecipeStore, RecipeEr
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(RecipeStore::default()),
         Err(error) => return Err(error.into()),
     };
+    if bytes.len() > MAX_RECIPE_STORE_BYTES {
+        return Err(RecipeError::Invalid(format!(
+            "recipe store {} is too large ({} bytes; limit is {MAX_RECIPE_STORE_BYTES})",
+            path.display(),
+            bytes.len()
+        )));
+    }
     let mut store: RecipeStore = serde_json::from_slice(&bytes).map_err(|error| {
         RecipeError::Invalid(format!(
             "could not parse recipe store {}: {error}",
@@ -552,5 +569,37 @@ mod tests {
         ));
         let _ = fs::remove_file(corrupt);
         let _ = fs::remove_file(future);
+    }
+
+    #[test]
+    fn rejects_oversized_store_and_too_many_recipes() {
+        let huge = temp_path("huge");
+        let mut payload = br#"{"version":1,"recipes":[]}"#.to_vec();
+        payload.resize(MAX_RECIPE_STORE_BYTES + 8, b' ');
+        fs::write(&huge, &payload).unwrap();
+        let err = load_recipe_store(&huge).unwrap_err();
+        assert!(err.to_string().contains("too large"), "error: {err}");
+        let _ = fs::remove_file(huge);
+
+        let options = ConversionOptions::default();
+        let mut recipes = Vec::with_capacity(MAX_RECIPE_COUNT + 1);
+        for index in 0..=MAX_RECIPE_COUNT {
+            recipes.push(
+                ConversionRecipe::new(
+                    format!("Recipe {index}"),
+                    OutputFormat::MARKDOWN,
+                    None,
+                    &options,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        let store = RecipeStore {
+            version: RECIPE_STORE_VERSION,
+            recipes,
+        };
+        let err = store.validate().unwrap_err();
+        assert!(err.to_string().contains("limit is"), "error: {err}");
     }
 }
