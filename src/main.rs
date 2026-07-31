@@ -6532,7 +6532,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                     div()
                         .id("settings-section-panel")
                         .w_full()
-                        .min_h_0()
+                        .flex_shrink_0()
                         .child(match section {
                             SettingsSection::Converters => settings_converters_panel(
                                 priority,
