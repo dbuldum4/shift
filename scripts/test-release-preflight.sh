@@ -190,4 +190,17 @@ if grep -nE 'shasum -a 256 "\$archive"' "$root/scripts/package-macos.sh" \
   exit 1
 fi
 
+# The PyPI typing backport must not shadow Python 3.11's standard-library
+# typing module inside the bundled target directory.
+grep -Fq 'typing_backport="$runtime/python/typing.py"' "$root/scripts/package-macos.sh" \
+  || {
+    echo "package-macos must remove the Python typing backport" >&2
+    exit 1
+  }
+grep -Fq 'typing-*.dist-info' "$root/scripts/package-macos.sh" \
+  || {
+    echo "package-macos must remove typing backport metadata" >&2
+    exit 1
+  }
+
 printf '%s\n' 'release preflight failure-path test passed'
