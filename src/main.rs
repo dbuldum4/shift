@@ -161,6 +161,29 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
+    fn index(self) -> usize {
+        match self {
+            Self::Converters => 0,
+            Self::General => 1,
+            Self::Recipes => 2,
+            Self::Theme => 3,
+            Self::Options => 4,
+            Self::Paths => 5,
+            Self::Diagnostics => 6,
+            Self::About => 7,
+        }
+    }
+
+    fn transition_direction_to(self, target: Self) -> crate::ui::animation::SettingsTabDirection {
+        if self == target {
+            crate::ui::animation::SettingsTabDirection::Enter
+        } else if target.index() > self.index() {
+            crate::ui::animation::SettingsTabDirection::Forward
+        } else {
+            crate::ui::animation::SettingsTabDirection::Back
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Converters => "Converters",
@@ -4746,6 +4769,10 @@ fn settings_nav_item(
                 .child(section.label()),
         )
         .on_click(cx.listener(move |this, _, _, cx| {
+            if this.settings_section != section {
+                this.settings_tab_direction =
+                    this.settings_section.transition_direction_to(section);
+            }
             this.settings_section = section;
             cx.notify();
             cx.stop_propagation();
@@ -6403,6 +6430,7 @@ fn settings_about_panel(priority: &[String]) -> impl IntoElement + use<> {
 
 pub(crate) struct SettingsView {
     section: SettingsSection,
+    tab_direction: crate::ui::animation::SettingsTabDirection,
     priority: Vec<String>,
     preference_error: Option<SharedString>,
     output_format: OutputFormat,
@@ -6442,6 +6470,7 @@ pub(crate) struct SettingsView {
 fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
     let SettingsView {
         section,
+        tab_direction,
         priority,
         preference_error,
         output_format,
@@ -6477,6 +6506,8 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         diagnostics,
         diagnostics_loading,
     } = view;
+    let section = *section;
+    let tab_direction = *tab_direction;
 
     div()
         .id("settings-content")
@@ -6497,66 +6528,95 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                 .w_full()
                 .overflow_y_scroll()
                 .p_8()
-                .child(match *section {
-                    SettingsSection::Converters => settings_converters_panel(
-                        priority,
-                        preference_error.clone(),
-                        diagnostics.clone(),
-                        cx,
-                    )
-                    .into_any_element(),
-                    SettingsSection::General => settings_general_panel(
-                        *output_format,
-                        *history_count,
-                        *history_limit,
-                        history_limit_input.clone(),
-                        *show_archived,
-                        cx,
-                    )
-                    .into_any_element(),
-                    SettingsSection::Recipes => settings_recipes_panel(
-                        recipes,
-                        active_recipe.as_deref(),
-                        *recipe_modified,
-                        recipe_preferred_module.as_deref(),
-                        recipe_name_input.clone(),
-                        recipe_naming_input.clone(),
-                        recipe_status.clone(),
-                        batch_output_dir.as_deref(),
-                        *batch_force,
-                        priority,
-                        cx,
-                    )
-                    .into_any_element(),
-                    SettingsSection::Theme => {
-                        settings_theme_panel(ui_font_family, cx).into_any_element()
-                    }
-                    SettingsSection::Options => settings_options_panel(
-                        *quality,
-                        *encode_mode,
-                        *mono,
-                        *docling_images,
-                        *docling_ocr,
-                        *docling_tables,
-                        *docling_table_mode,
-                        *docling_asr_model,
-                        *docling_video_sampling_mode,
-                        *docling_video_diarization,
-                        *defuddle_frontmatter,
-                        *pandoc_standalone,
-                        *pandoc_toc,
-                        *pandoc_citations,
-                        *markitdown_keep_data_uris,
-                        cx,
-                    )
-                    .into_any_element(),
-                    SettingsSection::Paths => settings_paths_panel().into_any_element(),
-                    SettingsSection::Diagnostics => {
-                        settings_diagnostics_panel(diagnostics.clone(), *diagnostics_loading, cx)
-                            .into_any_element()
-                    }
-                    SettingsSection::About => settings_about_panel(priority).into_any_element(),
-                }),
+                .child(
+                    div()
+                        .id("settings-section-panel")
+                        .w_full()
+                        .min_h_0()
+                        .child(match section {
+                            SettingsSection::Converters => settings_converters_panel(
+                                priority,
+                                preference_error.clone(),
+                                diagnostics.clone(),
+                                cx,
+                            )
+                            .into_any_element(),
+                            SettingsSection::General => settings_general_panel(
+                                *output_format,
+                                *history_count,
+                                *history_limit,
+                                history_limit_input.clone(),
+                                *show_archived,
+                                cx,
+                            )
+                            .into_any_element(),
+                            SettingsSection::Recipes => settings_recipes_panel(
+                                recipes,
+                                active_recipe.as_deref(),
+                                *recipe_modified,
+                                recipe_preferred_module.as_deref(),
+                                recipe_name_input.clone(),
+                                recipe_naming_input.clone(),
+                                recipe_status.clone(),
+                                batch_output_dir.as_deref(),
+                                *batch_force,
+                                priority,
+                                cx,
+                            )
+                            .into_any_element(),
+                            SettingsSection::Theme => {
+                                settings_theme_panel(ui_font_family, cx).into_any_element()
+                            }
+                            SettingsSection::Options => settings_options_panel(
+                                *quality,
+                                *encode_mode,
+                                *mono,
+                                *docling_images,
+                                *docling_ocr,
+                                *docling_tables,
+                                *docling_table_mode,
+                                *docling_asr_model,
+                                *docling_video_sampling_mode,
+                                *docling_video_diarization,
+                                *defuddle_frontmatter,
+                                *pandoc_standalone,
+                                *pandoc_toc,
+                                *pandoc_citations,
+                                *markitdown_keep_data_uris,
+                                cx,
+                            )
+                            .into_any_element(),
+                            SettingsSection::Paths => settings_paths_panel().into_any_element(),
+                            SettingsSection::Diagnostics => settings_diagnostics_panel(
+                                diagnostics.clone(),
+                                *diagnostics_loading,
+                                cx,
+                            )
+                            .into_any_element(),
+                            SettingsSection::About => {
+                                settings_about_panel(priority).into_any_element()
+                            }
+                        })
+                        .with_animation(
+                            ElementId::Name(
+                                format!(
+                                    "settings-section-transition-{}-{}",
+                                    section.label(),
+                                    tab_direction.id_tag()
+                                )
+                                .into(),
+                            ),
+                            Animation::new(animation::SETTINGS_TAB_DURATION)
+                                .with_easing(ease_out_quint()),
+                            move |element, progress| {
+                                let offset = tab_direction.slide_start_px() * (1.0 - progress);
+                                element
+                                    .opacity(0.88 + 0.12 * progress)
+                                    .mt(px(offset))
+                                    .mb(px(-offset))
+                            },
+                        ),
+                ),
         )
 }
 
@@ -9034,6 +9094,24 @@ mod pure_ui_helpers {
             assert!(!section.label().is_empty());
             assert!(!section.description().is_empty());
         }
+    }
+
+    #[test]
+    fn settings_section_transition_direction_follows_sidebar_order() {
+        use crate::ui::animation::SettingsTabDirection;
+
+        assert_eq!(
+            SettingsSection::Converters.transition_direction_to(SettingsSection::Options),
+            SettingsTabDirection::Forward
+        );
+        assert_eq!(
+            SettingsSection::About.transition_direction_to(SettingsSection::General),
+            SettingsTabDirection::Back
+        );
+        assert_eq!(
+            SettingsSection::Theme.transition_direction_to(SettingsSection::Theme),
+            SettingsTabDirection::Enter
+        );
     }
 
     // ── output_format_filter_choices ─────────────────────────────────────

@@ -5,7 +5,13 @@ use std::time::Duration;
 pub const ENTER_DURATION: Duration = Duration::from_millis(200);
 pub const PANEL_DURATION: Duration = Duration::from_millis(180);
 pub const DIALOG_DURATION: Duration = Duration::from_millis(220);
+pub const SETTINGS_TAB_DURATION: Duration = Duration::from_millis(180);
 pub const SPINNER_PERIOD: Duration = Duration::from_millis(1600);
+
+/// Small directional travel for settings content. GPUI divs do not expose a
+/// transform, so the settings panel pairs a tiny margin offset with opacity
+/// while keeping the net layout height unchanged.
+pub const SETTINGS_TAB_SLIDE_PX: f32 = 8.0;
 
 // Onboarding is rare / first-time (Emil frequency table → delight is allowed).
 // Keep under the modal budget; stagger must never feel slow.
@@ -105,6 +111,38 @@ impl OnboardingNavDirection {
     }
 }
 
+/// Direction of settings section navigation for content motion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SettingsTabDirection {
+    /// First paint or opening settings from another surface.
+    #[default]
+    Enter,
+    /// Moving down through the sidebar.
+    Forward,
+    /// Moving up through the sidebar.
+    Back,
+}
+
+impl SettingsTabDirection {
+    /// Signed offset at progress 0 (px).
+    pub fn slide_start_px(self) -> f32 {
+        match self {
+            Self::Enter => 0.0,
+            Self::Forward => SETTINGS_TAB_SLIDE_PX,
+            Self::Back => -SETTINGS_TAB_SLIDE_PX,
+        }
+    }
+
+    /// Short tag for animation ids so each direction restarts independently.
+    pub fn id_tag(self) -> &'static str {
+        match self {
+            Self::Enter => "e",
+            Self::Forward => "f",
+            Self::Back => "b",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +180,14 @@ mod tests {
         assert!(OnboardingNavDirection::Back.slide_start_px() < 0.0);
         // Enter keeps content still; the card shell owns first-paint lift.
         assert_eq!(OnboardingNavDirection::Enter.slide_start_px(), 0.0);
+    }
+
+    #[test]
+    fn settings_tab_direction_slide_signs() {
+        assert!(SettingsTabDirection::Forward.slide_start_px() > 0.0);
+        assert!(SettingsTabDirection::Back.slide_start_px() < 0.0);
+        assert_eq!(SettingsTabDirection::Enter.slide_start_px(), 0.0);
+        assert_eq!(SettingsTabDirection::Forward.id_tag(), "f");
     }
 
     #[test]

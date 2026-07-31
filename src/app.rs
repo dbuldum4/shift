@@ -228,6 +228,8 @@ pub(crate) struct Shift {
     pub(crate) format_filter_input: Entity<TextInput>,
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
+    /// Last settings navigation direction, used to make section changes feel spatial.
+    pub(crate) settings_tab_direction: crate::ui::animation::SettingsTabDirection,
     /// Saved conversion setups shared with `shift-cli`.
     pub(crate) recipes: Vec<ConversionRecipe>,
     /// Applied recipe name; remains visible when subsequently modified.
@@ -610,6 +612,7 @@ impl Shift {
             format_filter_input,
             settings_open: false,
             settings_section: SettingsSection::Converters,
+            settings_tab_direction: crate::ui::animation::SettingsTabDirection::Enter,
             recipes,
             active_recipe: None,
             recipe_modified: false,
@@ -3393,6 +3396,9 @@ impl Shift {
         cx: &mut Context<Self>,
     ) {
         self.output_menu_open = false;
+        if !self.settings_open {
+            self.settings_tab_direction = crate::ui::animation::SettingsTabDirection::Enter;
+        }
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.ensure_diagnostics(cx);
@@ -3457,6 +3463,13 @@ impl Shift {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_open {
+            self.settings_tab_direction = self
+                .settings_section
+                .transition_direction_to(SettingsSection::About);
+        } else {
+            self.settings_tab_direction = crate::ui::animation::SettingsTabDirection::Enter;
+        }
         self.settings_section = SettingsSection::About;
         self.settings_open = true;
         cx.notify();
@@ -4031,6 +4044,7 @@ impl Render for Shift {
         };
         let folder_confirm = self.folder_confirm.clone();
         let settings_section = self.settings_section;
+        let settings_tab_direction = self.settings_tab_direction;
         let module_priority = self.module_priority.clone();
         let preference_error = self.preference_error.clone();
         let url_input = self.url_input.clone();
@@ -4363,6 +4377,8 @@ impl Render for Shift {
                     .child("⚙")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.output_menu_open = false;
+                        this.settings_tab_direction =
+                            crate::ui::animation::SettingsTabDirection::Enter;
                         this.settings_open = true;
                         this.ensure_diagnostics(cx);
                         cx.notify();
@@ -4544,6 +4560,7 @@ impl Render for Shift {
                 root.child(settings_screen(
                     SettingsView {
                         section: settings_section,
+                        tab_direction: settings_tab_direction,
                         priority: module_priority,
                         preference_error,
                         output_format,
