@@ -102,15 +102,15 @@ printf '%s\n' "$path_prefixed_out" | grep -Fq "basename only" \
 # Finding 3 / 20: workflow_dispatch tag allow-list (env only, no shell inject).
 # Must match .github/workflows/release.yml resolve-tag step.
 # ---------------------------------------------------------------------------
-tag_re='^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$'
-for good in v1.0.0 1.0.0 v0.3.0 v1.2.3-rc.1 v2.0.0-beta.1; do
+tag_re='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+for good in v1.0.0 1.0.0 v0.3.0; do
   printf '%s' "$good" | grep -Eq "$tag_re" \
     || {
       echo "release tag allow-list unexpectedly rejected: $good" >&2
       exit 1
     }
 done
-for bad in '' 'v1' '1.0' '../main' 'v1.0.0;curl evil' 'v1.0.0$(id)' 'main' 'v1.0.0/../../../etc/passwd' 'v2.0.0_beta.1'; do
+for bad in '' 'v1' '1.0' '../main' 'v1.0.0;curl evil' 'v1.0.0$(id)' 'main' 'v1.0.0/../../../etc/passwd' 'v2.0.0_beta.1' 'v1.2.3-rc.1' '1.2.3+build.7'; do
   if printf '%s' "$bad" | grep -Eq "$tag_re"; then
     echo "release tag allow-list unexpectedly accepted: $bad" >&2
     exit 1

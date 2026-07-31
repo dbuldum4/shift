@@ -13,7 +13,7 @@ use super::defuddle::{
     block_private_urls, ensure_public_url_fetch_allowed_with_cancel, redact_credentials_in_text,
     redact_url_credentials, resolve_public_url_addresses_with_cancel,
 };
-use super::process::{is_runnable, run_command_cancellable};
+use super::process::{is_runnable, run_command_cancellable_with_output_limits};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -176,16 +176,24 @@ fn download_follow_redirects(
         .arg(path)
         .arg(&creds.clean_url);
 
-    let output = run_command_cancellable(
+    let watch_path = path.to_path_buf();
+    let output = run_command_cancellable_with_output_limits(
         command,
         options.timeout,
         1024 * 1024,
         options.cancel.clone(),
+        &[(watch_path, options.max_bytes)],
+        &[],
     )
     .map_err(|error| {
         drop_netrc(netrc.as_ref());
         if error.is_cancelled() {
             error
+        } else if error.to_string().contains("too large") {
+            ConversionError::new(format!(
+                "could not download {display_url}: exceeded size limit ({} bytes)",
+                options.max_bytes
+            ))
         } else {
             ConversionError::new(format!(
                 "could not download {display_url}: {}. Install curl or open the file locally.",
@@ -266,17 +274,25 @@ pub fn download_with_redirect_revalidation(
             .arg("%{http_code}")
             .arg(&creds.clean_url);
 
-        let output = run_command_cancellable(
+        let watch_path = path.to_path_buf();
+        let output = run_command_cancellable_with_output_limits(
             command,
             options.timeout,
             1024 * 1024,
             options.cancel.clone(),
+            &[(watch_path, options.max_bytes)],
+            &[],
         )
         .map_err(|error| {
             let _ = fs::remove_file(&header_path);
             drop_netrc(netrc.as_ref());
             if error.is_cancelled() {
                 error
+            } else if error.to_string().contains("too large") {
+                ConversionError::new(format!(
+                    "could not download {display_current}: exceeded size limit ({} bytes)",
+                    options.max_bytes
+                ))
             } else {
                 ConversionError::new(format!(
                     "could not download {display_current}: {}. Install curl or open the file locally.",
@@ -286,7 +302,13 @@ pub fn download_with_redirect_revalidation(
         })?;
         drop_netrc(netrc.as_ref());
 
-        let headers = read_headers_bounded(&header_path)?;
+        let headers = match read_headers_bounded(&header_path) {
+            Ok(headers) => headers,
+            Err(error) => {
+                let _ = fs::remove_file(&header_path);
+                return Err(error);
+            }
+        };
         let _ = fs::remove_file(&header_path);
 
         if !output.status.success() {
@@ -316,7 +338,7 @@ pub fn download_with_redirect_revalidation(
             continue;
         }
 
-        if code == 200 || code == 0 {
+        if (200..300).contains(&code) || code == 0 {
             // Some curl builds omit write-out on success; treat 0 + non-empty body as ok later.
             if code == 200 || path.is_file() {
                 return Ok(());

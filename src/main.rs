@@ -32,21 +32,20 @@ use shift_core::conversion::{
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
     DoclingVideoSamplingMode, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    MAX_CLIPBOARD_IMAGE_BYTES, MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, OutputFormat,
-    PandocOptions, PasteToken, PdfCompression, PdfInputOptions, Readiness, SipsFlip, SipsOptions,
-    SipsQuality, SpreadsheetOptions, available_outputs_for_batch_source, available_ready_outputs,
-    available_ready_url_outputs, cleanup_staged_path, expand_input_paths_preserving_roots,
+    MAX_CLIPBOARD_IMAGE_BYTES, MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, MaterializedSource,
+    OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, Readiness, SipsFlip,
+    SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, available_outputs_for_batch_source,
+    available_ready_outputs, available_ready_url_outputs, expand_input_paths_preserving_roots,
     ffmpeg_supports_target_size_output, is_audio_output, is_docling_timed_input,
-    is_docling_video_input, is_ffmpeg_output, is_image_output, is_paste_staging_path,
-    is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste,
-    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
-    sips_supports_target_size_output, stage_pasted_image, suggested_output_for_path,
-    suggested_output_for_url, url_display_host,
+    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+    looks_like_url, materialize_magic_paste_detailed, parse_magic_paste, paths_refer_to_same_file,
+    pdf_engine_candidates, run_batch, sips_supports_target_size_output, stage_pasted_image,
+    suggested_output_for_path, suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
     StoredHistoryEntry, StoredOutcome, StoredSource, history_db_path, intern_module_id,
-    load_history, save_history_delta_to,
+    load_history, save_history_delta_to, save_history_delta_to_if_current,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
@@ -6740,6 +6739,7 @@ mod ui_perf {
             output_format: OutputFormat::MARKDOWN,
             outcome,
             archived: false,
+            artifact_deferred: false,
         }
     }
 
@@ -7366,6 +7366,7 @@ mod pure_ui_helpers {
             output_format: OutputFormat::MARKDOWN,
             outcome,
             archived: false,
+            artifact_deferred: false,
         }
     }
 
@@ -7389,6 +7390,7 @@ mod pure_ui_helpers {
             output_format,
             outcome,
             archived: false,
+            artifact_deferred: false,
         }
     }
 

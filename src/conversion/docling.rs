@@ -2,7 +2,7 @@ use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
     InvocationRecord, OutputFormat, TempDirGuard, bundled_runtime_tool, command_argv_parts,
     format_argv_display, map_spawn_error, max_output_bytes, process_timeout, read_file_limited,
-    resolve_tool_executable, run_command_cancellable, unique_temp_dir,
+    resolve_tool_executable, run_command_cancellable_with_output_dirs, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -609,25 +609,31 @@ impl DoclingModule {
         } else {
             process_timeout()
         };
-        let output =
-            run_command_cancellable(command, timeout, max_output_bytes(), options.cancel.clone())
-                .map_err(|error| {
-                if error.to_string().to_ascii_lowercase().contains("timeout") {
-                    return ConversionError::new(format!(
-                        "Docling timed out converting {} (limit {}s). First Whisper model \
+        let output = run_command_cancellable_with_output_dirs(
+            command,
+            timeout,
+            max_output_bytes(),
+            options.cancel.clone(),
+            &[],
+            &[(work_dir.clone(), max_output_bytes() as u64)],
+        )
+        .map_err(|error| {
+            if error.to_string().to_ascii_lowercase().contains("timeout") {
+                return ConversionError::new(format!(
+                    "Docling timed out converting {} (limit {}s). First Whisper model \
                      download and long interviews can exceed the default; raise \
                      SHIFT_CONVERSION_TIMEOUT_SECS or use a smaller --docling-asr-model.",
-                        input.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                map_spawn_error(
-                    error,
-                    "Docling is not installed. Install it with `pip install 'docling==2.115.0'`. \
+                    input.display(),
+                    timeout.as_secs()
+                ));
+            }
+            map_spawn_error(
+                error,
+                "Docling is not installed. Install it with `pip install 'docling==2.115.0'`. \
                  For audio/video transcription install `docling[asr]` plus \
                  `docling-slim[format-video]`, or set SHIFT_DOCLING_BIN.",
-                )
-            })?;
+            )
+        })?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();

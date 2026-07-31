@@ -1223,7 +1223,7 @@ async fn invalid_ffmpeg_options_fail(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn clipboard_image_converts_via_sips(cx: &mut TestAppContext) {
-    let _env = TestEnv::new();
+    let env = TestEnv::new();
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
@@ -1245,6 +1245,13 @@ async fn clipboard_image_converts_via_sips(cx: &mut TestAppContext) {
     assert_eq!(module, "sips");
     #[cfg(not(target_os = "macos"))]
     assert_eq!(module, "ffmpeg");
+    assert!(
+        fs::read_dir(env.temp.join("paste"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "successful clipboard conversion should release its staged input"
+    );
 }
 
 #[gpui::test]
@@ -1535,6 +1542,33 @@ async fn folder_expand_dismiss_clears_confirm_without_queuing(cx: &mut TestAppCo
     });
     assert!(cleared);
     assert!(empty);
+}
+
+#[gpui::test]
+async fn stale_folder_expand_result_cannot_restore_after_dismiss(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let dir = env.inputs().join("stale-folder");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("nested.txt"), b"nested").unwrap();
+    let shift = create_shift(cx);
+
+    // Dismiss before the background walk gets a chance to publish its result.
+    // The generation guard must prevent the late completion from restoring the
+    // confirmation dialog.
+    shift.update(cx, |this, cx| this.ingest_paths(vec![dir], cx));
+    shift.update(cx, |this, cx| this.dismiss_folder_confirm(cx));
+    cx.run_until_parked();
+
+    let (confirm, status, queued) = shift.read_with(cx, |this, _| {
+        (
+            this.folder_confirm.is_some(),
+            this.batch_status.as_ref().map(ToString::to_string),
+            this.batch_queue.len(),
+        )
+    });
+    assert!(!confirm);
+    assert_eq!(status.as_deref(), Some("Folder expansion cancelled."));
+    assert_eq!(queued, 0);
 }
 
 #[gpui::test]

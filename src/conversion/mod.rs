@@ -78,8 +78,9 @@ pub use process::{
     max_output_bytes, path_looks_like_option, process_timeout, push_flag_path, push_operand_path,
     push_path_arg, read_file_limited, resolve_tool_executable, resolve_tool_path, run_command,
     run_command_cancellable, run_command_cancellable_with_output_dirs,
-    run_command_cancellable_with_output_paths, short_path_hash, unique_temp_dir,
-    unique_temp_file_name, validate_path_operand, write_secret_file,
+    run_command_cancellable_with_output_limits, run_command_cancellable_with_output_paths,
+    short_path_hash, unique_temp_dir, unique_temp_file_name, validate_path_operand,
+    write_secret_file,
 };
 pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};
@@ -904,6 +905,15 @@ pub fn write_bytes_atomically_with_replace(
     bytes: &[u8],
     replace: bool,
 ) -> Result<(), ConversionError> {
+    if std::fs::metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        return Err(ConversionError::new(format!(
+            "output path is a directory: {} (choose a file path)",
+            path.display()
+        )));
+    }
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
     let stem = file_stem_for_temp(path);
@@ -928,6 +938,16 @@ pub fn write_bytes_atomically_with_replace(
         // the only good copy before the new file is in place). The backup name
         // uses its own unique token so it cannot collide with the partial.
         if path.exists() {
+            if std::fs::metadata(path)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(&partial);
+                return Err(ConversionError::new(format!(
+                    "output path is a directory: {} (choose a file path)",
+                    path.display()
+                )));
+            }
             let backup = dir.join(unique_temp_file_name(&stem, ".shift-bak"));
             match std::fs::rename(path, &backup) {
                 Ok(()) => match std::fs::rename(&partial, path) {
@@ -2299,6 +2319,10 @@ mod tests {
         let free = dir.join("fresh.md");
         write_bytes_atomically_with_replace(&free, b"only", false).unwrap();
         assert_eq!(std::fs::read(&free).unwrap(), b"only");
+        let directory = dir.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let error = write_bytes_atomically_with_replace(&directory, b"nope", true).unwrap_err();
+        assert!(error.to_string().contains("output path is a directory"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

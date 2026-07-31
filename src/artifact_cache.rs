@@ -898,6 +898,9 @@ fn collect_cache_files(dir: &Path, now: &SystemTime, out: &mut Vec<CacheEntry>) 
             if !file_type.is_file() {
                 continue;
             }
+            if path.file_name().and_then(|name| name.to_str()) == Some(VERSION_FILE_NAME) {
+                continue;
+            }
             let meta = entry.metadata()?;
             let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let age = now.duration_since(modified).unwrap_or_default();
@@ -1654,6 +1657,10 @@ mod tests {
         assert!(
             remaining <= 5_000,
             "remaining cache payload {remaining} should be under budget"
+        );
+        assert!(
+            dir.join(VERSION_FILE_NAME).is_file(),
+            "cache version marker must not be evicted as payload"
         );
 
         unsafe {

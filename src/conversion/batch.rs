@@ -1243,14 +1243,31 @@ pub fn prepare_batch_destination(
         }
     }
 
-    if destination.exists() && !force {
-        return Err(ConversionError::new(format!(
-            "output already exists: {} (pass --force / enable Overwrite to replace)",
-            destination.display()
-        )));
+    if destination.exists() {
+        if std::fs::metadata(destination)
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(ConversionError::new(format!(
+                "output path is a directory: {} (choose a file path)",
+                destination.display()
+            )));
+        }
+        if !force {
+            return Err(ConversionError::new(format!(
+                "output already exists: {} (pass --force / enable Overwrite to replace)",
+                destination.display()
+            )));
+        }
     }
 
     if let Some(parent) = destination.parent() {
+        if path_has_symlink_component(parent) {
+            return Err(ConversionError::new(format!(
+                "refusing to write through a symbolic-link output directory: {}",
+                parent.display()
+            )));
+        }
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 ConversionError::new(format!(
@@ -1262,6 +1279,31 @@ pub fn prepare_batch_destination(
     }
 
     Ok(())
+}
+
+/// Refuse output parents that already contain a symlink component. Following a
+/// nested output symlink can redirect a watch/batch write back into its input
+/// tree, defeating containment checks and creating conversion loops.
+fn path_has_symlink_component(path: &Path) -> bool {
+    // macOS exposes temporary directories through root-level aliases such as
+    // `/tmp` and `/var`. Those system-owned prefixes are safe to normalize;
+    // a symlink created below any caller-controlled directory is not.
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if std::fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let root_level_alias = current
+                .parent()
+                .is_some_and(|parent| parent == Path::new("/"));
+            if !root_level_alias {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// If `preferred` exists and `force` is false, pick `stem-1.ext`, `stem-2.ext`, …
@@ -3067,6 +3109,11 @@ mod tests {
         let err = prepare_batch_destination(&existing, None, false).unwrap_err();
         assert!(err.to_string().contains("already exists"));
 
+        let existing_dir = dir.join("existing-dir");
+        std::fs::create_dir(&existing_dir).unwrap();
+        let err = prepare_batch_destination(&existing_dir, None, true).unwrap_err();
+        assert!(err.to_string().contains("output path is a directory"));
+
         // Refuses to overwrite the source.
         let source = dir.join("source.md");
         std::fs::write(&source, b"x").unwrap();
@@ -3081,6 +3128,23 @@ mod tests {
             dir.join("report-1.md")
         );
         assert_eq!(uniquify_destination(&preferred, true), preferred);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_batch_destination_rejects_nested_symlink_output_parent() {
+        let dir = unique_dir("symlink-parent");
+        let real = dir.join("real-output");
+        let link = dir.join("nested-link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let destination = link.join("converted.md");
+        let error = prepare_batch_destination(&destination, None, true).unwrap_err();
+        assert!(error.to_string().contains("symbolic-link output directory"));
+        assert!(!destination.exists());
 
         let _ = std::fs::remove_dir_all(dir);
     }

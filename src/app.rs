@@ -53,6 +53,8 @@ pub(crate) struct ConversionHistoryEntry {
     pub(crate) output_format: OutputFormat,
     pub(crate) outcome: HistoryOutcome,
     pub(crate) archived: bool,
+    /// Metadata-only history rows must not overwrite an existing deferred blob.
+    pub(crate) artifact_deferred: bool,
 }
 
 pub(crate) fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEntry {
@@ -89,13 +91,12 @@ pub(crate) fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEn
         output_format: entry.output_format.id().to_owned(),
         outcome,
         archived: entry.archived,
-        // In-memory entries always carry their payload (or ReadyLarge); never
-        // mark deferred so a save cannot wipe an on-disk blob by accident.
-        artifact_deferred: false,
+        artifact_deferred: entry.artifact_deferred,
     }
 }
 
 pub(crate) fn from_stored_entry(entry: StoredHistoryEntry) -> Option<ConversionHistoryEntry> {
+    let artifact_deferred = entry.artifact_deferred;
     let output_format = entry.output_format.parse().ok()?;
     let source = match entry.source {
         StoredSource::File(path) => HistorySource::File(path),
@@ -139,6 +140,7 @@ pub(crate) fn from_stored_entry(entry: StoredHistoryEntry) -> Option<ConversionH
         output_format,
         outcome,
         archived: entry.archived,
+        artifact_deferred,
     })
 }
 
@@ -305,6 +307,10 @@ pub(crate) struct Shift {
     pub(crate) batch_item_progress: HashMap<u64, (Option<f32>, SharedString)>,
     /// Pending recursive folder expansion (confirm before enqueue).
     pub(crate) folder_confirm: Option<FolderExpandConfirm>,
+    /// Generation guard for asynchronous folder expansion results.
+    pub(crate) folder_expand_generation: u64,
+    /// Temporary files materialized from clipboard/remote paste inputs.
+    pub(crate) staged_inputs: StagedInputs,
     /// Cooperative cancel for the active single-file / single-URL conversion.
     pub(crate) conversion_cancel: Arc<AtomicBool>,
     /// Live conversion progress (fraction when known + label).
@@ -654,6 +660,8 @@ impl Shift {
             batch_force: session.batch_force,
             batch_item_progress: HashMap::new(),
             folder_confirm: None,
+            folder_expand_generation: 0,
+            staged_inputs: StagedInputs::new(),
             conversion_cancel: Arc::new(AtomicBool::new(false)),
             conversion_progress: None,
             cached_ready_path: None,
@@ -883,6 +891,8 @@ impl Shift {
         if paths.is_empty() {
             return;
         }
+        self.folder_expand_generation = self.folder_expand_generation.wrapping_add(1);
+        let folder_generation = self.folder_expand_generation;
         let has_dir = paths.iter().any(|path| path.is_dir());
         // An external drop is an intentional first action. Close the
         // introduction before showing the normal conversion workspace.
@@ -900,6 +910,9 @@ impl Shift {
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 let _ = this.update(cx, |this, cx| {
+                    if this.folder_expand_generation != folder_generation {
+                        return;
+                    }
                     match result {
                         Ok(expanded) => {
                             if expanded.is_empty() {
@@ -951,6 +964,7 @@ impl Shift {
     }
 
     pub(crate) fn confirm_folder_expand(&mut self, cx: &mut Context<Self>) {
+        self.folder_expand_generation = self.folder_expand_generation.wrapping_add(1);
         let Some(confirm) = self.folder_confirm.take() else {
             return;
         };
@@ -958,6 +972,7 @@ impl Shift {
     }
 
     pub(crate) fn dismiss_folder_confirm(&mut self, cx: &mut Context<Self>) {
+        self.folder_expand_generation = self.folder_expand_generation.wrapping_add(1);
         self.folder_confirm = None;
         self.batch_status = Some("Folder expansion cancelled.".into());
         cx.notify();
@@ -1127,6 +1142,7 @@ impl Shift {
             return;
         }
         if self.batch_queue.remove(id) {
+            self.cleanup_unreferenced_staged_inputs();
             if self.batch_format_menu == Some(id) {
                 self.batch_format_menu = None;
             }
@@ -1410,6 +1426,7 @@ impl Shift {
                                 // batch can start. Do not restore the worker's queue onto
                                 // the UI (user already cleared it).
                                 this.batch_running = false;
+                                this.staged_inputs.cleanup();
                                 if this
                                     .batch_status
                                     .as_ref()
@@ -1422,6 +1439,9 @@ impl Shift {
                             }
                             this.batch_queue = queue;
                             this.batch_running = false;
+                            if summary.failed == 0 && summary.cancelled == 0 {
+                                this.staged_inputs.cleanup();
+                            }
                             this.batch_status = Some(
                                 format!(
                                     "Batch complete: {} succeeded, {} failed, {} cancelled",
@@ -1439,6 +1459,10 @@ impl Shift {
                                 this.batch_running = false;
                                 this.batch_status =
                                     Some("Batch worker stopped unexpectedly.".into());
+                                cx.notify();
+                            } else {
+                                this.batch_running = false;
+                                this.staged_inputs.cleanup();
                                 cx.notify();
                             }
                         });
@@ -1597,10 +1621,33 @@ impl Shift {
             self.batch_status = Some("Clearing queue…".into());
         } else {
             self.batch_status = None;
+            self.staged_inputs.cleanup();
         }
         self.batch_queue.clear();
         self.batch_format_menu = None;
         cx.notify();
+    }
+
+    /// Keep staged sources alive while any queued item still references them.
+    /// The focused file can be changed independently of the batch queue.
+    fn staged_path_is_referenced_by_batch(&self, path: &Path) -> bool {
+        self.batch_queue
+            .items()
+            .iter()
+            .any(|item| item.source.as_file().is_some_and(|source| source == path))
+    }
+
+    fn release_staged_path_if_unreferenced(&mut self, path: &Path) {
+        if !self.staged_path_is_referenced_by_batch(path) {
+            self.staged_inputs.release(path);
+        }
+    }
+
+    fn cleanup_unreferenced_staged_inputs(&mut self) {
+        let paths = self.staged_inputs.paths().to_vec();
+        for path in paths {
+            self.release_staged_path_if_unreferenced(&path);
+        }
     }
 
     pub(crate) fn set_selected_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1610,10 +1657,8 @@ impl Shift {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
 
-        if let Some(prev) = self.selected_file.as_ref() {
-            if is_paste_staging_path(prev) {
-                cleanup_staged_path(prev);
-            }
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
         }
 
         self.selected_url = None;
@@ -1742,10 +1787,8 @@ impl Shift {
         self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
-        if let Some(prev) = self.selected_file.as_ref() {
-            if is_paste_staging_path(prev) {
-                cleanup_staged_path(prev);
-            }
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
         }
         self.selected_file = None;
         self.selected_url = None;
@@ -1767,6 +1810,9 @@ impl Shift {
         self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
 
         // Optimistic preview while downloads / path checks run.
         match paste.tokens() {
@@ -1825,7 +1871,7 @@ impl Shift {
         let cancel = Arc::clone(&self.conversion_cancel);
         let resolve = cx
             .background_executor()
-            .spawn(async move { materialize_magic_paste(&paste, Some(cancel)) });
+            .spawn(async move { materialize_magic_paste_detailed(&paste, Some(cancel)) });
 
         cx.spawn(async move |this, cx| {
             let result = resolve.await;
@@ -1834,7 +1880,9 @@ impl Shift {
                     return;
                 }
                 match result {
-                    Ok(sources) => this.apply_materialized_sources(sources, display_text, cx),
+                    Ok(sources) => {
+                        this.apply_materialized_sources_detailed(sources, display_text, cx)
+                    }
                     Err(error) => {
                         this.selected_file = None;
                         this.selected_url = None;
@@ -1847,6 +1895,22 @@ impl Shift {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn apply_materialized_sources_detailed(
+        &mut self,
+        materialized: Vec<MaterializedSource>,
+        display_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut sources = Vec::with_capacity(materialized.len());
+        for mut item in materialized {
+            if let Some(path) = item.take_staged_path() {
+                self.staged_inputs.track(path);
+            }
+            sources.push(item.source.clone());
+        }
+        self.apply_materialized_sources(sources, display_text, cx);
     }
 
     pub(crate) fn apply_materialized_sources(
@@ -1903,6 +1967,9 @@ impl Shift {
         self.cancel_active_conversion();
         self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
         self.selected_file = None;
         self.selected_url = Some(url.clone());
         self.file_preview = Some(build_url_preview(&url));
@@ -3049,6 +3116,9 @@ impl Shift {
                             let artifact = Arc::new(artifact);
                             this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)), cx);
                             this.set_ready_artifact(artifact);
+                            if let BatchSource::File(path) = &source_for_check {
+                                this.staged_inputs.release(path);
+                            }
                         }
                         Ok(Err(error)) if error.is_cancelled() => {
                             this.conversion =
@@ -3159,10 +3229,8 @@ impl Shift {
     pub(crate) fn clear_selected_file(&mut self, cx: &mut Context<Self>) {
         self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
-        if let Some(prev) = self.selected_file.as_ref() {
-            if is_paste_staging_path(prev) {
-                cleanup_staged_path(prev);
-            }
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
         }
         self.selected_file = None;
         self.selected_url = None;
@@ -3518,6 +3586,7 @@ impl Shift {
             output_format: self.output_format,
             outcome,
             archived: false,
+            artifact_deferred: false,
         };
         entry.detail = history_entry_stored_detail(&entry).into();
         self.history.insert(0, entry);
@@ -3557,6 +3626,7 @@ impl Shift {
             return;
         };
         self.history_save_in_flight = true;
+        let history_epoch = shift_core::history::history_store_epoch();
 
         // Snapshot the revision at submission time. On completion we only clear
         // IDs whose revision is <= this value, so newer mutations remain dirty.
@@ -3565,9 +3635,10 @@ impl Shift {
         let changed: Vec<u64> = self.history_dirty_ids.keys().copied().collect();
         let deleted: Vec<u64> = self.history_deleted_ids.keys().copied().collect();
 
-        let task = cx
-            .background_executor()
-            .spawn(async move { save_history_delta_to(db_path, &stored, &changed, &deleted) });
+        let task = cx.background_executor().spawn(async move {
+            save_history_delta_to_if_current(db_path, &stored, &changed, &deleted, history_epoch)
+                .map(|_| ())
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -4781,6 +4852,7 @@ mod tests {
             output_format,
             outcome,
             archived,
+            artifact_deferred: false,
         }
     }
 
@@ -5591,6 +5663,7 @@ mod tests {
             output_format: OutputFormat::HTML,
             outcome: HistoryOutcome::Failed("nope".into()),
             archived: true,
+            artifact_deferred: false,
         };
         let stored = to_stored_entry(&entry);
         assert_eq!(stored.badge_color, 0xabcdef);
@@ -5600,6 +5673,41 @@ mod tests {
         assert_eq!(stored.name, "x.docx");
         assert_eq!(stored.output_format, "html");
         assert!(stored.archived);
+    }
+
+    #[test]
+    fn deferred_history_round_trip_preserves_lazy_artifact_marker() {
+        let stored = StoredHistoryEntry {
+            id: 12,
+            source: StoredSource::File(PathBuf::from("/tmp/large.mp4")),
+            name: "large.mp4".to_owned(),
+            detail: "MP4 → MP3".to_owned(),
+            extension_label: "MP4".to_owned(),
+            badge_color: BADGE_FILL,
+            badge_text_color: BADGE_TEXT,
+            output_format: OutputFormat::MARKDOWN.id().to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "ffmpeg".to_owned(),
+                file_name: "large.md".to_owned(),
+                format: OutputFormat::MARKDOWN.id().to_owned(),
+                bytes: Vec::new(),
+            },
+            archived: false,
+            artifact_deferred: true,
+        };
+
+        let entry = from_stored_entry(stored).expect("valid deferred history row");
+        assert!(entry.artifact_deferred);
+        match &entry.outcome {
+            HistoryOutcome::Ready(artifact) => assert!(artifact.bytes.is_empty()),
+            _ => panic!("expected deferred Ready outcome"),
+        }
+        let round_trip = to_stored_entry(&entry);
+        assert!(round_trip.artifact_deferred);
+        assert!(matches!(
+            round_trip.outcome,
+            StoredOutcome::Ready { bytes, .. } if bytes.is_empty()
+        ));
     }
 
     #[test]

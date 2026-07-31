@@ -74,12 +74,17 @@ pub fn run_command_cancellable_with_output_paths(
     cancel: Option<Arc<AtomicBool>>,
     watch_output_paths: &[PathBuf],
 ) -> Result<LimitedOutput, ConversionError> {
-    run_command_cancellable_with_output_dirs(
+    let path_limits: Vec<(PathBuf, u64)> = watch_output_paths
+        .iter()
+        .cloned()
+        .map(|path| (path, max_output_bytes as u64))
+        .collect();
+    run_command_cancellable_with_output_limits(
         command,
         timeout,
         max_output_bytes,
         cancel,
-        watch_output_paths,
+        &path_limits,
         &[],
     )
 }
@@ -89,11 +94,36 @@ pub fn run_command_cancellable_with_output_paths(
 /// stdout/stderr and file-output budgets, which lets callers enforce a larger
 /// temporary-workspace cap without weakening captured-process-output limits.
 pub fn run_command_cancellable_with_output_dirs(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     max_output_bytes: usize,
     cancel: Option<Arc<AtomicBool>>,
     watch_output_paths: &[PathBuf],
+    watch_output_dirs: &[(PathBuf, u64)],
+) -> Result<LimitedOutput, ConversionError> {
+    let path_limits: Vec<(PathBuf, u64)> = watch_output_paths
+        .iter()
+        .cloned()
+        .map(|path| (path, max_output_bytes as u64))
+        .collect();
+    run_command_cancellable_with_output_limits(
+        command,
+        timeout,
+        max_output_bytes,
+        cancel,
+        &path_limits,
+        watch_output_dirs,
+    )
+}
+
+/// Run a command while applying independent byte ceilings to captured output,
+/// watched files, and watched temporary directories.
+pub fn run_command_cancellable_with_output_limits(
+    mut command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancel: Option<Arc<AtomicBool>>,
+    watch_output_paths: &[(PathBuf, u64)],
     watch_output_dirs: &[(PathBuf, u64)],
 ) -> Result<LimitedOutput, ConversionError> {
     if cancel
@@ -140,7 +170,6 @@ pub fn run_command_cancellable_with_output_dirs(
         &mut child,
         timeout,
         cancel.clone(),
-        max_output_bytes,
         watch_output_paths,
         watch_output_dirs,
     ) {
@@ -160,14 +189,14 @@ pub fn run_command_cancellable_with_output_dirs(
             let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
             return Err(ConversionError::cancelled());
         }
-        WaitOutcome::OutputTooLarge { path, size } => {
+        WaitOutcome::OutputTooLarge { path, size, limit } => {
             let _ = join_reader_timeout(stdout_thread, READER_JOIN_TIMEOUT);
             let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
             return Err(ConversionError::new(format!(
                 "converter output {} is too large ({} bytes; limit is {} bytes)",
                 path.display(),
                 size,
-                max_output_bytes
+                limit
             )));
         }
         WaitOutcome::Error(error) => {
@@ -203,7 +232,11 @@ enum WaitOutcome {
     Exited(std::process::ExitStatus),
     TimedOut,
     Cancelled,
-    OutputTooLarge { path: PathBuf, size: u64 },
+    OutputTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
     Error(std::io::Error),
 }
 
@@ -216,26 +249,37 @@ fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
-    max_output_bytes: usize,
-    watch_output_paths: &[PathBuf],
+    watch_output_paths: &[(PathBuf, u64)],
     watch_output_dirs: &[(PathBuf, u64)],
 ) -> WaitOutcome {
     let start = std::time::Instant::now();
-    let max_bytes = max_output_bytes as u64;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return WaitOutcome::Exited(status),
+            Ok(Some(status)) => {
+                // A fast converter can create its entire output and exit before
+                // the next polling iteration. Check once more after reaping so
+                // on-disk limits are hard ceilings, not best-effort checks only
+                // for long-running children.
+                if let Some(over) = check_watched_output_size(watch_output_paths, watch_output_dirs)
+                {
+                    return WaitOutcome::OutputTooLarge {
+                        path: over.0,
+                        size: over.1,
+                        limit: over.2,
+                    };
+                }
+                return WaitOutcome::Exited(status);
+            }
             Ok(None) => {}
             Err(error) => return WaitOutcome::Error(error),
         }
 
-        if let Some(over) =
-            check_watched_output_size(watch_output_paths, watch_output_dirs, max_bytes)
-        {
+        if let Some(over) = check_watched_output_size(watch_output_paths, watch_output_dirs) {
             force_kill(child);
             return WaitOutcome::OutputTooLarge {
                 path: over.0,
                 size: over.1,
+                limit: over.2,
             };
         }
 
@@ -259,15 +303,14 @@ fn wait_with_timeout(
 }
 
 fn check_watched_output_size(
-    paths: &[PathBuf],
+    paths: &[(PathBuf, u64)],
     dirs: &[(PathBuf, u64)],
-    max_bytes: u64,
-) -> Option<(PathBuf, u64)> {
-    for path in paths {
+) -> Option<(PathBuf, u64, u64)> {
+    for (path, limit) in paths {
         if let Ok(metadata) = std::fs::metadata(path) {
             let len = metadata.len();
-            if len > max_bytes {
-                return Some((path.clone(), len));
+            if len > *limit {
+                return Some((path.clone(), len, *limit));
             }
         }
     }
@@ -289,7 +332,7 @@ fn check_watched_output_size(
                 {
                     total = total.saturating_add(metadata.len());
                     if total > *limit {
-                        return Some((dir.clone(), total));
+                        return Some((dir.clone(), total, *limit));
                     }
                 }
             }
@@ -2237,6 +2280,9 @@ mod tests {
 
     #[test]
     fn find_executable_accepts_absolute_runnable_path() {
+        // Discovery results are process-global; serialize cache clears with
+        // the environment-mutating discovery tests.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("find-abs");
         let tool = std::env::temp_dir().join(format!("shift-find-abs-{suffix}"));
         write_script(&tool, "#!/bin/sh\necho abs\n");
@@ -2706,6 +2752,37 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "on-disk size limit took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn watched_output_path_checks_fast_exit_after_child_reaps() {
+        let suffix = unique_suffix("watch-fast");
+        let script = std::env::temp_dir().join(format!("shift-process-watch-fast-{suffix}"));
+        let out = std::env::temp_dir().join(format!("shift-process-watch-fast-out-{suffix}.bin"));
+        let _ = std::fs::remove_file(&out);
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ndd if=/dev/zero of='{}' bs=200 count=1 2>/dev/null\nexit 0\n",
+                out.display()
+            ),
+        );
+
+        let error = run_command_cancellable_with_output_limits(
+            shell_command(&script),
+            Duration::from_secs(5),
+            64,
+            None,
+            &[(out.clone(), 128)],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("limit"),
+            "error: {error}"
         );
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(&out);

@@ -1,7 +1,7 @@
 # Shift security & reliability hardening plan
 
-**Date:** 2026-07-30  
-**Branch base:** `main` (`7649762`)  
+**Date:** 2026-07-30
+**Branch base:** `main` (`7649762`)
 **Scope:** Findings 1–64 from the security/reliability audit.
 
 ## Goals

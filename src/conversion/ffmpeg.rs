@@ -5,7 +5,8 @@ use super::{
     InvocationRecord, OutputFormat, TempDirGuard, command_argv_parts, format_argv_display,
     map_spawn_error, max_output_bytes, process_timeout, push_flag_path, push_path_arg,
     read_file_limited, resolve_tool_executable, run_command, run_command_cancellable,
-    run_command_cancellable_with_output_paths, unique_temp_dir,
+    run_command_cancellable_with_output_dirs, run_command_cancellable_with_output_paths,
+    unique_temp_dir,
 };
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -563,11 +564,13 @@ impl FfmpegModule {
         };
 
         report_phase(options, "FFmpeg extracting frames…");
-        let output = run_command_cancellable(
+        let output = run_command_cancellable_with_output_dirs(
             command,
             process_timeout(),
             max_output_bytes(),
             options.cancel.clone(),
+            &[],
+            &[(frames_dir.clone(), max_output_bytes() as u64)],
         )
         .map_err(|error| {
             map_spawn_error(

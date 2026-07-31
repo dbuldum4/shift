@@ -157,6 +157,11 @@ impl StagedInputs {
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
+    /// Release one staged source while keeping unrelated tracked inputs alive.
+    pub fn release(&mut self, path: &Path) {
+        self.paths.retain(|tracked| tracked != path);
+        cleanup_staged_path(path);
+    }
     pub fn cleanup(&mut self) {
         for path in self.paths.drain(..) {
             cleanup_staged_path(&path);
@@ -1669,6 +1674,33 @@ exit 0
             drop(staged);
         }
         assert!(!path.exists());
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_inputs_release_cleans_one_owned_path() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-release-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        let path = stage_pasted_image(b"\x89PNG", "png").unwrap();
+        let mut staged = StagedInputs::new();
+        staged.track(path.clone());
+        staged.release(&path);
+        assert!(staged.is_empty());
+        assert!(!path.exists());
+
         unsafe {
             std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
         }

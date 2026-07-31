@@ -27,6 +27,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, param
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Full artifact bytes retained per history entry; larger results store metadata only.
 pub const MAX_HISTORY_ARTIFACT_BYTES: usize = 512 * 1024;
@@ -41,6 +43,11 @@ pub const MAX_HISTORY_LIMIT: usize = 500;
 /// Kept for callers that used the older constant name.
 pub const MAX_HISTORY_ENTRIES: usize = DEFAULT_HISTORY_LIMIT;
 
+/// Bound the legacy blob before reading it into memory during migration.
+pub const MAX_LEGACY_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Bound each legacy text field before allocating its decoded buffer.
+const MAX_LEGACY_FIELD_BYTES: usize = 1024 * 1024;
+
 /// Max automatic save retries after a failed history persist (app layer).
 pub const HISTORY_SAVE_MAX_RETRIES: u32 = 6;
 /// Base delay for exponential backoff on history save failure (milliseconds).
@@ -50,6 +57,22 @@ const MAGIC: &[u8] = b"SHIFT_HISTORY_V1\n";
 /// Prefix for non-UTF-8 source paths stored as hex-encoded OS bytes.
 const OS_PATH_PREFIX: &str = "os:";
 const LEGACY_MIGRATION_KEY: &str = "legacy-history-v1-imported";
+
+static HISTORY_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static HISTORY_STORE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn history_store_lock() -> &'static Mutex<()> {
+    HISTORY_STORE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Return the current in-process history-store generation.
+///
+/// Background saves capture this value. A clear operation increments it before
+/// taking the store lock, so a save queued before the clear cannot recreate the
+/// deleted database after the clear completes.
+pub fn history_store_epoch() -> u64 {
+    HISTORY_STORE_EPOCH.load(Ordering::SeqCst)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoredSource {
@@ -572,15 +595,14 @@ pub fn load_history() -> LoadedHistory {
 
     if let Some(ref legacy) = legacy_path {
         if legacy.exists() && !legacy_migration_completed(&conn) {
-            let bytes = match std::fs::read(legacy) {
+            let bytes = match read_legacy_history_bounded(legacy) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    return LoadedHistory {
-                        entries: Vec::new(),
-                        next_id: peek_next_history_id(&conn).unwrap_or(1),
-                        load_error: Some(format!("could not read legacy history: {error}")),
-                        load_incomplete: true,
-                    };
+                    return legacy_load_failure(
+                        &conn,
+                        legacy,
+                        format!("could not read legacy history: {error}"),
+                    );
                 }
             };
             match import_legacy_history(&mut conn, &bytes) {
@@ -615,14 +637,11 @@ pub fn load_history() -> LoadedHistory {
                     }
                 }
                 Err(error) => {
-                    // Keep legacy file in place; do not treat partial import as success.
-                    let next_id = peek_next_history_id(&conn).unwrap_or(1);
-                    return LoadedHistory {
-                        entries: Vec::new(),
-                        next_id,
-                        load_error: Some(format!("legacy history import failed: {error}")),
-                        load_incomplete: true,
-                    };
+                    return legacy_load_failure(
+                        &conn,
+                        legacy,
+                        format!("legacy history import failed: {error}"),
+                    );
                 }
             }
         }
@@ -653,6 +672,65 @@ pub fn load_history() -> LoadedHistory {
                 load_incomplete: true,
             }
         }
+    }
+}
+
+fn read_legacy_history_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_LEGACY_HISTORY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy history exceeds the {} byte limit",
+                MAX_LEGACY_HISTORY_FILE_BYTES
+            ),
+        ));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LEGACY_HISTORY_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LEGACY_HISTORY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy history exceeds the {} byte limit",
+                MAX_LEGACY_HISTORY_FILE_BYTES
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn quarantine_legacy_history(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name()?.to_string_lossy();
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let quarantined = parent.join(format!("{name}.bad.{token}"));
+    std::fs::rename(path, &quarantined)
+        .ok()
+        .map(|()| quarantined)
+}
+
+fn legacy_load_failure(conn: &Connection, legacy: &Path, message: String) -> LoadedHistory {
+    // Keep valid SQLite rows visible even when an obsolete legacy blob is
+    // malformed. Quarantine the bad input so a startup failure is not repeated
+    // forever; the original bytes remain recoverable under the new name.
+    let entries = history_entries(conn, true).unwrap_or_default();
+    let next_id = peek_next_history_id(conn).unwrap_or(1);
+    let message = match quarantine_legacy_history(legacy) {
+        Some(path) => format!("{message}; legacy file quarantined at {}", path.display()),
+        None => message,
+    };
+    LoadedHistory {
+        entries,
+        next_id,
+        load_error: Some(message),
+        load_incomplete: true,
     }
 }
 
@@ -708,6 +786,39 @@ pub fn save_history_delta_to(
     deleted_ids: &[u64],
 ) -> io::Result<()> {
     let db_path = db_path.as_ref();
+    let _guard = history_store_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    save_history_delta_to_locked(db_path, entries, changed_ids, deleted_ids)
+}
+
+/// Write a history delta unless a clear operation has superseded the caller's
+/// snapshot. The check and write share the history-store lock, so a clear
+/// either happens before this save or removes the database after it.
+pub fn save_history_delta_to_if_current(
+    db_path: impl AsRef<Path>,
+    entries: &[StoredHistoryEntry],
+    changed_ids: &[u64],
+    deleted_ids: &[u64],
+    expected_epoch: u64,
+) -> io::Result<bool> {
+    let db_path = db_path.as_ref();
+    let _guard = history_store_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if history_store_epoch() != expected_epoch {
+        return Ok(false);
+    }
+    save_history_delta_to_locked(db_path, entries, changed_ids, deleted_ids)?;
+    Ok(true)
+}
+
+fn save_history_delta_to_locked(
+    db_path: &Path,
+    entries: &[StoredHistoryEntry],
+    changed_ids: &[u64],
+    deleted_ids: &[u64],
+) -> io::Result<()> {
     if let Some(parent) = db_path.parent() {
         ensure_private_dir(parent)?;
     }
@@ -754,6 +865,9 @@ pub fn save_history(entries: &[StoredHistoryEntry], _next_id: u64) -> io::Result
             "could not locate the user home directory",
         ));
     };
+    let _guard = history_store_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Some(parent) = db_path.parent() {
         ensure_private_dir(parent)?;
     }
@@ -770,7 +884,7 @@ pub fn save_history(entries: &[StoredHistoryEntry], _next_id: u64) -> io::Result
         .filter(|id| !kept.contains(id))
         .collect();
 
-    save_history_delta(entries, &changed_ids, &deleted_ids)
+    save_history_delta_to_locked(&db_path, entries, &changed_ids, &deleted_ids)
 }
 
 /// Return the IDs of every row currently stored in the history table.
@@ -842,6 +956,10 @@ fn enforce_artifact_byte_budget(conn: &Connection, budget: usize) -> Result<(), 
 /// When the SQLite file exists, rows are deleted and the file is VACUUMed
 /// before removal so freed pages are not left on disk longer than needed.
 pub fn clear_history_store() -> io::Result<()> {
+    HISTORY_STORE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let _guard = history_store_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Some(db_path) = history_db_path() {
         if db_path.is_file() {
             // Best-effort secure clear: delete rows + VACUUM, then remove file.
@@ -1484,6 +1602,12 @@ fn write_string(out: &mut Vec<u8>, value: &str) {
 
 fn read_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
     let len = read_u32(cursor)? as usize;
+    if len > MAX_LEGACY_FIELD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("legacy history field exceeds the {MAX_LEGACY_FIELD_BYTES} byte limit"),
+        ));
+    }
     let mut bytes = vec![0u8; len];
     cursor.read_exact(&mut bytes)?;
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -1497,6 +1621,12 @@ fn write_bytes(out: &mut Vec<u8>, value: &[u8]) {
 
 fn read_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
     let len = read_u32(cursor)? as usize;
+    if len > MAX_HISTORY_ARTIFACT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("legacy history artifact exceeds the {MAX_HISTORY_ARTIFACT_BYTES} byte limit"),
+        ));
+    }
     let mut bytes = vec![0u8; len];
     cursor.read_exact(&mut bytes)?;
     Ok(bytes)
@@ -2047,6 +2177,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_decoder_rejects_oversized_lengths_before_allocation() {
+        let mut field = Vec::new();
+        write_u32(
+            &mut field,
+            (MAX_LEGACY_FIELD_BYTES as u32).saturating_add(1),
+        );
+        let mut cursor = Cursor::new(field.as_slice());
+        let error = read_string(&mut cursor).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut artifact = Vec::new();
+        write_u32(
+            &mut artifact,
+            (MAX_HISTORY_ARTIFACT_BYTES as u32).saturating_add(1),
+        );
+        let mut cursor = Cursor::new(artifact.as_slice());
+        let error = read_bytes(&mut cursor).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn decode_history_rejects_garbage_and_wrong_magic() {
         assert!(decode_history(b"").is_err());
         assert!(decode_history(b"not-a-history-blob").is_err());
@@ -2408,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn load_history_keeps_legacy_when_import_fails() {
+    fn load_history_quarantines_malformed_legacy_and_keeps_sqlite_rows() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_support_dir("legacy-fail");
         unsafe {
@@ -2417,20 +2568,97 @@ mod tests {
 
         let legacy_path = dir.join("history");
         std::fs::write(&legacy_path, b"not a valid history blob").unwrap();
+        let db_path = history_db_path().unwrap();
+        let conn = open_history(&db_path).unwrap();
+        add_history_entry(
+            &conn,
+            &sample_entry(9, "from-sqlite", false),
+            DEFAULT_HISTORY_LIMIT,
+        )
+        .unwrap();
+        drop(conn);
 
         let loaded = load_history();
         assert!(loaded.load_incomplete);
         assert!(loaded.load_error.is_some());
-        assert!(legacy_path.exists(), "failed import must keep legacy file");
-        assert!(loaded.entries.is_empty());
+        assert!(
+            !legacy_path.exists(),
+            "malformed legacy file must be quarantined"
+        );
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].name, "from-sqlite");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("history.bad.")),
+            "quarantine should preserve the malformed bytes under a recoverable name"
+        );
 
-        // The failed first attempt created the SQLite schema, so the next
-        // startup must still retry the legacy blob instead of treating the
-        // empty database as a successful migration.
+        // The quarantined legacy blob must not make every later startup fail.
         let again = load_history();
-        assert!(again.load_incomplete);
-        assert!(again.load_error.is_some());
-        assert!(again.entries.is_empty());
+        assert!(!again.load_incomplete);
+        assert!(again.load_error.is_none());
+        assert_eq!(again.entries.len(), 1);
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_legacy_history_is_bounded_and_quarantined() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_support_dir("legacy-oversized");
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+        let legacy_path = dir.join("history");
+        let file = std::fs::File::create(&legacy_path).unwrap();
+        file.set_len(MAX_LEGACY_HISTORY_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let loaded = load_history();
+        assert!(loaded.load_incomplete);
+        assert!(
+            loaded
+                .load_error
+                .as_deref()
+                .is_some_and(|message| message.contains("exceeds"))
+        );
+        assert!(!legacy_path.exists());
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_history_save_is_skipped_after_clear_epoch_changes() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_support_dir("stale-save");
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+        let db_path = history_db_path().unwrap();
+        let epoch = history_store_epoch();
+        clear_history_store().unwrap();
+
+        let saved = save_history_delta_to_if_current(
+            &db_path,
+            &[sample_entry(1, "stale", false)],
+            &[1],
+            &[],
+            epoch,
+        )
+        .unwrap();
+        assert!(!saved);
+        assert!(
+            !db_path.exists(),
+            "a stale save must not recreate a cleared store"
+        );
 
         unsafe {
             std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
