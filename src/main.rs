@@ -35,12 +35,13 @@ use shift_core::conversion::{
     MAX_CLIPBOARD_IMAGE_BYTES, MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, MaterializedSource,
     OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, Readiness, SipsFlip,
     SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, available_outputs_for_batch_source,
-    available_ready_outputs, available_ready_url_outputs, expand_input_paths_preserving_roots,
-    ffmpeg_supports_target_size_output, is_audio_output, is_docling_timed_input,
-    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
-    looks_like_url, materialize_magic_paste_detailed, parse_magic_paste, paths_refer_to_same_file,
-    pdf_engine_candidates, run_batch, sips_supports_target_size_output, stage_pasted_image,
-    suggested_output_for_path, suggested_output_for_url, url_display_host,
+    available_ready_outputs, available_ready_url_outputs, default_install_command,
+    expand_input_paths_preserving_roots, ffmpeg_supports_target_size_output, is_audio_output,
+    is_docling_timed_input, is_docling_video_input, is_ffmpeg_output, is_image_output,
+    is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste_detailed,
+    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
+    sips_supports_target_size_output, stage_pasted_image, suggested_output_for_path,
+    suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -3499,7 +3500,8 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .child(message),
             )
             .children(install_hints.into_iter().enumerate().map(|(index, (label, hint))| {
-                let hint_for_copy = hint.clone();
+                let command_for_copy = default_install_command(&hint)
+                    .unwrap_or_else(|| hint.to_string());
                 div()
                     .id(("install-hint", index as u64))
                     .flex()
@@ -3540,7 +3542,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .child("Copy install command")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
-                                    hint_for_copy.to_string(),
+                                    command_for_copy.clone(),
                                 ));
                                 this.save_status = Some("Install command copied.".into());
                                 cx.notify();

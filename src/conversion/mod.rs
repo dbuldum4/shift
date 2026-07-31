@@ -46,7 +46,8 @@ pub use defuddle::{
 };
 pub use diagnostics::{
     DiagnosticsReport, EngineDiagnostic, FormatAvailability, PdfEngineDiagnostic, Readiness,
-    available_ready_outputs, available_ready_url_outputs, format_availability, supported_outputs,
+    available_ready_outputs, available_ready_url_outputs, default_install_command,
+    format_availability, supported_outputs,
 };
 pub use docling::{
     DoclingAsrModel, DoclingImageExportMode, DoclingModule, DoclingOptions, DoclingTableMode,

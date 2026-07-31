@@ -86,6 +86,35 @@ pub struct EngineDiagnostic {
     pub notes: Option<String>,
 }
 
+/// Return the primary shell command from an install hint.
+///
+/// Install hints may include alternatives for users who prefer another
+/// package manager or an environment override. The first command is the
+/// default that the UI should put on the clipboard; the complete hint remains
+/// available for display and for the text diagnostics report.
+pub fn default_install_command(hint: &str) -> Option<String> {
+    let line = hint.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut command = line;
+
+    // Keep the first command when the hint describes an alternative in prose.
+    // These markers cover the formats used by the built-in engine probes:
+    // parenthetical alternatives, shell comments, and environment overrides.
+    for marker in ["(or:", "# or:", " or set "] {
+        if let Some((primary, _)) = command.split_once(marker) {
+            command = primary.trim_end();
+        }
+    }
+
+    // Defuddle's Node guidance and similar hints may annotate the primary
+    // command with a shell comment rather than a parenthetical alternative.
+    if let Some((primary, _)) = command.split_once(" #") {
+        command = primary.trim_end();
+    }
+
+    let command = command.trim().trim_matches('`').trim();
+    (!command.is_empty()).then(|| command.to_owned())
+}
+
 /// Status of one Pandoc PDF backend candidate (or a custom `SHIFT_PDF_ENGINE`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PdfEngineDiagnostic {
@@ -604,9 +633,9 @@ fn probe_defuddle() -> EngineDiagnostic {
 
     let node = find_executable("node");
     let install_hint = if node.is_none() {
-        "brew install node  # Shift ships Defuddle; Node is required to run it\n# or: export SHIFT_NODE_BIN=/absolute/path/to/node".into()
+        "brew install node  (or: export SHIFT_NODE_BIN=/absolute/path/to/node)".into()
     } else {
-        "npm install -g defuddle  # or set SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle".into()
+        "npm install -g defuddle  (or: set SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle)".into()
     };
     let notes = if node.is_none() {
         Some(
@@ -642,7 +671,7 @@ fn probe_defuddle() -> EngineDiagnostic {
 }
 
 fn probe_docling() -> EngineDiagnostic {
-    let install_hint = "pip install docling  (or: uv pip install docling)".into();
+    let install_hint = "python3 -m pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0'  (or: uv pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0')".into();
     let env_override = "SHIFT_DOCLING_BIN";
     let resolved = resolve_tool_path(env_override, "docling", &[project_venv_bin("docling")]);
     finish_engine_probe(
@@ -1829,6 +1858,52 @@ mod tests {
             "supported (engine missing)"
         );
         assert_eq!(FormatAvailability::Unsupported.label(), "unsupported");
+    }
+
+    #[test]
+    fn default_install_command_uses_the_primary_command_for_each_external_engine() {
+        let cases = [
+            (
+                "python3 -m pip install 'markitdown[all]'  (or: uv pip install 'markitdown[all]')",
+                "python3 -m pip install 'markitdown[all]'",
+            ),
+            ("brew install pandoc", "brew install pandoc"),
+            (
+                "brew install node  (or: export SHIFT_NODE_BIN=/absolute/path/to/node)",
+                "brew install node",
+            ),
+            (
+                "npm install -g defuddle  (or: set SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle)",
+                "npm install -g defuddle",
+            ),
+            (
+                "python3 -m pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0'  (or: uv pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0')",
+                "python3 -m pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0'",
+            ),
+            ("brew install qpdf", "brew install qpdf"),
+            ("brew install ffmpeg", "brew install ffmpeg"),
+        ];
+
+        for (hint, expected) in cases {
+            assert_eq!(default_install_command(hint).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn default_install_command_handles_shell_comment_alternatives() {
+        assert_eq!(
+            default_install_command(
+                "brew install node  # Shift ships Defuddle; Node is required to run it\n# or: export SHIFT_NODE_BIN=/absolute/path/to/node"
+            )
+            .as_deref(),
+            Some("brew install node")
+        );
+        assert_eq!(
+            default_install_command("npm install -g defuddle # or set SHIFT_DEFUDDLE_BIN=/path")
+                .as_deref(),
+            Some("npm install -g defuddle")
+        );
+        assert_eq!(default_install_command("  \n  ").as_deref(), None);
     }
 
     #[test]
