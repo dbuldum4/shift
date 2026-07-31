@@ -117,11 +117,31 @@ pub fn download_url_to_path(
         download_follow_redirects(url, path, &options)
     };
     match result {
-        Ok(()) => Ok(()),
-        Err(error) if error.is_cancelled() => Err(error),
-        Err(error) => Err(ConversionError::new(redact_credentials_in_text(
-            &error.to_string().replace(url, &display_url),
-        ))),
+        Ok(()) => {
+            let size = fs::metadata(path).map_err(|error| {
+                ConversionError::new(format!(
+                    "download of {display_url} did not produce a readable file: {error}"
+                ))
+            })?;
+            if size.len() > options.max_bytes {
+                let _ = fs::remove_file(path);
+                return Err(ConversionError::new(format!(
+                    "could not download {display_url}: exceeded size limit ({} bytes)",
+                    options.max_bytes
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.is_cancelled() => {
+            let _ = fs::remove_file(path);
+            Err(error)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(path);
+            Err(ConversionError::new(redact_credentials_in_text(
+                &error.to_string().replace(url, &display_url),
+            )))
+        }
     }
 }
 

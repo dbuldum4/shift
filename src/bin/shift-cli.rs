@@ -1,11 +1,12 @@
 use shift_core::conversion::{
-    BatchEnqueueOptions, BatchEvent, BatchInput, BatchNamingTemplate, BatchQueue, BatchSource,
-    ConversionArtifact, ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions,
-    DiagnosticsReport, DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
-    DoclingVideoSamplingMode, ExpandBudget, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions,
-    FfmpegQuality, MAX_BATCH_ADMISSION, MagicPaste, MarkItDownOptions, MaterializedSource,
-    OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, SipsFlip,
-    SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, WatchTracker, default_output_path,
+    BatchEnqueueOptions, BatchEvent, BatchInput, BatchItemId, BatchItemState, BatchNamingTemplate,
+    BatchQueue, BatchSource, ConversionArtifact, ConversionOptions, ConversionProgress,
+    ConversionRegistry, DefuddleOptions, DiagnosticsReport, DoclingAsrModel,
+    DoclingImageExportMode, DoclingOptions, DoclingTableMode, DoclingVideoSamplingMode,
+    ExpandBudget, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
+    MAX_BATCH_ADMISSION, MagicPaste, MarkItDownOptions, MaterializedSource, OutputFormat,
+    PandocOptions, PasteToken, PdfCompression, PdfInputOptions, SipsFlip, SipsOptions, SipsQuality,
+    SpreadsheetOptions, StagedInputs, WatchTracker, default_output_path,
     ensure_public_url_fetch_allowed, expand_input_paths_preserving_roots_with_budget,
     looks_like_url, materialize_paste_token_detailed, parse_magic_paste, prepare_batch_destination,
     resolve_destination_with_policy, run_batch, url_display_host, validate_batch_output_formats,
@@ -424,7 +425,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             );
             return Ok(ExitCode::SUCCESS);
         }
-        return Ok(run_watch_batch(
+        let (exit_code, _) = run_watch_batch(
             paths,
             &watch.conversion.also_to,
             &enqueue,
@@ -433,7 +434,8 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             watch.conversion.verbose,
             watch.conversion.preferred_module.as_deref(),
             watch.conversion.path_print_mode,
-        ));
+        );
+        return Ok(exit_code);
     }
 
     eprintln!(
@@ -447,7 +449,7 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
             .poll(&watch.input_dir, SystemTime::now(), watch.debounce)
             .map_err(|error| error.to_string())?;
         if !paths.is_empty() {
-            let _ = run_watch_batch(
+            let (exit_code, outcomes) = run_watch_batch(
                 paths,
                 &watch.conversion.also_to,
                 &enqueue,
@@ -457,6 +459,10 @@ fn run_watch(arguments: &[OsString]) -> Result<ExitCode, String> {
                 watch.conversion.preferred_module.as_deref(),
                 watch.conversion.path_print_mode,
             );
+            tracker.report_outcomes(outcomes);
+            if exit_code == ExitCode::from(130) {
+                break;
+            }
         }
         let mut slept = Duration::ZERO;
         while slept < watch.poll_interval && !cancel.load(Ordering::SeqCst) {
@@ -481,9 +487,11 @@ fn run_watch_batch(
     verbose: bool,
     preferred_module: Option<&str>,
     path_print_mode: PathPrintMode,
-) -> ExitCode {
+) -> (ExitCode, Vec<(PathBuf, bool)>) {
     let mut queue = BatchQueue::new();
+    let mut source_jobs: Vec<(PathBuf, Vec<BatchItemId>)> = Vec::new();
     for expanded in paths {
+        let source_path = expanded.path.clone();
         let input = if let Some(relative_parent) = expanded.relative_parent() {
             match BatchInput::with_relative_parent(
                 BatchSource::File(expanded.path.clone()),
@@ -492,6 +500,7 @@ fn run_watch_batch(
                 Ok(input) => input,
                 Err(error) => {
                     eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
+                    source_jobs.push((source_path, Vec::new()));
                     continue;
                 }
             }
@@ -503,19 +512,34 @@ fn run_watch_batch(
         formats.extend(also_to.iter().copied());
         if let Err(error) = validate_batch_output_formats(registry, &input.source, &formats) {
             eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
+            source_jobs.push((source_path, Vec::new()));
             continue;
         }
-        let ids = queue.enqueue_fan_out(input, also_to, enqueue);
+        let ids = match queue.enqueue_fan_out(input, also_to, enqueue) {
+            Ok(ids) => ids,
+            Err(error) => {
+                eprintln!("shift-cli: skipped {}: {error}", expanded.path.display());
+                source_jobs.push((source_path, Vec::new()));
+                continue;
+            }
+        };
         if let Some(module) = preferred_module {
-            for id in ids {
-                if let Some(item) = queue.get_mut(id) {
+            for id in &ids {
+                if let Some(item) = queue.get_mut(*id) {
                     item.preferred_module = Some(module.to_owned());
                 }
             }
         }
+        source_jobs.push((source_path, ids));
     }
     if queue.is_empty() {
-        return ExitCode::SUCCESS;
+        return (
+            ExitCode::SUCCESS,
+            source_jobs
+                .into_iter()
+                .map(|(path, _)| (path, false))
+                .collect(),
+        );
     }
     let summary = run_batch(&mut queue, registry, cancel, |event| match event {
         BatchEvent::ItemStarted {
@@ -555,7 +579,19 @@ fn run_watch_batch(
             summary.succeeded, summary.failed, summary.cancelled
         );
     }
-    ExitCode::from(summary.exit_code())
+    let outcomes = source_jobs
+        .into_iter()
+        .map(|(path, ids)| {
+            let success = !ids.is_empty()
+                && ids.iter().all(|id| {
+                    queue
+                        .get(*id)
+                        .is_some_and(|item| matches!(item.state, BatchItemState::Succeeded { .. }))
+                });
+            (path, success)
+        })
+        .collect();
+    (ExitCode::from(summary.exit_code()), outcomes)
 }
 
 /// How output artifact paths are printed on stdout after a successful write.
@@ -1807,7 +1843,12 @@ fn run_batch_cli(
             staged.cleanup();
             return Err(error.to_string());
         }
-        let ids = queue.enqueue_fan_out(input, &also_to, &enqueue);
+        let ids = queue
+            .enqueue_fan_out(input, &also_to, &enqueue)
+            .map_err(|error| {
+                staged.cleanup();
+                error.to_string()
+            })?;
         if let Some(module) = preferred_module {
             for id in ids {
                 if let Some(item) = queue.get_mut(id) {

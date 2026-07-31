@@ -664,16 +664,17 @@ impl BatchQueue {
         input: BatchInput,
         additional_formats: &[OutputFormat],
         opts: &BatchEnqueueOptions,
-    ) -> Vec<BatchItemId> {
-        let group_id = self.allocate_group_id();
+    ) -> Result<Vec<BatchItemId>, ConversionError> {
         let mut formats = vec![opts.output_format];
         for &format in additional_formats {
             if !formats.contains(&format) {
                 formats.push(format);
             }
         }
+        self.check_admission(formats.len())?;
+        let group_id = self.allocate_group_id();
 
-        formats
+        Ok(formats
             .into_iter()
             .map(|format| {
                 let selection = if format == opts.output_format {
@@ -683,7 +684,7 @@ impl BatchQueue {
                 };
                 self.push_job(input.clone(), group_id, format, selection, opts)
             })
-            .collect()
+            .collect())
     }
 
     fn allocate_group_id(&mut self) -> u64 {
@@ -764,6 +765,9 @@ impl BatchQueue {
         format: OutputFormat,
         output_dir: Option<&Path>,
     ) -> Option<BatchItemId> {
+        if self.check_admission(1).is_err() {
+            return None;
+        }
         let template = self.get(id)?.clone();
         if !matches!(template.state, BatchItemState::Queued) {
             return None;
@@ -1967,15 +1971,17 @@ mod tests {
             force: true,
             ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
         };
-        let ids = queue.enqueue_fan_out(
-            BatchInput::new(BatchSource::File(input)),
-            &[
-                OutputFormat::HTML,
-                OutputFormat::MARKDOWN,
-                OutputFormat::HTML,
-            ],
-            &opts,
-        );
+        let ids = queue
+            .enqueue_fan_out(
+                BatchInput::new(BatchSource::File(input)),
+                &[
+                    OutputFormat::HTML,
+                    OutputFormat::MARKDOWN,
+                    OutputFormat::HTML,
+                ],
+                &opts,
+            )
+            .unwrap();
         assert_eq!(ids, vec![BatchItemId(0), BatchItemId(1)]);
         assert_eq!(
             queue
@@ -2028,14 +2034,43 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_and_extra_outputs_respect_admission_cap() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        for index in 0..MAX_BATCH_ADMISSION {
+            queue.enqueue(
+                BatchSource::File(PathBuf::from(format!("/tmp/source-{index}.txt"))),
+                &opts,
+            );
+        }
+
+        let error = queue
+            .enqueue_fan_out(
+                BatchInput::new(BatchSource::File(PathBuf::from("/tmp/overflow.txt"))),
+                &[OutputFormat::HTML],
+                &opts,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("queue items"));
+        assert!(
+            queue
+                .add_output_for_item(BatchItemId(0), OutputFormat::HTML, Some(Path::new("/out")),)
+                .is_none(),
+            "extra output must not bypass the queue cap"
+        );
+    }
+
+    #[test]
     fn per_item_format_change_cannot_duplicate_a_fan_out_output() {
         let mut queue = BatchQueue::new();
         let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
-        let ids = queue.enqueue_fan_out(
-            BatchInput::new(BatchSource::File(PathBuf::from("/tmp/a.txt"))),
-            &[OutputFormat::HTML],
-            &opts,
-        );
+        let ids = queue
+            .enqueue_fan_out(
+                BatchInput::new(BatchSource::File(PathBuf::from("/tmp/a.txt"))),
+                &[OutputFormat::HTML],
+                &opts,
+            )
+            .unwrap();
 
         assert!(
             !queue.set_item_format_selection(

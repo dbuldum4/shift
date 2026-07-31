@@ -49,6 +49,7 @@ pub const HISTORY_SAVE_BASE_DELAY_MS: u64 = 250;
 const MAGIC: &[u8] = b"SHIFT_HISTORY_V1\n";
 /// Prefix for non-UTF-8 source paths stored as hex-encoded OS bytes.
 const OS_PATH_PREFIX: &str = "os:";
+const LEGACY_MIGRATION_KEY: &str = "legacy-history-v1-imported";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoredSource {
@@ -361,6 +362,11 @@ fn initialize_history_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             next_id INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS history_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
     )?;
     migrate_history_to_autoincrement(conn)?;
@@ -518,6 +524,18 @@ pub fn allocate_history_id_default() -> Option<u64> {
     allocate_history_id(path).ok()
 }
 
+fn legacy_migration_completed(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM history_meta WHERE key = ?1 AND value = 'complete'",
+        params![LEGACY_MIGRATION_KEY],
+        |_| Ok(true),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Load history from disk (metadata only — artifact BLOBs are deferred).
 ///
 /// Schema/read failures set [`LoadedHistory::load_error`] and
@@ -533,25 +551,6 @@ pub fn load_history() -> LoadedHistory {
         };
     };
     let legacy_path = history_legacy_path();
-
-    let mut legacy_bytes: Option<Vec<u8>> = None;
-    if !db_path.exists() {
-        if let Some(ref legacy) = legacy_path {
-            if legacy.exists() {
-                match std::fs::read(legacy) {
-                    Ok(bytes) => legacy_bytes = Some(bytes),
-                    Err(error) => {
-                        return LoadedHistory {
-                            entries: Vec::new(),
-                            next_id: 1,
-                            load_error: Some(format!("could not read legacy history: {error}")),
-                            load_incomplete: true,
-                        };
-                    }
-                }
-            }
-        }
-    }
 
     if let Some(parent) = db_path.parent() {
         let _ = ensure_private_dir(parent);
@@ -572,7 +571,18 @@ pub fn load_history() -> LoadedHistory {
     };
 
     if let Some(ref legacy) = legacy_path {
-        if let Some(bytes) = legacy_bytes {
+        if legacy.exists() && !legacy_migration_completed(&conn) {
+            let bytes = match std::fs::read(legacy) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return LoadedHistory {
+                        entries: Vec::new(),
+                        next_id: peek_next_history_id(&conn).unwrap_or(1),
+                        load_error: Some(format!("could not read legacy history: {error}")),
+                        load_incomplete: true,
+                    };
+                }
+            };
             match import_legacy_history(&mut conn, &bytes) {
                 Ok(count) => {
                     // Verify imported rows match the decoded entry count.
@@ -1196,6 +1206,12 @@ pub fn import_legacy_history(conn: &mut Connection, bytes: &[u8]) -> io::Result<
             params![loaded.next_id as i64],
         );
     }
+    tx.execute(
+        "INSERT INTO history_meta (key, value) VALUES (?1, 'complete')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![LEGACY_MIGRATION_KEY],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
     tx.commit()
         .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(expected)
@@ -2407,6 +2423,14 @@ mod tests {
         assert!(loaded.load_error.is_some());
         assert!(legacy_path.exists(), "failed import must keep legacy file");
         assert!(loaded.entries.is_empty());
+
+        // The failed first attempt created the SQLite schema, so the next
+        // startup must still retry the legacy blob instead of treating the
+        // empty database as a successful migration.
+        let again = load_history();
+        assert!(again.load_incomplete);
+        assert!(again.load_error.is_some());
+        assert!(again.entries.is_empty());
 
         unsafe {
             std::env::remove_var("SHIFT_APP_SUPPORT_DIR");

@@ -7,8 +7,8 @@ use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, InvocationRecord,
     OutputFormat, TempDirGuard, absolute_command_path, command_argv_parts, format_argv_display,
     map_spawn_error, max_output_bytes, process_timeout, push_path_arg, read_file_limited,
-    resolve_tool_executable, run_command_cancellable_with_output_paths, unique_temp_dir,
-    write_secret_file,
+    resolve_tool_executable, run_command_cancellable_with_output_dirs,
+    run_command_cancellable_with_output_paths, unique_temp_dir, write_secret_file,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -154,13 +154,24 @@ impl QpdfModule {
         } else {
             vec![produced_abs]
         };
-        let output = run_command_cancellable_with_output_paths(
-            command,
-            process_timeout(),
-            max_output_bytes(),
-            options.cancel.clone(),
-            &watch,
-        )
+        let output = if output_format == OutputFormat::PDF_PAGES_ZIP {
+            run_command_cancellable_with_output_dirs(
+                command,
+                process_timeout(),
+                max_output_bytes(),
+                options.cancel.clone(),
+                &watch,
+                &[(work_dir.clone(), MAX_PDF_ZIP_INTERMEDIATE_BYTES)],
+            )
+        } else {
+            run_command_cancellable_with_output_paths(
+                command,
+                process_timeout(),
+                max_output_bytes(),
+                options.cancel.clone(),
+                &watch,
+            )
+        }
         .map_err(|error| {
             map_spawn_error(
                 error,

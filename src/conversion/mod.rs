@@ -77,8 +77,9 @@ pub use process::{
     absolute_command_path, bundled_runtime_tool, create_private_file, find_executable, is_runnable,
     max_output_bytes, path_looks_like_option, process_timeout, push_flag_path, push_operand_path,
     push_path_arg, read_file_limited, resolve_tool_executable, resolve_tool_path, run_command,
-    run_command_cancellable, run_command_cancellable_with_output_paths, short_path_hash,
-    unique_temp_dir, unique_temp_file_name, validate_path_operand, write_secret_file,
+    run_command_cancellable, run_command_cancellable_with_output_dirs,
+    run_command_cancellable_with_output_paths, short_path_hash, unique_temp_dir,
+    unique_temp_file_name, validate_path_operand, write_secret_file,
 };
 pub use qpdf::{PdfCompression, QpdfModule};
 pub use sips::{SipsFlip, SipsModule, SipsOptions, SipsQuality, sips_supports_target_size_output};

@@ -68,11 +68,33 @@ pub fn run_command_cancellable(
 /// is returned. Use this for engines that write artifacts to temp files rather
 /// than (or in addition to) stdout.
 pub fn run_command_cancellable_with_output_paths(
+    command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancel: Option<Arc<AtomicBool>>,
+    watch_output_paths: &[PathBuf],
+) -> Result<LimitedOutput, ConversionError> {
+    run_command_cancellable_with_output_dirs(
+        command,
+        timeout,
+        max_output_bytes,
+        cancel,
+        watch_output_paths,
+        &[],
+    )
+}
+
+/// Like [`run_command_cancellable_with_output_paths`], also watches the total
+/// size of files below each directory. Directory budgets are independent from
+/// stdout/stderr and file-output budgets, which lets callers enforce a larger
+/// temporary-workspace cap without weakening captured-process-output limits.
+pub fn run_command_cancellable_with_output_dirs(
     mut command: Command,
     timeout: Duration,
     max_output_bytes: usize,
     cancel: Option<Arc<AtomicBool>>,
     watch_output_paths: &[PathBuf],
+    watch_output_dirs: &[(PathBuf, u64)],
 ) -> Result<LimitedOutput, ConversionError> {
     if cancel
         .as_ref()
@@ -120,6 +142,7 @@ pub fn run_command_cancellable_with_output_paths(
         cancel.clone(),
         max_output_bytes,
         watch_output_paths,
+        watch_output_dirs,
     ) {
         WaitOutcome::Exited(status) => status,
         WaitOutcome::TimedOut => {
@@ -195,6 +218,7 @@ fn wait_with_timeout(
     cancel: Option<Arc<AtomicBool>>,
     max_output_bytes: usize,
     watch_output_paths: &[PathBuf],
+    watch_output_dirs: &[(PathBuf, u64)],
 ) -> WaitOutcome {
     let start = std::time::Instant::now();
     let max_bytes = max_output_bytes as u64;
@@ -205,7 +229,9 @@ fn wait_with_timeout(
             Err(error) => return WaitOutcome::Error(error),
         }
 
-        if let Some(over) = check_watched_output_size(watch_output_paths, max_bytes) {
+        if let Some(over) =
+            check_watched_output_size(watch_output_paths, watch_output_dirs, max_bytes)
+        {
             force_kill(child);
             return WaitOutcome::OutputTooLarge {
                 path: over.0,
@@ -232,12 +258,40 @@ fn wait_with_timeout(
     }
 }
 
-fn check_watched_output_size(paths: &[PathBuf], max_bytes: u64) -> Option<(PathBuf, u64)> {
+fn check_watched_output_size(
+    paths: &[PathBuf],
+    dirs: &[(PathBuf, u64)],
+    max_bytes: u64,
+) -> Option<(PathBuf, u64)> {
     for path in paths {
         if let Ok(metadata) = std::fs::metadata(path) {
             let len = metadata.len();
             if len > max_bytes {
                 return Some((path.clone(), len));
+            }
+        }
+    }
+    for (dir, limit) in dirs {
+        let mut pending = vec![dir.clone()];
+        let mut total = 0u64;
+        while let Some(current) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file()
+                    && let Ok(metadata) = entry.metadata()
+                {
+                    total = total.saturating_add(metadata.len());
+                    if total > *limit {
+                        return Some((dir.clone(), total));
+                    }
+                }
             }
         }
     }
@@ -2655,6 +2709,42 @@ mod tests {
         );
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn watched_output_directory_kills_oversized_on_disk_writer() {
+        let suffix = unique_suffix("watch-dir");
+        let script = std::env::temp_dir().join(format!("shift-process-watch-dir-{suffix}"));
+        let out_dir = std::env::temp_dir().join(format!("shift-process-watch-dir-out-{suffix}"));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ndd if=/dev/zero of='{}/page-1.pdf' bs=200 count=1 2>/dev/null\nsleep 30\n",
+                out_dir.display()
+            ),
+        );
+        let started = Instant::now();
+        let error = run_command_cancellable_with_output_dirs(
+            shell_command(&script),
+            Duration::from_secs(20),
+            64,
+            None,
+            &[],
+            &[(out_dir.clone(), 64)],
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "on-disk directory size limit took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 
     #[test]
