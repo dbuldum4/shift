@@ -90,6 +90,21 @@ EOF
 uv pip install --python 3.11 --prerelease=allow --target "$runtime/python" \
   "markitdown[all]==0.1.6" "docling[asr]==2.115.0" \
   "docling-slim[format-video]==2.115.0"
+
+# `typing` is a Python 2 compatibility backport, not a dependency that belongs
+# in a Python 3.11 runtime. Some transitive package metadata still causes uv to
+# install it, and PYTHONPATH puts this target ahead of the standard library.
+# Remove the backport so imports use Python 3.11's built-in typing module.
+typing_backport="$runtime/python/typing.py"
+if [ -e "$typing_backport" ]; then
+  rm -f "$typing_backport"
+fi
+for typing_metadata in "$runtime/python"/typing-*.dist-info; do
+  if [ -d "$typing_metadata" ]; then
+    rm -rf "$typing_metadata"
+  fi
+done
+
 npm install --prefix "$runtime/node" --omit=dev --no-package-lock "defuddle@0.19.2"
 
 cat > "$runtime/bin/markitdown" <<'EOF'
