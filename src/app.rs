@@ -53,6 +53,8 @@ pub(crate) struct ConversionHistoryEntry {
     pub(crate) output_format: OutputFormat,
     pub(crate) outcome: HistoryOutcome,
     pub(crate) archived: bool,
+    /// Metadata-only history rows must not overwrite an existing deferred blob.
+    pub(crate) artifact_deferred: bool,
 }
 
 pub(crate) fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEntry {
@@ -89,10 +91,12 @@ pub(crate) fn to_stored_entry(entry: &ConversionHistoryEntry) -> StoredHistoryEn
         output_format: entry.output_format.id().to_owned(),
         outcome,
         archived: entry.archived,
+        artifact_deferred: entry.artifact_deferred,
     }
 }
 
 pub(crate) fn from_stored_entry(entry: StoredHistoryEntry) -> Option<ConversionHistoryEntry> {
+    let artifact_deferred = entry.artifact_deferred;
     let output_format = entry.output_format.parse().ok()?;
     let source = match entry.source {
         StoredSource::File(path) => HistorySource::File(path),
@@ -136,6 +140,7 @@ pub(crate) fn from_stored_entry(entry: StoredHistoryEntry) -> Option<ConversionH
         output_format,
         outcome,
         archived: entry.archived,
+        artifact_deferred,
     })
 }
 
@@ -151,6 +156,17 @@ pub(crate) fn history_from_store(loaded: LoadedHistory) -> (Vec<ConversionHistor
         .collect();
     let next_id = loaded.next_id.max(max_id.saturating_add(1)).max(1);
     (entries, next_id)
+}
+
+/// Unpack a loaded store into UI state, including load-error flags that block
+/// accidental empty overwrites after a corrupt read.
+pub(crate) fn history_from_store_detailed(
+    loaded: LoadedHistory,
+) -> (Vec<ConversionHistoryEntry>, u64, Option<SharedString>, bool) {
+    let load_error = loaded.load_error.clone().map(Into::into);
+    let load_incomplete = loaded.load_incomplete;
+    let (entries, next_id) = history_from_store(loaded);
+    (entries, next_id, load_error, load_incomplete)
 }
 
 actions!(
@@ -262,6 +278,12 @@ pub(crate) struct Shift {
     pub(crate) history_persist_revision: u64,
     /// True while a background persistence task is in flight (serializes writes).
     pub(crate) history_save_in_flight: bool,
+    /// Consecutive failed history save attempts (drives exponential backoff).
+    pub(crate) history_save_failures: u32,
+    /// When set, a history load was incomplete/corrupt; surface to the user and
+    /// avoid treating an empty in-memory list as authority to wipe the store.
+    pub(crate) history_load_error: Option<SharedString>,
+    pub(crate) history_load_incomplete: bool,
     /// History sidebar width (logical pixels); resizable via left divider.
     pub(crate) history_sidebar_width: f32,
     /// Output panel width (logical pixels); resizable via right divider.
@@ -285,6 +307,10 @@ pub(crate) struct Shift {
     pub(crate) batch_item_progress: HashMap<u64, (Option<f32>, SharedString)>,
     /// Pending recursive folder expansion (confirm before enqueue).
     pub(crate) folder_confirm: Option<FolderExpandConfirm>,
+    /// Generation guard for asynchronous folder expansion results.
+    pub(crate) folder_expand_generation: u64,
+    /// Temporary files materialized from clipboard/remote paste inputs.
+    pub(crate) staged_inputs: StagedInputs,
     /// Cooperative cancel for the active single-file / single-URL conversion.
     pub(crate) conversion_cancel: Arc<AtomicBool>,
     /// Live conversion progress (fraction when known + label).
@@ -489,7 +515,12 @@ impl Shift {
                     .unwrap_or_default(),
             )
         });
-        let pdf_password_input = cx.new(|cx| TextInput::new(cx, "password (not saved)", ""));
+        let pdf_password_input = cx.new(|cx| {
+            let mut input = TextInput::new(cx, "password (not saved)", "");
+            input.set_masked(true, cx);
+            debug_assert!(input.is_masked());
+            input
+        });
         let pdf_split_pages_input = cx.new(|cx| {
             TextInput::new(
                 cx,
@@ -538,7 +569,8 @@ impl Shift {
                 Some(format!("Could not load recipes: {error}").into()),
             ),
         };
-        let (history, next_history_id) = history_from_store(load_history());
+        let (history, next_history_id, history_load_error, history_load_incomplete) =
+            history_from_store_detailed(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
         let cached_available_outputs = OutputFormat::ALL.to_vec();
@@ -568,7 +600,9 @@ impl Shift {
             selection_generation: 0,
             conversion_generation: 0,
             conversion: ConversionState::Empty,
-            save_status: None,
+            save_status: history_load_error
+                .clone()
+                .map(|err| format!("History load issue: {err}").into()),
             preference_error: None,
             output_format: session.output_format(),
             user_chose_format: false,
@@ -609,6 +643,9 @@ impl Shift {
             history_deleted_ids: HashMap::new(),
             history_persist_revision: 0,
             history_save_in_flight: false,
+            history_save_failures: 0,
+            history_load_error,
+            history_load_incomplete,
             history_sidebar_width,
             output_panel_width,
             panel_resize: None,
@@ -623,6 +660,8 @@ impl Shift {
             batch_force: session.batch_force,
             batch_item_progress: HashMap::new(),
             folder_confirm: None,
+            folder_expand_generation: 0,
+            staged_inputs: StagedInputs::new(),
             conversion_cancel: Arc::new(AtomicBool::new(false)),
             conversion_progress: None,
             cached_ready_path: None,
@@ -852,6 +891,8 @@ impl Shift {
         if paths.is_empty() {
             return;
         }
+        self.folder_expand_generation = self.folder_expand_generation.wrapping_add(1);
+        let folder_generation = self.folder_expand_generation;
         let has_dir = paths.iter().any(|path| path.is_dir());
         // An external drop is an intentional first action. Close the
         // introduction before showing the normal conversion workspace.
@@ -859,34 +900,59 @@ impl Shift {
             self.finish_onboarding(cx);
         }
         if has_dir {
-            match expand_input_paths_preserving_roots(&paths, true) {
-                Ok(expanded) => {
-                    if expanded.is_empty() {
-                        self.batch_status =
-                            Some("No convertible files found in the selected folder(s).".into());
-                        self.folder_confirm = None;
-                        cx.notify();
+            // Folder expansion can walk large trees; never block the UI thread.
+            self.folder_confirm = None;
+            self.batch_status = Some("Expanding folders…".into());
+            cx.notify();
+            let task = cx
+                .background_executor()
+                .spawn(async move { expand_input_paths_preserving_roots(&paths, true) });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.folder_expand_generation != folder_generation {
                         return;
                     }
-                    self.folder_confirm = Some(FolderExpandConfirm {
-                        expanded: expanded.clone(),
-                    });
-                    self.batch_status = Some(
-                        format!(
-                            "Expand folders? {} file(s) (cap {}). Confirm to queue or dismiss.",
-                            expanded.len(),
-                            MAX_EXPAND_FILES
-                        )
-                        .into(),
-                    );
-                    cx.notify();
-                }
-                Err(error) => {
-                    self.folder_confirm = None;
-                    self.batch_status = Some(error.to_string().into());
-                    cx.notify();
-                }
-            }
+                    match result {
+                        Ok(expanded) => {
+                            if expanded.is_empty() {
+                                this.batch_status = Some(
+                                    "No convertible files found in the selected folder(s).".into(),
+                                );
+                                this.folder_confirm = None;
+                            } else {
+                                this.folder_confirm = Some(FolderExpandConfirm {
+                                    expanded: expanded.clone(),
+                                });
+                                this.batch_status = Some(
+                                    format!(
+                                        "Expand folders? {} file(s) (cap {}). Confirm to queue or dismiss.",
+                                        expanded.len(),
+                                        MAX_EXPAND_FILES
+                                    )
+                                    .into(),
+                                );
+                            }
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            this.folder_confirm = None;
+                            this.batch_status = Some(error.to_string().into());
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        // Global admission for multi-file drops (not only recursive expand).
+        if paths.len() > MAX_EXPAND_FILES {
+            self.batch_status = Some(
+                format!("Too many files (limit is {MAX_EXPAND_FILES}); narrow the selection.")
+                    .into(),
+            );
+            cx.notify();
             return;
         }
         if paths.len() == 1 && self.batch_queue.is_empty() {
@@ -898,6 +964,7 @@ impl Shift {
     }
 
     pub(crate) fn confirm_folder_expand(&mut self, cx: &mut Context<Self>) {
+        self.folder_expand_generation = self.folder_expand_generation.wrapping_add(1);
         let Some(confirm) = self.folder_confirm.take() else {
             return;
         };
@@ -905,6 +972,7 @@ impl Shift {
     }
 
     pub(crate) fn dismiss_folder_confirm(&mut self, cx: &mut Context<Self>) {
+        self.folder_expand_generation = self.folder_expand_generation.wrapping_add(1);
         self.folder_confirm = None;
         self.batch_status = Some("Folder expansion cancelled.".into());
         cx.notify();
@@ -1074,6 +1142,7 @@ impl Shift {
             return;
         }
         if self.batch_queue.remove(id) {
+            self.cleanup_unreferenced_staged_inputs();
             if self.batch_format_menu == Some(id) {
                 self.batch_format_menu = None;
             }
@@ -1190,6 +1259,11 @@ impl Shift {
         if self.batch_running {
             self.batch_status =
                 Some("Cannot add files while a batch is running. Wait or Cancel first.".into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.batch_queue.check_admission(inputs.len()) {
+            self.batch_status = Some(error.to_string().into());
             cx.notify();
             return;
         }
@@ -1352,6 +1426,7 @@ impl Shift {
                                 // batch can start. Do not restore the worker's queue onto
                                 // the UI (user already cleared it).
                                 this.batch_running = false;
+                                this.staged_inputs.cleanup();
                                 if this
                                     .batch_status
                                     .as_ref()
@@ -1364,6 +1439,9 @@ impl Shift {
                             }
                             this.batch_queue = queue;
                             this.batch_running = false;
+                            if summary.failed == 0 && summary.cancelled == 0 {
+                                this.staged_inputs.cleanup();
+                            }
                             this.batch_status = Some(
                                 format!(
                                     "Batch complete: {} succeeded, {} failed, {} cancelled",
@@ -1381,6 +1459,10 @@ impl Shift {
                                 this.batch_running = false;
                                 this.batch_status =
                                     Some("Batch worker stopped unexpectedly.".into());
+                                cx.notify();
+                            } else {
+                                this.batch_running = false;
+                                this.staged_inputs.cleanup();
                                 cx.notify();
                             }
                         });
@@ -1539,10 +1621,33 @@ impl Shift {
             self.batch_status = Some("Clearing queue…".into());
         } else {
             self.batch_status = None;
+            self.staged_inputs.cleanup();
         }
         self.batch_queue.clear();
         self.batch_format_menu = None;
         cx.notify();
+    }
+
+    /// Keep staged sources alive while any queued item still references them.
+    /// The focused file can be changed independently of the batch queue.
+    fn staged_path_is_referenced_by_batch(&self, path: &Path) -> bool {
+        self.batch_queue
+            .items()
+            .iter()
+            .any(|item| item.source.as_file().is_some_and(|source| source == path))
+    }
+
+    fn release_staged_path_if_unreferenced(&mut self, path: &Path) {
+        if !self.staged_path_is_referenced_by_batch(path) {
+            self.staged_inputs.release(path);
+        }
+    }
+
+    fn cleanup_unreferenced_staged_inputs(&mut self) {
+        let paths = self.staged_inputs.paths().to_vec();
+        for path in paths {
+            self.release_staged_path_if_unreferenced(&path);
+        }
     }
 
     pub(crate) fn set_selected_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1552,8 +1657,15 @@ impl Shift {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
 
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
+
         self.selected_url = None;
         self.url_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        // Secrets are source-scoped: never reuse a prior PDF password on a new file.
+        self.pdf_password_input
             .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = Some(build_file_preview_with_size(&path, "…".into()));
         self.selected_file = Some(path.clone());
@@ -1614,7 +1726,13 @@ impl Shift {
         if trimmed.is_empty() {
             return;
         }
-        let paste = parse_magic_paste(trimmed);
+        let paste = match parse_magic_paste(trimmed) {
+            Ok(paste) => paste,
+            Err(error) => {
+                self.fail_magic_paste(&error.to_string(), cx);
+                return;
+            }
+        };
         if paste.is_empty() {
             let message = if trimmed.to_ascii_lowercase().starts_with("file:") {
                 "Invalid file:// URL — use a local path or a valid file:// path."
@@ -1633,6 +1751,16 @@ impl Shift {
         extension: &str,
         cx: &mut Context<Self>,
     ) {
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            self.fail_magic_paste(
+                &format!(
+                    "clipboard image exceeds size limit ({} bytes)",
+                    MAX_CLIPBOARD_IMAGE_BYTES
+                ),
+                cx,
+            );
+            return;
+        }
         // Clipboard images can be large, so write to the staging directory on
         // the background executor instead of blocking the UI thread.
         let extension = extension.to_owned();
@@ -1659,6 +1787,9 @@ impl Shift {
         self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.conversion_generation = self.conversion_generation.wrapping_add(1);
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
         self.selected_file = None;
         self.selected_url = None;
         self.file_preview = None;
@@ -1679,6 +1810,9 @@ impl Shift {
         self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
 
         // Optimistic preview while downloads / path checks run.
         match paste.tokens() {
@@ -1737,7 +1871,7 @@ impl Shift {
         let cancel = Arc::clone(&self.conversion_cancel);
         let resolve = cx
             .background_executor()
-            .spawn(async move { materialize_magic_paste(&paste, Some(cancel)) });
+            .spawn(async move { materialize_magic_paste_detailed(&paste, Some(cancel)) });
 
         cx.spawn(async move |this, cx| {
             let result = resolve.await;
@@ -1746,7 +1880,9 @@ impl Shift {
                     return;
                 }
                 match result {
-                    Ok(sources) => this.apply_materialized_sources(sources, display_text, cx),
+                    Ok(sources) => {
+                        this.apply_materialized_sources_detailed(sources, display_text, cx)
+                    }
                     Err(error) => {
                         this.selected_file = None;
                         this.selected_url = None;
@@ -1759,6 +1895,22 @@ impl Shift {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn apply_materialized_sources_detailed(
+        &mut self,
+        materialized: Vec<MaterializedSource>,
+        display_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut sources = Vec::with_capacity(materialized.len());
+        for mut item in materialized {
+            if let Some(path) = item.take_staged_path() {
+                self.staged_inputs.track(path);
+            }
+            sources.push(item.source.clone());
+        }
+        self.apply_materialized_sources(sources, display_text, cx);
     }
 
     pub(crate) fn apply_materialized_sources(
@@ -1815,11 +1967,17 @@ impl Shift {
         self.cancel_active_conversion();
         self.ensure_diagnostics(cx);
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
         self.selected_file = None;
         self.selected_url = Some(url.clone());
         self.file_preview = Some(build_url_preview(&url));
         self.url_input
             .update(cx, |input, cx| input.set_content(url.clone(), cx));
+        // Secrets are source-scoped: clear any prior PDF password when the source changes.
+        self.pdf_password_input
+            .update(cx, |input, cx| input.set_content("", cx));
         self.rebuild_output_caches();
 
         let available_outputs = &self.cached_available_outputs;
@@ -2506,7 +2664,12 @@ impl Shift {
     }
 
     pub(crate) fn persist_session_settings(&self, cx: &App) {
-        let mut settings = load_default_session_settings();
+        // Never silently clobber a newer schema or quarantine without recovery.
+        let loaded = shift_core::load_default_session_settings_detailed();
+        if loaded.write_blocked() {
+            return;
+        }
+        let mut settings = loaded.settings();
         settings.set_output_format(self.output_format);
         settings.batch_output_dir = self.batch_output_dir.clone();
         settings.batch_force = self.batch_force;
@@ -2638,11 +2801,18 @@ impl Shift {
 
     /// Cache an in-memory artifact and stage it under a user-facing file name.
     ///
-    /// This writes bytes to disk and may hard-link/copy large files, so it must
-    /// run on the background executor, not the UI thread.
+    /// This writes bytes to disk and **copies** into the export staging path (never
+    /// hard-links the canonical cache entry), so it must run on the background
+    /// executor, not the UI thread. After a successful store, runs [`purge_now`]
+    /// so TTL/size budgets apply promptly; the app also purges on startup and
+    /// should keep calling `purge_now` periodically (idle timer is fine).
     fn stage_ready_artifact(artifact: &ConversionArtifact) -> Result<PathBuf, io::Error> {
         let cache_path = cache_artifact_bytes(&artifact.file_name, &artifact.bytes)?;
-        stage_export_file(&artifact.file_name, &cache_path)
+        let staged = stage_export_file(&artifact.file_name, &cache_path)?;
+        // Best-effort: free expired/oversized cache entries after each write.
+        // Leased paths (if any) are skipped inside purge.
+        let _ = shift_core::purge_now();
+        Ok(staged)
     }
 
     /// Mark conversion Ready. Export staging is lazy (first Reveal / Open / drag)
@@ -2673,7 +2843,7 @@ impl Shift {
         }
 
         // Large binary artifacts are staged on the background executor so the
-        // UI thread does not block on disk writes / hard-links.
+        // UI thread does not block on disk writes / copies.
         let selection_generation = self.selection_generation;
         let conversion_generation = self.conversion_generation;
         let artifact = Arc::clone(artifact);
@@ -2946,6 +3116,9 @@ impl Shift {
                             let artifact = Arc::new(artifact);
                             this.record_history(HistoryOutcome::Ready(Arc::clone(&artifact)), cx);
                             this.set_ready_artifact(artifact);
+                            if let BatchSource::File(path) = &source_for_check {
+                                this.staged_inputs.release(path);
+                            }
                         }
                         Ok(Err(error)) if error.is_cancelled() => {
                             this.conversion =
@@ -3056,9 +3229,14 @@ impl Shift {
     pub(crate) fn clear_selected_file(&mut self, cx: &mut Context<Self>) {
         self.cancel_active_conversion();
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        if let Some(prev) = self.selected_file.clone() {
+            self.release_staged_path_if_unreferenced(&prev);
+        }
         self.selected_file = None;
         self.selected_url = None;
         self.url_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        self.pdf_password_input
             .update(cx, |input, cx| input.set_content("", cx));
         self.file_preview = None;
         self.conversion = ConversionState::Empty;
@@ -3388,8 +3566,15 @@ impl Shift {
             other => other,
         };
 
-        let id = self.next_history_id;
-        self.next_history_id = self.next_history_id.wrapping_add(1);
+        // Prefer SQLite-backed transactional allocation so concurrent processes
+        // sharing the same store cannot mint the same id. Fall back to the
+        // in-memory counter when the DB path is unavailable.
+        let id = shift_core::history::allocate_history_id_default().unwrap_or_else(|| {
+            let id = self.next_history_id;
+            self.next_history_id = self.next_history_id.wrapping_add(1).max(1);
+            id
+        });
+        self.next_history_id = self.next_history_id.max(id.saturating_add(1)).max(1);
         let mut entry = ConversionHistoryEntry {
             id,
             source,
@@ -3401,6 +3586,7 @@ impl Shift {
             output_format: self.output_format,
             outcome,
             archived: false,
+            artifact_deferred: false,
         };
         entry.detail = history_entry_stored_detail(&entry).into();
         self.history.insert(0, entry);
@@ -3427,10 +3613,20 @@ impl Shift {
             // Another save will be triggered when the current one finishes.
             return;
         }
+        // After a corrupt load, refuse full-reconcile style wipes driven by an
+        // empty in-memory list. Delta upserts of explicit dirty ids still run.
+        if self.history_load_incomplete
+            && self.history.is_empty()
+            && self.history_dirty_ids.is_empty()
+            && !self.history_deleted_ids.is_empty()
+        {
+            // Explicit clear while incomplete: fall through so deleted_ids apply.
+        }
         let Some(db_path) = history_db_path() else {
             return;
         };
         self.history_save_in_flight = true;
+        let history_epoch = shift_core::history::history_store_epoch();
 
         // Snapshot the revision at submission time. On completion we only clear
         // IDs whose revision is <= this value, so newer mutations remain dirty.
@@ -3439,28 +3635,101 @@ impl Shift {
         let changed: Vec<u64> = self.history_dirty_ids.keys().copied().collect();
         let deleted: Vec<u64> = self.history_deleted_ids.keys().copied().collect();
 
-        let task = cx
-            .background_executor()
-            .spawn(async move { save_history_delta_to(db_path, &stored, &changed, &deleted) });
+        let task = cx.background_executor().spawn(async move {
+            save_history_delta_to_if_current(db_path, &stored, &changed, &deleted, history_epoch)
+                .map(|_| ())
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.history_save_in_flight = false;
-                if result.is_ok() {
-                    // Only remove entries whose revision has not been bumped
-                    // since this snapshot was taken. Newer mutations survive.
-                    this.history_dirty_ids
-                        .retain(|_id, rev| *rev > snapshot_revision);
-                    this.history_deleted_ids
-                        .retain(|_id, rev| *rev > snapshot_revision);
-                }
-                // If mutations arrived while we were writing, start another save.
-                if !this.history_dirty_ids.is_empty() || !this.history_deleted_ids.is_empty() {
-                    this.persist_history(cx);
+                match result {
+                    Ok(()) => {
+                        this.history_save_failures = 0;
+                        // Only remove entries whose revision has not been bumped
+                        // since this snapshot was taken. Newer mutations survive.
+                        this.history_dirty_ids
+                            .retain(|_id, rev| *rev > snapshot_revision);
+                        this.history_deleted_ids
+                            .retain(|_id, rev| *rev > snapshot_revision);
+                        // Clear a prior save-error banner on success.
+                        if this
+                            .save_status
+                            .as_ref()
+                            .is_some_and(|s| s.as_ref().starts_with("Could not save history"))
+                        {
+                            this.save_status = None;
+                        }
+                        // If mutations arrived while we were writing, start another save.
+                        if !this.history_dirty_ids.is_empty()
+                            || !this.history_deleted_ids.is_empty()
+                        {
+                            this.persist_history(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.history_save_failures = this.history_save_failures.saturating_add(1);
+                        let failures = this.history_save_failures;
+                        let message = format!("Could not save history: {error}");
+                        this.save_status = Some(message.into());
+                        cx.notify();
+                        // Dirty IDs stay; schedule exponential backoff rather than
+                        // hot-looping immediate retries. Cap retries so a permanent
+                        // failure does not spin forever.
+                        if failures <= shift_core::history::HISTORY_SAVE_MAX_RETRIES {
+                            let shift = failures.saturating_sub(1).min(5);
+                            let delay_ms = shift_core::history::HISTORY_SAVE_BASE_DELAY_MS
+                                .saturating_mul(1u64 << shift);
+                            let delay = Duration::from_millis(delay_ms);
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(delay).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    if !this.history_dirty_ids.is_empty()
+                                        || !this.history_deleted_ids.is_empty()
+                                    {
+                                        this.persist_history(cx);
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        // Beyond max retries: keep dirty, surface error, stop auto-retry.
+                        // A subsequent user mutation bumps revision and restarts saves.
+                    }
                 }
             });
         })
         .detach();
+    }
+
+    /// Synchronously flush pending history writes. Used on quit so dirty
+    /// mutations are not lost when the process exits before the background
+    /// save task completes.
+    pub(crate) fn flush_history_blocking(&mut self) {
+        if self.history_dirty_ids.is_empty() && self.history_deleted_ids.is_empty() {
+            return;
+        }
+        let Some(db_path) = history_db_path() else {
+            return;
+        };
+        let stored: Vec<StoredHistoryEntry> = self.history.iter().map(to_stored_entry).collect();
+        let changed: Vec<u64> = self.history_dirty_ids.keys().copied().collect();
+        let deleted: Vec<u64> = self.history_deleted_ids.keys().copied().collect();
+        match save_history_delta_to(db_path, &stored, &changed, &deleted) {
+            Ok(()) => {
+                self.history_dirty_ids.clear();
+                self.history_deleted_ids.clear();
+                self.history_save_failures = 0;
+            }
+            Err(error) => {
+                self.save_status = Some(format!("Could not save history on quit: {error}").into());
+            }
+        }
+    }
+
+    pub(crate) fn action_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_history_blocking();
+        cx.quit();
     }
 
     pub(crate) fn restore_history_entry(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -3533,8 +3802,40 @@ impl Shift {
 
         match entry.outcome {
             HistoryOutcome::Ready(artifact) => {
-                self.set_ready_artifact(artifact);
-                cx.notify();
+                // Metadata-first loads leave empty bytes; fetch the BLOB on demand.
+                if artifact.bytes.is_empty() {
+                    let id = entry.id;
+                    let artifact = Arc::clone(&artifact);
+                    let task = cx.background_executor().spawn(async move {
+                        shift_core::history::load_history_artifact_default(id)
+                    });
+                    cx.spawn(async move |this, cx| {
+                        let loaded = task.await.ok().flatten();
+                        let _ = this.update(cx, |this, cx| {
+                            if this.active_history_id != Some(id) {
+                                return;
+                            }
+                            if let Some(bytes) = loaded {
+                                this.set_ready_artifact(Arc::new(ConversionArtifact {
+                                    file_name: artifact.file_name.clone(),
+                                    media_type: artifact.media_type,
+                                    bytes,
+                                    format: artifact.format,
+                                    module_id: artifact.module_id,
+                                    pipeline: artifact.pipeline.clone(),
+                                    invocations: artifact.invocations.clone(),
+                                }));
+                            } else {
+                                this.set_ready_artifact(artifact);
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    self.set_ready_artifact(artifact);
+                    cx.notify();
+                }
             }
             HistoryOutcome::ReadyLarge { .. } => {
                 // Full bytes were not retained; re-run conversion for this source.
@@ -3558,8 +3859,14 @@ impl Shift {
         self.history.clear();
         self.history_dirty_ids.clear();
         self.active_history_id = None;
+        self.history_load_incomplete = false;
+        self.history_load_error = None;
         self.mark_history_cache_dirty();
-        self.persist_history(cx);
+        // Remove SQLite + legacy + legacy.bak immediately so clear is durable
+        // even if a later delta save is skipped; also resets id sequence.
+        let _ = shift_core::history::clear_history_store();
+        self.history_deleted_ids.clear();
+        self.next_history_id = 1;
         cx.notify();
         self.rebuild_app_menus(cx);
     }
@@ -3850,6 +4157,7 @@ impl Render for Shift {
             .on_action(cx.listener(Self::action_zoom))
             .on_action(cx.listener(Self::action_toggle_fullscreen))
             .on_action(cx.listener(Self::action_clear_recent))
+            .on_action(cx.listener(Self::action_quit))
             .relative()
             .flex()
             .size_full()
@@ -4478,7 +4786,10 @@ pub(crate) fn main() {
 
         // Warm the open/save panel service so the first click is fast.
         file_picker::prewarm();
-        let _ = shift_core::purge_artifact_cache_defaults();
+        // Periodic artifact-cache hygiene: startup purge (TTL + size budget).
+        // Also invoked after each staged write via `stage_ready_artifact` → purge_now.
+        // Optional: schedule additional idle `purge_now` calls for long sessions.
+        let _ = shift_core::purge_now();
 
         cx.activate(true);
     });
@@ -4541,6 +4852,7 @@ mod tests {
             output_format,
             outcome,
             archived,
+            artifact_deferred: false,
         }
     }
 
@@ -4913,6 +5225,7 @@ mod tests {
             output_format: "not-a-real-format".into(),
             outcome: StoredOutcome::Failed("nope".into()),
             archived: false,
+            artifact_deferred: false,
         };
         assert!(from_stored_entry(entry).is_none());
     }
@@ -4936,6 +5249,7 @@ mod tests {
                 bytes: b"# body".to_vec(),
             },
             archived: false,
+            artifact_deferred: false,
         };
         let back = from_stored_entry(entry).expect("output_format is valid");
         assert_eq!(back.output_format, OutputFormat::MARKDOWN);
@@ -4973,6 +5287,7 @@ mod tests {
                 bytes: b"<p>hi</p>".to_vec(),
             },
             archived: false,
+            artifact_deferred: false,
         };
         let back = from_stored_entry(entry).expect("valid");
         assert_eq!(back.output_format, OutputFormat::MARKDOWN);
@@ -5011,6 +5326,7 @@ mod tests {
                     bytes: vec![],
                 },
                 archived: false,
+                artifact_deferred: false,
             };
             let back = from_stored_entry(entry).expect("valid");
             match back.outcome {
@@ -5042,6 +5358,7 @@ mod tests {
                 bytes: vec![],
             },
             archived: false,
+            artifact_deferred: false,
         };
         let back = from_stored_entry(entry).expect("valid");
         match back.outcome {
@@ -5063,6 +5380,8 @@ mod tests {
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: Vec::new(),
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert!(entries.is_empty());
         assert_eq!(next_id, 1, "next_id must be at least 1");
@@ -5085,12 +5404,15 @@ mod tests {
             output_format: "markdown".into(),
             outcome: StoredOutcome::Failed("x".into()),
             archived: false,
+            artifact_deferred: false,
         };
 
         // loaded.next_id already ahead of max entry id.
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: vec![make(1), make(3), make(2)],
             next_id: 10,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 3);
         assert_eq!(next_id, 10);
@@ -5099,6 +5421,8 @@ mod tests {
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: vec![make(1), make(5), make(2)],
             next_id: 2,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 3);
         assert_eq!(next_id, 6); // max_id(5) + 1
@@ -5107,6 +5431,8 @@ mod tests {
         let (_, next_id) = history_from_store(LoadedHistory {
             entries: vec![make(4)],
             next_id: 5,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(next_id, 5);
     }
@@ -5124,6 +5450,7 @@ mod tests {
             output_format: "markdown".into(),
             outcome: StoredOutcome::Failed(format!("fail-{id}")),
             archived: id % 2 == 0,
+            artifact_deferred: false,
         };
         let invalid = |id: u64| StoredHistoryEntry {
             id,
@@ -5136,11 +5463,14 @@ mod tests {
             output_format: "not-a-format".into(),
             outcome: StoredOutcome::Failed("ignored".into()),
             archived: false,
+            artifact_deferred: false,
         };
 
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: vec![valid(1), invalid(2), valid(3), invalid(99), valid(4)],
             next_id: 1,
+            load_error: None,
+            load_incomplete: false,
         });
         // Invalid formats skipped; max_id still considers their ids (99).
         assert_eq!(entries.len(), 3);
@@ -5173,8 +5503,11 @@ mod tests {
                 output_format: "nope".into(),
                 outcome: StoredOutcome::Failed("x".into()),
                 archived: false,
+                artifact_deferred: false,
             }],
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert!(entries.is_empty());
         // max_id = 0 → saturating_add(1) = 1; max(loaded 0, 1).max(1) = 1
@@ -5223,6 +5556,8 @@ mod tests {
         let (entries, next_id) = history_from_store(LoadedHistory {
             entries: stored,
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 3);
         assert_eq!(next_id, 4);
@@ -5328,6 +5663,7 @@ mod tests {
             output_format: OutputFormat::HTML,
             outcome: HistoryOutcome::Failed("nope".into()),
             archived: true,
+            artifact_deferred: false,
         };
         let stored = to_stored_entry(&entry);
         assert_eq!(stored.badge_color, 0xabcdef);
@@ -5337,6 +5673,41 @@ mod tests {
         assert_eq!(stored.name, "x.docx");
         assert_eq!(stored.output_format, "html");
         assert!(stored.archived);
+    }
+
+    #[test]
+    fn deferred_history_round_trip_preserves_lazy_artifact_marker() {
+        let stored = StoredHistoryEntry {
+            id: 12,
+            source: StoredSource::File(PathBuf::from("/tmp/large.mp4")),
+            name: "large.mp4".to_owned(),
+            detail: "MP4 → MP3".to_owned(),
+            extension_label: "MP4".to_owned(),
+            badge_color: BADGE_FILL,
+            badge_text_color: BADGE_TEXT,
+            output_format: OutputFormat::MARKDOWN.id().to_owned(),
+            outcome: StoredOutcome::Ready {
+                module_id: "ffmpeg".to_owned(),
+                file_name: "large.md".to_owned(),
+                format: OutputFormat::MARKDOWN.id().to_owned(),
+                bytes: Vec::new(),
+            },
+            archived: false,
+            artifact_deferred: true,
+        };
+
+        let entry = from_stored_entry(stored).expect("valid deferred history row");
+        assert!(entry.artifact_deferred);
+        match &entry.outcome {
+            HistoryOutcome::Ready(artifact) => assert!(artifact.bytes.is_empty()),
+            _ => panic!("expected deferred Ready outcome"),
+        }
+        let round_trip = to_stored_entry(&entry);
+        assert!(round_trip.artifact_deferred);
+        assert!(matches!(
+            round_trip.outcome,
+            StoredOutcome::Ready { bytes, .. } if bytes.is_empty()
+        ));
     }
 
     #[test]
@@ -5382,8 +5753,11 @@ mod tests {
                 output_format: "markdown".into(),
                 outcome: StoredOutcome::Failed("x".into()),
                 archived: false,
+                artifact_deferred: false,
             }],
             next_id: 0,
+            load_error: None,
+            load_incomplete: false,
         });
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 0);

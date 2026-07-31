@@ -2,7 +2,7 @@ use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
     InvocationRecord, OutputFormat, TempDirGuard, bundled_runtime_tool, command_argv_parts,
     format_argv_display, map_spawn_error, max_output_bytes, process_timeout, read_file_limited,
-    resolve_tool_executable, run_command_cancellable, unique_temp_dir,
+    resolve_tool_executable, run_command_cancellable_with_output_dirs, unique_temp_dir,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -261,6 +261,13 @@ impl std::str::FromStr for DoclingVideoSamplingMode {
     }
 }
 
+/// Minimum fixed-interval spacing accepted for video representative frames.
+pub const MIN_VIDEO_FRAME_INTERVAL_SECS: f64 = 0.5;
+/// Maximum scene-change rate (cuts per minute) accepted for video sampling.
+pub const MAX_VIDEO_CUTS_PER_MINUTE: f64 = 30.0;
+/// Hard cap on representative frames derived from media duration.
+pub const MAX_VIDEO_REPRESENTATIVE_FRAMES: u32 = 300;
+
 /// Optional knobs for Docling. Defaults keep desktop conversions small/fast.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DoclingOptions {
@@ -308,22 +315,87 @@ impl Default for DoclingOptions {
 
 impl DoclingOptions {
     pub fn validate(&self) -> Result<(), ConversionError> {
+        self.validate_with_duration(None)
+    }
+
+    /// Validate sampling knobs, optionally bounding frame count from media duration.
+    pub fn validate_with_duration(
+        &self,
+        duration_secs: Option<f64>,
+    ) -> Result<(), ConversionError> {
         if !self.video_frame_interval_secs.is_finite() || self.video_frame_interval_secs <= 0.0 {
             return Err(ConversionError::new(
                 "Docling video frame interval must be a positive number of seconds",
             ));
+        }
+        if self.video_frame_interval_secs < MIN_VIDEO_FRAME_INTERVAL_SECS {
+            return Err(ConversionError::new(format!(
+                "Docling video frame interval must be at least {MIN_VIDEO_FRAME_INTERVAL_SECS} seconds"
+            )));
         }
         if !self.video_cuts_per_minute.is_finite() || self.video_cuts_per_minute < 0.0 {
             return Err(ConversionError::new(
                 "Docling video cuts per minute must be a non-negative number",
             ));
         }
+        if self.video_cuts_per_minute > MAX_VIDEO_CUTS_PER_MINUTE {
+            return Err(ConversionError::new(format!(
+                "Docling video cuts per minute must be at most {MAX_VIDEO_CUTS_PER_MINUTE}"
+            )));
+        }
         if !self.video_prominence.is_finite() || self.video_prominence < 0.0 {
             return Err(ConversionError::new(
                 "Docling video prominence must be a non-negative number",
             ));
         }
+        if let Some(duration) = duration_secs.filter(|value| value.is_finite() && *value > 0.0) {
+            let frames = estimate_representative_frames(self, duration);
+            if frames > MAX_VIDEO_REPRESENTATIVE_FRAMES as u64 {
+                return Err(ConversionError::new(format!(
+                    "Docling video sampling would produce about {frames} frames for {duration:.1}s \
+                     (limit is {MAX_VIDEO_REPRESENTATIVE_FRAMES}); raise the frame interval or lower cuts/minute"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Raise the fixed interval so `duration / interval` stays within the frame cap.
+    pub fn clamp_interval_for_duration(&mut self, duration_secs: f64) {
+        if !duration_secs.is_finite() || duration_secs <= 0.0 {
+            return;
+        }
+        let min_for_cap = duration_secs / f64::from(MAX_VIDEO_REPRESENTATIVE_FRAMES);
+        if min_for_cap > self.video_frame_interval_secs {
+            self.video_frame_interval_secs = min_for_cap.max(MIN_VIDEO_FRAME_INTERVAL_SECS);
+        }
+        if self.video_frame_interval_secs < MIN_VIDEO_FRAME_INTERVAL_SECS {
+            self.video_frame_interval_secs = MIN_VIDEO_FRAME_INTERVAL_SECS;
+        }
+        if self.video_cuts_per_minute > MAX_VIDEO_CUTS_PER_MINUTE {
+            self.video_cuts_per_minute = MAX_VIDEO_CUTS_PER_MINUTE;
+        }
+    }
+}
+
+fn estimate_representative_frames(options: &DoclingOptions, duration_secs: f64) -> u64 {
+    match options.video_sampling_mode {
+        DoclingVideoSamplingMode::Fixed => {
+            let interval = options
+                .video_frame_interval_secs
+                .max(MIN_VIDEO_FRAME_INTERVAL_SECS);
+            (duration_secs / interval).ceil().max(1.0) as u64
+        }
+        DoclingVideoSamplingMode::Scene => {
+            let rate = options
+                .video_cuts_per_minute
+                .clamp(0.0, MAX_VIDEO_CUTS_PER_MINUTE);
+            if rate <= 0.0 {
+                // Docling auto-calibrates; assume the hard cap as the worst case.
+                return u64::from(MAX_VIDEO_REPRESENTATIVE_FRAMES);
+            }
+            ((duration_secs / 60.0) * rate).ceil().max(1.0) as u64
+        }
     }
 }
 
@@ -431,7 +503,13 @@ impl DoclingModule {
         output_format: OutputFormat,
         options: &ConversionOptions,
     ) -> Result<ConversionArtifact, ConversionError> {
-        options.docling.validate()?;
+        // When the user set an FFmpeg trim duration, treat it as the processing
+        // window for representative-frame budgeting.
+        let duration_hint = options
+            .ffmpeg
+            .duration_secs
+            .filter(|value| value.is_finite() && *value > 0.0);
+        options.docling.validate_with_duration(duration_hint)?;
         let to_arg = Self::to_arg(output_format).ok_or_else(|| {
             ConversionError::new(format!(
                 "Docling does not produce {}",
@@ -453,13 +531,14 @@ impl DoclingModule {
         let is_audio = input_has_extension(input, AUDIO_EXTENSIONS);
         let is_video = input_has_extension(input, VIDEO_EXTENSIONS);
         let mut command = Command::new(&self.executable);
+        // `convert <input> --to …` — absolute input right after the subcommand.
+        command.arg("convert");
+        super::push_operand_path(&mut command, input)?;
         command
-            .arg("convert")
-            .arg(input)
             .arg("--to")
             .arg(to_arg)
             .arg("--output")
-            .arg(&work_dir)
+            .arg(super::absolute_command_path(&work_dir))
             .arg("--image-export-mode")
             .arg(knobs.image_export_mode.id())
             .arg(if knobs.ocr { "--ocr" } else { "--no-ocr" })
@@ -530,25 +609,31 @@ impl DoclingModule {
         } else {
             process_timeout()
         };
-        let output =
-            run_command_cancellable(command, timeout, max_output_bytes(), options.cancel.clone())
-                .map_err(|error| {
-                if error.to_string().to_ascii_lowercase().contains("timeout") {
-                    return ConversionError::new(format!(
-                        "Docling timed out converting {} (limit {}s). First Whisper model \
+        let output = run_command_cancellable_with_output_dirs(
+            command,
+            timeout,
+            max_output_bytes(),
+            options.cancel.clone(),
+            &[],
+            &[(work_dir.clone(), max_output_bytes() as u64)],
+        )
+        .map_err(|error| {
+            if error.to_string().to_ascii_lowercase().contains("timeout") {
+                return ConversionError::new(format!(
+                    "Docling timed out converting {} (limit {}s). First Whisper model \
                      download and long interviews can exceed the default; raise \
                      SHIFT_CONVERSION_TIMEOUT_SECS or use a smaller --docling-asr-model.",
-                        input.display(),
-                        timeout.as_secs()
-                    ));
-                }
-                map_spawn_error(
-                    error,
-                    "Docling is not installed. Install it with `pip install 'docling==2.115.0'`. \
+                    input.display(),
+                    timeout.as_secs()
+                ));
+            }
+            map_spawn_error(
+                error,
+                "Docling is not installed. Install it with `pip install 'docling==2.115.0'`. \
                  For audio/video transcription install `docling[asr]` plus \
                  `docling-slim[format-video]`, or set SHIFT_DOCLING_BIN.",
-                )
-            })?;
+            )
+        })?;
 
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -1545,11 +1630,35 @@ printf '%s' "$body" > "$output/$stem.$ext"
                 .to_string()
                 .contains("interval")
         );
+        let too_small = DoclingOptions {
+            video_frame_interval_secs: MIN_VIDEO_FRAME_INTERVAL_SECS / 2.0,
+            ..DoclingOptions::default()
+        };
+        assert!(
+            too_small
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("at least"),
+            "min interval must be enforced"
+        );
         let invalid = DoclingOptions {
             video_cuts_per_minute: -1.0,
             ..DoclingOptions::default()
         };
         assert!(invalid.validate().unwrap_err().to_string().contains("cuts"));
+        let too_fast = DoclingOptions {
+            video_cuts_per_minute: MAX_VIDEO_CUTS_PER_MINUTE + 1.0,
+            ..DoclingOptions::default()
+        };
+        assert!(
+            too_fast
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("at most"),
+            "max scene rate must be enforced"
+        );
         let invalid = DoclingOptions {
             video_prominence: f64::NAN,
             ..DoclingOptions::default()
@@ -1561,6 +1670,40 @@ printf '%s' "$body" > "$output/$stem.$ext"
                 .to_string()
                 .contains("prominence")
         );
+    }
+
+    #[test]
+    fn docling_video_frame_cap_from_duration() {
+        let opts = DoclingOptions {
+            video_sampling_mode: DoclingVideoSamplingMode::Fixed,
+            video_frame_interval_secs: MIN_VIDEO_FRAME_INTERVAL_SECS,
+            ..DoclingOptions::default()
+        };
+        // 0.5s interval over an hour ⇒ far above MAX_VIDEO_REPRESENTATIVE_FRAMES.
+        let err = opts
+            .validate_with_duration(Some(3600.0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frames") || err.contains("limit"), "{err}");
+
+        let ok = DoclingOptions {
+            video_sampling_mode: DoclingVideoSamplingMode::Fixed,
+            video_frame_interval_secs: 10.0,
+            ..DoclingOptions::default()
+        };
+        assert!(ok.validate_with_duration(Some(60.0)).is_ok());
+
+        let mut clamped = DoclingOptions {
+            video_sampling_mode: DoclingVideoSamplingMode::Fixed,
+            video_frame_interval_secs: MIN_VIDEO_FRAME_INTERVAL_SECS,
+            ..DoclingOptions::default()
+        };
+        clamped.clamp_interval_for_duration(3600.0);
+        assert!(
+            clamped.video_frame_interval_secs
+                >= 3600.0 / f64::from(MAX_VIDEO_REPRESENTATIVE_FRAMES)
+        );
+        assert!(clamped.validate_with_duration(Some(3600.0)).is_ok());
     }
 
     #[test]

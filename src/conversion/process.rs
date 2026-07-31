@@ -7,10 +7,13 @@
 use super::ConversionError;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +23,12 @@ pub const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default ceiling for captured stdout, stderr, or on-disk converter output.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Max time to wait for stdout/stderr reader threads after the child is killed.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Portable basename length budget for temp names (POSIX `NAME_MAX` is commonly 255).
+pub const FS_NAME_MAX: usize = 255;
 
 /// Captured process output (same shape as `std::process::Output`).
 #[derive(Debug)]
@@ -44,10 +53,78 @@ pub fn run_command(
 
 /// Like [`run_command`], but also aborts when `cancel` becomes true.
 pub fn run_command_cancellable(
+    command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<LimitedOutput, ConversionError> {
+    run_command_cancellable_with_output_paths(command, timeout, max_output_bytes, cancel, &[])
+}
+
+/// Like [`run_command_cancellable`], also polling on-disk converter outputs.
+///
+/// While the child runs, each path in `watch_output_paths` is `stat`ed; if any
+/// file grows past `max_output_bytes` the process group is killed and an error
+/// is returned. Use this for engines that write artifacts to temp files rather
+/// than (or in addition to) stdout.
+pub fn run_command_cancellable_with_output_paths(
+    command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancel: Option<Arc<AtomicBool>>,
+    watch_output_paths: &[PathBuf],
+) -> Result<LimitedOutput, ConversionError> {
+    let path_limits: Vec<(PathBuf, u64)> = watch_output_paths
+        .iter()
+        .cloned()
+        .map(|path| (path, max_output_bytes as u64))
+        .collect();
+    run_command_cancellable_with_output_limits(
+        command,
+        timeout,
+        max_output_bytes,
+        cancel,
+        &path_limits,
+        &[],
+    )
+}
+
+/// Like [`run_command_cancellable_with_output_paths`], also watches the total
+/// size of files below each directory. Directory budgets are independent from
+/// stdout/stderr and file-output budgets, which lets callers enforce a larger
+/// temporary-workspace cap without weakening captured-process-output limits.
+pub fn run_command_cancellable_with_output_dirs(
+    command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancel: Option<Arc<AtomicBool>>,
+    watch_output_paths: &[PathBuf],
+    watch_output_dirs: &[(PathBuf, u64)],
+) -> Result<LimitedOutput, ConversionError> {
+    let path_limits: Vec<(PathBuf, u64)> = watch_output_paths
+        .iter()
+        .cloned()
+        .map(|path| (path, max_output_bytes as u64))
+        .collect();
+    run_command_cancellable_with_output_limits(
+        command,
+        timeout,
+        max_output_bytes,
+        cancel,
+        &path_limits,
+        watch_output_dirs,
+    )
+}
+
+/// Run a command while applying independent byte ceilings to captured output,
+/// watched files, and watched temporary directories.
+pub fn run_command_cancellable_with_output_limits(
     mut command: Command,
     timeout: Duration,
     max_output_bytes: usize,
     cancel: Option<Arc<AtomicBool>>,
+    watch_output_paths: &[(PathBuf, u64)],
+    watch_output_dirs: &[(PathBuf, u64)],
 ) -> Result<LimitedOutput, ConversionError> {
     if cancel
         .as_ref()
@@ -89,26 +166,43 @@ pub fn run_command_cancellable(
     let stdout_thread = thread::spawn(move || read_process_stream(stdout, max, pid));
     let stderr_thread = thread::spawn(move || read_process_stream(stderr, max, pid));
 
-    let status = match wait_with_timeout(&mut child, timeout, cancel.clone()) {
+    let status = match wait_with_timeout(
+        &mut child,
+        timeout,
+        cancel.clone(),
+        watch_output_paths,
+        watch_output_dirs,
+    ) {
         WaitOutcome::Exited(status) => status,
         WaitOutcome::TimedOut => {
-            // Watchdog already signalled and reaped the process group.
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            // Process group already signalled/reaped; bound reader drain so a
+            // wedged descendant holding a pipe cannot hang the caller forever.
+            let _ = join_reader_timeout(stdout_thread, READER_JOIN_TIMEOUT);
+            let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
             return Err(ConversionError::new(format!(
                 "conversion timed out after {}s",
                 timeout.as_secs().max(1)
             )));
         }
         WaitOutcome::Cancelled => {
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            let _ = join_reader_timeout(stdout_thread, READER_JOIN_TIMEOUT);
+            let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
             return Err(ConversionError::cancelled());
+        }
+        WaitOutcome::OutputTooLarge { path, size, limit } => {
+            let _ = join_reader_timeout(stdout_thread, READER_JOIN_TIMEOUT);
+            let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
+            return Err(ConversionError::new(format!(
+                "converter output {} is too large ({} bytes; limit is {} bytes)",
+                path.display(),
+                size,
+                limit
+            )));
         }
         WaitOutcome::Error(error) => {
             force_kill(&mut child);
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            let _ = join_reader_timeout(stdout_thread, READER_JOIN_TIMEOUT);
+            let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
             return Err(ConversionError::new(format!(
                 "could not wait for converter: {error}"
             )));
@@ -119,8 +213,8 @@ pub fn run_command_cancellable(
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::SeqCst))
     {
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
+        let _ = join_reader_timeout(stdout_thread, READER_JOIN_TIMEOUT);
+        let _ = join_reader_timeout(stderr_thread, READER_JOIN_TIMEOUT);
         return Err(ConversionError::cancelled());
     }
 
@@ -138,10 +232,16 @@ enum WaitOutcome {
     Exited(std::process::ExitStatus),
     TimedOut,
     Cancelled,
+    OutputTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
     Error(std::io::Error),
 }
 
-/// Poll until the child exits, `timeout` elapses, or `cancel` is set.
+/// Poll until the child exits, `timeout` elapses, cancel fires, or a watched
+/// on-disk output exceeds `max_output_bytes`.
 ///
 /// Uses `try_wait` + `child.kill()` so cancel and timeout work on all platforms
 /// (Unix also tears down the process group via [`kill_pid`]).
@@ -149,13 +249,38 @@ fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    watch_output_paths: &[(PathBuf, u64)],
+    watch_output_dirs: &[(PathBuf, u64)],
 ) -> WaitOutcome {
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return WaitOutcome::Exited(status),
+            Ok(Some(status)) => {
+                // A fast converter can create its entire output and exit before
+                // the next polling iteration. Check once more after reaping so
+                // on-disk limits are hard ceilings, not best-effort checks only
+                // for long-running children.
+                if let Some(over) = check_watched_output_size(watch_output_paths, watch_output_dirs)
+                {
+                    return WaitOutcome::OutputTooLarge {
+                        path: over.0,
+                        size: over.1,
+                        limit: over.2,
+                    };
+                }
+                return WaitOutcome::Exited(status);
+            }
             Ok(None) => {}
             Err(error) => return WaitOutcome::Error(error),
+        }
+
+        if let Some(over) = check_watched_output_size(watch_output_paths, watch_output_dirs) {
+            force_kill(child);
+            return WaitOutcome::OutputTooLarge {
+                path: over.0,
+                size: over.1,
+                limit: over.2,
+            };
         }
 
         let elapsed = start.elapsed();
@@ -175,6 +300,45 @@ fn wait_with_timeout(
         // promptly instead of overshooting by up to 50 ms.
         thread::sleep(Duration::from_millis(50).min(timeout - elapsed));
     }
+}
+
+fn check_watched_output_size(
+    paths: &[(PathBuf, u64)],
+    dirs: &[(PathBuf, u64)],
+) -> Option<(PathBuf, u64, u64)> {
+    for (path, limit) in paths {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let len = metadata.len();
+            if len > *limit {
+                return Some((path.clone(), len, *limit));
+            }
+        }
+    }
+    for (dir, limit) in dirs {
+        let mut pending = vec![dir.clone()];
+        let mut total = 0u64;
+        while let Some(current) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file()
+                    && let Ok(metadata) = entry.metadata()
+                {
+                    total = total.saturating_add(metadata.len());
+                    if total > *limit {
+                        return Some((dir.clone(), total, *limit));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn kill_pid(pid: u32) {
@@ -212,8 +376,146 @@ fn kill_pid(pid: u32) {
 fn force_kill(child: &mut Child) {
     kill_pid(child.id());
     let _ = child.kill();
+    // Drop stdio handles aggressively so reader threads observe EOF even if a
+    // descendant briefly holds the write end (Child drops pipes on wait).
+    let _ = child.stdout.take();
+    let _ = child.stderr.take();
+    let _ = child.stdin.take();
     // Reap so the next try_wait/wait does not race a zombie.
     let _ = child.wait();
+}
+
+/// Create a new file with mode `0600` **before** writing secrets.
+///
+/// On Unix the open uses `OpenOptionsExt::mode(0o600)` so the content is never
+/// briefly world-readable under a default umask. Callers should place these
+/// files under a private temp directory ([`unique_temp_dir`]). Exclusive
+/// creation also prevents a symlink at `path` from redirecting the secret.
+pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create private file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
+        ConversionError::new(format!(
+            "could not write private file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        ConversionError::new(format!(
+            "could not sync private file {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Create a new regular file with mode `0600` for sensitive intermediate
+/// converter output. The exclusive open prevents a symlink at `path` from
+/// redirecting the output.
+pub fn create_private_file(path: &Path) -> Result<std::fs::File, ConversionError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create private file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Absolute path suitable for child argv (prefers canonicalize when the path exists).
+pub fn absolute_command_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// True when the path string itself would be parsed as a CLI option (`-…`).
+///
+/// Absolute paths like `/tmp/-evil.pdf` are safe (they start with `/`). Relative
+/// names such as `-rf` or `--help` are not — absolutize before passing them as
+/// bare argv operands (see [`push_operand_path`]).
+pub fn path_looks_like_option(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().first().copied() == Some(b'-')
+}
+
+/// Reject empty paths and operands that would be parsed as CLI flags.
+///
+/// Prefer [`push_operand_path`], which absolutizes first so relative names like
+/// `-notes.md` become `/cwd/-notes.md` and are accepted.
+pub fn validate_path_operand(path: &Path) -> Result<(), ConversionError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConversionError::new("path operand is empty"));
+    }
+    if path_looks_like_option(path) {
+        return Err(ConversionError::new(format!(
+            "refusing path operand that looks like a CLI option: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Append an absolute path after a flag that consumes a path value (`-i`, `--out`, …).
+///
+/// Absolute paths prevent option-injection for relative names starting with `-`.
+pub fn push_flag_path(command: &mut Command, flag: impl AsRef<OsStr>, path: &Path) -> PathBuf {
+    let absolute = absolute_command_path(path);
+    command.arg(flag).arg(&absolute);
+    absolute
+}
+
+/// Append an absolute path as a positional operand.
+///
+/// Paths are absolutized so they never begin with `-` on Unix (absolute paths
+/// start with `/`), which closes option-injection for relative names like
+/// `-rf`. We intentionally do **not** insert a bare `--` separator: several
+/// converters and test fakes (including BSD `cat`) reject GNU-style `--`.
+///
+/// Relative operands whose basename starts with `-` are still rejected when
+/// absolutization cannot produce a safe form (empty / non-absolute edge cases).
+pub fn push_operand_path(command: &mut Command, path: &Path) -> Result<PathBuf, ConversionError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConversionError::new("path operand is empty"));
+    }
+    let absolute = absolute_command_path(path);
+    // Absolute Unix paths start with `/` and cannot be mistaken for flags.
+    // If absolutization failed to produce a non-option-like path, refuse.
+    if path_looks_like_option(&absolute) {
+        return Err(ConversionError::new(format!(
+            "refusing path operand that looks like a CLI option: {}",
+            path.display()
+        )));
+    }
+    command.arg(&absolute);
+    Ok(absolute)
+}
+
+/// Append an absolute path as a bare positional arg, rejecting option-like names.
+pub fn push_path_arg(command: &mut Command, path: &Path) -> Result<PathBuf, ConversionError> {
+    push_operand_path(command, path)
 }
 
 /// Read a converter-produced file with a hard size ceiling.
@@ -221,7 +523,7 @@ pub fn read_file_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Conve
     let metadata = std::fs::metadata(path).map_err(|error| {
         ConversionError::new(format!("could not read {}: {error}", path.display()))
     })?;
-    if metadata.len() as usize > max_bytes {
+    if metadata.len() > max_bytes as u64 {
         return Err(ConversionError::new(format!(
             "converter output {} is too large ({} bytes; limit is {} bytes)",
             path.display(),
@@ -251,18 +553,48 @@ fn join_reader(
     stream: &str,
     max_output_bytes: usize,
 ) -> Result<Vec<u8>, ConversionError> {
-    let result = handle
-        .join()
-        .map_err(|_| ConversionError::new(format!("converter {stream} reader panicked")))?
-        .map_err(|error| {
-            ConversionError::new(format!("could not read converter {stream}: {error}"))
-        })?;
+    // Normal exit: readers should drain quickly once the child closed the pipe.
+    // Still bound the join so a wedged reader cannot hang the conversion thread.
+    let joined = join_reader_timeout(handle, READER_JOIN_TIMEOUT).map_err(|_| {
+        ConversionError::new(format!(
+            "converter {stream} reader did not finish within {}s after process exit",
+            READER_JOIN_TIMEOUT.as_secs().max(1)
+        ))
+    })?;
+    let result = match joined {
+        Ok(io_result) => io_result,
+        Err(_) => {
+            return Err(ConversionError::new(format!(
+                "converter {stream} reader panicked"
+            )));
+        }
+    };
+    let result = result.map_err(|error| {
+        ConversionError::new(format!("could not read converter {stream}: {error}"))
+    })?;
     if result.truncated {
         return Err(ConversionError::new(format!(
             "converter {stream} exceeded the {max_output_bytes} byte limit"
         )));
     }
     Ok(result.bytes)
+}
+
+/// Join a reader thread, abandoning the join after `timeout` so cancel/timeout
+/// paths cannot block forever on a wedged pipe reader.
+fn join_reader_timeout<T: Send + 'static>(
+    handle: thread::JoinHandle<T>,
+    timeout: Duration,
+) -> Result<std::thread::Result<T>, ()> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(handle.join());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Ok(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+    }
 }
 
 struct ReadResult {
@@ -569,14 +901,19 @@ pub fn unique_temp_dir(prefix: &str) -> Result<PathBuf, ConversionError> {
 }
 
 fn unique_temp_dir_in(base_dir: &Path, prefix: &str) -> Result<PathBuf, ConversionError> {
+    // Keep directory basenames well under NAME_MAX even if callers pass long prefixes.
+    let slug = bound_temp_slug(prefix, 48);
     for _ in 0..100 {
         let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let base = base_dir.join(format!("{prefix}-{}-{counter}-{nanos}", std::process::id()));
-        match std::fs::create_dir(&base) {
+        // Short hex of nanos keeps names unique without multi-decade decimal width.
+        let name = format!("{slug}-{}-{counter:x}-{:x}", std::process::id(), nanos);
+        debug_assert!(name.len() <= FS_NAME_MAX);
+        let base = base_dir.join(&name);
+        match create_private_dir(&base) {
             Ok(()) => return Ok(base),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -590,6 +927,96 @@ fn unique_temp_dir_in(base_dir: &Path, prefix: &str) -> Result<PathBuf, Conversi
     Err(ConversionError::new(format!(
         "could not create a unique temporary directory for prefix {prefix} after 100 attempts"
     )))
+}
+
+/// Create a directory with mode `0700` on Unix (private by default).
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+/// Sanitize and truncate a temp-name slug, replacing path separators.
+fn bound_temp_slug(raw: &str, max_chars: usize) -> String {
+    let mut slug = String::new();
+    for ch in raw.chars() {
+        if slug.len() >= max_chars {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch);
+        } else if ch == '.' || ch == ' ' {
+            slug.push('-');
+        }
+        // Drop other characters (including `/` `\`).
+    }
+    if slug.is_empty() {
+        slug.push_str("shift");
+    }
+    slug
+}
+
+/// Stable short hash of `input` for bounded temp file basenames.
+pub fn short_path_hash(input: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Build a temp file basename under [`FS_NAME_MAX`], reserving room for `suffix`.
+///
+/// Format: `.{slug}-{hash16}-{pid:x}-{counter:x}{suffix}` where `slug` is a
+/// short sanitized fragment of `stem`. Callers must pass a suffix that includes
+/// any extension (e.g. `.shift-partial`).
+pub fn unique_temp_file_name(stem: &str, suffix: &str) -> String {
+    unique_temp_file_name_with_counter(
+        stem,
+        suffix,
+        TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+fn unique_temp_file_name_with_counter(stem: &str, suffix: &str, counter: u64) -> String {
+    let pid = std::process::id();
+    let hash = short_path_hash(stem);
+    // Fixed-width pieces: '-' + 16 hex hash + '-' + up to 8 hex pid + '-' + counter hex.
+    let fixed = format!("-{hash:016x}-{pid:x}-{counter:x}");
+    let reserved = 1 // leading '.'
+        + fixed.len()
+        + suffix.len();
+    let slug_budget = FS_NAME_MAX.saturating_sub(reserved).min(32);
+    let slug = bound_temp_slug(stem, slug_budget.max(1));
+    let mut name = format!(".{slug}{fixed}{suffix}");
+    if name.len() > FS_NAME_MAX {
+        // Extreme suffix: drop the slug entirely.
+        name = format!(".t{fixed}{suffix}");
+        if name.len() > FS_NAME_MAX {
+            // Last resort: hash-only + truncated suffix (should not happen for
+            // our known suffixes).
+            let keep_suffix = FS_NAME_MAX.saturating_sub(18);
+            let short_suffix: String = suffix
+                .chars()
+                .rev()
+                .take(keep_suffix)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            name = format!(".{hash:016x}{short_suffix}");
+        }
+    }
+    debug_assert!(
+        name.len() <= FS_NAME_MAX,
+        "temp name too long: {}",
+        name.len()
+    );
+    name
 }
 
 /// Clear all memoized tool-discovery results so the next diagnostics/probe pass
@@ -1827,6 +2254,9 @@ mod tests {
 
     #[test]
     fn find_executable_accepts_absolute_runnable_path() {
+        // Discovery results are process-global; serialize cache clears with
+        // the environment-mutating discovery tests.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let suffix = unique_suffix("find-abs");
         let tool = std::env::temp_dir().join(format!("shift-find-abs-{suffix}"));
         write_script(&tool, "#!/bin/sh\necho abs\n");
@@ -2195,6 +2625,196 @@ mod tests {
             "error: {err}"
         );
         let _ = std::fs::remove_file(blocker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unique_temp_dir_is_mode_0700() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("shift-utd-mode").unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "temp dir mode must be 0700, got {mode:o}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_creates_with_mode_0600_before_content() {
+        let path = std::env::temp_dir().join(format!("shift-secret-{}", unique_suffix("secret")));
+        let _ = std::fs::remove_file(&path);
+        write_secret_file(&path, b"s3cret-value").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file mode must be 0600, got {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"s3cret-value");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_refuses_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = unique_suffix("secret-symlink");
+        let target = std::env::temp_dir().join(format!("shift-secret-target-{suffix}"));
+        let link = std::env::temp_dir().join(format!("shift-secret-link-{suffix}"));
+        std::fs::write(&target, b"keep me").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = write_secret_file(&link, b"do not redirect").unwrap_err();
+        assert!(error.to_string().contains("could not create private file"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[test]
+    fn unique_temp_file_name_stays_under_fs_name_max() {
+        let long = "x".repeat(1_000);
+        for suffix in [".shift-partial", ".shift-bak", ".tmp"] {
+            let name = unique_temp_file_name(&long, suffix);
+            assert!(
+                name.len() <= FS_NAME_MAX,
+                "len {} for suffix {suffix}: {name}",
+                name.len()
+            );
+            assert!(name.ends_with(suffix), "{name}");
+        }
+        // Short stems still produce unique-looking names.
+        let a = unique_temp_file_name("out", ".shift-partial");
+        let b = unique_temp_file_name("out", ".shift-partial");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn path_operand_helpers_reject_option_like_names() {
+        assert!(path_looks_like_option(Path::new("-evil.pdf")));
+        assert!(!path_looks_like_option(Path::new("/tmp/-evil.pdf")));
+        assert!(!path_looks_like_option(Path::new("good.pdf")));
+        assert!(validate_path_operand(Path::new("-evil.pdf")).is_err());
+        assert!(validate_path_operand(Path::new("/tmp/-evil.pdf")).is_ok());
+        assert!(validate_path_operand(Path::new("good.pdf")).is_ok());
+
+        // Relative option-like names become absolute `/…/-n` and are accepted.
+        let mut cmd = Command::new("true");
+        let absolute = push_operand_path(&mut cmd, Path::new("-n")).unwrap();
+        assert!(absolute.is_absolute(), "{absolute:?}");
+        assert!(!path_looks_like_option(&absolute));
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(absolute.to_str().unwrap())
+        );
+        // No bare `--` (BSD cat and similar reject it).
+        assert!(!args.iter().any(|a| a == "--"), "{args:?}");
+    }
+
+    #[test]
+    fn watched_output_path_kills_oversized_on_disk_writer() {
+        let suffix = unique_suffix("watch-out");
+        let script = std::env::temp_dir().join(format!("shift-process-watch-{suffix}"));
+        let out = std::env::temp_dir().join(format!("shift-process-watch-out-{suffix}.bin"));
+        let _ = std::fs::remove_file(&out);
+        // Grow the output file past the limit, then hang so the wait loop must
+        // notice the size (not just process exit).
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ndd if=/dev/zero of='{}' bs=200 count=1 2>/dev/null\nsleep 30\n",
+                out.display()
+            ),
+        );
+        let started = Instant::now();
+        let error = run_command_cancellable_with_output_paths(
+            shell_command(&script),
+            Duration::from_secs(20),
+            64,
+            None,
+            std::slice::from_ref(&out),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "on-disk size limit took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn watched_output_path_checks_fast_exit_after_child_reaps() {
+        let suffix = unique_suffix("watch-fast");
+        let script = std::env::temp_dir().join(format!("shift-process-watch-fast-{suffix}"));
+        let out = std::env::temp_dir().join(format!("shift-process-watch-fast-out-{suffix}.bin"));
+        let _ = std::fs::remove_file(&out);
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ndd if=/dev/zero of='{}' bs=200 count=1 2>/dev/null\nexit 0\n",
+                out.display()
+            ),
+        );
+
+        let error = run_command_cancellable_with_output_limits(
+            shell_command(&script),
+            Duration::from_secs(5),
+            64,
+            None,
+            &[(out.clone(), 128)],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn watched_output_directory_kills_oversized_on_disk_writer() {
+        let suffix = unique_suffix("watch-dir");
+        let script = std::env::temp_dir().join(format!("shift-process-watch-dir-{suffix}"));
+        let out_dir = std::env::temp_dir().join(format!("shift-process-watch-dir-out-{suffix}"));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ndd if=/dev/zero of='{}/page-1.pdf' bs=200 count=1 2>/dev/null\nsleep 30\n",
+                out_dir.display()
+            ),
+        );
+        let started = Instant::now();
+        let error = run_command_cancellable_with_output_dirs(
+            shell_command(&script),
+            Duration::from_secs(20),
+            64,
+            None,
+            &[],
+            &[(out_dir.clone(), 64)],
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("limit"),
+            "error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "on-disk directory size limit took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 
     #[test]

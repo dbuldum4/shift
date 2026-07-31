@@ -16,9 +16,11 @@ use super::{
 use calamine::{Data, Reader, open_workbook_auto};
 use csv::{ReaderBuilder, WriterBuilder};
 use rust_xlsxwriter::{ExcelDateTime as XlsxDateTime, Format, Workbook, XlsxError};
+use std::fs::{self, File};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use zip::read::ZipArchive;
 
 /// Formats this module can open as a grid of cell values.
 const EXTENSIONS: &[&str] = &[
@@ -35,6 +37,14 @@ const CHAINABLE: &[OutputFormat] = &[OutputFormat::CSV, OutputFormat::TSV];
 /// Soft cap on intermediate grid size (rows × average width). Sparse used
 /// ranges can still allocate heavily before final encoding.
 const MAX_GRID_CELLS: usize = 2_000_000;
+/// Reject inputs larger than this on disk before any parser materializes them.
+pub const MAX_SPREADSHEET_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// For zip-based workbooks (xlsx/ods/…), total uncompressed entry size cap.
+pub const MAX_SPREADSHEET_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+/// Aggregate UTF-8 payload of cell strings while building the grid.
+pub const MAX_SPREADSHEET_AGGREGATE_CELL_BYTES: usize = 64 * 1024 * 1024;
+/// Single cell string ceiling (guards pathological cells before push).
+pub const MAX_SPREADSHEET_CELL_BYTES: usize = 1024 * 1024;
 
 /// How often to re-check cancellation while scanning or encoding rows.
 const CANCEL_CHECK_EVERY_ROWS: usize = 256;
@@ -191,6 +201,8 @@ fn load_grid(
     sheet: &SpreadsheetOptions,
     options: &ConversionOptions,
 ) -> Result<(String, Vec<Vec<String>>), ConversionError> {
+    ensure_input_budgets(input)?;
+
     let ext = input
         .extension()
         .and_then(|value| value.to_str())
@@ -202,6 +214,66 @@ fn load_grid(
         "tsv" => Ok(("tsv".into(), read_delimited(input, b'\t', options)?)),
         _ => read_workbook(input, sheet, options),
     }
+}
+
+/// File size + zip decompressed budgets checked **before** full grid materialization.
+fn ensure_input_budgets(path: &Path) -> Result<(), ConversionError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not stat spreadsheet {}: {error}",
+            path.display()
+        ))
+    })?;
+    let len = metadata.len();
+    if len > MAX_SPREADSHEET_INPUT_BYTES {
+        return Err(ConversionError::new(format!(
+            "spreadsheet input exceeds the {MAX_SPREADSHEET_INPUT_BYTES} byte file size limit ({len} bytes)"
+        )));
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    // OOXML / ODS containers are zip; bound uncompressed size before calamine expands them.
+    if matches!(
+        ext.as_str(),
+        "xlsx" | "xlsm" | "xlsb" | "xla" | "xlam" | "ods"
+    ) {
+        ensure_zip_decompressed_budget(path)?;
+    }
+    Ok(())
+}
+
+fn ensure_zip_decompressed_budget(path: &Path) -> Result<(), ConversionError> {
+    let file = File::open(path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not open spreadsheet {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        // Not a zip (legacy BIFF, corrupt header): leave further validation to calamine.
+        Err(_) => return Ok(()),
+    };
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            ConversionError::new(format!(
+                "could not inspect spreadsheet zip entry in {}: {error}",
+                path.display()
+            ))
+        })?;
+        total = total.saturating_add(entry.size());
+        if total > MAX_SPREADSHEET_DECOMPRESSED_BYTES {
+            return Err(ConversionError::new(format!(
+                "spreadsheet decompressed size exceeds the {MAX_SPREADSHEET_DECOMPRESSED_BYTES} byte limit"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_delimited(
@@ -220,6 +292,7 @@ fn read_delimited(
 
     let mut rows = Vec::new();
     let mut cell_count = 0usize;
+    let mut aggregate_bytes = 0usize;
     for (row_idx, record) in reader.records().enumerate() {
         if row_idx % CANCEL_CHECK_EVERY_ROWS == 0 {
             check_cancel(options)?;
@@ -229,7 +302,12 @@ fn read_delimited(
         })?;
         cell_count = cell_count.saturating_add(record.len());
         ensure_cell_budget(cell_count)?;
-        rows.push(record.iter().map(|cell| cell.to_owned()).collect());
+        let mut row = Vec::with_capacity(record.len());
+        for cell in record.iter() {
+            ensure_cell_string_budget(cell, &mut aggregate_bytes)?;
+            row.push(cell.to_owned());
+        }
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -262,15 +340,37 @@ fn read_workbook(
         ))
     })?;
 
-    let mut rows = Vec::with_capacity(range.height());
+    // Bound the used range before allocating every cell string.
+    let height = range.height();
+    let width = range.width();
+    let projected = height.saturating_mul(width);
+    ensure_cell_budget(projected)?;
+    if projected > 0 {
+        // Worst-case: every cell could hold MAX_SPREADSHEET_CELL_BYTES; reject
+        // ranges that cannot fit under the aggregate budget even at 1 byte/cell.
+        if projected > MAX_SPREADSHEET_AGGREGATE_CELL_BYTES {
+            return Err(ConversionError::new(format!(
+                "spreadsheet used range ({height}×{width}) exceeds the aggregate cell byte budget"
+            )));
+        }
+    }
+
+    let mut rows = Vec::with_capacity(height);
     let mut cell_count = 0usize;
+    let mut aggregate_bytes = 0usize;
     for (row_idx, row) in range.rows().enumerate() {
         if row_idx % CANCEL_CHECK_EVERY_ROWS == 0 {
             check_cancel(options)?;
         }
         cell_count = cell_count.saturating_add(row.len());
         ensure_cell_budget(cell_count)?;
-        rows.push(row.iter().map(cell_to_string).collect());
+        let mut out_row = Vec::with_capacity(row.len());
+        for cell in row {
+            let text = cell_to_string(cell);
+            ensure_cell_string_budget(&text, &mut aggregate_bytes)?;
+            out_row.push(text);
+        }
+        rows.push(out_row);
     }
     Ok((sheet_name, rows))
 }
@@ -279,6 +379,25 @@ fn ensure_cell_budget(cell_count: usize) -> Result<(), ConversionError> {
     if cell_count > MAX_GRID_CELLS {
         return Err(ConversionError::new(format!(
             "spreadsheet exceeds the {MAX_GRID_CELLS} cell limit; narrow the sheet or split the file"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_cell_string_budget(
+    cell: &str,
+    aggregate_bytes: &mut usize,
+) -> Result<(), ConversionError> {
+    let len = cell.len();
+    if len > MAX_SPREADSHEET_CELL_BYTES {
+        return Err(ConversionError::new(format!(
+            "spreadsheet cell exceeds the {MAX_SPREADSHEET_CELL_BYTES} byte limit"
+        )));
+    }
+    *aggregate_bytes = aggregate_bytes.saturating_add(len);
+    if *aggregate_bytes > MAX_SPREADSHEET_AGGREGATE_CELL_BYTES {
+        return Err(ConversionError::new(format!(
+            "spreadsheet cell text exceeds the {MAX_SPREADSHEET_AGGREGATE_CELL_BYTES} byte aggregate limit"
         )));
     }
     Ok(())
@@ -716,6 +835,48 @@ mod tests {
         assert!(ensure_cell_budget(MAX_GRID_CELLS).is_ok());
         let err = ensure_cell_budget(MAX_GRID_CELLS + 1).unwrap_err();
         assert!(err.to_string().contains("cell limit"), "{err}");
+    }
+
+    #[test]
+    fn ensure_input_budgets_rejects_oversize_files() {
+        let path = std::env::temp_dir().join(format!(
+            "shift-sheet-oversize-{}-{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Sparse file if the OS allows; otherwise write a small marker and
+        // temporarily exercise the check via a renamed huge path is not portable.
+        // Write just over the limit when feasible; for CI speed, mock by writing
+        // a modest file and calling the size check logic directly when large
+        // writes are too expensive.
+        let oversize = MAX_SPREADSHEET_INPUT_BYTES.saturating_add(1);
+        if let Ok(file) = File::create(&path) {
+            let _ = file.set_len(oversize);
+        }
+        if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_SPREADSHEET_INPUT_BYTES {
+            let err = ensure_input_budgets(&path).unwrap_err();
+            assert!(
+                err.to_string().contains("file size limit"),
+                "unexpected: {err}"
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ensure_cell_string_budget_tracks_aggregate() {
+        let mut aggregate = 0usize;
+        ensure_cell_string_budget("hello", &mut aggregate).unwrap();
+        assert_eq!(aggregate, 5);
+        let big = "x".repeat(MAX_SPREADSHEET_CELL_BYTES + 1);
+        let err = ensure_cell_string_budget(&big, &mut aggregate).unwrap_err();
+        assert!(err.to_string().contains("cell exceeds"), "{err}");
+        let mut aggregate = MAX_SPREADSHEET_AGGREGATE_CELL_BYTES - 2;
+        let err = ensure_cell_string_budget("abcd", &mut aggregate).unwrap_err();
+        assert!(err.to_string().contains("aggregate"), "{err}");
     }
 
     #[test]

@@ -3,30 +3,28 @@
 //! Accepts page URLs, local paths, `file://` URLs, remote file downloads,
 //! and (via helpers) clipboard image bytes staged as temporary files.
 
-use super::defuddle::{
-    block_private_urls, ensure_public_url_fetch_allowed, looks_like_url, redact_url_credentials,
-};
-use super::process::run_command_cancellable;
+use super::defuddle::{ensure_public_url_fetch_allowed, looks_like_url, redact_url_credentials};
 use super::sources::supported_input_extensions;
+use super::url_fetch::{self, DownloadOptions};
 use super::{BatchSource, ConversionError, ConversionRegistry};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use url::Url;
 
-/// Soft cap for remote file downloads (512 MiB).
-pub const MAX_REMOTE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub use super::url_fetch::{MAX_REMOTE_FILE_BYTES, REMOTE_DOWNLOAD_TIMEOUT};
 
-/// Wall-clock budget for remote downloads (allows large files on moderate links).
-pub const REMOTE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Aggregate download budget across one multi-token materialize call (512 MiB).
+pub const MAX_AGGREGATE_DOWNLOAD_BYTES: u64 = MAX_REMOTE_FILE_BYTES;
 
-/// Max HTTP redirects when private-URL blocking revalidates each hop.
-const MAX_DOWNLOAD_REDIRECTS: u32 = 10;
+/// Max whitespace-separated tokens accepted in one magic-paste string.
+pub const MAX_PASTE_TOKENS: usize = 64;
+
+/// Max clipboard image payload accepted for staging (50 MiB).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
 /// One classified paste token before materialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,27 +63,152 @@ impl MagicPaste {
 ///
 /// Supports whitespace-separated items and double/single-quoted paths with spaces.
 /// Does not hit the network; remote file URLs are only classified.
-pub fn parse_magic_paste(input: &str) -> MagicPaste {
-    let tokens: Vec<PasteToken> = tokenize_paste(input)
+///
+/// Rejects pastes with more than [`MAX_PASTE_TOKENS`] whitespace tokens (fail closed).
+pub fn parse_magic_paste(input: &str) -> Result<MagicPaste, ConversionError> {
+    let raw_tokens = tokenize_paste(input);
+    if raw_tokens.len() > MAX_PASTE_TOKENS {
+        return Err(ConversionError::new(format!(
+            "too many paste tokens (limit is {MAX_PASTE_TOKENS}); split into smaller batches"
+        )));
+    }
+    let tokens: Vec<PasteToken> = raw_tokens
         .into_iter()
         .filter_map(|raw| classify_token(&raw))
         .collect();
-    match tokens.len() {
+    Ok(match tokens.len() {
         0 => MagicPaste::Empty,
         1 => MagicPaste::Single(tokens.into_iter().next().expect("len checked")),
         _ => MagicPaste::Multiple(tokens),
+    })
+}
+
+/// A materialized conversion source that may own a temporary staged input.
+#[derive(Debug, Eq, PartialEq)]
+pub struct MaterializedSource {
+    pub source: BatchSource,
+    pub staged_path: Option<PathBuf>,
+    pub origin_url: Option<String>,
+}
+
+impl MaterializedSource {
+    pub fn local(path: PathBuf) -> Self {
+        Self {
+            source: BatchSource::File(path),
+            staged_path: None,
+            origin_url: None,
+        }
+    }
+    pub fn page_url(url: String) -> Self {
+        Self {
+            source: BatchSource::Url(url),
+            staged_path: None,
+            origin_url: None,
+        }
+    }
+    pub fn staged_download(path: PathBuf, origin_url: String) -> Self {
+        Self {
+            source: BatchSource::File(path.clone()),
+            staged_path: Some(path),
+            origin_url: Some(origin_url),
+        }
+    }
+    pub fn staged_clipboard(path: PathBuf) -> Self {
+        Self {
+            source: BatchSource::File(path.clone()),
+            staged_path: Some(path),
+            origin_url: None,
+        }
+    }
+    pub fn cleanup(&mut self) {
+        if let Some(path) = self.staged_path.take() {
+            cleanup_staged_path(&path);
+        }
+    }
+    pub fn take_staged_path(&mut self) -> Option<PathBuf> {
+        self.staged_path.take()
     }
 }
 
-/// Resolve a classified token into a [`BatchSource`], downloading remote files when needed.
-///
-/// `cancel` may be `None` for short-lived callers; when supplied, it is polled
-/// before each network fetch and passed to curl so a running download can be
-/// aborted.
-pub fn materialize_paste_token(
+impl Drop for MaterializedSource {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Collection of Shift-owned staged input paths.
+#[derive(Clone, Debug, Default)]
+pub struct StagedInputs {
+    paths: Vec<PathBuf>,
+}
+
+impl StagedInputs {
+    pub fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+    pub fn track(&mut self, path: PathBuf) {
+        if !self.paths.iter().any(|e| e == &path) {
+            self.paths.push(path);
+        }
+    }
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+    /// Release one staged source while keeping unrelated tracked inputs alive.
+    pub fn release(&mut self, path: &Path) {
+        self.paths.retain(|tracked| tracked != path);
+        cleanup_staged_path(path);
+    }
+    pub fn cleanup(&mut self) {
+        for path in self.paths.drain(..) {
+            cleanup_staged_path(&path);
+        }
+    }
+}
+
+impl Drop for StagedInputs {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// True when `path` lives under the paste staging directory Shift owns.
+pub fn is_paste_staging_path(path: &Path) -> bool {
+    let Ok(staging) = paste_staging_dir() else {
+        return false;
+    };
+    let staging = normalize_existing_prefix(&staging);
+    let candidate = normalize_existing_prefix(path);
+    candidate.starts_with(&staging)
+}
+
+/// Delete a staged input file and its unique parent directory when empty.
+pub fn cleanup_staged_path(path: &Path) {
+    if !is_paste_staging_path(path) {
+        return;
+    }
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        if is_paste_staging_path(parent) {
+            if let Ok(staging) = paste_staging_dir() {
+                let staging = normalize_existing_prefix(&staging);
+                let parent_norm = normalize_existing_prefix(parent);
+                if parent_norm != staging {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a classified token into a [`MaterializedSource`].
+pub fn materialize_paste_token_detailed(
     token: &PasteToken,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<BatchSource, ConversionError> {
+) -> Result<MaterializedSource, ConversionError> {
     if cancel
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -107,41 +230,84 @@ pub fn materialize_paste_token(
                     path.display()
                 )));
             }
-            Ok(BatchSource::File(path))
+            Ok(MaterializedSource::local(path))
         }
         PasteToken::PageUrl(url) => {
             ensure_url_fetch_allowed(url)?;
-            Ok(BatchSource::Url(url.clone()))
+            Ok(MaterializedSource::page_url(url.clone()))
         }
         PasteToken::RemoteFileUrl(url) => {
             ensure_url_fetch_allowed(url)?;
             let path = download_remote_file(url, cancel)?;
-            Ok(BatchSource::File(path))
+            Ok(MaterializedSource::staged_download(path, url.clone()))
         }
     }
 }
 
+/// Resolve a classified token into an owned materialized source.
+///
+/// The returned value owns any downloaded staging file and removes it when
+/// dropped. Keep it alive until the conversion has finished.
+pub fn materialize_paste_token(
+    token: &PasteToken,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<MaterializedSource, ConversionError> {
+    materialize_paste_token_detailed(token, cancel)
+}
+
 /// Materialize every token in a magic-paste parse result.
+///
+/// Each returned item owns its staged input, if any, and cleans it up on drop.
 pub fn materialize_magic_paste(
     paste: &MagicPaste,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<Vec<BatchSource>, ConversionError> {
-    paste
-        .tokens()
-        .iter()
-        .map(|token| materialize_paste_token(token, cancel.clone()))
-        .collect()
+) -> Result<Vec<MaterializedSource>, ConversionError> {
+    materialize_magic_paste_detailed(paste, cancel)
+}
+
+/// Materialize every token, retaining staged ownership and origin URLs.
+pub fn materialize_magic_paste_detailed(
+    paste: &MagicPaste,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Vec<MaterializedSource>, ConversionError> {
+    let mut out = Vec::with_capacity(paste.tokens().len());
+    let mut aggregate_bytes: u64 = 0;
+    for token in paste.tokens() {
+        match materialize_paste_token_detailed(token, cancel.clone()) {
+            Ok(item) => {
+                if let Some(path) = item.staged_path.as_ref() {
+                    let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    aggregate_bytes = aggregate_bytes.saturating_add(len);
+                    if aggregate_bytes > MAX_AGGREGATE_DOWNLOAD_BYTES {
+                        drop(item);
+                        drop(out);
+                        return Err(ConversionError::new(format!(
+                            "aggregate remote downloads exceeded size limit ({} bytes)",
+                            MAX_AGGREGATE_DOWNLOAD_BYTES
+                        )));
+                    }
+                }
+                out.push(item);
+            }
+            Err(error) => {
+                drop(out);
+                return Err(error);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Stage raw image bytes from the clipboard as a temporary source file.
-///
-/// `extension` should be a lowercase extension without the leading dot (e.g. `png`).
-/// Rejects formats that no conversion module accepts as input. The accepted set
-/// follows the registry, so it widens as modules are added (SVG, for example,
-/// became stageable with the macOS sips adapter).
 pub fn stage_pasted_image(bytes: &[u8], extension: &str) -> Result<PathBuf, ConversionError> {
     if bytes.is_empty() {
         return Err(ConversionError::new("clipboard image is empty"));
+    }
+    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(ConversionError::new(format!(
+            "clipboard image exceeds size limit ({} bytes)",
+            MAX_CLIPBOARD_IMAGE_BYTES
+        )));
     }
     let ext = extension
         .trim()
@@ -155,11 +321,11 @@ pub fn stage_pasted_image(bytes: &[u8], extension: &str) -> Result<PathBuf, Conv
             "clipboard image format .{ext} is not a supported conversion input"
         )));
     }
-    let dir = paste_staging_dir()?;
-    let stamp = unique_stamp();
-    let path = dir.join(format!("clipboard-image-{stamp}.{ext}"));
+    let work = unique_staging_workdir()?;
+    let path = work.join(format!("clipboard-image.{ext}"));
     if let Err(error) = fs::write(&path, bytes) {
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&work);
         return Err(ConversionError::new(format!(
             "could not stage clipboard image {}: {error}",
             path.display()
@@ -329,40 +495,42 @@ fn download_remote_file(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, ConversionError> {
     let display_url = redact_url_credentials(url);
-    let dir = paste_staging_dir()?;
+    let work = unique_staging_workdir()?;
     let name = remote_file_name(url);
-    let stamp = unique_stamp();
-    let path = dir.join(format!("{stamp}-{name}"));
+    let path = work.join(name);
 
-    let result = if block_private_urls() {
-        // Re-validate every hop so a public URL cannot redirect into private space.
-        download_with_redirect_revalidation(url, &path, cancel)
-    } else {
-        download_follow_redirects(url, &path, cancel)
-    };
+    let result = url_fetch::download_url_to_path(
+        url,
+        &path,
+        DownloadOptions {
+            cancel,
+            max_bytes: MAX_REMOTE_FILE_BYTES,
+            timeout: REMOTE_DOWNLOAD_TIMEOUT,
+        },
+    );
 
     if let Err(error) = result {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         return Err(ConversionError::new(
             error.to_string().replace(url, &display_url),
         ));
     }
 
     let meta = fs::metadata(&path).map_err(|error| {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         ConversionError::new(format!(
             "download succeeded but could not read {}: {error}",
             path.display()
         ))
     })?;
     if meta.len() == 0 {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         return Err(ConversionError::new(format!(
             "download of {display_url} produced an empty file"
         )));
     }
     if meta.len() > MAX_REMOTE_FILE_BYTES {
-        let _ = fs::remove_file(&path);
+        cleanup_staged_path(&path);
         return Err(ConversionError::new(format!(
             "download of {display_url} exceeded size limit ({} bytes)",
             MAX_REMOTE_FILE_BYTES
@@ -370,229 +538,6 @@ fn download_remote_file(
     }
 
     Ok(path)
-}
-
-/// Fast path: curl follows redirects (no private-URL policy).
-fn download_follow_redirects(
-    url: &str,
-    path: &Path,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<(), ConversionError> {
-    let display_url = redact_url_credentials(url);
-    if cancel
-        .as_ref()
-        .is_some_and(|flag| flag.load(Ordering::SeqCst))
-    {
-        return Err(ConversionError::cancelled());
-    }
-    let mut command = Command::new("curl");
-    apply_curl_http_only(&mut command);
-    command
-        .arg("-fsSL")
-        .arg("--max-filesize")
-        .arg(MAX_REMOTE_FILE_BYTES.to_string())
-        .arg("--connect-timeout")
-        .arg("15")
-        .arg("-o")
-        .arg(path)
-        .arg(url);
-
-    let output = run_command_cancellable(command, REMOTE_DOWNLOAD_TIMEOUT, 1024 * 1024, cancel)
-        .map_err(|error| {
-            if error.is_cancelled() {
-                error
-            } else {
-                ConversionError::new(format!(
-                    "could not download {display_url}: {error}. Install curl or open the file locally."
-                ))
-            }
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(ConversionError::new(if detail.is_empty() {
-            format!(
-                "could not download {display_url} (curl exit {})",
-                output.status
-            )
-        } else if detail.contains("maximum file size exceeded") || detail.contains("max-filesize") {
-            format!(
-                "could not download {display_url}: exceeded size limit ({} bytes)",
-                MAX_REMOTE_FILE_BYTES
-            )
-        } else if detail.contains("timed out") || detail.contains("Timeout") {
-            format!("could not download {display_url}: download timed out")
-        } else {
-            format!("could not download {display_url}: {detail}")
-        }));
-    }
-    Ok(())
-}
-
-/// Safer path when private URLs are blocked (default): no auto-follow; re-check each Location.
-fn download_with_redirect_revalidation(
-    url: &str,
-    path: &Path,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<(), ConversionError> {
-    let mut current = url.to_string();
-    for hop in 0..=MAX_DOWNLOAD_REDIRECTS {
-        let display_current = redact_url_credentials(&current);
-        if cancel
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
-        {
-            let _ = fs::remove_file(path);
-            return Err(ConversionError::cancelled());
-        }
-        ensure_url_fetch_allowed(&current)?;
-
-        let header_path = path.with_extension(format!("hdr{hop}"));
-        let mut command = Command::new("curl");
-        // No -L / max-redirs 0: surface 3xx so we can validate the next hop.
-        // No -f: we need to inspect redirect status codes ourselves.
-        apply_curl_http_only(&mut command);
-        command
-            .arg("-sS")
-            .arg("--max-redirs")
-            .arg("0")
-            .arg("--max-filesize")
-            .arg(MAX_REMOTE_FILE_BYTES.to_string())
-            .arg("--connect-timeout")
-            .arg("15")
-            .arg("-D")
-            .arg(&header_path)
-            .arg("-o")
-            .arg(path)
-            .arg("-w")
-            .arg("%{http_code}")
-            .arg(&current);
-
-        let output = run_command_cancellable(
-            command,
-            REMOTE_DOWNLOAD_TIMEOUT,
-            1024 * 1024,
-            cancel.clone(),
-        )
-        .map_err(|error| {
-            let _ = fs::remove_file(&header_path);
-            if error.is_cancelled() {
-                error
-            } else {
-                ConversionError::new(format!(
-                    "could not download {display_current}: {error}. Install curl or open the file locally."
-                ))
-            }
-        })?;
-
-        let headers = fs::read_to_string(&header_path).unwrap_or_default();
-        let _ = fs::remove_file(&header_path);
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim();
-            return Err(ConversionError::new(if detail.is_empty() {
-                format!(
-                    "could not download {display_current} (curl exit {})",
-                    output.status
-                )
-            } else {
-                format!("could not download {display_current}: {detail}")
-            }));
-        }
-
-        let code_text = String::from_utf8_lossy(&output.stdout);
-        let code: u16 = code_text.trim().parse().unwrap_or(0);
-
-        if (300..400).contains(&code) {
-            let Some(location) = location_header(&headers) else {
-                return Err(ConversionError::new(format!(
-                    "could not download {display_current}: redirect ({code}) without Location header"
-                )));
-            };
-            current = resolve_redirect_url(&current, &location)?;
-            let _ = fs::remove_file(path);
-            continue;
-        }
-
-        if code == 200 || code == 0 {
-            // Some curl builds omit write-out on success; treat 0 + non-empty body as ok later.
-            if code == 200 || path.is_file() {
-                return Ok(());
-            }
-        }
-
-        return Err(ConversionError::new(format!(
-            "could not download {display_current}: HTTP {code}"
-        )));
-    }
-
-    Err(ConversionError::new(format!(
-        "could not download {}: too many redirects (max {MAX_DOWNLOAD_REDIRECTS})",
-        redact_url_credentials(url)
-    )))
-}
-
-fn location_header(headers: &str) -> Option<String> {
-    for line in headers.lines() {
-        let line = line.trim();
-        // Status lines (`HTTP/1.1 302 Found`) have no colon — skip them.
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("location") {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_owned());
-            }
-        }
-    }
-    None
-}
-
-fn resolve_redirect_url(base: &str, location: &str) -> Result<String, ConversionError> {
-    let location = location.trim();
-    let resolved = if let Ok(absolute) = Url::parse(location) {
-        // Absolute URL in Location — only http(s) may proceed.
-        if !matches!(absolute.scheme(), "http" | "https") {
-            return Err(ConversionError::new(format!(
-                "refusing non-http(s) redirect Location '{location}'"
-            )));
-        }
-        absolute
-    } else {
-        let base = Url::parse(base).map_err(|error| {
-            ConversionError::new(format!("invalid redirect base URL {base}: {error}"))
-        })?;
-        base.join(location).map_err(|error| {
-            ConversionError::new(format!(
-                "could not resolve redirect Location '{location}': {error}"
-            ))
-        })?
-    };
-
-    if !matches!(resolved.scheme(), "http" | "https") || resolved.host().is_none() {
-        return Err(ConversionError::new(format!(
-            "refusing non-http(s) redirect target '{resolved}'"
-        )));
-    }
-    // Drop userinfo so credentials in Location cannot be forwarded blindly.
-    if !resolved.username().is_empty() || resolved.password().is_some() {
-        return Err(ConversionError::new(format!(
-            "refusing redirect Location with credentials: {location}"
-        )));
-    }
-    Ok(resolved.to_string())
-}
-
-/// Limit curl to http(s) only (blocks file:// and other protocol smuggling).
-fn apply_curl_http_only(command: &mut Command) {
-    command
-        .arg("--proto")
-        .arg("=https,http")
-        .arg("--proto-redir")
-        .arg("=https,http");
 }
 
 fn remote_file_name(url: &str) -> String {
@@ -644,12 +589,27 @@ fn paste_staging_dir() -> Result<PathBuf, ConversionError> {
     Ok(dir)
 }
 
+fn unique_staging_workdir() -> Result<PathBuf, ConversionError> {
+    let dir = paste_staging_dir()?.join(unique_stamp());
+    fs::create_dir_all(&dir).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create paste staging work directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
 fn unique_stamp() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}-{nanos}", std::process::id())
+}
+
+fn normalize_existing_prefix(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -673,17 +633,9 @@ mod tests {
         path
     }
 
-    #[cfg(unix)]
-    fn prepend_to_path(dir: &Path) -> Option<std::ffi::OsString> {
-        let current = std::env::var_os("PATH").unwrap_or_default();
-        let mut parts: Vec<PathBuf> = vec![dir.to_path_buf()];
-        parts.extend(std::env::split_paths(&current));
-        std::env::join_paths(parts).ok()
-    }
-
     #[test]
     fn parses_page_urls() {
-        let paste = parse_magic_paste("https://example.com/article");
+        let paste = parse_magic_paste("https://example.com/article").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::PageUrl("https://example.com/article".into()))
@@ -692,7 +644,7 @@ mod tests {
 
     #[test]
     fn parses_remote_file_urls() {
-        let paste = parse_magic_paste("https://cdn.example.com/docs/report.pdf");
+        let paste = parse_magic_paste("https://cdn.example.com/docs/report.pdf").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::RemoteFileUrl(
@@ -700,7 +652,7 @@ mod tests {
             ))
         );
         // Query string still classifies from path extension.
-        let paste = parse_magic_paste("https://cdn.example.com/f/doc.docx?dl=1");
+        let paste = parse_magic_paste("https://cdn.example.com/f/doc.docx?dl=1").unwrap();
         assert!(matches!(
             paste,
             MagicPaste::Single(PasteToken::RemoteFileUrl(_))
@@ -709,7 +661,7 @@ mod tests {
 
     #[test]
     fn html_urls_are_pages_not_files() {
-        let paste = parse_magic_paste("https://example.com/index.html");
+        let paste = parse_magic_paste("https://example.com/index.html").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::PageUrl("https://example.com/index.html".into()))
@@ -718,7 +670,7 @@ mod tests {
 
     #[test]
     fn parses_file_urls() {
-        let paste = parse_magic_paste("file:///tmp/sample.pdf");
+        let paste = parse_magic_paste("file:///tmp/sample.pdf").unwrap();
         match paste {
             MagicPaste::Single(PasteToken::LocalPath(path)) => {
                 assert_eq!(path, PathBuf::from("/tmp/sample.pdf"));
@@ -730,19 +682,19 @@ mod tests {
     #[test]
     fn invalid_file_urls_are_rejected() {
         // Host-form file URLs cannot be converted to a local path on Unix.
-        let paste = parse_magic_paste("file://hostname/only");
+        let paste = parse_magic_paste("file://hostname/only").unwrap();
         assert_eq!(paste, MagicPaste::Empty);
     }
 
     #[test]
     fn parses_absolute_and_quoted_paths() {
-        let paste = parse_magic_paste("/Users/me/report.pdf");
+        let paste = parse_magic_paste("/Users/me/report.pdf").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("/Users/me/report.pdf")))
         );
 
-        let paste = parse_magic_paste("\"/Users/me/My Docs/file.pdf\"");
+        let paste = parse_magic_paste("\"/Users/me/My Docs/file.pdf\"").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -754,7 +706,8 @@ mod tests {
     #[test]
     fn parses_multiple_mixed_tokens() {
         let paste =
-            parse_magic_paste("https://example.com/a /tmp/x.pdf https://cdn.example.com/y.png");
+            parse_magic_paste("https://example.com/a /tmp/x.pdf https://cdn.example.com/y.png")
+                .unwrap();
         match paste {
             MagicPaste::Multiple(tokens) => {
                 assert_eq!(tokens.len(), 3);
@@ -768,9 +721,12 @@ mod tests {
 
     #[test]
     fn empty_and_noise_yield_empty() {
-        assert_eq!(parse_magic_paste(""), MagicPaste::Empty);
-        assert_eq!(parse_magic_paste("   "), MagicPaste::Empty);
-        assert_eq!(parse_magic_paste("not a path or url"), MagicPaste::Empty);
+        assert_eq!(parse_magic_paste("").unwrap(), MagicPaste::Empty);
+        assert_eq!(parse_magic_paste("   ").unwrap(), MagicPaste::Empty);
+        assert_eq!(
+            parse_magic_paste("not a path or url").unwrap(),
+            MagicPaste::Empty
+        );
     }
 
     #[test]
@@ -790,7 +746,7 @@ mod tests {
         let path = dir.join("note.md");
         fs::write(&path, b"# hi\n").unwrap();
         let source = materialize_paste_token(&PasteToken::LocalPath(path.clone()), None).unwrap();
-        assert_eq!(source, BatchSource::File(path));
+        assert_eq!(&source.source, &BatchSource::File(path));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -837,51 +793,6 @@ mod tests {
         assert!(url_looks_like_remote_file("https://example.com/a/b/c.mp4"));
         assert!(!url_looks_like_remote_file("https://example.com/post"));
         assert!(!url_looks_like_remote_file("https://example.com/page.html"));
-    }
-
-    #[test]
-    fn resolve_redirect_joins_relative_location() {
-        let next = resolve_redirect_url("https://cdn.example.com/a/b.pdf", "../c.pdf").unwrap();
-        assert_eq!(next, "https://cdn.example.com/c.pdf");
-    }
-
-    #[test]
-    fn location_header_skips_status_line() {
-        let headers = "HTTP/1.1 302 Found\r\n\
-             Server: cloudflare\r\n\
-             Location: https://cdn.example.com/real.pdf\r\n\
-             Content-Length: 0\r\n\r\n";
-        assert_eq!(
-            location_header(headers).as_deref(),
-            Some("https://cdn.example.com/real.pdf")
-        );
-        // LF-only dumps and lower-case names.
-        let headers = "HTTP/2 301\nlocation: /next.pdf\n";
-        assert_eq!(location_header(headers).as_deref(), Some("/next.pdf"));
-        assert_eq!(location_header("HTTP/1.1 200 OK\n"), None);
-    }
-
-    #[test]
-    fn resolve_redirect_rejects_non_http_schemes() {
-        let err = resolve_redirect_url("https://cdn.example.com/a.pdf", "file:///etc/passwd")
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("non-http"),
-            "unexpected error: {err}"
-        );
-        let err =
-            resolve_redirect_url("https://cdn.example.com/a.pdf", "gopher://evil/").unwrap_err();
-        assert!(err.to_string().contains("non-http"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn resolve_redirect_rejects_credentials_in_location() {
-        let err = resolve_redirect_url(
-            "https://cdn.example.com/a.pdf",
-            "https://user:pass@evil.example/x.pdf",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("credentials"), "unexpected: {err}");
     }
 
     #[test]
@@ -1003,19 +914,19 @@ exit 0
     #[test]
     fn looks_like_path_token_branches() {
         assert_eq!(
-            parse_magic_paste("relative/path/file.pdf"),
+            parse_magic_paste("relative/path/file.pdf").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
                 "relative/path/file.pdf"
             )))
         );
         assert_eq!(
-            parse_magic_paste("relative\\path\\file.pdf"),
+            parse_magic_paste("relative\\path\\file.pdf").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
                 "relative\\path\\file.pdf"
             )))
         );
         assert_eq!(
-            parse_magic_paste("document.pdf"),
+            parse_magic_paste("document.pdf").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("document.pdf")))
         );
 
@@ -1024,7 +935,7 @@ exit 0
         let file = dir.join("note");
         fs::write(&file, b"hi").unwrap();
         assert_eq!(
-            parse_magic_paste(file.to_str().unwrap()),
+            parse_magic_paste(file.to_str().unwrap()).unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(file.clone()))
         );
         let _ = fs::remove_dir_all(&dir);
@@ -1183,7 +1094,12 @@ exit 0
         }
 
         let err = stage_pasted_image(b"\x89PNG", "png").unwrap_err();
-        assert!(err.to_string().contains("could not stage clipboard image"));
+        let message = err.to_string();
+        assert!(
+            message.contains("could not stage clipboard image")
+                || message.contains("could not create paste staging work directory"),
+            "unexpected error: {message}"
+        );
 
         let mut permissions = fs::metadata(&dir).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -1217,32 +1133,16 @@ exit 0
         ]);
         let sources = materialize_magic_paste(&paste, None).unwrap();
         assert_eq!(sources.len(), 2);
-        assert!(sources.iter().all(|s| matches!(s, BatchSource::File(_))));
+        assert!(
+            sources
+                .iter()
+                .all(|s| matches!(&s.source, BatchSource::File(_)))
+        );
 
         let cancel = Arc::new(AtomicBool::new(true));
         let err = materialize_magic_paste(&paste, Some(cancel)).unwrap_err();
         assert!(err.is_cancelled());
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_redirect_url_edge_cases() {
-        let err = resolve_redirect_url("not-a-url", "/x").unwrap_err();
-        assert!(err.to_string().contains("invalid redirect base URL"));
-    }
-
-    #[test]
-    fn apply_curl_http_only_adds_protocol_args() {
-        let mut cmd = Command::new("curl");
-        apply_curl_http_only(&mut cmd);
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let joined = args.join(" ");
-        assert!(joined.contains("--proto"));
-        assert!(joined.contains("=https,http"));
-        assert!(joined.contains("--proto-redir"));
     }
 
     #[cfg(unix)]
@@ -1255,10 +1155,9 @@ exit 0
         let fake_dir =
             std::env::temp_dir().join(format!("shift-magic-fakecurl-{}", std::process::id()));
         fs::create_dir_all(&fake_dir).unwrap();
-        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
-        let old_path = std::env::var_os("PATH");
+        let fake_curl = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
         unsafe {
-            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            std::env::set_var("SHIFT_CURL_BIN", &fake_curl);
             std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
             std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
         }
@@ -1268,18 +1167,17 @@ exit 0
             None,
         )
         .unwrap();
-        assert!(matches!(source, BatchSource::File(_)));
+        assert!(matches!(&source.source, BatchSource::File(_)));
+        let staged_path = source.staged_path.clone().expect("remote file is staged");
+        assert!(staged_path.is_file());
+        drop(source);
+        assert!(
+            !staged_path.exists(),
+            "dropping the source must clean staging"
+        );
 
-        if let Some(p) = old_path {
-            unsafe {
-                std::env::set_var("PATH", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
         unsafe {
+            std::env::remove_var("SHIFT_CURL_BIN");
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
         }
@@ -1297,10 +1195,9 @@ exit 0
         let fake_dir =
             std::env::temp_dir().join(format!("shift-magic-fakecurl-{}", std::process::id()));
         fs::create_dir_all(&fake_dir).unwrap();
-        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
-        let old_path = std::env::var_os("PATH");
+        let fake_curl = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
         unsafe {
-            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
+            std::env::set_var("SHIFT_CURL_BIN", &fake_curl);
             std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
             std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
         }
@@ -1320,65 +1217,8 @@ exit 0
         assert!(err.to_string().contains("could not download"));
         assert!(err.to_string().contains("boom"));
 
-        if let Some(p) = old_path {
-            unsafe {
-                std::env::set_var("PATH", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
         unsafe {
-            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
-            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
-        }
-        let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_dir_all(&fake_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn download_with_redirect_revalidation_scenarios() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let staging =
-            std::env::temp_dir().join(format!("shift-magic-redirect-{}", std::process::id()));
-        fs::create_dir_all(&staging).unwrap();
-        let fake_dir =
-            std::env::temp_dir().join(format!("shift-magic-fakecurl2-{}", std::process::id()));
-        fs::create_dir_all(&fake_dir).unwrap();
-        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
-        let old_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
-            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
-            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
-        }
-
-        let out = staging.join("downloaded");
-        download_with_redirect_revalidation("http://example.com/redirect", &out, None).unwrap();
-        assert_eq!(fs::read_to_string(&out).unwrap(), "fake");
-
-        let out2 = staging.join("missing");
-        let err = download_with_redirect_revalidation("http://example.com/nolocation", &out2, None)
-            .unwrap_err();
-        assert!(err.to_string().contains("without Location header"));
-
-        let out3 = staging.join("loop");
-        let err = download_with_redirect_revalidation("http://example.com/loop", &out3, None)
-            .unwrap_err();
-        assert!(err.to_string().contains("too many redirects"));
-
-        if let Some(p) = old_path {
-            unsafe {
-                std::env::set_var("PATH", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
-        unsafe {
+            std::env::remove_var("SHIFT_CURL_BIN");
             std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
             std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
         }
@@ -1389,7 +1229,7 @@ exit 0
     #[test]
     fn parse_quotes_multiline_and_windows_like_paths() {
         // Single-quoted path with spaces.
-        let paste = parse_magic_paste("'/Users/me/My Docs/file.pdf'");
+        let paste = parse_magic_paste("'/Users/me/My Docs/file.pdf'").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -1398,7 +1238,7 @@ exit 0
         );
 
         // Nested-looking quotes: outer double, inner single kept as content.
-        let paste = parse_magic_paste(r#""/tmp/outer 'inner' still.pdf""#);
+        let paste = parse_magic_paste(r#""/tmp/outer 'inner' still.pdf""#).unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -1407,14 +1247,14 @@ exit 0
         );
 
         // Single outer with double inside.
-        let paste = parse_magic_paste(r#"'"quoted name".pdf'"#);
+        let paste = parse_magic_paste(r#"'"quoted name".pdf'"#).unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(r#""quoted name".pdf"#)))
         );
 
         // Multiline whitespace separation.
-        let paste = parse_magic_paste("/tmp/a.pdf\n/tmp/b.pdf\r\nhttps://example.com/c");
+        let paste = parse_magic_paste("/tmp/a.pdf\n/tmp/b.pdf\r\nhttps://example.com/c").unwrap();
         match paste {
             MagicPaste::Multiple(tokens) => {
                 assert_eq!(tokens.len(), 3);
@@ -1426,7 +1266,7 @@ exit 0
         }
 
         // Windows-like path with backslashes is a local path token.
-        let paste = parse_magic_paste(r"C:\Users\me\report.pdf");
+        let paste = parse_magic_paste(r"C:\Users\me\report.pdf").unwrap();
         assert_eq!(
             paste,
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from(
@@ -1435,7 +1275,7 @@ exit 0
         );
 
         // Mixed tabs and multiple spaces.
-        let paste = parse_magic_paste("  /tmp/a.pdf\t\t/tmp/b.md  ");
+        let paste = parse_magic_paste("  /tmp/a.pdf\t\t/tmp/b.md  ").unwrap();
         assert!(matches!(paste, MagicPaste::Multiple(ref t) if t.len() == 2));
 
         // Unclosed quote still yields the buffered content as a token.
@@ -1464,7 +1304,7 @@ exit 0
         let first =
             materialize_paste_token(&PasteToken::LocalPath(p1.clone()), Some(cancel.clone()))
                 .unwrap();
-        assert_eq!(first, BatchSource::File(p1));
+        assert_eq!(&first.source, &BatchSource::File(p1));
 
         // Flip cancel before the next token — mid-multi abort.
         cancel.store(true, Ordering::SeqCst);
@@ -1500,7 +1340,7 @@ exit 0
             );
             assert!(
                 matches!(
-                    parse_magic_paste(url),
+                    parse_magic_paste(url).unwrap(),
                     MagicPaste::Single(PasteToken::RemoteFileUrl(_))
                 ),
                 "parse should classify remote file: {url}"
@@ -1570,7 +1410,7 @@ exit 0
     #[test]
     fn file_url_with_and_without_host() {
         // Standard absolute file URL (no host).
-        match parse_magic_paste("file:///Users/me/doc.pdf") {
+        match parse_magic_paste("file:///Users/me/doc.pdf").unwrap() {
             MagicPaste::Single(PasteToken::LocalPath(path)) => {
                 assert_eq!(path, PathBuf::from("/Users/me/doc.pdf"));
             }
@@ -1578,7 +1418,7 @@ exit 0
         }
 
         // Empty / bare file URL must not become a page or remote-file token.
-        let paste = parse_magic_paste("file://");
+        let paste = parse_magic_paste("file://").unwrap();
         assert!(
             matches!(
                 paste,
@@ -1588,10 +1428,13 @@ exit 0
         );
 
         // Non-local host cannot convert to a path on Unix.
-        assert_eq!(parse_magic_paste("file://hostname/only"), MagicPaste::Empty);
+        assert_eq!(
+            parse_magic_paste("file://hostname/only").unwrap(),
+            MagicPaste::Empty
+        );
 
         // `localhost` is accepted by url::Url::to_file_path on Unix.
-        match parse_magic_paste("file://localhost/tmp/x.pdf") {
+        match parse_magic_paste("file://localhost/tmp/x.pdf").unwrap() {
             MagicPaste::Single(PasteToken::LocalPath(path)) => {
                 assert_eq!(path, PathBuf::from("/tmp/x.pdf"));
             }
@@ -1630,11 +1473,11 @@ exit 0
         );
         // Bare ~ is classified as a path token.
         assert_eq!(
-            parse_magic_paste("~"),
+            parse_magic_paste("~").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("~")))
         );
         assert_eq!(
-            parse_magic_paste("~/Docs/note.md"),
+            parse_magic_paste("~/Docs/note.md").unwrap(),
             MagicPaste::Single(PasteToken::LocalPath(PathBuf::from("~/Docs/note.md")))
         );
 
@@ -1644,7 +1487,7 @@ exit 0
             None,
         )
         .unwrap();
-        assert_eq!(source, BatchSource::File(file));
+        assert_eq!(&source.source, &BatchSource::File(file));
 
         // ~user (no slash) is not home expansion.
         assert_eq!(
@@ -1723,8 +1566,8 @@ exit 0
         )
         .unwrap();
         assert_eq!(
-            source,
-            BatchSource::Url("https://example.com/article".into())
+            &source.source,
+            &BatchSource::Url("https://example.com/article".into())
         );
         // Rejected when private-URL policy blocks (no allow flag, localhost).
         unsafe {
@@ -1734,184 +1577,6 @@ exit 0
             materialize_paste_token(&PasteToken::PageUrl("http://127.0.0.1/local".into()), None);
         // May succeed if policy allows or fail with private-URL message depending on env.
         let _ = err;
-    }
-
-    #[test]
-    fn resolve_redirect_rejects_target_without_host() {
-        // Absolute http URL with empty host hits the post-resolve scheme/host guard.
-        let err = resolve_redirect_url("https://example.com/a", "http://").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("refusing non-http(s) redirect target")
-                || err.to_string().contains("redirect"),
-            "error: {err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn download_follow_redirects_cancel_and_http_errors() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let staging =
-            std::env::temp_dir().join(format!("shift-magic-follow-{}", std::process::id()));
-        fs::create_dir_all(&staging).unwrap();
-        let fake_dir = std::env::temp_dir().join(format!(
-            "shift-magic-fakecurl-follow-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&fake_dir).unwrap();
-        let _ = write_curl_script(&fake_dir, FAKE_CURL_SCRIPT);
-        let old_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
-            // Disable private-URL policy so download_remote_file takes follow-redirects path.
-            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
-            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
-        }
-
-        // Cancel before curl starts.
-        let cancel = Arc::new(AtomicBool::new(true));
-        let out = staging.join("cancelled");
-        let err =
-            download_follow_redirects("http://example.com/ok", &out, Some(cancel)).unwrap_err();
-        assert!(err.is_cancelled(), "error: {err}");
-
-        // Successful download via follow path.
-        let path = download_remote_file("http://example.com/ok", None).unwrap();
-        assert!(path.is_file());
-
-        // Fail with stderr detail.
-        let err = download_remote_file("http://example.com/fail", None).unwrap_err();
-        assert!(
-            err.to_string().contains("boom") || err.to_string().contains("could not download"),
-            "error: {err}"
-        );
-
-        if let Some(p) = old_path {
-            unsafe {
-                std::env::set_var("PATH", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
-        unsafe {
-            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
-            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
-        }
-        let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_dir_all(&fake_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn download_with_redirect_revalidation_http_error_and_non_http_location() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let staging =
-            std::env::temp_dir().join(format!("shift-magic-redir-err-{}", std::process::id()));
-        fs::create_dir_all(&staging).unwrap();
-        let fake_dir = std::env::temp_dir().join(format!(
-            "shift-magic-fakecurl-redir-err-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&fake_dir).unwrap();
-        // Extended fake curl: HTTP 404 body path and file:// Location.
-        let script = r#"#!/bin/sh
-output=""
-header=""
-status_arg=""
-url=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -o) output="$2"; shift 2;;
-    -D) header="$2"; shift 2;;
-    -w) status_arg="$2"; shift 2;;
-    -*) shift;;
-    *) url="$1"; shift;;
-  esac
-done
-case "$url" in
-  *fileloc*)
-    code=302
-    location="file:///etc/passwd"
-    ;;
-  *http404*)
-    code=404
-    if [ -n "$output" ]; then rm -f "$output"; : > "$output"; fi
-    ;;
-  *emptyfail*)
-    code=500
-    echo "" >&2
-    if [ -n "$output" ]; then rm -f "$output"; : > "$output"; fi
-    ;;
-  *)
-    code=200
-    if [ -n "$output" ]; then rm -f "$output"; printf 'fake' > "$output"; fi
-    ;;
-esac
-if [ -n "$header" ]; then
-  if [ "$code" -eq 302 ]; then
-    cat > "$header" <<EOF
-HTTP/1.1 302 Found
-Location: $location
-
-EOF
-  else
-    cat > "$header" <<EOF
-HTTP/1.1 $code X
-
-EOF
-  fi
-fi
-if [ -n "$status_arg" ]; then printf '%s' "$code"; fi
-exit 0
-"#;
-        let _ = write_curl_script(&fake_dir, script);
-        let old_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_to_path(&fake_dir).unwrap());
-            std::env::set_var("SHIFT_ALLOW_PRIVATE_URLS", "1");
-            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &staging);
-        }
-
-        let out = staging.join("fileloc");
-        let err = download_with_redirect_revalidation("http://example.com/fileloc", &out, None)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("non-http") || err.to_string().contains("redirect"),
-            "error: {err}"
-        );
-
-        let out2 = staging.join("404");
-        let err = download_with_redirect_revalidation("http://example.com/http404", &out2, None)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("HTTP 404") || err.to_string().contains("404"),
-            "error: {err}"
-        );
-
-        let cancel = Arc::new(AtomicBool::new(true));
-        let out3 = staging.join("cancel");
-        let err = download_with_redirect_revalidation("http://example.com/ok", &out3, Some(cancel))
-            .unwrap_err();
-        assert!(err.is_cancelled(), "error: {err}");
-
-        if let Some(p) = old_path {
-            unsafe {
-                std::env::set_var("PATH", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
-        unsafe {
-            std::env::remove_var("SHIFT_ALLOW_PRIVATE_URLS");
-            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
-        }
-        let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_dir_all(&fake_dir);
     }
 
     #[test]
@@ -1937,5 +1602,134 @@ exit 0
         assert!(matches!(token, PasteToken::LocalPath(_)));
         let _ = cwd;
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_too_many_paste_tokens() {
+        let many = (0..=MAX_PASTE_TOKENS)
+            .map(|i| format!("/tmp/file{i}.pdf"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let err = parse_magic_paste(&many).unwrap_err();
+        assert!(
+            err.to_string().contains("too many paste tokens"),
+            "unexpected: {err}"
+        );
+        let ok = (0..MAX_PASTE_TOKENS)
+            .map(|i| format!("/tmp/file{i}.pdf"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(parse_magic_paste(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_clipboard_image() {
+        let oversized = vec![0u8; MAX_CLIPBOARD_IMAGE_BYTES + 1];
+        let err = stage_pasted_image(&oversized, "png").unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds size limit"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn staged_clipboard_stable_basename_and_cleanup() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-stage-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        let path = stage_pasted_image(b"\x89PNG\r\nfake", "png").unwrap();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("clipboard-image.png")
+        );
+        assert!(is_paste_staging_path(&path));
+        cleanup_staged_path(&path);
+        assert!(!path.exists());
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialized_source_drop_cleans_staged_file() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-drop-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        let path = stage_pasted_image(b"\x89PNG", "png").unwrap();
+        {
+            let staged = MaterializedSource::staged_clipboard(path.clone());
+            assert!(path.exists());
+            drop(staged);
+        }
+        assert!(!path.exists());
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_inputs_release_cleans_one_owned_path() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-release-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        unsafe {
+            std::env::set_var("SHIFT_PASTE_STAGING_DIR", &dir);
+        }
+        let path = stage_pasted_image(b"\x89PNG", "png").unwrap();
+        let mut staged = StagedInputs::new();
+        staged.track(path.clone());
+        staged.release(&path);
+        assert!(staged.is_empty());
+        assert!(!path.exists());
+
+        unsafe {
+            std::env::remove_var("SHIFT_PASTE_STAGING_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_staging_paths_are_not_cleaned() {
+        let dir = std::env::temp_dir().join(format!(
+            "shift-magic-not-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user-file.pdf");
+        fs::write(&path, b"keep").unwrap();
+        assert!(!is_paste_staging_path(&path));
+        cleanup_staged_path(&path);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

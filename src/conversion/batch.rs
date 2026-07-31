@@ -7,9 +7,11 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
-    InvocationRecord, OutputFormat, ProgressSink, default_output_path, looks_like_url,
-    normalize_path, paths_refer_to_same_file,
+    InvocationRecord, MAX_BATCH_ADMISSION, OutputFormat, ProgressSink, default_output_path,
+    is_paste_staging_path, looks_like_url, normalize_path, paths_refer_to_same_file,
 };
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +19,29 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use url::Url;
+
+/// Default maximum concurrent conversion workers (`min(cpus, 4)`).
+pub const DEFAULT_BATCH_WORKER_CAP: usize = 4;
+
+/// Environment variable overriding the batch worker cap (`SHIFT_BATCH_WORKERS`).
+pub const BATCH_WORKERS_ENV: &str = "SHIFT_BATCH_WORKERS";
+
+/// Resolve how many worker threads `run_batch` should spawn for `task_len` jobs.
+pub fn batch_worker_count(task_len: usize) -> usize {
+    if task_len == 0 {
+        return 0;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let default_cap = cpus.clamp(1, DEFAULT_BATCH_WORKER_CAP);
+    let env_cap = std::env::var(BATCH_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let cap = env_cap.unwrap_or(default_cap);
+    cap.min(task_len).max(1)
+}
 
 /// Stable handle for one queue entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -507,10 +532,13 @@ pub struct BatchSummary {
 }
 
 impl BatchSummary {
+    /// - `1` when any item failed
+    /// - `130` when any item was cancelled (including mixed success+cancel)
+    /// - `0` only when every item succeeded (or the queue was empty)
     pub fn exit_code(self) -> u8 {
         if self.failed > 0 {
             1
-        } else if self.cancelled > 0 && self.succeeded == 0 {
+        } else if self.cancelled > 0 {
             130
         } else {
             0
@@ -613,16 +641,37 @@ impl BatchQueue {
         self.enqueue_input(BatchInput::new(source), opts)
     }
 
+    /// Fallible variant of [`Self::enqueue`] for callers that need to surface
+    /// an admission error instead of treating over-capacity as a programmer
+    /// error.
+    pub fn try_enqueue(
+        &mut self,
+        source: BatchSource,
+        opts: &BatchEnqueueOptions,
+    ) -> Result<BatchItemId, ConversionError> {
+        self.try_enqueue_input(BatchInput::new(source), opts)
+    }
+
     /// Enqueue one source with recursive hierarchy metadata.
     pub fn enqueue_input(&mut self, input: BatchInput, opts: &BatchEnqueueOptions) -> BatchItemId {
+        self.try_enqueue_input(input, opts)
+            .expect("BatchQueue admission limit exceeded; use try_enqueue to handle this error")
+    }
+
+    pub fn try_enqueue_input(
+        &mut self,
+        input: BatchInput,
+        opts: &BatchEnqueueOptions,
+    ) -> Result<BatchItemId, ConversionError> {
+        self.check_admission(1)?;
         let group_id = self.allocate_group_id();
-        self.push_job(
+        Ok(self.push_job(
             input,
             group_id,
             opts.output_format,
             BatchFormatSelection::Inherit,
             opts,
-        )
+        ))
     }
 
     /// Enqueue one source to the primary format and every additional format.
@@ -636,16 +685,17 @@ impl BatchQueue {
         input: BatchInput,
         additional_formats: &[OutputFormat],
         opts: &BatchEnqueueOptions,
-    ) -> Vec<BatchItemId> {
-        let group_id = self.allocate_group_id();
+    ) -> Result<Vec<BatchItemId>, ConversionError> {
         let mut formats = vec![opts.output_format];
         for &format in additional_formats {
             if !formats.contains(&format) {
                 formats.push(format);
             }
         }
+        self.check_admission(formats.len())?;
+        let group_id = self.allocate_group_id();
 
-        formats
+        Ok(formats
             .into_iter()
             .map(|format| {
                 let selection = if format == opts.output_format {
@@ -655,7 +705,7 @@ impl BatchQueue {
                 };
                 self.push_job(input.clone(), group_id, format, selection, opts)
             })
-            .collect()
+            .collect())
     }
 
     fn allocate_group_id(&mut self) -> u64 {
@@ -701,15 +751,50 @@ impl BatchQueue {
         id
     }
 
+    /// Remaining slots under the global multi-file admission cap.
+    pub fn admission_remaining(&self) -> usize {
+        MAX_BATCH_ADMISSION.saturating_sub(self.items.len())
+    }
+
+    /// Reject when adding `additional` items would exceed [`MAX_BATCH_ADMISSION`].
+    pub fn check_admission(&self, additional: usize) -> Result<(), ConversionError> {
+        let total = self.items.len().saturating_add(additional);
+        if total > MAX_BATCH_ADMISSION {
+            return Err(ConversionError::new(format!(
+                "too many queue items (limit is {MAX_BATCH_ADMISSION}); narrow the selection"
+            )));
+        }
+        Ok(())
+    }
+
     /// Enqueue many sources (files or URLs).
     pub fn enqueue_many(
         &mut self,
         sources: impl IntoIterator<Item = BatchSource>,
         opts: &BatchEnqueueOptions,
     ) -> Vec<BatchItemId> {
+        let sources: Vec<_> = sources.into_iter().collect();
+        self.check_admission(sources.len()).expect(
+            "BatchQueue admission limit exceeded; use try_enqueue_many to handle this error",
+        );
         sources
             .into_iter()
             .map(|source| self.enqueue(source, opts))
+            .collect()
+    }
+
+    /// Fallible variant of [`Self::enqueue_many`] for callers that need to
+    /// surface an admission error.
+    pub fn try_enqueue_many(
+        &mut self,
+        sources: impl IntoIterator<Item = BatchSource>,
+        opts: &BatchEnqueueOptions,
+    ) -> Result<Vec<BatchItemId>, ConversionError> {
+        let sources: Vec<_> = sources.into_iter().collect();
+        self.check_admission(sources.len())?;
+        sources
+            .into_iter()
+            .map(|source| self.try_enqueue(source, opts))
             .collect()
     }
 
@@ -720,6 +805,9 @@ impl BatchQueue {
         format: OutputFormat,
         output_dir: Option<&Path>,
     ) -> Option<BatchItemId> {
+        if self.check_admission(1).is_err() {
+            return None;
+        }
         let template = self.get(id)?.clone();
         if !matches!(template.state, BatchItemState::Queued) {
             return None;
@@ -802,9 +890,25 @@ impl BatchQueue {
         opts: &BatchEnqueueOptions,
         preferred_module: Option<&str>,
     ) -> Vec<BatchItemId> {
+        self.try_enqueue_many_with_recipe(sources, opts, preferred_module)
+            .expect(
+                "BatchQueue admission limit exceeded; use try_enqueue_many_with_recipe to handle this error",
+            )
+    }
+
+    /// Fallible variant of [`Self::enqueue_many_with_recipe`].
+    pub fn try_enqueue_many_with_recipe(
+        &mut self,
+        sources: impl IntoIterator<Item = BatchSource>,
+        opts: &BatchEnqueueOptions,
+        preferred_module: Option<&str>,
+    ) -> Result<Vec<BatchItemId>, ConversionError> {
+        let sources: Vec<_> = sources.into_iter().collect();
+        self.check_admission(sources.len())?;
         sources
             .into_iter()
             .map(|source| self.enqueue_with_recipe(source, opts, preferred_module))
+            .map(Ok)
             .collect()
     }
 
@@ -1034,17 +1138,15 @@ impl BatchQueue {
     /// Cross-source name clashes (e.g. two `report.pdf` into one folder) become
     /// `report.md`, `report-1.md`, … so both can succeed without overwriting.
     pub fn uniquify_planned_destinations(&mut self) {
-        let mut claimed: Vec<PathBuf> = Vec::new();
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
         for item in &self.items {
             match &item.state {
                 BatchItemState::Succeeded { written_path, .. } => {
-                    claimed.push(written_path.clone());
+                    claimed.insert(collision_key(written_path));
                 }
                 BatchItemState::Queued => {}
                 _ => {
-                    // Running / failed / cancelled still reserve their planned path
-                    // so a re-queue later can uniquify against them if needed.
-                    claimed.push(item.destination.clone());
+                    claimed.insert(collision_key(&item.destination));
                 }
             }
         }
@@ -1053,10 +1155,8 @@ impl BatchQueue {
             if !matches!(item.state, BatchItemState::Queued) {
                 continue;
             }
-            // Only avoid paths claimed by this queue — on-disk existence without
-            // force is enforced at write time (same as single-file).
             let dest = uniquify_against_claimed(&item.destination, &claimed, false);
-            claimed.push(dest.clone());
+            claimed.insert(collision_key(&dest));
             item.destination = dest;
         }
     }
@@ -1102,6 +1202,7 @@ pub fn resolve_destination_with_policy(
                 dir.to_path_buf()
             }
         }
+        (BatchSource::File(path), None) if is_paste_staging_path(path) => PathBuf::new(),
         (BatchSource::File(path), None) => path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1198,14 +1299,31 @@ pub fn prepare_batch_destination(
         }
     }
 
-    if destination.exists() && !force {
-        return Err(ConversionError::new(format!(
-            "output already exists: {} (pass --force / enable Overwrite to replace)",
-            destination.display()
-        )));
+    if destination.exists() {
+        if std::fs::metadata(destination)
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(ConversionError::new(format!(
+                "output path is a directory: {} (choose a file path)",
+                destination.display()
+            )));
+        }
+        if !force {
+            return Err(ConversionError::new(format!(
+                "output already exists: {} (pass --force / enable Overwrite to replace)",
+                destination.display()
+            )));
+        }
     }
 
     if let Some(parent) = destination.parent() {
+        if path_has_symlink_component(parent) {
+            return Err(ConversionError::new(format!(
+                "refusing to write through a symbolic-link output directory: {}",
+                parent.display()
+            )));
+        }
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 ConversionError::new(format!(
@@ -1219,23 +1337,79 @@ pub fn prepare_batch_destination(
     Ok(())
 }
 
+/// Refuse output parents that already contain a symlink component. Following a
+/// nested output symlink can redirect a watch/batch write back into its input
+/// tree, defeating containment checks and creating conversion loops.
+fn path_has_symlink_component(path: &Path) -> bool {
+    // macOS exposes temporary directories through root-level aliases such as
+    // `/tmp` and `/var`. Those system-owned prefixes are safe to normalize;
+    // a symlink created below any caller-controlled directory is not.
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if std::fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let root_level_alias = current
+                .parent()
+                .is_some_and(|parent| parent == Path::new("/"));
+            if !root_level_alias {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// If `preferred` exists and `force` is false, pick `stem-1.ext`, `stem-2.ext`, …
 pub fn uniquify_destination(preferred: &Path, force: bool) -> PathBuf {
     if force || !preferred.exists() {
         return preferred.to_path_buf();
     }
-    uniquify_against_claimed(preferred, &[], true)
+    let empty = HashSet::new();
+    uniquify_against_claimed(preferred, &empty, true)
+}
+
+fn collision_key(path: &Path) -> PathBuf {
+    let normalized = normalize_path(path);
+    #[cfg(target_os = "macos")]
+    {
+        case_fold_path(&normalized)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        normalized
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn case_fold_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => out.push("."),
+            Component::ParentDir => out.push(".."),
+            Component::Normal(part) => {
+                let folded = part.to_string_lossy().to_lowercase();
+                out.push(OsStr::new(folded.as_str()));
+            }
+        }
+    }
+    out
 }
 
 /// Pick a path not present in `claimed` (and optionally not already on disk).
-///
-/// All paths are lexically normalized first so equivalent forms like
-/// `a/../out/x.md` and `out/x.md` are detected as collisions.
-fn uniquify_against_claimed(preferred: &Path, claimed: &[PathBuf], check_disk: bool) -> PathBuf {
+fn uniquify_against_claimed(
+    preferred: &Path,
+    claimed: &HashSet<PathBuf>,
+    check_disk: bool,
+) -> PathBuf {
     let preferred = normalize_path(preferred);
-    let claimed: Vec<PathBuf> = claimed.iter().map(|p| normalize_path(p)).collect();
     let is_taken = |path: &Path| -> bool {
-        claimed.iter().any(|other| other == path) || (check_disk && path.exists())
+        claimed.contains(&collision_key(path)) || (check_disk && path.exists())
     };
     if !is_taken(&preferred) {
         return preferred;
@@ -1294,9 +1468,11 @@ fn write_artifact(
 ) -> Result<PathBuf, ConversionError> {
     // Align with single-file CLI: refuse existing outputs unless force.
     // In-queue name clashes are resolved earlier via uniquify_planned_destinations.
+    // `prepare_batch_destination` is a best-effort early check; exclusive create
+    // in write_to_with_replace closes the TOCTOU when force is false.
     prepare_batch_destination(planned, source, force)?;
-    // Atomic write: partial sibling then rename. On failure scrub any leftovers.
-    match artifact.write_to(planned) {
+    // Atomic write: exclusive create when force is false (closes TOCTOU).
+    match artifact.write_to_with_replace(planned, force) {
         Ok(()) => Ok(planned.to_path_buf()),
         Err(error) => {
             let _ = super::remove_partial_outputs(planned);
@@ -1459,10 +1635,7 @@ pub fn run_batch(
         .collect();
 
     if !tasks.is_empty() {
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2);
-        let worker_count = parallelism.min(tasks.len()).max(1);
+        let worker_count = batch_worker_count(tasks.len());
 
         // Shared cursor: each worker claims the next index with fetch_add.
         let cursor = AtomicUsize::new(0);
@@ -1896,15 +2069,17 @@ mod tests {
             force: true,
             ..BatchEnqueueOptions::new(OutputFormat::MARKDOWN)
         };
-        let ids = queue.enqueue_fan_out(
-            BatchInput::new(BatchSource::File(input)),
-            &[
-                OutputFormat::HTML,
-                OutputFormat::MARKDOWN,
-                OutputFormat::HTML,
-            ],
-            &opts,
-        );
+        let ids = queue
+            .enqueue_fan_out(
+                BatchInput::new(BatchSource::File(input)),
+                &[
+                    OutputFormat::HTML,
+                    OutputFormat::MARKDOWN,
+                    OutputFormat::HTML,
+                ],
+                &opts,
+            )
+            .unwrap();
         assert_eq!(ids, vec![BatchItemId(0), BatchItemId(1)]);
         assert_eq!(
             queue
@@ -1957,14 +2132,54 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_and_extra_outputs_respect_admission_cap() {
+        let mut queue = BatchQueue::new();
+        let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
+        for index in 0..MAX_BATCH_ADMISSION {
+            queue.enqueue(
+                BatchSource::File(PathBuf::from(format!("/tmp/source-{index}.txt"))),
+                &opts,
+            );
+        }
+
+        let error = queue
+            .enqueue_fan_out(
+                BatchInput::new(BatchSource::File(PathBuf::from("/tmp/overflow.txt"))),
+                &[OutputFormat::HTML],
+                &opts,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("queue items"));
+        assert!(
+            queue
+                .add_output_for_item(BatchItemId(0), OutputFormat::HTML, Some(Path::new("/out")),)
+                .is_none(),
+            "extra output must not bypass the queue cap"
+        );
+        let error = queue
+            .try_enqueue(BatchSource::File(PathBuf::from("/tmp/overflow.txt")), &opts)
+            .unwrap_err();
+        assert!(error.to_string().contains("queue items"));
+        let error = queue
+            .try_enqueue_many(
+                [BatchSource::File(PathBuf::from("/tmp/overflow-a.txt"))],
+                &opts,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("queue items"));
+    }
+
+    #[test]
     fn per_item_format_change_cannot_duplicate_a_fan_out_output() {
         let mut queue = BatchQueue::new();
         let opts = BatchEnqueueOptions::new(OutputFormat::MARKDOWN);
-        let ids = queue.enqueue_fan_out(
-            BatchInput::new(BatchSource::File(PathBuf::from("/tmp/a.txt"))),
-            &[OutputFormat::HTML],
-            &opts,
-        );
+        let ids = queue
+            .enqueue_fan_out(
+                BatchInput::new(BatchSource::File(PathBuf::from("/tmp/a.txt"))),
+                &[OutputFormat::HTML],
+                &opts,
+            )
+            .unwrap();
 
         assert!(
             !queue.set_item_format_selection(
@@ -2537,14 +2752,16 @@ mod tests {
     #[test]
     fn uniquify_against_claimed_never_returns_taken_path() {
         let preferred = PathBuf::from("/out/report.md");
-        // Claim preferred and every numeric suffix the short loop tries.
-        let mut claimed = vec![preferred.clone()];
+        let mut claimed = HashSet::new();
+        claimed.insert(collision_key(&preferred));
         for index in 1..10_000 {
-            claimed.push(PathBuf::from(format!("/out/report-{index}.md")));
+            claimed.insert(collision_key(&PathBuf::from(format!(
+                "/out/report-{index}.md"
+            ))));
         }
         let resolved = uniquify_against_claimed(&preferred, &claimed, false);
         assert!(
-            !claimed.contains(&resolved),
+            !claimed.contains(&collision_key(&resolved)),
             "resolved path must not collide with claimed set: {}",
             resolved.display()
         );
@@ -2931,7 +3148,16 @@ mod tests {
                 cancelled: 1
             }
             .exit_code(),
-            0
+            130
+        );
+        assert_eq!(
+            BatchSummary {
+                succeeded: 1,
+                failed: 1,
+                cancelled: 1
+            }
+            .exit_code(),
+            1
         );
     }
 
@@ -2949,6 +3175,11 @@ mod tests {
         std::fs::write(&existing, b"x").unwrap();
         let err = prepare_batch_destination(&existing, None, false).unwrap_err();
         assert!(err.to_string().contains("already exists"));
+
+        let existing_dir = dir.join("existing-dir");
+        std::fs::create_dir(&existing_dir).unwrap();
+        let err = prepare_batch_destination(&existing_dir, None, true).unwrap_err();
+        assert!(err.to_string().contains("output path is a directory"));
 
         // Refuses to overwrite the source.
         let source = dir.join("source.md");
@@ -2968,16 +3199,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepare_batch_destination_rejects_nested_symlink_output_parent() {
+        let dir = unique_dir("symlink-parent");
+        let real = dir.join("real-output");
+        let link = dir.join("nested-link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let destination = link.join("converted.md");
+        let error = prepare_batch_destination(&destination, None, true).unwrap_err();
+        assert!(error.to_string().contains("symbolic-link output directory"));
+        assert!(!destination.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn uniquify_against_claimed_falls_back_to_token() {
         let preferred = PathBuf::from("/out/report.md");
-        let mut claimed: Vec<PathBuf> = (1..10_000)
-            .map(|i| PathBuf::from(format!("/out/report-{i}.md")))
+        let mut claimed: HashSet<PathBuf> = (1..10_000)
+            .map(|i| collision_key(&PathBuf::from(format!("/out/report-{i}.md"))))
             .collect();
-        claimed.push(preferred.clone());
+        claimed.insert(collision_key(&preferred));
 
         let resolved = uniquify_against_claimed(&preferred, &claimed, false);
-        assert!(!claimed.contains(&resolved));
+        assert!(!claimed.contains(&collision_key(&resolved)));
         assert!(
             resolved
                 .file_name()

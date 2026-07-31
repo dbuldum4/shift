@@ -1,7 +1,9 @@
 //! Tiny shared preferences needed by both the native app and CLI.
 
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Must match the registration order in `ConversionRegistry::build_default`.
 ///
@@ -30,7 +32,7 @@ pub fn load_module_priority() -> Vec<String> {
     }
 
     preferences_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|path| fs::read_to_string(path).ok())
         .map(|value| normalize(value.lines().map(str::trim)))
         .unwrap_or_else(default_module_priority)
 }
@@ -42,13 +44,53 @@ pub fn save_module_priority(priority: &[String]) -> io::Result<()> {
             "could not locate the user home directory",
         ));
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let payload = normalize(priority.iter().map(String::as_str)).join("\n");
+    atomic_write_text(&path, &payload)
+}
+
+/// Unique-temp + rename write (mirrors session settings durability).
+fn atomic_write_text(path: &Path, contents: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("module-priority");
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), token));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&temporary, permissions)?;
+        }
+        file.write_all(contents.as_bytes())?;
+        if !contents.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    std::fs::write(
-        path,
-        normalize(priority.iter().map(String::as_str)).join("\n"),
-    )
+    result
 }
 
 fn normalize<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -264,12 +306,11 @@ mod tests {
         ])
         .unwrap();
 
-        let saved =
-            std::fs::read_to_string(home.join("Library/Application Support/Shift/module-priority"))
-                .unwrap();
+        let path = home.join("Library/Application Support/Shift/module-priority");
+        let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             saved,
-            "pandoc\ndocling\nmarkitdown\ndefuddle\nqpdf\nspreadsheet\nsips\nffmpeg"
+            "pandoc\ndocling\nmarkitdown\ndefuddle\nqpdf\nspreadsheet\nsips\nffmpeg\n"
         );
 
         assert_eq!(
@@ -284,6 +325,16 @@ mod tests {
                 "sips",
                 "ffmpeg"
             ]
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -307,7 +358,7 @@ mod tests {
         let saved = std::fs::read_to_string(override_dir.join("module-priority")).unwrap();
         assert_eq!(
             saved,
-            "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle\nqpdf\nspreadsheet\nsips"
+            "docling\nffmpeg\nmarkitdown\npandoc\ndefuddle\nqpdf\nspreadsheet\nsips\n"
         );
 
         assert_eq!(

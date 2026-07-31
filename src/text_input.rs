@@ -58,6 +58,8 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// When true, paint bullets instead of plaintext and block copy/cut.
+    masked: bool,
     on_submit: Option<SubmitCallback>,
     on_paste: Option<PasteCallback>,
 }
@@ -80,9 +82,24 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            masked: false,
             on_submit: None,
             on_paste: None,
         }
+    }
+
+    /// Mask the field for secrets (PDF passwords). Display uses bullets; copy/cut
+    /// are disabled so the secret never enters the clipboard from this control.
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked == masked {
+            return;
+        }
+        self.masked = masked;
+        cx.notify();
+    }
+
+    pub fn is_masked(&self) -> bool {
+        self.masked
     }
 
     pub fn set_on_submit(&mut self, callback: impl Fn(&str, &mut Context<Self>) + 'static) {
@@ -178,6 +195,10 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        // Never place secrets on the clipboard from a masked field.
+        if self.masked {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -186,6 +207,13 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.masked {
+            // Allow clearing the selection without copying the secret.
+            if !self.selected_range.is_empty() {
+                self.replace_text_in_range(None, "", window, cx);
+            }
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -320,6 +348,10 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
+        // Accessibility / IME probes should not receive the plaintext secret.
+        if self.masked {
+            return Some("*".repeat(range.end.saturating_sub(range.start)));
+        }
         Some(self.content[range].to_string())
     }
 
@@ -497,6 +529,7 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
+        let masked = input.masked;
 
         let (display_text, text_color) = if content.is_empty() {
             (
@@ -504,6 +537,11 @@ impl Element for TextElement {
                 // Muted gray placeholder — monochrome developer theme.
                 hsla(0.0, 0.0, 0.40, 1.0),
             )
+        } else if masked {
+            // One ASCII mask glyph per UTF-8 byte so existing byte-offset cursor
+            // math continues to line up with the shaped display string.
+            let bullets = "*".repeat(content.len());
+            (SharedString::from(bullets), style.color)
         } else {
             (content, style.color)
         };
@@ -1458,5 +1496,23 @@ mod tests {
             assert_eq!(got, expected_utf8_from_utf16(text, offset));
             assert!(text.is_char_boundary(got));
         }
+    }
+
+    #[gpui::test]
+    async fn masked_secret_field_flags_and_preserves_content(cx: &mut TestAppContext) {
+        let input = new_input(cx, "s3cret");
+        input.update(cx, |input, cx| {
+            assert!(!input.is_masked());
+            input.set_masked(true, cx);
+            assert!(input.is_masked());
+            assert_eq!(input.content(), "s3cret");
+            // Internal content stays plaintext for convert options; only display/copy are masked.
+            input.set_content("other-secret", cx);
+            assert!(input.is_masked());
+            assert_eq!(input.content(), "other-secret");
+            input.set_masked(false, cx);
+            assert!(!input.is_masked());
+            assert_eq!(input.content(), "other-secret");
+        });
     }
 }

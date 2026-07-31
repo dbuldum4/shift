@@ -31,7 +31,14 @@ cli_version="$("$app/Contents/Resources/bin/shift-cli" --version)"
 for artifact in "$archive" "$dmg"; do
   [ -f "$artifact" ] || fail "missing artifact: $artifact"
   [ -f "$artifact.sha256" ] || fail "missing checksum: $artifact.sha256"
-  (cd "$(dirname "$artifact")" && shasum -a 256 -c "$(basename "$artifact").sha256") >/dev/null \
+  # Sidecars must name basenames only (no directory prefix). package-macos.sh
+  # writes them with `(cd dist && shasum file > file.sha256)` for this reason.
+  # Accept "HASH  basename" or "HASH *basename" (binary mode); reject path prefixes.
+  base="$(basename "$artifact")"
+  checksum_line="$(tr -d '\r' < "$artifact.sha256" | head -n 1)"
+  printf '%s\n' "$checksum_line" | grep -Eq "^[0-9a-fA-F]{64} [ *]${base}\$" \
+    || fail "checksum must be 'HASH  $base' with basename only (got: $checksum_line)"
+  (cd "$(dirname "$artifact")" && shasum -a 256 -c "$base.sha256") >/dev/null \
     || fail "checksum does not match: $artifact"
 done
 

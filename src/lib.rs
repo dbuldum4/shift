@@ -8,10 +8,12 @@ pub mod recipes;
 pub mod session_settings;
 
 pub use artifact_cache::{
-    DEFAULT_CACHE_MAX_BYTES, DEFAULT_CACHE_TTL, PurgeStats, artifact_cache_dir,
-    cache_artifact_bytes, cache_artifact_file, default_paste_staging_dir,
-    ensure_artifact_cache_dir, export_matches_bytes, purge_artifact_cache,
-    purge_artifact_cache_defaults, purge_paste_staging, stage_export_bytes, stage_export_file,
+    ArtifactLease, DEFAULT_CACHE_MAX_BYTES, DEFAULT_CACHE_TTL, PurgeStats, acquire_export_lease,
+    artifact_cache_dir, cache_artifact_bytes, cache_artifact_file, default_paste_staging_dir,
+    ensure_artifact_cache_dir, export_matches_bytes, export_matches_bytes_strict,
+    purge_artifact_cache, purge_artifact_cache_defaults, purge_now, purge_paste_staging,
+    stage_export_bytes, stage_export_file, verify_export_integrity,
+    verify_export_integrity_blocking,
 };
 pub use recipes::{
     ConversionRecipe, RecipeDestination, RecipeError, RecipeStore, default_recipe_store_path,
@@ -19,9 +21,10 @@ pub use recipes::{
     validate_naming_template, validate_recipe_name,
 };
 pub use session_settings::{
-    SessionConversionOptions, SessionSettings, application_support_dir,
-    default_session_settings_path, load_default_session_settings, load_session_settings,
-    save_default_session_settings, save_session_settings,
+    MAX_SETTINGS_FILE_BYTES, SessionConversionOptions, SessionSettings, SessionSettingsLoad,
+    application_support_dir, default_session_settings_path, load_default_session_settings,
+    load_default_session_settings_detailed, load_session_settings, load_session_settings_detailed,
+    quarantine_settings_file, save_default_session_settings, save_session_settings,
 };
 
 /// Serializes `shift_core` tests that mutate process-global state: env vars

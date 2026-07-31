@@ -6,10 +6,15 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use gpui::{AppContext, Entity, TestAppContext};
 
@@ -34,6 +39,79 @@ use std::sync::Arc;
 // Binary-wide lock shared with `file_picker` tests (see `crate::ENV_LOCK` in main.rs).
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+struct TestHttpServer {
+    address: SocketAddr,
+    stop: std::sync::Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TestHttpServer {
+    fn new() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_test_http(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        assert!(path.starts_with('/'), "test HTTP paths must start with '/'");
+        format!("http://{}{}", self.address, path)
+    }
+}
+
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_test_http(mut stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let mut request = [0_u8; 8 * 1024];
+    let bytes_read = stream.read(&mut request).unwrap_or(0);
+    let request = String::from_utf8_lossy(&request[..bytes_read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let body = format!("shift test fixture: {path}");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+static TEST_HTTP_SERVER: OnceLock<TestHttpServer> = OnceLock::new();
+
+fn test_url(path: &str) -> String {
+    TEST_HTTP_SERVER.get_or_init(TestHttpServer::new).url(path)
+}
+
 const MARKITDOWN_FAKE: &str = r#"#!/bin/sh
 cat "$1"
 "#;
@@ -42,7 +120,11 @@ const DEFUDDLE_FAKE: &str = r#"#!/bin/sh
 # defuddle parse <source> [options]
 SOURCE="$2"
 printf '# '
+if [ -f "$SOURCE" ]; then
+cat "$SOURCE"
+else
 printf '%s' "$SOURCE"
+fi
 printf '\n'
 "#;
 
@@ -244,6 +326,17 @@ impl TestEnv {
             Some(sips.clone().into_os_string()),
         );
         set_env(&mut previous, "SHIFT_ALLOW_PRIVATE_URLS", Some("1".into()));
+        set_env(&mut previous, "SHIFT_CURL_BIN", None);
+        set_env(
+            &mut previous,
+            "NO_PROXY",
+            Some("127.0.0.1,localhost".into()),
+        );
+        set_env(
+            &mut previous,
+            "no_proxy",
+            Some("127.0.0.1,localhost".into()),
+        );
         // Absolute path so resolve_pdf_engine succeeds without a real engine.
         // Fake pandoc ignores --pdf-engine and still writes stdout.
         set_env(&mut previous, "SHIFT_PDF_ENGINE", Some("/bin/true".into()));
@@ -464,10 +557,11 @@ async fn changing_output_format_reconverts(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn selecting_a_url_converts_via_defuddle(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
+    let url = test_url("/article.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://example.com/article.html".into(), cx);
+        this.set_selected_url(url, cx);
         this.start_conversion(cx);
     });
     cx.run_until_parked();
@@ -482,7 +576,7 @@ async fn selecting_a_url_converts_via_defuddle(cx: &mut TestAppContext) {
     });
     assert_eq!(format, OutputFormat::MARKDOWN);
     assert_eq!(module, "defuddle");
-    assert!(text.contains("example.com/article.html"));
+    assert!(text.contains("shift test fixture: /article.html"));
 }
 
 #[gpui::test]
@@ -511,17 +605,18 @@ async fn magic_paste_with_local_path_converts(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn magic_paste_with_url_converts(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
+    let expected_url = test_url("/page.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.submit_magic_paste_text("http://example.com/page.html".into(), cx)
+        this.submit_magic_paste_text(expected_url.clone(), cx)
     });
     cx.run_until_parked();
     shift.update(cx, |this, cx| this.start_conversion(cx));
     cx.run_until_parked();
 
     let url = shift.read_with(cx, |this, _| this.selected_url.clone());
-    assert_eq!(url, Some("http://example.com/page.html".into()));
+    assert_eq!(url, Some(expected_url));
     let module = shift.read_with(cx, |this, _| match &this.conversion {
         ConversionState::Ready(artifact) => artifact.module_id,
         other => panic!("expected Ready, got {other:?}"),
@@ -1128,7 +1223,7 @@ async fn invalid_ffmpeg_options_fail(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn clipboard_image_converts_via_sips(cx: &mut TestAppContext) {
-    let _env = TestEnv::new();
+    let env = TestEnv::new();
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
@@ -1150,6 +1245,13 @@ async fn clipboard_image_converts_via_sips(cx: &mut TestAppContext) {
     assert_eq!(module, "sips");
     #[cfg(not(target_os = "macos"))]
     assert_eq!(module, "ffmpeg");
+    assert!(
+        fs::read_dir(env.temp.join("paste"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "successful clipboard conversion should release its staged input"
+    );
 }
 
 #[gpui::test]
@@ -1370,8 +1472,11 @@ async fn history_limit_truncates_entries_and_updates_input(cx: &mut TestAppConte
 
     shift.update(cx, |this, cx| {
         this.set_history_limit(100_000, cx);
-        assert_eq!(this.history_limit, 30_000);
-        assert_eq!(this.history_limit_input.read(cx).content(), "30000");
+        assert_eq!(this.history_limit, MAX_HISTORY_LIMIT);
+        assert_eq!(
+            this.history_limit_input.read(cx).content(),
+            MAX_HISTORY_LIMIT.to_string()
+        );
     });
 }
 
@@ -1437,6 +1542,33 @@ async fn folder_expand_dismiss_clears_confirm_without_queuing(cx: &mut TestAppCo
     });
     assert!(cleared);
     assert!(empty);
+}
+
+#[gpui::test]
+async fn stale_folder_expand_result_cannot_restore_after_dismiss(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let dir = env.inputs().join("stale-folder");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("nested.txt"), b"nested").unwrap();
+    let shift = create_shift(cx);
+
+    // Dismiss before the background walk gets a chance to publish its result.
+    // The generation guard must prevent the late completion from restoring the
+    // confirmation dialog.
+    shift.update(cx, |this, cx| this.ingest_paths(vec![dir], cx));
+    shift.update(cx, |this, cx| this.dismiss_folder_confirm(cx));
+    cx.run_until_parked();
+
+    let (confirm, status, queued) = shift.read_with(cx, |this, _| {
+        (
+            this.folder_confirm.is_some(),
+            this.batch_status.as_ref().map(ToString::to_string),
+            this.batch_queue.len(),
+        )
+    });
+    assert!(!confirm);
+    assert_eq!(status.as_deref(), Some("Folder expansion cancelled."));
+    assert_eq!(queued, 0);
 }
 
 #[gpui::test]
@@ -2601,10 +2733,11 @@ async fn delete_multiple_history_entries(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn history_records_url_source(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
+    let url = test_url("/hist.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://example.com/hist.html".into(), cx);
+        this.set_selected_url(url, cx);
         this.start_conversion(cx);
     });
     cx.run_until_parked();
@@ -2612,17 +2745,18 @@ async fn history_records_url_source(cx: &mut TestAppContext) {
     let source = shift.read_with(cx, |this, _| this.history.first().map(|e| e.source.clone()));
     assert!(matches!(
         source,
-        Some(HistorySource::Url(u)) if u.contains("example.com/hist.html")
+        Some(HistorySource::Url(u)) if u.ends_with("/hist.html")
     ));
 }
 
 #[gpui::test]
 async fn restore_url_history_entry(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
+    let expected_url = test_url("/restore.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://example.com/restore.html".into(), cx);
+        this.set_selected_url(expected_url.clone(), cx);
         this.start_conversion(cx);
     });
     cx.run_until_parked();
@@ -2642,7 +2776,7 @@ async fn restore_url_history_entry(cx: &mut TestAppContext) {
             matches!(this.conversion, ConversionState::Ready(_)),
         )
     });
-    assert_eq!(url.as_deref(), Some("http://example.com/restore.html"));
+    assert_eq!(url.as_deref(), Some(expected_url.as_str()));
     assert!(ready);
 }
 
@@ -2992,11 +3126,12 @@ async fn source_matches_false_after_clear(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn defuddle_frontmatter_session_option_persists(cx: &mut TestAppContext) {
     let env = TestEnv::new();
+    let url = test_url("/fm.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
         this.defuddle_frontmatter = true;
-        this.set_selected_url("http://example.com/fm.html".into(), cx);
+        this.set_selected_url(url, cx);
         this.apply_session_option_change(cx);
     });
     cx.run_until_parked();
@@ -3845,10 +3980,11 @@ async fn retry_single_batch_item_succeeds_after_fixing_tool(cx: &mut TestAppCont
 async fn set_selected_url_private_succeeds_when_allow_private_enabled(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
     // TestEnv sets SHIFT_ALLOW_PRIVATE_URLS=1.
+    let expected_url = test_url("/private.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://192.168.0.10/private.html".into(), cx);
+        this.set_selected_url(expected_url.clone(), cx);
         this.start_conversion(cx);
     });
     cx.run_until_parked();
@@ -3859,7 +3995,7 @@ async fn set_selected_url_private_succeeds_when_allow_private_enabled(cx: &mut T
             matches!(this.conversion, ConversionState::Ready(_)),
         )
     });
-    assert_eq!(url.as_deref(), Some("http://192.168.0.10/private.html"));
+    assert_eq!(url.as_deref(), Some(expected_url.as_str()));
     assert!(ready, "private URL should convert when allow-private is on");
 }
 
@@ -3888,6 +4024,7 @@ async fn set_selected_url_private_fails_when_allow_private_toggled_off(cx: &mut 
 #[gpui::test]
 async fn fail_magic_paste_then_recover_with_valid_paste(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
+    let expected_url = test_url("/recovered.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
@@ -3905,7 +4042,7 @@ async fn fail_magic_paste_then_recover_with_valid_paste(cx: &mut TestAppContext)
     }));
 
     shift.update(cx, |this, cx| {
-        this.submit_magic_paste_text("http://example.com/recovered.html".into(), cx);
+        this.submit_magic_paste_text(expected_url.clone(), cx);
     });
     cx.run_until_parked();
     shift.update(cx, |this, cx| this.start_conversion(cx));
@@ -3915,7 +4052,7 @@ async fn fail_magic_paste_then_recover_with_valid_paste(cx: &mut TestAppContext)
         ConversionState::Ready(artifact) => (this.selected_url.clone(), artifact.module_id),
         other => panic!("expected Ready after recovery, got {other:?}"),
     });
-    assert_eq!(url.as_deref(), Some("http://example.com/recovered.html"));
+    assert_eq!(url.as_deref(), Some(expected_url.as_str()));
     assert_eq!(module, "defuddle");
 }
 
@@ -4236,6 +4373,8 @@ async fn apply_session_option_change_without_visible_options_skips_reconvert(
 #[gpui::test]
 async fn enqueue_sources_with_url_batch(cx: &mut TestAppContext) {
     let env = TestEnv::new();
+    let first_url = test_url("/a.html");
+    let second_url = test_url("/b.html");
     let out = env.temp.join("url_batch_out");
     fs::create_dir_all(&out).unwrap();
     let shift = create_shift(cx);
@@ -4244,10 +4383,7 @@ async fn enqueue_sources_with_url_batch(cx: &mut TestAppContext) {
         this.batch_force = true;
         this.set_batch_output_dir(out.clone(), cx);
         this.enqueue_sources(
-            vec![
-                BatchSource::Url("http://example.com/a.html".into()),
-                BatchSource::Url("http://example.com/b.html".into()),
-            ],
+            vec![BatchSource::Url(first_url), BatchSource::Url(second_url)],
             true,
             cx,
         );
@@ -5172,10 +5308,11 @@ async fn set_history_limit_same_value_is_noop(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn cancel_conversion_mid_url_leaves_cancelled(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
+    let url = test_url("/cancel-mid.html");
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.set_selected_url("http://example.com/cancel-mid.html".into(), cx);
+        this.set_selected_url(url, cx);
         this.start_conversion(cx);
         this.cancel_conversion(cx);
     });

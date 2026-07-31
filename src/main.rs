@@ -32,20 +32,20 @@ use shift_core::conversion::{
     ConversionOptions, ConversionProgress, ConversionRegistry, DefuddleOptions, DiagnosticsReport,
     DoclingAsrModel, DoclingImageExportMode, DoclingOptions, DoclingTableMode,
     DoclingVideoSamplingMode, ExpandedInputPath, FfmpegEncodeMode, FfmpegOptions, FfmpegQuality,
-    MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, OutputFormat, PandocOptions, PasteToken,
-    PdfCompression, PdfInputOptions, Readiness, SipsFlip, SipsOptions, SipsQuality,
-    SpreadsheetOptions, available_outputs_for_batch_source, available_ready_outputs,
-    available_ready_url_outputs, expand_input_paths_preserving_roots,
+    MAX_CLIPBOARD_IMAGE_BYTES, MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, MaterializedSource,
+    OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, Readiness, SipsFlip,
+    SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, available_outputs_for_batch_source,
+    available_ready_outputs, available_ready_url_outputs, expand_input_paths_preserving_roots,
     ffmpeg_supports_target_size_output, is_audio_output, is_docling_timed_input,
     is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
-    looks_like_url, materialize_magic_paste, parse_magic_paste, paths_refer_to_same_file,
+    looks_like_url, materialize_magic_paste_detailed, parse_magic_paste, paths_refer_to_same_file,
     pdf_engine_candidates, run_batch, sips_supports_target_size_output, stage_pasted_image,
     suggested_output_for_path, suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
     StoredHistoryEntry, StoredOutcome, StoredSource, history_db_path, intern_module_id,
-    load_history, save_history_delta_to,
+    load_history, save_history_delta_to, save_history_delta_to_if_current,
 };
 use shift_core::preferences::{load_module_priority, save_module_priority};
 use shift_core::{
@@ -3393,7 +3393,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .text_sm()
                     .text_color(THEME.text_muted)
                     .child(
-                        "Choose a document, media file, or paste a URL, path, or image — Shift converts it automatically.",
+                        "Choose a document, media file, or paste a URL, path, or image — then press Convert when you are ready.",
                     ),
             ),
         ConversionState::Converting => {
@@ -6739,6 +6739,7 @@ mod ui_perf {
             output_format: OutputFormat::MARKDOWN,
             outcome,
             archived: false,
+            artifact_deferred: false,
         }
     }
 
@@ -7093,6 +7094,8 @@ mod ui_perf {
                     let loaded = LoadedHistory {
                         entries: stored,
                         next_id: MAX_HISTORY_ENTRIES as u64 + 1,
+                        load_error: None,
+                        load_incomplete: false,
                     };
                     let (restored, next_id) = history_from_store(loaded);
                     black_box((restored.len(), next_id));
@@ -7126,6 +7129,7 @@ mod ui_perf {
                 },
                 outcome: StoredOutcome::Failed("nope".into()),
                 archived: false,
+                artifact_deferred: false,
             });
         }
         assert_within(Duration::from_secs(1), "history_from_store filter", || {
@@ -7133,6 +7137,8 @@ mod ui_perf {
                 let loaded = LoadedHistory {
                     entries: entries.clone(),
                     next_id: 201,
+                    load_error: None,
+                    load_incomplete: false,
                 };
                 let (restored, next_id) = history_from_store(loaded);
                 assert_eq!(next_id, 201);
@@ -7360,6 +7366,7 @@ mod pure_ui_helpers {
             output_format: OutputFormat::MARKDOWN,
             outcome,
             archived: false,
+            artifact_deferred: false,
         }
     }
 
@@ -7383,6 +7390,7 @@ mod pure_ui_helpers {
             output_format,
             outcome,
             archived: false,
+            artifact_deferred: false,
         }
     }
 

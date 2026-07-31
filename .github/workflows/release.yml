@@ -13,56 +13,150 @@ on:
 permissions:
   contents: write
 
+# Pin third-party actions to full commit SHAs (immutable). Version comments are
+# for humans only; never float on major tags like @v4 / @v6 in this workflow.
 jobs:
-  macos:
-    runs-on: macos-14
+  # Validate the release tag in isolation before any build shell sees it.
+  # Untrusted workflow_dispatch input is passed only via env (RELEASE_TAG /
+  # DISPATCH_TAG), never interpolated into the script body with ${{ }}.
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate release tag allow-list
+        id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          PUSH_TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            raw="$DISPATCH_TAG"
+          else
+            raw="$PUSH_TAG"
+          fi
+          # Packaging and Cargo metadata consume plain numeric semver only.
+          # Must stay in sync with scripts/test-release-preflight.sh.
+          if ! printf '%s' "$raw" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Invalid release tag '$raw' (expected ^v?[0-9]+.[0-9]+.[0-9]+$)" >&2
+            exit 1
+          fi
+          case "$raw" in
+            v*) tag="$raw" ;;
+            *) tag="v$raw" ;;
+          esac
+          version="${tag#v}"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'Resolved release tag=%s version=%s\n' "$tag" "$version"
+
+  macos:
+    needs: resolve-tag
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Apple Silicon
+          - os: macos-14
+            arch: arm64
+          # Intel
+          - os: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ inputs.tag || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 1.97.1 notes
         with:
           toolchain: 1.97.0
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
-      - name: Verify release metadata
+      - name: Verify host architecture matches matrix
         run: |
-          tag="${GITHUB_REF_NAME}"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
-          scripts/release-preflight.sh "${tag#v}"
+          set -eu
+          host="$(uname -m)"
+          expected="${{ matrix.arch }}"
+          if [ "$host" != "$expected" ]; then
+            echo "Runner arch is $host, matrix expected $expected" >&2
+            exit 1
+          fi
+      - name: Verify release metadata
+        env:
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -eu
+          version="${RELEASE_TAG#v}"
+          scripts/release-preflight.sh "$version"
       - name: Build Shift
         run: cargo build --release --locked
       - name: Package self-contained converter runtime
+        env:
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            version="${{ inputs.tag }}"
-            version="${version#v}"
-          fi
+          set -eu
+          version="${RELEASE_TAG#v}"
           chmod +x scripts/package-macos.sh
           scripts/package-macos.sh "$version"
       - name: Validate release artifacts
+        env:
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
-          scripts/verify-macos-package.sh "${tag#v}" dist
+          set -eu
+          version="${RELEASE_TAG#v}"
+          scripts/verify-macos-package.sh "$version" dist "${{ matrix.arch }}"
+      - name: Upload architecture artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shift-macos-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve-tag, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+      - name: Download multi-arch artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: shift-macos-*
+          merge-multiple: true
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-tag.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
-          version="${tag#v}"
+          set -eu
+          version="${RELEASE_TAG#v}"
           notes="release-notes/${version}.md"
           if [ ! -f "$notes" ]; then
             echo "Missing release notes file: $notes" >&2
             exit 1
           fi
-          gh release create "$tag" dist/*.zip dist/*.dmg dist/*.sha256 \
+          # Expect one ZIP + DMG + checksums per architecture (arm64 + x86_64).
+          zip_count="$(find dist -maxdepth 1 -name 'shift-*-macos-*.zip' | wc -l | tr -d ' ')"
+          dmg_count="$(find dist -maxdepth 1 -name 'shift-*-macos-*.dmg' | wc -l | tr -d ' ')"
+          if [ "$zip_count" -lt 2 ] || [ "$dmg_count" -lt 2 ]; then
+            echo "Expected multi-arch ZIP/DMG artifacts under dist/; found zip=$zip_count dmg=$dmg_count" >&2
+            ls -la dist || true
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" dist/*.zip dist/*.dmg dist/*.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "Shift ${version}" \
             --notes-file "$notes" \

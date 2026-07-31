@@ -3,8 +3,10 @@
 use super::{
     ConversionArtifact, ConversionError, ConversionModule, ConversionOptions, ConversionProgress,
     InvocationRecord, OutputFormat, TempDirGuard, command_argv_parts, format_argv_display,
-    map_spawn_error, max_output_bytes, process_timeout, read_file_limited, resolve_tool_executable,
-    run_command, run_command_cancellable, unique_temp_dir,
+    map_spawn_error, max_output_bytes, process_timeout, push_flag_path, push_path_arg,
+    read_file_limited, resolve_tool_executable, run_command, run_command_cancellable,
+    run_command_cancellable_with_output_dirs, run_command_cancellable_with_output_paths,
+    unique_temp_dir,
 };
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -410,11 +412,12 @@ impl FfmpegModule {
                 },
             );
             let progress_stop = spawn_progress_watcher(progress_path, options);
-            let output = run_command_cancellable(
+            let output = run_command_cancellable_with_output_paths(
                 command,
                 process_timeout(),
                 max_output_bytes(),
                 options.cancel.clone(),
+                std::slice::from_ref(&produced),
             );
             stop_progress_watcher(progress_stop);
             let output = output.map_err(|error| {
@@ -539,7 +542,7 @@ impl FfmpegModule {
         if let Some(secs) = options.ffmpeg.start_secs {
             command.arg("-ss").arg(format_timestamp(secs));
         }
-        command.arg("-i").arg(input);
+        push_flag_path(&mut command, "-i", input);
         if let Some(secs) = options.ffmpeg.duration_secs {
             command.arg("-t").arg(format_timestamp(secs));
         }
@@ -553,7 +556,7 @@ impl FfmpegModule {
         command
             .arg("-frames:v")
             .arg(MAX_SEQUENCE_FRAMES.to_string());
-        command.arg(&pattern);
+        push_path_arg(&mut command, &pattern)?;
 
         let invocation = InvocationRecord {
             module_id: self.id(),
@@ -561,11 +564,13 @@ impl FfmpegModule {
         };
 
         report_phase(options, "FFmpeg extracting frames…");
-        let output = run_command_cancellable(
+        let output = run_command_cancellable_with_output_dirs(
             command,
             process_timeout(),
             max_output_bytes(),
             options.cancel.clone(),
+            &[],
+            &[(frames_dir.clone(), max_output_bytes() as u64)],
         )
         .map_err(|error| {
             map_spawn_error(
@@ -656,7 +661,7 @@ impl FfmpegModule {
             }
         }
 
-        command.arg("-i").arg(input);
+        push_flag_path(&mut command, "-i", input);
 
         if is_image_output(output_format) {
             if let Some(secs) = options.frame_secs.or(options.start_secs) {
@@ -673,7 +678,8 @@ impl FfmpegModule {
         apply_stream_maps(&mut command, output_format, options);
         apply_encode_settings(&mut command, input, output_format, options, target_bitrates)?;
 
-        command.arg(produced);
+        // Trailing output path: absolute, rejected if option-like as a bare arg.
+        push_path_arg(&mut command, produced)?;
         Ok(command)
     }
 
@@ -743,8 +749,8 @@ impl FfmpegModule {
             .arg("-show_entries")
             .arg("format=duration")
             .arg("-of")
-            .arg("default=noprint_wrappers=1:nokey=1")
-            .arg(input);
+            .arg("default=noprint_wrappers=1:nokey=1");
+        push_path_arg(&mut command, input)?;
         let output = run_command_cancellable(
             command,
             Duration::from_secs(15),
@@ -774,6 +780,10 @@ impl FfmpegModule {
             .parse::<f64>()
             .map_err(|_| ConversionError::new("ffprobe returned an invalid media duration"))
     }
+}
+
+pub fn validate_ffmpeg_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
+    validate_options(options)
 }
 
 fn validate_options(options: &FfmpegOptions) -> Result<(), ConversionError> {
@@ -1488,6 +1498,9 @@ dd if=/dev/zero of="$output" bs=1 count="$size" 2>/dev/null
 
     #[test]
     fn target_size_probes_duration_and_retries_actual_output() {
+        // max_output_bytes() reads process-global environment state; serialize
+        // this read with tests that temporarily override the limit.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = format!("{}-fit", std::process::id());
         let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));
@@ -2738,7 +2751,9 @@ dd if=/dev/zero of="$output" bs=1 count="$size" 2>/dev/null
                 format.id()
             );
             assert!(
-                args.iter().any(|a| a == out_name),
+                args.iter().any(|a| a == out_name
+                    || a.ends_with(out_name)
+                    || a.ends_with(&format!("/{out_name}"))),
                 "{} missing output path: {joined}",
                 format.id()
             );
