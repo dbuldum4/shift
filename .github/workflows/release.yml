@@ -63,7 +63,7 @@ jobs:
           - os: macos-14
             arch: arm64
           # Intel
-          - os: macos-13
+          - os: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
