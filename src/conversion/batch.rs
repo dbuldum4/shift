@@ -641,16 +641,37 @@ impl BatchQueue {
         self.enqueue_input(BatchInput::new(source), opts)
     }
 
+    /// Fallible variant of [`Self::enqueue`] for callers that need to surface
+    /// an admission error instead of treating over-capacity as a programmer
+    /// error.
+    pub fn try_enqueue(
+        &mut self,
+        source: BatchSource,
+        opts: &BatchEnqueueOptions,
+    ) -> Result<BatchItemId, ConversionError> {
+        self.try_enqueue_input(BatchInput::new(source), opts)
+    }
+
     /// Enqueue one source with recursive hierarchy metadata.
     pub fn enqueue_input(&mut self, input: BatchInput, opts: &BatchEnqueueOptions) -> BatchItemId {
+        self.try_enqueue_input(input, opts)
+            .expect("BatchQueue admission limit exceeded; use try_enqueue to handle this error")
+    }
+
+    pub fn try_enqueue_input(
+        &mut self,
+        input: BatchInput,
+        opts: &BatchEnqueueOptions,
+    ) -> Result<BatchItemId, ConversionError> {
+        self.check_admission(1)?;
         let group_id = self.allocate_group_id();
-        self.push_job(
+        Ok(self.push_job(
             input,
             group_id,
             opts.output_format,
             BatchFormatSelection::Inherit,
             opts,
-        )
+        ))
     }
 
     /// Enqueue one source to the primary format and every additional format.
@@ -752,9 +773,28 @@ impl BatchQueue {
         sources: impl IntoIterator<Item = BatchSource>,
         opts: &BatchEnqueueOptions,
     ) -> Vec<BatchItemId> {
+        let sources: Vec<_> = sources.into_iter().collect();
+        self.check_admission(sources.len()).expect(
+            "BatchQueue admission limit exceeded; use try_enqueue_many to handle this error",
+        );
         sources
             .into_iter()
             .map(|source| self.enqueue(source, opts))
+            .collect()
+    }
+
+    /// Fallible variant of [`Self::enqueue_many`] for callers that need to
+    /// surface an admission error.
+    pub fn try_enqueue_many(
+        &mut self,
+        sources: impl IntoIterator<Item = BatchSource>,
+        opts: &BatchEnqueueOptions,
+    ) -> Result<Vec<BatchItemId>, ConversionError> {
+        let sources: Vec<_> = sources.into_iter().collect();
+        self.check_admission(sources.len())?;
+        sources
+            .into_iter()
+            .map(|source| self.try_enqueue(source, opts))
             .collect()
     }
 
@@ -850,9 +890,25 @@ impl BatchQueue {
         opts: &BatchEnqueueOptions,
         preferred_module: Option<&str>,
     ) -> Vec<BatchItemId> {
+        self.try_enqueue_many_with_recipe(sources, opts, preferred_module)
+            .expect(
+                "BatchQueue admission limit exceeded; use try_enqueue_many_with_recipe to handle this error",
+            )
+    }
+
+    /// Fallible variant of [`Self::enqueue_many_with_recipe`].
+    pub fn try_enqueue_many_with_recipe(
+        &mut self,
+        sources: impl IntoIterator<Item = BatchSource>,
+        opts: &BatchEnqueueOptions,
+        preferred_module: Option<&str>,
+    ) -> Result<Vec<BatchItemId>, ConversionError> {
+        let sources: Vec<_> = sources.into_iter().collect();
+        self.check_admission(sources.len())?;
         sources
             .into_iter()
             .map(|source| self.enqueue_with_recipe(source, opts, preferred_module))
+            .map(Ok)
             .collect()
     }
 
@@ -2100,6 +2156,17 @@ mod tests {
                 .is_none(),
             "extra output must not bypass the queue cap"
         );
+        let error = queue
+            .try_enqueue(BatchSource::File(PathBuf::from("/tmp/overflow.txt")), &opts)
+            .unwrap_err();
+        assert!(error.to_string().contains("queue items"));
+        let error = queue
+            .try_enqueue_many(
+                [BatchSource::File(PathBuf::from("/tmp/overflow-a.txt"))],
+                &opts,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("queue items"));
     }
 
     #[test]

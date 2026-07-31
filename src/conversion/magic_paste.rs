@@ -84,7 +84,7 @@ pub fn parse_magic_paste(input: &str) -> Result<MagicPaste, ConversionError> {
 }
 
 /// A materialized conversion source that may own a temporary staged input.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct MaterializedSource {
     pub source: BatchSource,
     pub staged_path: Option<PathBuf>,
@@ -244,29 +244,25 @@ pub fn materialize_paste_token_detailed(
     }
 }
 
-/// Resolve a classified token into a [`BatchSource`].
+/// Resolve a classified token into an owned materialized source.
+///
+/// The returned value owns any downloaded staging file and removes it when
+/// dropped. Keep it alive until the conversion has finished.
 pub fn materialize_paste_token(
     token: &PasteToken,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<BatchSource, ConversionError> {
-    let mut detailed = materialize_paste_token_detailed(token, cancel)?;
-    let _ = detailed.take_staged_path();
-    Ok(detailed.source.clone())
+) -> Result<MaterializedSource, ConversionError> {
+    materialize_paste_token_detailed(token, cancel)
 }
 
 /// Materialize every token in a magic-paste parse result.
+///
+/// Each returned item owns its staged input, if any, and cleans it up on drop.
 pub fn materialize_magic_paste(
     paste: &MagicPaste,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<Vec<BatchSource>, ConversionError> {
-    let detailed = materialize_magic_paste_detailed(paste, cancel)?;
-    Ok(detailed
-        .into_iter()
-        .map(|mut item| {
-            let _ = item.take_staged_path();
-            item.source.clone()
-        })
-        .collect())
+) -> Result<Vec<MaterializedSource>, ConversionError> {
+    materialize_magic_paste_detailed(paste, cancel)
 }
 
 /// Materialize every token, retaining staged ownership and origin URLs.
@@ -750,7 +746,7 @@ mod tests {
         let path = dir.join("note.md");
         fs::write(&path, b"# hi\n").unwrap();
         let source = materialize_paste_token(&PasteToken::LocalPath(path.clone()), None).unwrap();
-        assert_eq!(source, BatchSource::File(path));
+        assert_eq!(&source.source, &BatchSource::File(path));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1137,7 +1133,11 @@ exit 0
         ]);
         let sources = materialize_magic_paste(&paste, None).unwrap();
         assert_eq!(sources.len(), 2);
-        assert!(sources.iter().all(|s| matches!(s, BatchSource::File(_))));
+        assert!(
+            sources
+                .iter()
+                .all(|s| matches!(&s.source, BatchSource::File(_)))
+        );
 
         let cancel = Arc::new(AtomicBool::new(true));
         let err = materialize_magic_paste(&paste, Some(cancel)).unwrap_err();
@@ -1167,7 +1167,14 @@ exit 0
             None,
         )
         .unwrap();
-        assert!(matches!(source, BatchSource::File(_)));
+        assert!(matches!(&source.source, BatchSource::File(_)));
+        let staged_path = source.staged_path.clone().expect("remote file is staged");
+        assert!(staged_path.is_file());
+        drop(source);
+        assert!(
+            !staged_path.exists(),
+            "dropping the source must clean staging"
+        );
 
         unsafe {
             std::env::remove_var("SHIFT_CURL_BIN");
@@ -1297,7 +1304,7 @@ exit 0
         let first =
             materialize_paste_token(&PasteToken::LocalPath(p1.clone()), Some(cancel.clone()))
                 .unwrap();
-        assert_eq!(first, BatchSource::File(p1));
+        assert_eq!(&first.source, &BatchSource::File(p1));
 
         // Flip cancel before the next token — mid-multi abort.
         cancel.store(true, Ordering::SeqCst);
@@ -1480,7 +1487,7 @@ exit 0
             None,
         )
         .unwrap();
-        assert_eq!(source, BatchSource::File(file));
+        assert_eq!(&source.source, &BatchSource::File(file));
 
         // ~user (no slash) is not home expansion.
         assert_eq!(
@@ -1559,8 +1566,8 @@ exit 0
         )
         .unwrap();
         assert_eq!(
-            source,
-            BatchSource::Url("https://example.com/article".into())
+            &source.source,
+            &BatchSource::Url("https://example.com/article".into())
         );
         // Rejected when private-URL policy blocks (no allow flag, localhost).
         unsafe {

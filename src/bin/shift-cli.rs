@@ -240,7 +240,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             .map_err(|error| error.to_string())
             .and_then(|_| {
                 artifact
-                    .write_to(&destination)
+                    // The preflight check is only advisory; the exclusive
+                    // publish closes the race with another writer.
+                    .write_to_with_replace(&destination, parsed.force)
                     .map_err(|error| error.to_string())
             })
             .and_then(|_| print_output_path(&destination, parsed.path_print_mode))

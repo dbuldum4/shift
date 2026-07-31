@@ -23,7 +23,9 @@
 //! metadata only; full bytes are fetched on demand.
 
 use crate::conversion::redact_url_credentials;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, params, params_from_iter,
+};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -192,7 +194,9 @@ fn home_dir_for_history() -> Option<PathBuf> {
 
 /// Ensure `dir` exists with mode 0700 on Unix.
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    reject_symlinked_directory(dir)?;
     std::fs::create_dir_all(dir)?;
+    reject_symlinked_directory(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -203,19 +207,61 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn reject_symlinked_directory(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlinked history directory: {}", path.display()),
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("history path is not a directory: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Restrict an existing file to mode 0600 on Unix.
 fn ensure_private_file(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlinked history database: {}", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("history database is not a regular file: {}", path.display()),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if path.is_file() {
-            let mut perms = std::fs::metadata(path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
-        }
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
     }
-    let _ = path;
     Ok(())
+}
+
+fn canonical_history_open_path(path: &Path) -> Result<PathBuf, rusqlite::Error> {
+    if path == Path::new(":memory:") {
+        return Ok(path.to_path_buf());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+    Ok(parent.join(file_name))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -489,12 +535,18 @@ fn sync_id_seq_from_history(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// Open (or create) the history database at the given path and ensure the schema exists.
 pub fn open_history(path: impl AsRef<Path>) -> Result<Connection, rusqlite::Error> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        let _ = ensure_private_dir(parent);
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        ensure_private_dir(parent)
+            .map_err(|_| rusqlite::Error::InvalidPath(parent.to_path_buf()))?;
     }
-    let conn = Connection::open(path)?;
+    let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let open_path = canonical_history_open_path(path)?;
+    let conn = Connection::open_with_flags(&open_path, flags)?;
     initialize_history_schema(&conn)?;
-    let _ = ensure_private_file(path);
+    if open_path != Path::new(":memory:") {
+        ensure_private_file(&open_path)
+            .map_err(|_| rusqlite::Error::InvalidPath(open_path.clone()))?;
+    }
     Ok(conn)
 }
 
@@ -735,7 +787,9 @@ fn legacy_load_failure(conn: &Connection, legacy: &Path, message: String) -> Loa
 }
 
 fn peek_next_id_best_effort(db_path: &Path) -> Option<u64> {
-    let conn = Connection::open(db_path).ok()?;
+    let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let open_path = canonical_history_open_path(db_path).ok()?;
+    let conn = Connection::open_with_flags(open_path, flags).ok()?;
     // Avoid full schema init; just read what we can.
     if let Ok(n) = conn.query_row(
         "SELECT next_id FROM history_id_seq WHERE singleton = 1",
@@ -961,22 +1015,32 @@ pub fn clear_history_store() -> io::Result<()> {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if let Some(db_path) = history_db_path() {
-        if db_path.is_file() {
-            // Best-effort secure clear: delete rows + VACUUM, then remove file.
-            if let Ok(conn) = Connection::open(&db_path) {
-                let _ = conn.execute_batch(
-                    "
+        match std::fs::symlink_metadata(&db_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Remove only the link; never open or vacuum its target.
+                let _ = std::fs::remove_file(&db_path);
+            }
+            Ok(metadata) if metadata.is_file() => {
+                // Best-effort secure clear: delete rows + VACUUM, then remove file.
+                let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+                if let Ok(open_path) = canonical_history_open_path(&db_path)
+                    && let Ok(conn) = Connection::open_with_flags(open_path, flags)
+                {
+                    let _ = conn.execute_batch(
+                        "
                     DELETE FROM history;
                     DELETE FROM history_id_seq;
                     VACUUM;
                     ",
-                );
+                    );
+                }
+                let _ = std::fs::remove_file(&db_path);
+                // Also remove SQLite sidecars if present.
+                let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+                let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+                let _ = std::fs::remove_file(format!("{}-journal", db_path.display()));
             }
-            let _ = std::fs::remove_file(&db_path);
-            // Also remove SQLite sidecars if present.
-            let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
-            let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
-            let _ = std::fs::remove_file(format!("{}-journal", db_path.display()));
+            _ => {}
         }
     }
     if let Some(legacy) = history_legacy_path() {
@@ -2937,6 +3001,46 @@ mod tests {
         let file_mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "support dir mode {dir_mode:o}");
         assert_eq!(file_mode, 0o600, "db file mode {file_mode:o}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_database_symlinks_are_not_followed_or_cleared() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_support_dir("symlink");
+        let target = dir.join("outside.sqlite");
+        let link = dir.join("history.sqlite");
+        let target_conn = open_history(&target).unwrap();
+        add_history_entry(
+            &target_conn,
+            &sample_entry(1, "keep", false),
+            DEFAULT_HISTORY_LIMIT,
+        )
+        .unwrap();
+        drop(target_conn);
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            open_history(&link).is_err(),
+            "database symlink must be rejected"
+        );
+        unsafe {
+            std::env::set_var("SHIFT_APP_SUPPORT_DIR", &dir);
+        }
+        clear_history_store().unwrap();
+        assert!(!link.exists(), "clear should remove only the symlink");
+        let conn = open_history(&target).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "clearing a symlink must not mutate its target");
+
+        unsafe {
+            std::env::remove_var("SHIFT_APP_SUPPORT_DIR");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

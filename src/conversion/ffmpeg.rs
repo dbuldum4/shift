@@ -1498,6 +1498,9 @@ dd if=/dev/zero of="$output" bs=1 count="$size" 2>/dev/null
 
     #[test]
     fn target_size_probes_duration_and_retries_actual_output() {
+        // max_output_bytes() reads process-global environment state; serialize
+        // this read with tests that temporarily override the limit.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let directory = std::env::temp_dir();
         let suffix = format!("{}-fit", std::process::id());
         let executable = directory.join(format!("shift-ffmpeg-test-{suffix}"));

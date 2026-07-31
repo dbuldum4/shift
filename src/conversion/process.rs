@@ -385,84 +385,58 @@ fn force_kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Create (or truncate) a file with mode `0600` **before** writing secrets.
+/// Create a new file with mode `0600` **before** writing secrets.
 ///
 /// On Unix the open uses `OpenOptionsExt::mode(0o600)` so the content is never
 /// briefly world-readable under a default umask. Callers should place these
-/// files under a private temp directory ([`unique_temp_dir`]).
+/// files under a private temp directory ([`unique_temp_dir`]). Exclusive
+/// creation also prevents a symlink at `path` from redirecting the secret.
 pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), ConversionError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| {
-                ConversionError::new(format!(
-                    "could not create private file {}: {error}",
-                    path.display()
-                ))
-            })?;
-        file.write_all(bytes).map_err(|error| {
-            ConversionError::new(format!(
-                "could not write private file {}: {error}",
-                path.display()
-            ))
-        })?;
-        file.sync_all().map_err(|error| {
-            ConversionError::new(format!(
-                "could not sync private file {}: {error}",
-                path.display()
-            ))
-        })?;
-        Ok(())
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes).map_err(|error| {
-            ConversionError::new(format!(
-                "could not write private file {}: {error}",
-                path.display()
-            ))
-        })
-    }
+    let mut file = options.open(path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create private file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
+        ConversionError::new(format!(
+            "could not write private file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        ConversionError::new(format!(
+            "could not sync private file {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
-/// Create a regular file with mode `0600` for sensitive intermediate converter output.
+/// Create a new regular file with mode `0600` for sensitive intermediate
+/// converter output. The exclusive open prevents a symlink at `path` from
+/// redirecting the output.
 pub fn create_private_file(path: &Path) -> Result<std::fs::File, ConversionError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| {
-                ConversionError::new(format!(
-                    "could not create private file {}: {error}",
-                    path.display()
-                ))
-            })
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|error| {
-                ConversionError::new(format!(
-                    "could not create private file {}: {error}",
-                    path.display()
-                ))
-            })
-    }
+    options.open(path).map_err(|error| {
+        ConversionError::new(format!(
+            "could not create private file {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Absolute path suitable for child argv (prefers canonicalize when the path exists).
@@ -549,7 +523,7 @@ pub fn read_file_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Conve
     let metadata = std::fs::metadata(path).map_err(|error| {
         ConversionError::new(format!("could not read {}: {error}", path.display()))
     })?;
-    if metadata.len() as usize > max_bytes {
+    if metadata.len() > max_bytes as u64 {
         return Err(ConversionError::new(format!(
             "converter output {} is too large ({} bytes; limit is {} bytes)",
             path.display(),
@@ -2674,6 +2648,25 @@ mod tests {
         assert_eq!(mode, 0o600, "secret file mode must be 0600, got {mode:o}");
         assert_eq!(std::fs::read(&path).unwrap(), b"s3cret-value");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_refuses_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = unique_suffix("secret-symlink");
+        let target = std::env::temp_dir().join(format!("shift-secret-target-{suffix}"));
+        let link = std::env::temp_dir().join(format!("shift-secret-link-{suffix}"));
+        std::fs::write(&target, b"keep me").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = write_secret_file(&link, b"do not redirect").unwrap_err();
+        assert!(error.to_string().contains("could not create private file"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
     }
 
     #[test]

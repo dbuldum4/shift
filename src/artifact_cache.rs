@@ -302,14 +302,20 @@ pub fn cache_artifact_bytes(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
         _ => format!("{safe}-{name_hash:016x}"),
     };
     let path = dir.join(&file_name);
-    if path.exists() {
+    let path_metadata = fs::symlink_metadata(&path).ok();
+    if path_metadata.is_some() {
         // Reuse only when length + digest match; never trust existence alone.
         if cache_file_matches(&path, bytes.len() as u64, &digest) {
             return Ok(path);
         }
         // Collision on FNV name with different content: rewrite under same name
         // only after verifying we can replace (rare; FNV collision).
-        make_writable_if_needed(&path);
+        if !path_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            make_writable_if_needed(&path);
+        }
         write_bytes_via_unique_temp(&path, bytes)?;
     } else {
         write_bytes_via_unique_temp(&path, bytes)?;
@@ -441,14 +447,18 @@ pub fn export_matches_bytes_strict(path: &Path, bytes: &[u8]) -> bool {
 /// or missing sidecar fields, and `Err` on I/O failures. Safe to call from a
 /// background executor for large files.
 pub fn verify_export_integrity(path: &Path) -> io::Result<bool> {
-    if !path.is_file() {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    let meta = fs::metadata(path)?;
     let Some(sidecar) = read_integrity_sidecar(path) else {
         return Ok(false);
     };
-    if sidecar.len != meta.len() {
+    if sidecar.len != metadata.len() {
         return Ok(false);
     }
     let actual = sha256_file(path)?;
@@ -511,7 +521,12 @@ struct IntegritySidecar {
 fn read_integrity_sidecar(path: &Path) -> Option<IntegritySidecar> {
     let file_name = path.file_name()?.to_str()?;
     let dir = path.parent().unwrap_or(Path::new(""));
-    let text = fs::read_to_string(hash_sidecar_path(dir, file_name)).ok()?;
+    let sidecar = hash_sidecar_path(dir, file_name);
+    let metadata = fs::symlink_metadata(&sidecar).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(sidecar).ok()?;
     parse_integrity_sidecar(&text)
 }
 
@@ -612,12 +627,12 @@ fn write_integrity_sidecar_for_path(path: &Path, digest: &str) -> io::Result<()>
 /// When `force_full` is false and the sidecar binds the same length, mtime, and
 /// digest, skip hashing the whole file (large-artifact UI-safe path).
 fn export_file_matches_digest(path: &Path, len: u64, digest: &str, force_full: bool) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    let Ok(meta) = fs::metadata(path) else {
+    let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
     if meta.len() != len {
         return false;
     }
@@ -1974,6 +1989,54 @@ mod tests {
             std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
         }
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_and_export_do_not_trust_child_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("child-symlink");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("SHIFT_ARTIFACT_CACHE_DIR", &dir);
+        }
+
+        let cached = cache_artifact_bytes("linked.bin", b"payload").unwrap();
+        let sidecar = cached.parent().unwrap().join(format!(
+            ".{}.hash",
+            cached.file_name().unwrap().to_string_lossy()
+        ));
+        fs::remove_file(&cached).unwrap();
+        let _ = fs::remove_file(sidecar);
+        let target = dir.join("outside.bin");
+        fs::write(&target, b"payload").unwrap();
+        symlink(&target, &cached).unwrap();
+
+        let replaced = cache_artifact_bytes("linked.bin", b"payload").unwrap();
+        assert_eq!(replaced, cached);
+        assert!(
+            !fs::symlink_metadata(&replaced)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"payload");
+
+        fs::create_dir_all(dir.join("export")).unwrap();
+        let export_target = dir.join("outside-export.md");
+        fs::write(&export_target, b"export").unwrap();
+        let preferred = dir.join("export/export-link.md");
+        symlink(&export_target, &preferred).unwrap();
+        let export = stage_export_bytes("export-link.md", b"export").unwrap();
+        assert_ne!(export, preferred);
+        assert_eq!(fs::read(&export_target).unwrap(), b"export");
+
+        unsafe {
+            std::env::remove_var("SHIFT_ARTIFACT_CACHE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
