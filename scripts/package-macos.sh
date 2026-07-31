@@ -98,9 +98,25 @@ cat > "$contents/Info.plist" <<EOF
 </plist>
 EOF
 
-uv pip install --python 3.11 --prerelease=allow --target "$runtime/python" \
-  "markitdown[all]==0.1.6" "docling[asr]==2.115.0" \
-  "docling-slim[format-video]==2.115.0"
+# PyTorch 2.8+ no longer publishes macOS Intel wheels, so Docling 2.115's
+# ASR/video extras cannot be resolved on x86_64. Keep layout-aware document
+# conversion in the Intel artifact and bundle the complete transcription stack
+# on Apple Silicon, where upstream supports it.
+case "$arch" in
+  arm64)
+    set -- "markitdown[all]==0.1.6" "docling[asr]==2.115.0" \
+      "docling-slim[format-video]==2.115.0"
+    ;;
+  x86_64)
+    set -- "markitdown[all]==0.1.6" "docling==2.115.0" \
+      "docling-slim==2.115.0"
+    ;;
+  *)
+    echo "package-macos: unsupported architecture: $arch" >&2
+    exit 2
+    ;;
+esac
+uv pip install --python 3.11 --prerelease=allow --target "$runtime/python" "$@"
 
 # `typing` is a Python 2 compatibility backport, not a dependency that belongs
 # in a Python 3.11 runtime. Some transitive package metadata still causes uv to

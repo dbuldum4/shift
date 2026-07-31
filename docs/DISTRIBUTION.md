@@ -3,12 +3,15 @@
 Shift uses GitHub Releases as its distribution channel. Each macOS release
 includes a drag-to-install DMG, a ZIP archive, and SHA-256 checksum files.
 
-The release artifacts contain `Shift.app`, `shift-cli`, the pinned Python packages
-MarkItDown 0.1.6, Docling 2.115.0 with ASR extras (`docling[asr]` and
-`docling-slim[format-video]`), and the pinned Node package Defuddle 0.19.2. The
-native runtimes and tools they require—Python 3.11, Node, FFmpeg, Pandoc, Typst,
-and qpdf—remain explicit system requirements. Shift never installs packages or
-mutates the host system at first launch.
+The release artifacts contain `Shift.app`, `shift-cli`, the pinned Python
+packages MarkItDown 0.1.6 and Docling 2.115.0, and the pinned Node package
+Defuddle 0.19.2. Apple Silicon artifacts include Docling's ASR/video extras
+(`docling[asr]` and `docling-slim[format-video]`). Intel artifacts include base
+Docling document support without transcription because PyTorch 2.8+ has no
+macOS Intel wheels; Shift removes those unsupported pairs from the Intel
+capability lists. The native runtimes and tools they require—Python 3.11, Node,
+FFmpeg, Pandoc, Typst, and qpdf—remain explicit system requirements. Shift never
+installs packages or mutates the host system at first launch.
 
 Docling model weights are intentionally not embedded because upstream selects
 models for the active pipeline and downloads them on demand. They are cached by
@@ -36,7 +39,7 @@ notarization to test during development.
 
 ## Security status
 
-Shift 1.1.0 is not yet distributed with a Developer ID signature or Apple
+Shift 1.1.1 is not yet distributed with a Developer ID signature or Apple
 notarization. This release process deliberately does not add signing work.
 Users may need to use macOS's Control-click → Open flow. Signing and
 notarization are explicit follow-up release work, not an implied guarantee of

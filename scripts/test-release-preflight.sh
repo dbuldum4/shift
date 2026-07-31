@@ -127,7 +127,7 @@ if awk '
   echo "release.yml interpolates inputs.tag into a run script; use RELEASE_TAG env instead" >&2
   exit 1
 fi
-# Multi-arch matrix must cover arm64 (macos-14) and x86_64 (macos-15-intel).
+# Multi-arch matrix must cover the latest GA arm64 and x86_64 images.
 require_workflow_contains() {
   grep -Fq "$1" "$root/.github/workflows/release.yml" \
     || {
@@ -135,10 +135,11 @@ require_workflow_contains() {
       exit 1
     }
 }
-require_workflow_contains "macos-14"
-require_workflow_contains "macos-15-intel"
+require_workflow_contains "macos-26"
+require_workflow_contains "macos-26-intel"
 require_workflow_contains "arch: arm64"
 require_workflow_contains "arch: x86_64"
+require_workflow_contains 'MACOSX_DEPLOYMENT_TARGET: "13.0"'
 require_workflow_contains "RELEASE_TAG"
 require_workflow_contains "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 require_workflow_contains "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"

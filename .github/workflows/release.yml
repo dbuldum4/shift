@@ -8,7 +8,7 @@ on:
       tag:
         description: Existing version tag to release
         required: true
-        default: v1.1.0
+        default: v1.1.1
 
 permissions:
   contents: write
@@ -55,15 +55,17 @@ jobs:
 
   macos:
     needs: resolve-tag
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     strategy:
       fail-fast: true
       matrix:
         include:
           # Apple Silicon
-          - os: macos-14
+          - os: macos-26
             arch: arm64
           # Intel
-          - os: macos-15-intel
+          - os: macos-26-intel
             arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:

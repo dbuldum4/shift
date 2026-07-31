@@ -12,21 +12,88 @@ use std::process::Command;
 /// Inputs exposed by the pinned Docling 2.115 CLI.
 ///
 /// Audio/video formats need Docling's optional ASR/video extras and FFmpeg at
-/// conversion time. They remain capabilities even when those optional
-/// dependencies are absent; base Docling readiness must not be downgraded just
-/// because transcription has not been installed yet.
+/// conversion time. PyTorch 2.8+ has no macOS Intel wheels, so the pinned
+/// Docling stack cannot provide those routes on macOS x86_64. Keep them out of
+/// that build's capability lists instead of advertising conversions that the
+/// packaged runtime cannot execute.
 const EXTENSIONS: &[&str] = &[
     // Office and publishing (including the aliases registered by Docling 2.115).
-    "pdf", "docx", "dotx", "docm", "dotm", "doc", "dot", "pptx", "potx", "ppsx", "pptm", "potm",
-    "ppsm", "ppt", "pot", "pps", "xlsx", "xlsm", "xls", "xlt", "odt", "ott", "ods", "ots", "odp",
-    "otp", "epub", // Markup / text / mail / timed transcripts.
-    "md", "markdown", "qmd", "rmd", "adoc", "asciidoc", "asc", "tex", "latex", "txt", "text",
-    "html", "htm", "xhtml", "csv", "eml", "boxnote", "vtt",
+    "pdf",
+    "docx",
+    "dotx",
+    "docm",
+    "dotm",
+    "doc",
+    "dot",
+    "pptx",
+    "potx",
+    "ppsx",
+    "pptm",
+    "potm",
+    "ppsm",
+    "ppt",
+    "pot",
+    "pps",
+    "xlsx",
+    "xlsm",
+    "xls",
+    "xlt",
+    "odt",
+    "ott",
+    "ods",
+    "ots",
+    "odp",
+    "otp",
+    "epub", // Markup / text / mail / timed transcripts.
+    "md",
+    "markdown",
+    "qmd",
+    "rmd",
+    "adoc",
+    "asciidoc",
+    "asc",
+    "tex",
+    "latex",
+    "txt",
+    "text",
+    "html",
+    "htm",
+    "xhtml",
+    "csv",
+    "eml",
+    "boxnote",
+    "vtt",
     // Images (layout / OCR pipeline)
-    "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", // Audio (ASR pipeline)
-    "wav", "mp3", "m4a", "aac", "ogg", "flac",
-    // Video (ASR + representative-frame pipeline, new in Docling 2.115)
-    "mp4", "avi", "mov", "mkv", "webm",
+    "png",
+    "jpg",
+    "jpeg",
+    "tif",
+    "tiff",
+    "bmp",
+    "webp",
+    // Timed media is unavailable only in the macOS Intel build.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "wav",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "mp3",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "m4a",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "aac",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "ogg",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "flac",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "mp4",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "avi",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "mov",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "mkv",
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    "webm",
 ];
 
 const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "m4a", "aac", "ogg", "flac"];
@@ -40,6 +107,7 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "avi", "mov", "mkv", "webm"];
 /// inputs in [`DoclingModule::supports`].
 const OUTPUTS: &[OutputFormat] = &[
     OutputFormat::MARKDOWN,
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     OutputFormat::TRANSCRIPT,
     OutputFormat::HTML,
     OutputFormat("plain"),
@@ -1153,7 +1221,10 @@ printf '%s' "$body" > "$output/$stem.$ext"
         );
         let outputs = module.output_formats();
         assert!(outputs.contains(&OutputFormat::MARKDOWN));
-        assert!(outputs.contains(&OutputFormat::TRANSCRIPT));
+        assert_eq!(
+            outputs.contains(&OutputFormat::TRANSCRIPT),
+            !cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        );
         assert!(outputs.contains(&OutputFormat::HTML));
         assert!(outputs.contains(&OutputFormat("plain")));
         assert_eq!(module.chainable_output_formats(), CHAINABLE_OUTPUTS);
@@ -1495,7 +1566,8 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert_eq!(module.input_extensions(), EXTENSIONS);
 
         let outputs = module.output_formats();
-        assert_eq!(outputs.len(), 5);
+        let timed_media_supported = !cfg!(all(target_os = "macos", target_arch = "x86_64"));
+        assert_eq!(outputs.len(), if timed_media_supported { 5 } else { 4 });
         assert_eq!(outputs, OUTPUTS);
         assert_eq!(module.chainable_output_formats(), CHAINABLE_OUTPUTS);
         assert!(
@@ -1511,7 +1583,10 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert!(module.supports(Path::new("slide.docx"), OutputFormat::MARKDOWN));
         assert!(module.supports(Path::new("scan.png"), OutputFormat("plain")));
         assert!(!module.supports(Path::new("clip.mp4"), OutputFormat::MARKDOWN));
-        assert!(module.supports(Path::new("clip.mp4"), OutputFormat::TRANSCRIPT));
+        assert_eq!(
+            module.supports(Path::new("clip.mp4"), OutputFormat::TRANSCRIPT),
+            timed_media_supported
+        );
         assert!(!module.supports(Path::new("clip.mp4"), OutputFormat::VTT));
         assert!(!module.supports(Path::new("captions.vtt"), OutputFormat::TRANSCRIPT));
         assert!(module.supports(Path::new("captions.vtt"), OutputFormat::MARKDOWN));
@@ -1538,6 +1613,7 @@ printf '%s' "$body" > "$output/$stem.$ext"
         assert_eq!(defaults.video_frame_interval_secs, 10.0);
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     #[test]
     fn audio_and_video_options_use_pinned_docling_argv() {
         let directory = std::env::temp_dir();

@@ -9,7 +9,10 @@ also pins the following runtime packages:
 
 - [Microsoft MarkItDown](https://github.com/microsoft/markitdown) `markitdown[all]==0.1.6`
 - [Docling](https://github.com/docling-project/docling) `docling[asr]==2.115.0`
-- [Docling Slim](https://github.com/docling-project/docling) `docling-slim[format-video]==2.115.0`
+  on Apple Silicon; base `docling==2.115.0` on Intel
+- [Docling Slim](https://github.com/docling-project/docling)
+  `docling-slim[format-video]==2.115.0` on Apple Silicon; base
+  `docling-slim==2.115.0` on Intel
 - [Defuddle](https://github.com/kepano/defuddle) `defuddle@0.19.2`
 
 Their licenses, notices, and transitive dependencies are governed by their

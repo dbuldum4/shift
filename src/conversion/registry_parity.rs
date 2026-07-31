@@ -160,11 +160,13 @@ fn default_registry_capability_consistency() {
     // Docling's non-cartesian surface is an explicit allowlist so accidental
     // expansion of timed-media Markdown/VTT (or untimed transcript) fails CI.
     if let Some(docling) = registry.modules().find(|module| module.id() == "docling") {
+        let timed_media_supported = !cfg!(all(target_os = "macos", target_arch = "x86_64"));
         for media in ["clip.mp4", "track.wav", "clip.mov"] {
             let path = PathBuf::from(media);
-            assert!(
+            assert_eq!(
                 docling.supports(&path, OutputFormat::TRANSCRIPT),
-                "docling must support {media} → transcript"
+                timed_media_supported,
+                "Docling timed-media capability must match platform support for {media}"
             );
             assert!(
                 !docling.supports(&path, OutputFormat::MARKDOWN),

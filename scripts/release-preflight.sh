@@ -66,6 +66,8 @@ require_contains "$root/THIRD_PARTY_NOTICES.md" "docling[asr]=="
 require_contains "$root/THIRD_PARTY_NOTICES.md" "docling-slim[format-video]=="
 require_contains "$root/scripts/package-macos.sh" "docling[asr]=="
 require_contains "$root/scripts/package-macos.sh" "docling-slim[format-video]=="
+require_contains "$root/scripts/package-macos.sh" "docling==2.115.0"
+require_contains "$root/scripts/package-macos.sh" "docling-slim==2.115.0"
 require_contains "$root/scripts/package-macos.sh" "CFBundleDocumentTypes"
 
 printf '%s\n' "release preflight passed for Shift $version"

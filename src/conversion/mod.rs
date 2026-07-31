@@ -2499,12 +2499,17 @@ mod tests {
         assert!(video_outputs.contains(&OutputFormat::MP3));
         // ASR lives on the dedicated transcript action so MarkItDown/FFmpeg
         // chains keep video → Markdown and FFmpeg keeps subtitle-track VTT/SRT.
-        assert!(video_outputs.contains(&OutputFormat::TRANSCRIPT));
-        assert!(
+        let timed_media_supported = !cfg!(all(target_os = "macos", target_arch = "x86_64"));
+        assert_eq!(
+            video_outputs.contains(&OutputFormat::TRANSCRIPT),
+            timed_media_supported
+        );
+        assert_eq!(
             registry
                 .module_for(Path::new("clip.mov"), OutputFormat::TRANSCRIPT)
                 .is_some_and(|module| module.id() == "docling"),
-            "Docling should own video → Transcript (ASR)"
+            timed_media_supported,
+            "Docling video → Transcript must match platform ASR support"
         );
         assert!(
             registry
@@ -4035,11 +4040,15 @@ mod tests {
     fn two_step_url_and_file_route_ids_cover_common_chains() {
         let registry = ConversionRegistry::default();
 
-        // Video → Transcript is the direct Docling ASR route.
-        let ids = registry
-            .route_module_ids(Path::new("clip.mp4"), OutputFormat::TRANSCRIPT)
-            .expect("video→transcript route");
-        assert_eq!(ids, vec!["docling"]);
+        // Video → Transcript is the direct Docling ASR route where the pinned
+        // runtime supports it (PyTorch no longer ships macOS Intel wheels).
+        let transcript_ids =
+            registry.route_module_ids(Path::new("clip.mp4"), OutputFormat::TRANSCRIPT);
+        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            assert!(transcript_ids.is_none());
+        } else {
+            assert_eq!(transcript_ids, Some(vec!["docling"]));
+        }
         // Video → Markdown should not be a Docling direct route (ASR is transcript).
         if let Some(md_ids) =
             registry.route_module_ids(Path::new("clip.mp4"), OutputFormat::MARKDOWN)
@@ -4175,13 +4184,14 @@ mod tests {
             };
             assert_eq!(ids, vec!["ffmpeg"], "route for {}", format.id());
         }
-        // ASR is a dedicated action outside the MEDIA partition.
-        assert_eq!(
-            registry
-                .route_module_ids(input, OutputFormat::TRANSCRIPT)
-                .expect("video→transcript"),
-            vec!["docling"]
-        );
+        // ASR is a dedicated action outside the MEDIA partition where the
+        // pinned runtime supports it.
+        let transcript_ids = registry.route_module_ids(input, OutputFormat::TRANSCRIPT);
+        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            assert!(transcript_ids.is_none());
+        } else {
+            assert_eq!(transcript_ids, Some(vec!["docling"]));
+        }
     }
 
     #[test]

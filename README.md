@@ -13,7 +13,7 @@ Releases](https://github.com/dbuldum4/shift/releases), then verify its checksum
 before opening it:
 
 ```sh
-shasum -a 256 -c shift-1.1.0-macos-<arch>.zip.sha256
+shasum -a 256 -c shift-1.1.1-macos-<arch>.zip.sha256
 ```
 
 Open the DMG and drag `Shift.app` into Applications. The command-line tool is
@@ -44,8 +44,11 @@ set. Web pages are extracted with [Defuddle](https://github.com/kepano/defuddle)
 which removes clutter and returns clean Markdown or HTML.
 [Docling](https://github.com/docling-project/docling) reads PDFs and other
 documents with layout-aware parsing and exports Markdown, HTML, plain text, or
-JSON (including PDF → HTML). Its local ASR pipeline turns audio and video into
-a dedicated `transcript` output (FFmpeg keeps subtitle-track SRT/VTT).
+JSON (including PDF → HTML). On Apple Silicon, its local ASR pipeline turns
+audio and video into a dedicated `transcript` output (FFmpeg keeps
+subtitle-track SRT/VTT). The pinned ASR stack is unavailable on macOS Intel
+because PyTorch 2.8+ does not publish Intel Mac wheels; Intel builds retain
+Docling's document conversion routes.
 [qpdf](https://qpdf.sourceforge.io/)
 provides PDF page extraction, rotation, compression (lossless Flate or smaller
 lossy image recompress), linearization, and page splitting.
@@ -129,9 +132,11 @@ uv pip install --python .venv/bin/python \
 ```
 
 Set `SHIFT_DOCLING_BIN=/absolute/path/to/docling` when it is not available on
-`PATH`. Audio/video transcription also needs FFmpeg; the chosen Whisper model
-downloads on first use. Prefer Docling above MarkItDown in Settings when you
-want higher-quality PDF → Markdown.
+`PATH`. Audio/video transcription is available on Apple Silicon and also needs
+FFmpeg; the chosen Whisper model downloads on first use. On macOS Intel, install
+base `docling==2.115.0` for document conversion; Shift does not advertise its
+unsupported transcript route. Prefer Docling above MarkItDown in Settings when
+you want higher-quality PDF → Markdown.
 
 - [qpdf](https://qpdf.sourceforge.io/) for PDF toolkit operations:
 
@@ -443,7 +448,7 @@ secrets: automation should be explicit, inspectable, and easy to stop.
 GPUI app ─────┐                          ┌─ MarkItDownModule
               ├── ConversionRegistry ───┼─ PandocModule
 shift-cli ────┘                          ├─ DefuddleModule  (URLs + HTML)
-         └── BatchQueue / run_batch      ├─ DoclingModule   (docs/audio/video → md/html/text/json/vtt)
+         └── BatchQueue / run_batch      ├─ DoclingModule   (docs → text formats; ARM ASR → transcript)
                                          └─ FfmpegModule    (audio/video/stills/subs)
 ```
 

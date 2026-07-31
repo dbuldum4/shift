@@ -7,7 +7,7 @@ on:
 
 jobs:
   rust:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
