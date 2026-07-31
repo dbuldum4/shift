@@ -41,7 +41,7 @@ place.
    `shift-cli --version`, run `shift-cli doctor`, convert a representative local
    file, and confirm source preservation and output placement.
 
-## Signing and notarization (not part of 1.0.0)
+## Signing and notarization (not part of 1.1.0)
 
 Signing and notarization require a Developer ID certificate, a secure credential
 handling plan, CI keychain setup, `codesign` verification, and `spctl`/notary

@@ -2,7 +2,7 @@ const statement =
   "shift is a blazingly fast, native, opinionated, and robust file converter built for macOS";
 
 const githubUrl = "https://github.com/dbuldum4/shift";
-const releaseUrl = `${githubUrl}/releases/tag/v1.0.0`;
+const releaseUrl = `${githubUrl}/releases/tag/v1.1.0`;
 
 function ExternalLink({ href, children, className = "" }) {
   return (
@@ -25,7 +25,7 @@ export function App() {
 
       <section className="hero" aria-labelledby="intro">
         <h1 id="intro">{statement}</h1>
-        <ExternalLink className="download-link" href={releaseUrl}>download shift 1.0.0</ExternalLink>
+        <ExternalLink className="download-link" href={releaseUrl}>download shift 1.1.0</ExternalLink>
       </section>
 
       <footer>

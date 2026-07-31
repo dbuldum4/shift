@@ -36,7 +36,7 @@ notarization to test during development.
 
 ## Security status
 
-Shift 1.0.0 is not yet distributed with a Developer ID signature or Apple
+Shift 1.1.0 is not yet distributed with a Developer ID signature or Apple
 notarization. This release process deliberately does not add signing work.
 Users may need to use macOS's Control-click → Open flow. Signing and
 notarization are explicit follow-up release work, not an implied guarantee of

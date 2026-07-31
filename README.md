@@ -7,13 +7,13 @@ conversion modules for scripts and terminal workflows.
 
 ## Install, upgrade, and uninstall
 
-Shift 1.0 supports macOS 13 (Ventura) and later on Apple Silicon and Intel.
+Shift 1.1 supports macOS 13 (Ventura) and later on Apple Silicon and Intel.
 Download the archive that matches your Mac from [GitHub
 Releases](https://github.com/dbuldum4/shift/releases), then verify its checksum
 before opening it:
 
 ```sh
-shasum -a 256 -c shift-1.0.0-macos-<arch>.zip.sha256
+shasum -a 256 -c shift-1.1.0-macos-<arch>.zip.sha256
 ```
 
 Open the DMG and drag `Shift.app` into Applications. The command-line tool is
