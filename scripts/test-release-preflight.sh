@@ -205,4 +205,19 @@ grep -Fq 'typing-*.dist-info' "$root/scripts/package-macos.sh" \
     exit 1
   }
 
+# Managed dependency archives must be relocatable and match the architecture
+# names consumed by the Rust manifest selector.
+for required in \
+  'python_prefix="$("$python_bin" -c' \
+  'cp -R -L "$python_prefix" "$docs_payload/python-runtime"' \
+  'cp -R -L "$node_prefix" "$web_payload/node-runtime"' \
+  'if find "$docs_payload" "$web_payload" -type l -print' \
+  'provides": $documents_provides'; do
+  grep -Fq "$required" "$root/scripts/package-macos.sh" \
+    || {
+      echo "package-macos missing managed dependency hardening: $required" >&2
+      exit 1
+    }
+done
+
 printf '%s\n' 'release preflight failure-path test passed'

@@ -1,10 +1,12 @@
 # Distribution strategy
 
 Shift uses GitHub Releases as its distribution channel. Each macOS release
-includes a drag-to-install DMG, a ZIP archive, and SHA-256 checksum files.
+includes a drag-to-install DMG, an application ZIP, architecture-specific
+managed dependency ZIPs, and SHA-256 checksum files for every artifact.
 
-The release artifacts contain `Shift.app` and `shift-cli`; MarkItDown, Docling,
-and Defuddle are not embedded in the application bundle. Onboarding offers an
+The application artifacts contain `Shift.app` and `shift-cli`; MarkItDown,
+Docling, and Defuddle are not embedded in the application bundle. Onboarding
+offers an
 optional verified dependency installation that keeps converter components under
 `~/Library/Application Support/Shift/dependencies`. It neither changes the
 user's shell nor invokes Homebrew, pip, or npm. Each release pins and verifies

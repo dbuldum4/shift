@@ -9,7 +9,7 @@
 use crate::session_settings::application_support_dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -43,6 +43,10 @@ pub struct DependencyComponent {
     pub unpacked_bytes: u64,
     #[serde(default)]
     pub requires: Vec<String>,
+    /// Additional capabilities provided by the same archive. For example,
+    /// the Apple Silicon document archive also contains Docling's ASR stack.
+    #[serde(default)]
+    pub provides: Vec<DependencyCapability>,
     #[serde(default)]
     pub executables: BTreeMap<String, String>,
     #[serde(default)]
@@ -56,6 +60,12 @@ pub enum DependencyCapability {
     WebExtraction,
     MediaTranscription,
     PdfPublishingToolkit,
+}
+
+impl DependencyComponent {
+    fn supports_capability(&self, capability: DependencyCapability) -> bool {
+        self.capability == capability || self.provides.contains(&capability)
+    }
 }
 
 impl DependencyCapability {
@@ -211,17 +221,60 @@ pub fn managed_runtime_tool(name: &str) -> Option<PathBuf> {
     None
 }
 
+fn manifest_architecture_for(target_arch: &str) -> &str {
+    match target_arch {
+        // The release packager uses `uname -m`, which calls Apple Silicon
+        // `arm64`; Rust's target architecture name is `aarch64`.
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+fn current_manifest_architecture() -> &'static str {
+    manifest_architecture_for(std::env::consts::ARCH)
+}
+
+fn capabilities_for_components(
+    components: &[DependencyComponent],
+    architecture: &str,
+) -> Vec<DependencyCapability> {
+    let mut capabilities = BTreeSet::new();
+    for component in components
+        .iter()
+        .filter(|component| component.architecture == architecture)
+    {
+        capabilities.insert(component.capability);
+        capabilities.extend(component.provides.iter().copied());
+    }
+    capabilities.into_iter().collect()
+}
+
+/// Capabilities backed by at least one component for this release and CPU.
+/// The onboarding UI uses this instead of advertising future/unpublished
+/// dependency groups that would otherwise install nothing.
+pub fn available_capabilities() -> Result<Vec<DependencyCapability>, DependencyError> {
+    let manifest = embedded_manifest()?;
+    Ok(capabilities_for_components(
+        &manifest.components,
+        current_manifest_architecture(),
+    ))
+}
+
 pub fn components_for_selection(
     selection: &InstallSelection,
 ) -> Result<Vec<DependencyComponent>, DependencyError> {
     let manifest = embedded_manifest()?;
-    let arch = std::env::consts::ARCH;
+    let arch = current_manifest_architecture();
     let mut wanted: BTreeMap<String, DependencyComponent> = manifest
         .components
         .into_iter()
         .filter(|component| component.architecture == arch)
         .filter(|component| {
-            selection.capabilities.contains(&component.capability)
+            selection
+                .capabilities
+                .iter()
+                .copied()
+                .any(|capability| component.supports_capability(capability))
                 || selection.replace_with_managed.contains(&component.id)
         })
         .map(|component| (component.id.clone(), component))
@@ -573,6 +626,76 @@ fn is_regular_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_component(
+        id: &str,
+        architecture: &str,
+        capability: DependencyCapability,
+        provides: Vec<DependencyCapability>,
+    ) -> DependencyComponent {
+        DependencyComponent {
+            id: id.into(),
+            capability,
+            architecture: architecture.into(),
+            url: "https://github.com/dbuldum4/shift/releases/download/v1.0.0/test.zip".into(),
+            sha256: "0".repeat(64),
+            compressed_bytes: 1,
+            unpacked_bytes: 1,
+            requires: Vec::new(),
+            provides,
+            executables: BTreeMap::new(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn release_architecture_names_match_packager() {
+        assert_eq!(manifest_architecture_for("aarch64"), "arm64");
+        assert_eq!(manifest_architecture_for("x86_64"), "x86_64");
+    }
+
+    #[test]
+    fn component_provides_secondary_capabilities() {
+        let component = test_component(
+            "documents-markdown",
+            "arm64",
+            DependencyCapability::DocumentsMarkdown,
+            vec![DependencyCapability::MediaTranscription],
+        );
+        assert!(component.supports_capability(DependencyCapability::DocumentsMarkdown));
+        assert!(component.supports_capability(DependencyCapability::MediaTranscription));
+        assert!(!component.supports_capability(DependencyCapability::PdfPublishingToolkit));
+    }
+
+    #[test]
+    fn available_capabilities_are_architecture_specific() {
+        let components = vec![
+            test_component(
+                "documents-arm",
+                "arm64",
+                DependencyCapability::DocumentsMarkdown,
+                vec![DependencyCapability::MediaTranscription],
+            ),
+            test_component(
+                "documents-intel",
+                "x86_64",
+                DependencyCapability::DocumentsMarkdown,
+                Vec::new(),
+            ),
+        ];
+        assert_eq!(
+            capabilities_for_components(&components, "arm64"),
+            vec![
+                DependencyCapability::DocumentsMarkdown,
+                DependencyCapability::MediaTranscription
+            ]
+        );
+        assert_eq!(
+            capabilities_for_components(&components, "x86_64"),
+            vec![DependencyCapability::DocumentsMarkdown]
+        );
+    }
+
     #[test]
     fn rejects_unsafe_archive_paths() {
         assert!(!is_safe_relative("../x"));

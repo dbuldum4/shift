@@ -34,7 +34,7 @@ Finder, choose **Go → Go to Folder…**, enter
 `~/Library/Application Support/Shift`, and move that folder to the Trash. This
 does not remove files you converted or downloaded elsewhere. See [the release
 guide](docs/RELEASE.md) for the maintainer checklist and [third-party
-notices](THIRD_PARTY_NOTICES.md) for bundled and source dependencies.
+notices](THIRD_PARTY_NOTICES.md) for release-managed and source dependencies.
 
 The ingestion module is powered by
 [Microsoft MarkItDown](https://github.com/microsoft/markitdown), which preserves
@@ -113,8 +113,10 @@ Without any engine, DOCX → PDF fails with an install hint instead of Pandoc's
 raw `pdflatex not found` message.
 
 - [Defuddle](https://github.com/kepano/defuddle) for extracting clean article
-  content from web pages (URLs) or local HTML. Packaged `Shift.app` embeds
-  Defuddle but still needs a system [Node.js](https://nodejs.org/) binary:
+  content from web pages (URLs) or local HTML. Official releases install
+  Defuddle and a verified private [Node.js](https://nodejs.org/) runtime through
+  onboarding. Development and standalone builds still need a system Node.js
+  binary:
 
 ```sh
 brew install node

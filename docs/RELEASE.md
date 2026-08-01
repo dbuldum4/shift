@@ -24,18 +24,20 @@ place.
    sh scripts/test-release-preflight.sh
    ```
 
-6. Review `THIRD_PARTY_NOTICES.md` whenever dependencies or bundled runtime
-   packages change. Confirm the bundled package versions and their upstream
+6. Review `THIRD_PARTY_NOTICES.md` whenever dependencies or release-managed
+   runtime packages change. Confirm the package versions and their upstream
    licenses remain accurate.
 
 ## Release run
 
 1. Create and push an annotated `v<version>` tag from the reviewed commit.
 2. The macOS release workflow builds with `--locked`, runs the metadata gate,
-   packages the application, and validates the app bundle, embedded CLI version,
-   ZIP/DMG integrity, and SHA-256 sidecars before publishing.
-3. Verify the GitHub Release contains one ZIP, one DMG, and one `.sha256` file
-   for each artifact; use the release notes as the public changelog.
+   packages the application and architecture-specific managed dependency
+   archives, and validates the app bundle, embedded CLI version, ZIP/DMG
+   integrity, and SHA-256 sidecars before publishing.
+3. Verify the GitHub Release contains the application ZIP, DMG, both managed
+   dependency ZIPs, and a matching `.sha256` sidecar for every artifact; use
+   the release notes as the public changelog.
 4. On a clean macOS 13+ machine (Apple Silicon and Intel where available),
    verify the checksum, drag the app to Applications, run
    `shift-cli --version`, run `shift-cli doctor`, convert a representative local

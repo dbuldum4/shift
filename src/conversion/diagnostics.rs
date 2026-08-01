@@ -592,11 +592,12 @@ fn probe_markitdown() -> EngineDiagnostic {
     let install_hint =
         "python3 -m pip install 'markitdown[all]'  (or: uv pip install 'markitdown[all]')".into();
     let env_override = "SHIFT_MARKITDOWN_BIN";
-    let resolved = resolve_tool_path(
-        env_override,
-        "markitdown",
-        &[project_venv_bin("markitdown")],
-    );
+    let mut locals = Vec::new();
+    if let Some(bundled) = bundled_runtime_tool("markitdown") {
+        locals.push(bundled);
+    }
+    locals.push(project_venv_bin("markitdown"));
+    let resolved = resolve_tool_path(env_override, "markitdown", &locals);
     finish_engine_probe(
         "markitdown",
         "MarkItDown",
@@ -626,20 +627,22 @@ fn probe_pandoc() -> EngineDiagnostic {
 fn probe_defuddle() -> EngineDiagnostic {
     let env_override = "SHIFT_DEFUDDLE_BIN";
     let mut locals = Vec::new();
-    if let Some(bundled) = bundled_runtime_tool("defuddle") {
-        locals.push(bundled);
+    let bundled = bundled_runtime_tool("defuddle");
+    if let Some(path) = bundled.as_ref() {
+        locals.push(path.clone());
     }
     locals.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/.bin/defuddle"));
 
     let node = find_executable("node");
+    let has_bundled_launcher = bundled.as_deref().is_some_and(is_runnable);
     let install_hint = if node.is_none() {
         "brew install node  (or: export SHIFT_NODE_BIN=/absolute/path/to/node)".into()
     } else {
         "npm install -g defuddle  (or: set SHIFT_DEFUDDLE_BIN=/absolute/path/to/defuddle)".into()
     };
-    let notes = if node.is_none() {
+    let notes = if node.is_none() && !has_bundled_launcher {
         Some(
-            "Packaged Shift embeds Defuddle but needs a system Node binary \
+            "Defuddle needs Node.js for system or development installs \
              (Homebrew, nvm, fnm, volta, asdf, or mise)."
                 .into(),
         )
@@ -659,7 +662,11 @@ fn probe_defuddle() -> EngineDiagnostic {
 
     // A packaged shell launcher can exist and still fail when Node is missing.
     // Prefer Missing so Settings and failure install hints match runtime reality.
-    if diagnostic.readiness.is_ready() && diagnostic.version.is_none() && node.is_none() {
+    if diagnostic.readiness.is_ready()
+        && diagnostic.version.is_none()
+        && node.is_none()
+        && !has_bundled_launcher
+    {
         diagnostic.readiness = Readiness::Missing;
         if diagnostic.notes.is_none() {
             diagnostic.notes =
@@ -673,7 +680,12 @@ fn probe_defuddle() -> EngineDiagnostic {
 fn probe_docling() -> EngineDiagnostic {
     let install_hint = "python3 -m pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0'  (or: uv pip install 'docling[asr]==2.115.0' 'docling-slim[format-video]==2.115.0')".into();
     let env_override = "SHIFT_DOCLING_BIN";
-    let resolved = resolve_tool_path(env_override, "docling", &[project_venv_bin("docling")]);
+    let mut locals = Vec::new();
+    if let Some(bundled) = bundled_runtime_tool("docling") {
+        locals.push(bundled);
+    }
+    locals.push(project_venv_bin("docling"));
+    let resolved = resolve_tool_path(env_override, "docling", &locals);
     finish_engine_probe(
         "docling",
         "Docling",

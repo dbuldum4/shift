@@ -3,7 +3,8 @@ use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use shift_core::conversion::PdfCompression;
 use shift_core::dependencies::{
-    DependencyCapability, InstallOutcome, InstallSelection, embedded_manifest, install_selected,
+    DependencyCapability, InstallOutcome, InstallSelection, available_capabilities,
+    install_selected,
 };
 use std::io;
 use std::sync::mpsc::TryRecvError;
@@ -252,6 +253,7 @@ pub(crate) struct Shift {
     pub(crate) dependency_install_status: Option<SharedString>,
     pub(crate) dependency_install_outcome: Option<InstallOutcome>,
     pub(crate) dependency_install_cancel: Arc<AtomicBool>,
+    pub(crate) dependency_capabilities: Vec<DependencyCapability>,
     pub(crate) dependency_selection: Vec<DependencyCapability>,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
@@ -585,6 +587,7 @@ impl Shift {
             history_from_store_detailed(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
+        let dependency_capabilities = available_capabilities().unwrap_or_default();
         let cached_available_outputs = OutputFormat::ALL.to_vec();
         let cached_ready_outputs = None;
         let cached_history_filter = (String::new(), session.show_archived, history.len());
@@ -636,12 +639,8 @@ impl Shift {
             dependency_install_status: None,
             dependency_install_outcome: None,
             dependency_install_cancel: Arc::new(AtomicBool::new(false)),
-            dependency_selection: vec![
-                DependencyCapability::DocumentsMarkdown,
-                DependencyCapability::WebExtraction,
-                DependencyCapability::MediaTranscription,
-                DependencyCapability::PdfPublishingToolkit,
-            ],
+            dependency_capabilities: dependency_capabilities.clone(),
+            dependency_selection: dependency_capabilities,
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -2072,39 +2071,54 @@ impl Shift {
         cx.notify();
     }
 
-    /// Download the release-pinned managed toolchain without invoking a package
-    /// manager or changing the user's shell environment.
+    /// Download every managed component published for this release and CPU.
+    /// This deliberately ignores the onboarding selection so the Settings
+    /// action remains an actual "install all" operation.
     pub(crate) fn install_all_dependencies(&mut self, cx: &mut Context<Self>) {
         if self.dependency_installing {
             return;
         }
-        if self.dependency_selection.is_empty() {
-            self.dependency_install_status =
-                Some("Select at least one dependency group to install.".into());
-            cx.notify();
-            return;
-        }
-        match embedded_manifest() {
-            Ok(manifest) if !manifest.components.is_empty() => {}
+        match available_capabilities() {
+            Ok(capabilities) if !capabilities.is_empty() => {
+                self.start_dependency_install(capabilities, cx)
+            }
             Ok(_) => {
                 self.dependency_install_status =
                     Some("Managed dependencies are published with official Shift releases.".into());
                 cx.notify();
-                return;
             }
             Err(error) => {
                 self.dependency_install_status =
                     Some(format!("Dependency setup is unavailable: {error}").into());
                 cx.notify();
-                return;
             }
-        };
+        }
+    }
+
+    /// Download only the capability groups selected in onboarding.
+    pub(crate) fn install_selected_dependencies(&mut self, cx: &mut Context<Self>) {
+        self.start_dependency_install(self.dependency_selection.clone(), cx);
+    }
+
+    fn start_dependency_install(
+        &mut self,
+        capabilities: Vec<DependencyCapability>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dependency_installing {
+            return;
+        }
+        if capabilities.is_empty() {
+            self.dependency_install_status =
+                Some("Select at least one dependency group to install.".into());
+            cx.notify();
+            return;
+        }
         self.dependency_installing = true;
         self.dependency_install_status = Some("Downloading verified dependencies…".into());
         self.dependency_install_outcome = None;
         self.dependency_install_cancel = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&self.dependency_install_cancel);
-        let capabilities = self.dependency_selection.clone();
         cx.notify();
         let task = cx.background_executor().spawn(async move {
             install_selected(
@@ -2124,8 +2138,11 @@ impl Shift {
                     Ok(outcome) => {
                         let installed = outcome.installed.len();
                         let failed = outcome.failed.len();
-                        this.dependency_install_status = Some(if failed == 0 {
-                            format!("Installed {installed} verified dependency component(s). ")
+                        this.dependency_install_status = Some(if installed == 0 && failed == 0 {
+                            "No selected dependency components are available for this release."
+                                .into()
+                        } else if failed == 0 {
+                            format!("Installed {installed} verified dependency component(s).")
                                 .into()
                         } else {
                             format!("Installed {installed}; {failed} component(s) need retry.")
@@ -4176,6 +4193,7 @@ impl Render for Shift {
         };
         let dependency_installing = self.dependency_installing;
         let dependency_install_status = self.dependency_install_status.clone();
+        let dependency_capabilities = self.dependency_capabilities.clone();
         let folder_confirm = self.folder_confirm.clone();
         let settings_section = self.settings_section;
         let settings_tab_direction = self.settings_tab_direction;
@@ -4741,6 +4759,7 @@ impl Render for Shift {
                     onboarding_nav,
                     self.dependency_installing,
                     self.dependency_install_status.clone(),
+                    dependency_capabilities,
                     self.dependency_selection.clone(),
                     cx,
                 ))

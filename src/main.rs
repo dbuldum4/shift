@@ -4107,13 +4107,18 @@ fn onboarding_step_index(step: OnboardingStep) -> usize {
     }
 }
 
-fn onboarding_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
+fn onboarding_button<Id, Label, OnClick>(
+    id: Id,
+    label: Label,
     primary: bool,
     cx: &mut Context<Shift>,
-    on_click: impl Fn(&mut Shift, &mut Context<Shift>) + 'static,
-) -> impl IntoElement {
+    on_click: OnClick,
+) -> impl IntoElement + use<Id, Label, OnClick>
+where
+    Id: Into<ElementId>,
+    Label: Into<SharedString>,
+    OnClick: Fn(&mut Shift, &mut Context<Shift>) + 'static,
+{
     // Press feedback: opacity stand-in for scale(0.97) — GPUI divs have no transform.
     // Primary uses a snappier dip so the CTA feels physical (Emil: 100–160ms press feel).
     div()
@@ -4153,7 +4158,7 @@ fn onboarding_dependency_toggle(
     capability: shift_core::dependencies::DependencyCapability,
     selected: bool,
     cx: &mut Context<Shift>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     onboarding_button(
         ("onboarding-dependency", id),
         format!(
@@ -4321,10 +4326,17 @@ fn onboarding_overlay(
     nav: animation::OnboardingNavDirection,
     dependency_installing: bool,
     dependency_install_status: Option<SharedString>,
+    dependency_capabilities: Vec<shift_core::dependencies::DependencyCapability>,
     dependency_selection: Vec<shift_core::dependencies::DependencyCapability>,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let step_key = onboarding_step_index(step);
+    let has_dependency_capabilities = !dependency_capabilities.is_empty();
+    let mut dependency_toggles = Vec::with_capacity(dependency_capabilities.len());
+    for (id, capability) in dependency_capabilities.iter().copied().enumerate() {
+        let selected = dependency_selection.contains(&capability);
+        dependency_toggles.push(onboarding_dependency_toggle(id, capability, selected, cx));
+    }
     let (title, body) = match step {
         // Stagger indices: title is always 0; body items start at 1 so the cascade reads top-down.
         OnboardingStep::Welcome => (
@@ -4427,64 +4439,47 @@ fn onboarding_overlay(
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(onboarding_dependency_toggle(
-                            0,
-                            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
-                            dependency_selection.contains(
-                                &shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
-                            ),
-                            cx,
-                        ))
-                        .child(onboarding_dependency_toggle(
-                            1,
-                            shift_core::dependencies::DependencyCapability::WebExtraction,
-                            dependency_selection.contains(
-                                &shift_core::dependencies::DependencyCapability::WebExtraction,
-                            ),
-                            cx,
-                        ))
-                        .child(onboarding_dependency_toggle(
-                            2,
-                            shift_core::dependencies::DependencyCapability::MediaTranscription,
-                            dependency_selection.contains(
-                                &shift_core::dependencies::DependencyCapability::MediaTranscription,
-                            ),
-                            cx,
-                        ))
-                        .child(onboarding_dependency_toggle(
-                            3,
-                            shift_core::dependencies::DependencyCapability::PdfPublishingToolkit,
-                            dependency_selection.contains(
-                                &shift_core::dependencies::DependencyCapability::PdfPublishingToolkit,
-                            ),
-                            cx,
-                        )),
-                ))
-                .child(onboarding_stagger_in(
-                    step_key,
-                    3,
-                    nav,
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(onboarding_button(
-                            "onboarding-install-dependencies",
-                            "Install selected dependencies",
-                            true,
-                            cx,
-                            |this, cx| this.install_all_dependencies(cx),
-                        ))
-                        .when(dependency_installing, |row| {
-                            row.child(onboarding_button(
-                                "onboarding-cancel-dependencies",
-                                "Cancel",
-                                false,
-                                cx,
-                                |this, cx| this.cancel_dependency_install(cx),
-                            ))
+                        .when(has_dependency_capabilities, |list| {
+                            list.children(dependency_toggles)
+                        })
+                        .when(!has_dependency_capabilities, |list| {
+                            list.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(THEME.text_muted)
+                                    .child(
+                                        "Managed dependencies are available with official Shift releases.",
+                                    ),
+                            )
                         }),
                 ))
+                .when(has_dependency_capabilities, |column| {
+                    column.child(onboarding_stagger_in(
+                        step_key,
+                        3,
+                        nav,
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(onboarding_button(
+                                "onboarding-install-dependencies",
+                                "Install selected dependencies",
+                                true,
+                                cx,
+                                |this, cx| this.install_selected_dependencies(cx),
+                            ))
+                            .when(dependency_installing, |row| {
+                                row.child(onboarding_button(
+                                    "onboarding-cancel-dependencies",
+                                    "Cancel",
+                                    false,
+                                    cx,
+                                    |this, cx| this.cancel_dependency_install(cx),
+                                ))
+                            }),
+                    ))
+                })
                 .when_some(dependency_install_status, |column, status| {
                     column.child(
                         div()

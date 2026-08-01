@@ -249,15 +249,27 @@ SHIFT_NODE_BIN="$(command -v node)" "$runtime/bin/defuddle" --help >/dev/null
 docs_payload="$resources/.dependency-documents"
 web_payload="$resources/.dependency-web"
 mkdir -p "$docs_payload/bin" "$web_payload/bin"
-cp -R "$runtime/python" "$docs_payload/python"
-python_prefix="$(CDPATH= cd -- "$(dirname "$(command -v python3.11)")/.." && pwd)"
-node_prefix="$(CDPATH= cd -- "$(dirname "$(command -v node)")/.." && pwd)"
-cp -R "$python_prefix" "$docs_payload/python-runtime"
+python_bin="$(command -v python3.11)"
+node_bin="$(command -v node)"
+# Use the interpreter's real prefix rather than the parent of a PATH shim
+# (setup-uv commonly exposes Python through ~/.local/bin/python3.11).
+python_prefix="$("$python_bin" -c 'import sys; print(sys.prefix)')"
+node_real="$("$node_bin" -p 'require("fs").realpathSync(process.execPath)')"
+node_prefix="$(CDPATH= cd -- "$(dirname "$node_real")/.." && pwd)"
+# Runtime aliases such as bin/python3 and npm's node_modules/.bin links are
+# not needed by the launchers and cannot be safely recreated by the installer.
+# Dereference them while assembling the immutable release components.
+cp -R -L "$runtime/python" "$docs_payload/python"
+cp -R -L "$python_prefix" "$docs_payload/python-runtime"
 cp "$runtime/bin/markitdown" "$runtime/bin/docling" "$docs_payload/bin/"
-cp -R "$runtime/node" "$web_payload/node"
-cp -R "$node_prefix" "$web_payload/node-runtime"
+cp -R -L "$runtime/node" "$web_payload/node"
+cp -R -L "$node_prefix" "$web_payload/node-runtime"
 cp "$runtime/bin/defuddle" "$web_payload/bin/"
 chmod +x "$docs_payload/bin/"* "$web_payload/bin/"*
+if find "$docs_payload" "$web_payload" -type l -print | grep -q .; then
+  echo "package-macos: dependency payload still contains symlinks" >&2
+  exit 2
+fi
 "$docs_payload/bin/markitdown" --help >/dev/null
 "$docs_payload/bin/docling" --help >/dev/null
 "$web_payload/bin/defuddle" --help >/dev/null
@@ -280,6 +292,11 @@ docs_bytes="$(stat -f %z "$docs_archive")"
 web_bytes="$(stat -f %z "$web_archive")"
 docs_unpacked="$(du -sk "$docs_payload" | awk '{print $1 * 1024}')"
 web_unpacked="$(du -sk "$web_payload" | awk '{print $1 * 1024}')"
+if [ "$arch" = "arm64" ]; then
+  documents_provides='["media-transcription"]'
+else
+  documents_provides='[]'
+fi
 cat > "$resources/dependency-manifest.json" <<EOF
 {
   "schema_version": 1,
@@ -293,6 +310,7 @@ cat > "$resources/dependency-manifest.json" <<EOF
       "sha256": "$docs_sha",
       "compressed_bytes": $docs_bytes,
       "unpacked_bytes": $docs_unpacked,
+      "provides": $documents_provides,
       "executables": {"markitdown": "bin/markitdown", "docling": "bin/docling"}
     },
     {
