@@ -3,6 +3,8 @@ set -eu
 
 version="${1:?version required}"
 output_dir="${2:-dist}"
+mkdir -p "$output_dir"
+output_dir="$(CDPATH= cd -- "$output_dir" && pwd)"
 arch="$(uname -m)"
 app="$output_dir/Shift.app"
 contents="$app/Contents"
@@ -28,7 +30,6 @@ if [ ! -x target/release/shift ] || [ ! -x target/release/shift-cli ]; then
   exit 2
 fi
 
-mkdir -p "$output_dir"
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$resources/bin" "$runtime/bin" "$runtime/python" "$runtime/node"
 
@@ -140,7 +141,7 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 python="${SHIFT_PYTHON_BIN:-}"
 if [ -z "$python" ]; then
-  for candidate in /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/opt/python@3.11/bin/python3.11 python3.11; do
+  for candidate in "$root/python-runtime/bin/python3.11" /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/opt/python@3.11/bin/python3.11 python3.11; do
     if command -v "$candidate" >/dev/null 2>&1; then python="$candidate"; break; fi
   done
 fi
@@ -153,7 +154,7 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 python="${SHIFT_PYTHON_BIN:-}"
 if [ -z "$python" ]; then
-  for candidate in /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/opt/python@3.11/bin/python3.11 python3.11; do
+  for candidate in "$root/python-runtime/bin/python3.11" /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/opt/python@3.11/bin/python3.11 python3.11; do
     if command -v "$candidate" >/dev/null 2>&1; then python="$candidate"; break; fi
   done
 fi
@@ -167,6 +168,10 @@ root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 
 # Resolve Node for GUI apps with a minimal PATH (Homebrew, nvm, fnm, volta, asdf, mise).
 resolve_node() {
+  if [ -x "$root/node-runtime/bin/node" ]; then
+    printf '%s\n' "$root/node-runtime/bin/node"
+    return 0
+  fi
   if [ -n "${SHIFT_NODE_BIN:-}" ] && [ -x "${SHIFT_NODE_BIN}" ]; then
     printf '%s\n' "${SHIFT_NODE_BIN}"
     return 0
@@ -238,6 +243,73 @@ SHIFT_PYTHON_BIN="$(command -v python3.11)" "$runtime/bin/markitdown" --help >/d
 SHIFT_PYTHON_BIN="$(command -v python3.11)" "$runtime/bin/docling" --help >/dev/null
 SHIFT_NODE_BIN="$(command -v node)" "$runtime/bin/defuddle" --help >/dev/null
 
+# Converter packages are an optional, verified download — never a hidden part
+# of Shift.app. Build two immutable release components, record their exact
+# hashes in Resources, then remove every runtime payload before signing the app.
+docs_payload="$resources/.dependency-documents"
+web_payload="$resources/.dependency-web"
+mkdir -p "$docs_payload/bin" "$web_payload/bin"
+cp -R "$runtime/python" "$docs_payload/python"
+python_prefix="$(CDPATH= cd -- "$(dirname "$(command -v python3.11)")/.." && pwd)"
+node_prefix="$(CDPATH= cd -- "$(dirname "$(command -v node)")/.." && pwd)"
+cp -R "$python_prefix" "$docs_payload/python-runtime"
+cp "$runtime/bin/markitdown" "$runtime/bin/docling" "$docs_payload/bin/"
+cp -R "$runtime/node" "$web_payload/node"
+cp -R "$node_prefix" "$web_payload/node-runtime"
+cp "$runtime/bin/defuddle" "$web_payload/bin/"
+chmod +x "$docs_payload/bin/"* "$web_payload/bin/"*
+"$docs_payload/bin/markitdown" --help >/dev/null
+"$docs_payload/bin/docling" --help >/dev/null
+"$web_payload/bin/defuddle" --help >/dev/null
+
+docs_name="shift-dependencies-${version}-macos-${arch}-documents-markdown.zip"
+web_name="shift-dependencies-${version}-macos-${arch}-web-extraction.zip"
+docs_archive="$output_dir/$docs_name"
+web_archive="$output_dir/$web_name"
+(
+  cd "$docs_payload"
+  ditto -c -k --sequesterRsrc bin python python-runtime "$docs_archive"
+)
+(
+  cd "$web_payload"
+  ditto -c -k --sequesterRsrc bin node node-runtime "$web_archive"
+)
+docs_sha="$(shasum -a 256 "$docs_archive" | awk '{print $1}')"
+web_sha="$(shasum -a 256 "$web_archive" | awk '{print $1}')"
+docs_bytes="$(stat -f %z "$docs_archive")"
+web_bytes="$(stat -f %z "$web_archive")"
+docs_unpacked="$(du -sk "$docs_payload" | awk '{print $1 * 1024}')"
+web_unpacked="$(du -sk "$web_payload" | awk '{print $1 * 1024}')"
+cat > "$resources/dependency-manifest.json" <<EOF
+{
+  "schema_version": 1,
+  "release_version": "$version",
+  "components": [
+    {
+      "id": "documents-markdown",
+      "capability": "documents-markdown",
+      "architecture": "$arch",
+      "url": "https://github.com/dbuldum4/shift/releases/download/v$version/$docs_name",
+      "sha256": "$docs_sha",
+      "compressed_bytes": $docs_bytes,
+      "unpacked_bytes": $docs_unpacked,
+      "executables": {"markitdown": "bin/markitdown", "docling": "bin/docling"}
+    },
+    {
+      "id": "web-extraction",
+      "capability": "web-extraction",
+      "architecture": "$arch",
+      "url": "https://github.com/dbuldum4/shift/releases/download/v$version/$web_name",
+      "sha256": "$web_sha",
+      "compressed_bytes": $web_bytes,
+      "unpacked_bytes": $web_unpacked,
+      "executables": {"defuddle": "bin/defuddle"}
+    }
+  ]
+}
+EOF
+rm -rf "$runtime" "$docs_payload" "$web_payload"
+
 # No Developer ID is available yet. Ad-hoc signing keeps the bundle internally
 # consistent, but the release notes must disclose that Gatekeeper notarization
 # is not available for 0.1.x.
@@ -252,6 +324,8 @@ ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
 (
   cd "$output_dir"
   shasum -a 256 "$archive_name" > "${archive_name}.sha256"
+  shasum -a 256 "$docs_name" > "${docs_name}.sha256"
+  shasum -a 256 "$web_name" > "${web_name}.sha256"
 )
 
 dmg_root="$(mktemp -d "${TMPDIR:-/tmp}/shift-dmg.XXXXXX")"

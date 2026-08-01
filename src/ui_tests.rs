@@ -455,13 +455,19 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::Dependencies)
+    );
+
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
         Some(OnboardingStep::Ready)
     );
 
     shift.update(cx, |this, cx| this.previous_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
-        Some(OnboardingStep::HowItWorks)
+        Some(OnboardingStep::Dependencies)
     );
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_nav),
@@ -470,8 +476,14 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
     shift.update(cx, |this, cx| this.previous_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::HowItWorks)
+    );
+    shift.update(cx, |this, cx| this.previous_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
         Some(OnboardingStep::Welcome)
     );
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(

@@ -3,15 +3,14 @@
 Shift uses GitHub Releases as its distribution channel. Each macOS release
 includes a drag-to-install DMG, a ZIP archive, and SHA-256 checksum files.
 
-The release artifacts contain `Shift.app`, `shift-cli`, the pinned Python
-packages MarkItDown 0.1.6 and Docling 2.115.0, and the pinned Node package
-Defuddle 0.19.2. Apple Silicon artifacts include Docling's ASR/video extras
-(`docling[asr]` and `docling-slim[format-video]`). Intel artifacts include base
-Docling document support without transcription because PyTorch 2.8+ has no
-macOS Intel wheels; Shift removes those unsupported pairs from the Intel
-capability lists. The native runtimes and tools they require—Python 3.11, Node,
-FFmpeg, Pandoc, Typst, and qpdf—remain explicit system requirements. Shift never
-installs packages or mutates the host system at first launch.
+The release artifacts contain `Shift.app` and `shift-cli`; MarkItDown, Docling,
+and Defuddle are not embedded in the application bundle. Onboarding offers an
+optional verified dependency installation that keeps converter components under
+`~/Library/Application Support/Shift/dependencies`. It neither changes the
+user's shell nor invokes Homebrew, pip, or npm. Each release pins and verifies
+its dependency archives before they are activated. Apple Silicon packs include
+Docling ASR/video support; Intel packs retain document conversion and omit the
+unsupported transcription routes.
 
 Docling model weights are intentionally not embedded because upstream selects
 models for the active pipeline and downloads them on demand. They are cached by

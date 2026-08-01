@@ -2,6 +2,9 @@ use crate::*;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use shift_core::conversion::PdfCompression;
+use shift_core::dependencies::{
+    DependencyCapability, InstallOutcome, InstallSelection, embedded_manifest, install_selected,
+};
 use std::io;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -208,6 +211,7 @@ pub(crate) struct FolderExpandConfirm {
 pub(crate) enum OnboardingStep {
     Welcome,
     HowItWorks,
+    Dependencies,
     Ready,
 }
 
@@ -243,6 +247,12 @@ pub(crate) struct Shift {
     pub(crate) onboarding_step: Option<OnboardingStep>,
     /// Last onboarding navigation direction (for direction-aware step motion).
     pub(crate) onboarding_nav: crate::ui::animation::OnboardingNavDirection,
+    /// Optional first-run managed dependency installation state.
+    pub(crate) dependency_installing: bool,
+    pub(crate) dependency_install_status: Option<SharedString>,
+    pub(crate) dependency_install_outcome: Option<InstallOutcome>,
+    pub(crate) dependency_install_cancel: Arc<AtomicBool>,
+    pub(crate) dependency_selection: Vec<DependencyCapability>,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
     pub(crate) shortcuts_help_open: bool,
@@ -622,6 +632,16 @@ impl Shift {
             recipe_status,
             onboarding_step: (!session.onboarding_completed).then_some(OnboardingStep::Welcome),
             onboarding_nav: crate::ui::animation::OnboardingNavDirection::Enter,
+            dependency_installing: false,
+            dependency_install_status: None,
+            dependency_install_outcome: None,
+            dependency_install_cancel: Arc::new(AtomicBool::new(false)),
+            dependency_selection: vec![
+                DependencyCapability::DocumentsMarkdown,
+                DependencyCapability::WebExtraction,
+                DependencyCapability::MediaTranscription,
+                DependencyCapability::PdfPublishingToolkit,
+            ],
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -2018,6 +2038,10 @@ impl Shift {
             }
             Some(OnboardingStep::HowItWorks) => {
                 self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Forward;
+                Some(OnboardingStep::Dependencies)
+            }
+            Some(OnboardingStep::Dependencies) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Forward;
                 Some(OnboardingStep::Ready)
             }
             Some(OnboardingStep::Ready) => {
@@ -2037,11 +2061,119 @@ impl Shift {
             }
             Some(OnboardingStep::Ready) => {
                 self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Back;
+                Some(OnboardingStep::Dependencies)
+            }
+            Some(OnboardingStep::Dependencies) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Back;
                 Some(OnboardingStep::HowItWorks)
             }
             _ => return,
         };
         cx.notify();
+    }
+
+    /// Download the release-pinned managed toolchain without invoking a package
+    /// manager or changing the user's shell environment.
+    pub(crate) fn install_all_dependencies(&mut self, cx: &mut Context<Self>) {
+        if self.dependency_installing {
+            return;
+        }
+        if self.dependency_selection.is_empty() {
+            self.dependency_install_status =
+                Some("Select at least one dependency group to install.".into());
+            cx.notify();
+            return;
+        }
+        match embedded_manifest() {
+            Ok(manifest) if !manifest.components.is_empty() => {}
+            Ok(_) => {
+                self.dependency_install_status =
+                    Some("Managed dependencies are published with official Shift releases.".into());
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.dependency_install_status =
+                    Some(format!("Dependency setup is unavailable: {error}").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.dependency_installing = true;
+        self.dependency_install_status = Some("Downloading verified dependencies…".into());
+        self.dependency_install_outcome = None;
+        self.dependency_install_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&self.dependency_install_cancel);
+        let capabilities = self.dependency_selection.clone();
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            install_selected(
+                &InstallSelection {
+                    capabilities,
+                    replace_with_managed: Vec::new(),
+                },
+                &cancel,
+                |_| {},
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.dependency_installing = false;
+                match result {
+                    Ok(outcome) => {
+                        let installed = outcome.installed.len();
+                        let failed = outcome.failed.len();
+                        this.dependency_install_status = Some(if failed == 0 {
+                            format!("Installed {installed} verified dependency component(s). ")
+                                .into()
+                        } else {
+                            format!("Installed {installed}; {failed} component(s) need retry.")
+                                .into()
+                        });
+                        this.dependency_install_outcome = Some(outcome);
+                        let _ = this.rebuild_registry_with_recipe_preference();
+                        this.diagnostics = None;
+                        this.refresh_diagnostics(cx);
+                    }
+                    Err(error) => {
+                        this.dependency_install_status =
+                            Some(format!("Dependency installation failed: {error}").into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn toggle_dependency_capability(
+        &mut self,
+        capability: DependencyCapability,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dependency_installing {
+            return;
+        }
+        if let Some(index) = self
+            .dependency_selection
+            .iter()
+            .position(|selected| *selected == capability)
+        {
+            self.dependency_selection.remove(index);
+        } else {
+            self.dependency_selection.push(capability);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_dependency_install(&mut self, cx: &mut Context<Self>) {
+        if self.dependency_installing {
+            self.dependency_install_cancel
+                .store(true, Ordering::Relaxed);
+            self.dependency_install_status = Some("Cancelling dependency installation…".into());
+            cx.notify();
+        }
     }
 
     pub(crate) fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
@@ -4042,6 +4174,8 @@ impl Render for Shift {
         } else {
             Vec::new()
         };
+        let dependency_installing = self.dependency_installing;
+        let dependency_install_status = self.dependency_install_status.clone();
         let folder_confirm = self.folder_confirm.clone();
         let settings_section = self.settings_section;
         let settings_tab_direction = self.settings_tab_direction;
@@ -4595,12 +4729,21 @@ impl Render for Shift {
                         markitdown_keep_data_uris,
                         diagnostics,
                         diagnostics_loading,
+                        dependency_installing,
+                        dependency_install_status,
                     },
                     cx,
                 ))
             })
             .when_some(onboarding_step, |root, step| {
-                root.child(onboarding_overlay(step, onboarding_nav, cx))
+                root.child(onboarding_overlay(
+                    step,
+                    onboarding_nav,
+                    self.dependency_installing,
+                    self.dependency_install_status.clone(),
+                    self.dependency_selection.clone(),
+                    cx,
+                ))
             })
     }
 }

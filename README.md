@@ -77,6 +77,12 @@ locally where the upstream converter supports it.
 
 ## Prerequisites
 
+For a downloaded Shift release, the optional onboarding **Install all
+dependencies** step is the normal setup path. It installs release-pinned tools
+privately for Shift after verifying their archive hashes; no terminal, package
+manager, PATH change, or administrator access is required. The commands below
+remain for contributors and standalone development builds.
+
 - macOS with Xcode and its command-line tools
 - Rust stable (selected automatically by `rust-toolchain.toml`)
 - Python 3.11 (packaged launchers and release packaging resolve `python3.11`;

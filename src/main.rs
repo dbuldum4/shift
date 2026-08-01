@@ -35,13 +35,12 @@ use shift_core::conversion::{
     MAX_CLIPBOARD_IMAGE_BYTES, MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, MaterializedSource,
     OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, Readiness, SipsFlip,
     SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, available_outputs_for_batch_source,
-    available_ready_outputs, available_ready_url_outputs, default_install_command,
-    expand_input_paths_preserving_roots, ffmpeg_supports_target_size_output, is_audio_output,
-    is_docling_timed_input, is_docling_video_input, is_ffmpeg_output, is_image_output,
-    is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste_detailed,
-    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
-    sips_supports_target_size_output, stage_pasted_image, suggested_output_for_path,
-    suggested_output_for_url, url_display_host,
+    available_ready_outputs, available_ready_url_outputs, expand_input_paths_preserving_roots,
+    ffmpeg_supports_target_size_output, is_audio_output, is_docling_timed_input,
+    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
+    looks_like_url, materialize_magic_paste_detailed, parse_magic_paste, paths_refer_to_same_file,
+    pdf_engine_candidates, run_batch, sips_supports_target_size_output, stage_pasted_image,
+    suggested_output_for_path, suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -3523,8 +3522,6 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .child(message),
             )
             .children(install_hints.into_iter().enumerate().map(|(index, (label, hint))| {
-                let command_for_copy = default_install_command(&hint)
-                    .unwrap_or_else(|| hint.to_string());
                 div()
                     .id(("install-hint", index as u64))
                     .flex()
@@ -3550,7 +3547,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     )
                     .child(
                         div()
-                            .id(("copy-install", index as u64))
+                            .id(("install-dependencies", index as u64))
                             .px_2()
                             .py_1()
                             .rounded_md()
@@ -3562,13 +3559,9 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .cursor_pointer()
                             .hover(|style| style.bg(THEME.active))
                             .active(|style| style.opacity(THEME.active_opacity))
-                            .child("Copy install command")
+                            .child("Install managed dependencies")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    command_for_copy.clone(),
-                                ));
-                                this.save_status = Some("Install command copied.".into());
-                                cx.notify();
+                                this.install_all_dependencies(cx);
                                 cx.stop_propagation();
                             })),
                     )
@@ -4109,7 +4102,8 @@ fn onboarding_step_index(step: OnboardingStep) -> usize {
     match step {
         OnboardingStep::Welcome => 0,
         OnboardingStep::HowItWorks => 1,
-        OnboardingStep::Ready => 2,
+        OnboardingStep::Dependencies => 2,
+        OnboardingStep::Ready => 3,
     }
 }
 
@@ -4154,6 +4148,25 @@ fn onboarding_button(
         }))
 }
 
+fn onboarding_dependency_toggle(
+    id: usize,
+    capability: shift_core::dependencies::DependencyCapability,
+    selected: bool,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    onboarding_button(
+        ("onboarding-dependency", id),
+        format!(
+            "{} {}",
+            if selected { "✓" } else { "○" },
+            capability.label()
+        ),
+        false,
+        cx,
+        move |this, cx| this.toggle_dependency_capability(capability, cx),
+    )
+}
+
 fn onboarding_progress(step: OnboardingStep) -> impl IntoElement {
     let active = onboarding_step_index(step);
     // Key by step so the active marker re-animates on navigation (state indication).
@@ -4164,7 +4177,7 @@ fn onboarding_progress(step: OnboardingStep) -> impl IntoElement {
         .flex()
         .items_center()
         .gap_1p5()
-        .children((0..3).map(move |index| {
+        .children((0..4).map(move |index| {
             let is_active = index == active;
             let is_past = index < active;
             let settled_opacity = if is_active {
@@ -4306,6 +4319,9 @@ fn onboarding_step_row(
 fn onboarding_overlay(
     step: OnboardingStep,
     nav: animation::OnboardingNavDirection,
+    dependency_installing: bool,
+    dependency_install_status: Option<SharedString>,
+    dependency_selection: Vec<shift_core::dependencies::DependencyCapability>,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let step_key = onboarding_step_index(step);
@@ -4384,6 +4400,99 @@ fn onboarding_overlay(
                     nav,
                     step_key,
                 ))
+                .into_any_element(),
+        ),
+        OnboardingStep::Dependencies => (
+            "Set up converters",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(onboarding_stagger_in(
+                    step_key,
+                    1,
+                    nav,
+                    div()
+                        .text_sm()
+                        .text_color(THEME.text_secondary)
+                        .child(
+                            "Optionally install Shift’s verified converter toolchain. It stays private to Shift, never changes your shell or package managers, and can be managed later in Settings.",
+                        ),
+                ))
+                .child(onboarding_stagger_in(
+                    step_key,
+                    2,
+                    nav,
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(onboarding_dependency_toggle(
+                            0,
+                            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+                            dependency_selection.contains(
+                                &shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+                            ),
+                            cx,
+                        ))
+                        .child(onboarding_dependency_toggle(
+                            1,
+                            shift_core::dependencies::DependencyCapability::WebExtraction,
+                            dependency_selection.contains(
+                                &shift_core::dependencies::DependencyCapability::WebExtraction,
+                            ),
+                            cx,
+                        ))
+                        .child(onboarding_dependency_toggle(
+                            2,
+                            shift_core::dependencies::DependencyCapability::MediaTranscription,
+                            dependency_selection.contains(
+                                &shift_core::dependencies::DependencyCapability::MediaTranscription,
+                            ),
+                            cx,
+                        ))
+                        .child(onboarding_dependency_toggle(
+                            3,
+                            shift_core::dependencies::DependencyCapability::PdfPublishingToolkit,
+                            dependency_selection.contains(
+                                &shift_core::dependencies::DependencyCapability::PdfPublishingToolkit,
+                            ),
+                            cx,
+                        )),
+                ))
+                .child(onboarding_stagger_in(
+                    step_key,
+                    3,
+                    nav,
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(onboarding_button(
+                            "onboarding-install-dependencies",
+                            "Install selected dependencies",
+                            true,
+                            cx,
+                            |this, cx| this.install_all_dependencies(cx),
+                        ))
+                        .when(dependency_installing, |row| {
+                            row.child(onboarding_button(
+                                "onboarding-cancel-dependencies",
+                                "Cancel",
+                                false,
+                                cx,
+                                |this, cx| this.cancel_dependency_install(cx),
+                            ))
+                        }),
+                ))
+                .when_some(dependency_install_status, |column, status| {
+                    column.child(
+                        div()
+                            .text_xs()
+                            .text_color(THEME.text_muted)
+                            .child(status),
+                    )
+                })
                 .into_any_element(),
         ),
         OnboardingStep::Ready => (
@@ -6051,6 +6160,8 @@ fn settings_paths_panel() -> impl IntoElement + use<> {
 fn settings_diagnostics_panel(
     diagnostics: Option<Arc<DiagnosticsReport>>,
     loading: bool,
+    dependency_installing: bool,
+    dependency_install_status: Option<SharedString>,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement + use<> {
     let summary = diagnostics.as_ref().map(|report| {
@@ -6075,6 +6186,33 @@ fn settings_diagnostics_panel(
         .child(settings_section_header(
             "Diagnostics",
             "Installed engines on this Mac versus formats Shift knows how to convert.",
+        ))
+        .child(settings_card(
+            "Managed dependencies",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_sm().text_color(THEME.text_primary).child(
+                    "Install Shift’s verified toolchain without changing Homebrew, pip, npm, or your shell.",
+                ))
+                .child(onboarding_button(
+                    "settings-install-dependencies",
+                    if dependency_installing { "Installing…" } else { "Install all dependencies" },
+                    true,
+                    cx,
+                    |this, cx| this.install_all_dependencies(cx),
+                ))
+                .when(dependency_installing, |card| card.child(onboarding_button(
+                    "settings-cancel-dependencies",
+                    "Cancel",
+                    false,
+                    cx,
+                    |this, cx| this.cancel_dependency_install(cx),
+                )))
+                .when_some(dependency_install_status, |card, status| card.child(
+                    div().text_xs().text_color(THEME.text_muted).child(status),
+                )),
         ))
         .child(settings_card(
             "Supported vs available",
@@ -6465,6 +6603,8 @@ pub(crate) struct SettingsView {
     markitdown_keep_data_uris: bool,
     diagnostics: Option<Arc<DiagnosticsReport>>,
     diagnostics_loading: bool,
+    dependency_installing: bool,
+    dependency_install_status: Option<SharedString>,
 }
 
 fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
@@ -6505,6 +6645,8 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         markitdown_keep_data_uris,
         diagnostics,
         diagnostics_loading,
+        dependency_installing,
+        dependency_install_status,
     } = view;
     let section = *section;
     let tab_direction = *tab_direction;
@@ -6590,6 +6732,8 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                             SettingsSection::Diagnostics => settings_diagnostics_panel(
                                 diagnostics.clone(),
                                 *diagnostics_loading,
+                                *dependency_installing,
+                                dependency_install_status.clone(),
                                 cx,
                             )
                             .into_any_element(),

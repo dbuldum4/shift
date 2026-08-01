@@ -77,6 +77,7 @@ cp "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-cli" \
 chmod +x "$checksum_fixture/dist/Shift.app/Contents/MacOS/shift"
 printf 'license\n' > "$checksum_fixture/dist/Shift.app/Contents/Resources/LICENSE"
 printf 'notices\n' > "$checksum_fixture/dist/Shift.app/Contents/Resources/THIRD_PARTY_NOTICES.md"
+printf '{}\n' > "$checksum_fixture/dist/Shift.app/Contents/Resources/dependency-manifest.json"
 # Minimal Info.plist with matching version (PlistBuddy-readable).
 cat > "$checksum_fixture/dist/Shift.app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
