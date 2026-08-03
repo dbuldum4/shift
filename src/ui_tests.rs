@@ -3852,10 +3852,9 @@ async fn dependency_install_waits_for_active_single_and_batch_conversions(cx: &m
     let shift = create_shift(cx);
 
     shift.update(cx, |this, cx| {
-        this.dependency_selection =
-            vec![shift_core::dependencies::DependencyCapability::DocumentsMarkdown];
+        let capability = shift_core::dependencies::DependencyCapability::DocumentsMarkdown;
         this.conversion = ConversionState::Converting;
-        this.install_selected_dependencies(cx);
+        this.install_dependency_for_failure(capability, cx);
         assert!(!this.dependency_installing);
         assert!(
             this.dependency_install_status
@@ -3866,7 +3865,7 @@ async fn dependency_install_waits_for_active_single_and_batch_conversions(cx: &m
         this.conversion = ConversionState::Empty;
         this.batch_running = true;
         this.dependency_install_status = None;
-        this.install_selected_dependencies(cx);
+        this.install_dependency_for_failure(capability, cx);
         assert!(!this.dependency_installing);
         assert!(
             this.dependency_install_status

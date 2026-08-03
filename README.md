@@ -13,7 +13,7 @@ Releases](https://github.com/dbuldum4/shift/releases), then verify its checksum
 before opening it:
 
 ```sh
-shasum -a 256 -c shift-1.1.1-macos-<arch>.zip.sha256
+shasum -a 256 -c shift-1.2.0-macos-<arch>.zip.sha256
 ```
 
 Open the DMG and drag `Shift.app` into Applications. The command-line tool is
@@ -77,11 +77,9 @@ locally where the upstream converter supports it.
 
 ## Prerequisites
 
-For a downloaded Shift release, the optional onboarding **Install all
-dependencies** step is the normal setup path. It installs release-pinned tools
-privately for Shift after verifying their archive hashes; no terminal, package
-manager, PATH change, or administrator access is required. The commands below
-remain for contributors and standalone development builds.
+On first launch, onboarding offers a copy-paste Homebrew command for the main
+converter CLIs. The same tools can be installed anytime from Terminal, conversion
+error hints, or Settings. The commands below are the supported setup path.
 
 - macOS with Xcode and its command-line tools
 - Rust stable (selected automatically by `rust-toolchain.toml`)
