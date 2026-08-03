@@ -4178,24 +4178,9 @@ where
         }))
 }
 
-fn onboarding_dependency_toggle(
-    id: usize,
-    capability: shift_core::dependencies::DependencyCapability,
-    selected: bool,
-    cx: &mut Context<Shift>,
-) -> impl IntoElement + use<> {
-    onboarding_button(
-        ("onboarding-dependency", id),
-        format!(
-            "{} {}",
-            if selected { "✓" } else { "○" },
-            capability.label()
-        ),
-        false,
-        cx,
-        move |this, cx| this.toggle_dependency_capability(capability, cx),
-    )
-}
+/// Homebrew installs the optional converter CLIs Shift shells out to.
+/// Safe to re-run; does not touch PATH configs or require admin beyond brew.
+const ONBOARDING_INSTALL_COMMAND: &str = "brew install ffmpeg pandoc typst qpdf node";
 
 fn onboarding_progress(step: OnboardingStep) -> impl IntoElement {
     let active = onboarding_step_index(step);
@@ -4290,11 +4275,10 @@ fn onboarding_bullet(
         direction,
         div()
             .flex()
-            .items_start()
+            .items_center()
             .gap_2()
             .child(
                 div()
-                    .mt(px(6.0))
                     .size(px(4.0))
                     .rounded_full()
                     .flex_shrink_0()
@@ -4302,6 +4286,78 @@ fn onboarding_bullet(
             )
             .child(div().text_sm().text_color(THEME.text_secondary).child(text)),
     )
+}
+
+fn dependency_install_progress_ui(
+    installing: bool,
+    progress: Option<(Option<f32>, SharedString)>,
+    status: Option<SharedString>,
+) -> impl IntoElement {
+    let label = progress.as_ref().map(|(_, label)| label.clone()).or(status);
+    let fraction = progress
+        .as_ref()
+        .and_then(|(fraction, _)| *fraction)
+        .map(|value| value.clamp(0.0, 1.0));
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .w_full()
+        .when_some(label, |column, text| {
+            column.child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if installing {
+                        THEME.text_secondary
+                    } else {
+                        THEME.text_muted
+                    })
+                    .child(text),
+            )
+        })
+        .when(installing, |column| {
+            column
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(THEME.elevated)
+                        .border_1()
+                        .border_color(THEME.border)
+                        .overflow_hidden()
+                        .child(match fraction {
+                            Some(value) => div()
+                                .h_full()
+                                .rounded_full()
+                                .bg(THEME.text_secondary)
+                                .w(relative(value))
+                                .into_any_element(),
+                            None => div()
+                                .h_full()
+                                .rounded_full()
+                                .bg(THEME.text_secondary)
+                                .w(relative(0.35))
+                                .with_animation(
+                                    "dependency-install-indeterminate",
+                                    Animation::new(animation::SPINNER_PERIOD)
+                                        .with_easing(pulsating_between(0.25, 0.85))
+                                        .repeat(),
+                                    |element, progress| element.opacity(progress),
+                                )
+                                .into_any_element(),
+                        }),
+                )
+                .when_some(fraction, |column, value| {
+                    column.child(
+                        div()
+                            .text_xs()
+                            .text_color(THEME.text_muted)
+                            .child(format!("{:.0}%", value * 100.0)),
+                    )
+                })
+        })
 }
 
 fn onboarding_step_row(
@@ -4349,19 +4405,10 @@ fn onboarding_step_row(
 fn onboarding_overlay(
     step: OnboardingStep,
     nav: animation::OnboardingNavDirection,
-    dependency_installing: bool,
-    dependency_install_status: Option<SharedString>,
-    dependency_capabilities: Vec<shift_core::dependencies::DependencyCapability>,
-    dependency_selection: Vec<shift_core::dependencies::DependencyCapability>,
+    install_command_copied: bool,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement {
     let step_key = onboarding_step_index(step);
-    let has_dependency_capabilities = !dependency_capabilities.is_empty();
-    let mut dependency_toggles = Vec::with_capacity(dependency_capabilities.len());
-    for (id, capability) in dependency_capabilities.iter().copied().enumerate() {
-        let selected = dependency_selection.contains(&capability);
-        dependency_toggles.push(onboarding_dependency_toggle(id, capability, selected, cx));
-    }
     let (title, body) = match step {
         // Stagger indices: title is always 0; body items start at 1 so the cascade reads top-down.
         OnboardingStep::Welcome => (
@@ -4453,7 +4500,7 @@ fn onboarding_overlay(
                         .text_sm()
                         .text_color(THEME.text_secondary)
                         .child(
-                            "Optionally install Shift’s verified converter toolchain. It stays private to Shift, never changes your shell or package managers, and can be managed later in Settings.",
+                            "Optional. Paste this into Terminal to install the converter CLIs Shift uses (Homebrew required). Skip anytime — you can install later from conversion errors or Settings.",
                         ),
                 ))
                 .child(onboarding_stagger_in(
@@ -4463,56 +4510,62 @@ fn onboarding_overlay(
                     div()
                         .flex()
                         .flex_col()
-                        .gap_1()
-                        .when(has_dependency_capabilities, |list| {
-                            list.children(dependency_toggles)
-                        })
-                        .when(!has_dependency_capabilities, |list| {
-                            list.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(THEME.text_muted)
-                                    .child(
-                                        "Managed dependencies are available with official Shift releases.",
-                                    ),
-                            )
-                        }),
-                ))
-                .when(has_dependency_capabilities, |column| {
-                    column.child(onboarding_stagger_in(
-                        step_key,
-                        3,
-                        nav,
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(onboarding_button(
-                                "onboarding-install-dependencies",
-                                "Install selected dependencies",
-                                true,
-                                cx,
-                                |this, cx| this.install_selected_dependencies(cx),
-                            ))
-                            .when(dependency_installing, |row| {
-                                row.child(onboarding_button(
-                                    "onboarding-cancel-dependencies",
-                                    "Cancel",
-                                    false,
+                        .gap_2()
+                        .w_full()
+                        .child(
+                            div()
+                                .w_full()
+                                .px_3()
+                                .py_2p5()
+                                .rounded_md()
+                                .bg(THEME.elevated)
+                                .border_1()
+                                .border_color(THEME.border)
+                                .font_family("Menlo")
+                                .text_xs()
+                                .text_color(THEME.text_primary)
+                                .child(ONBOARDING_INSTALL_COMMAND),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(onboarding_button(
+                                    "onboarding-copy-install-command",
+                                    if install_command_copied {
+                                        "Copied"
+                                    } else {
+                                        "Copy"
+                                    },
+                                    true,
                                     cx,
-                                    |this, cx| this.cancel_dependency_install(cx),
+                                    |this, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            ONBOARDING_INSTALL_COMMAND.to_owned(),
+                                        ));
+                                        this.onboarding_install_command_copied = true;
+                                        cx.notify();
+                                    },
                                 ))
-                            }),
-                    ))
-                })
-                .when_some(dependency_install_status, |column, status| {
-                    column.child(
-                        div()
-                            .text_xs()
-                            .text_color(THEME.text_muted)
-                            .child(status),
-                    )
-                })
+                                .when(install_command_copied, |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(THEME.text_muted)
+                                            .child("Ready to paste in Terminal"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(THEME.text_muted)
+                                .child(
+                                    "Installs FFmpeg, Pandoc, Typst, qpdf, and Node. MarkItDown/Docling use Python and can be added later.",
+                                ),
+                        ),
+                ))
                 .into_any_element(),
         ),
         OnboardingStep::Ready => (
@@ -6182,6 +6235,7 @@ fn settings_diagnostics_panel(
     loading: bool,
     dependency_installing: bool,
     dependency_install_status: Option<SharedString>,
+    dependency_install_progress: Option<(Option<f32>, SharedString)>,
     cx: &mut Context<Shift>,
 ) -> impl IntoElement + use<> {
     let summary = diagnostics.as_ref().map(|report| {
@@ -6216,23 +6270,44 @@ fn settings_diagnostics_panel(
                 .child(div().text_sm().text_color(THEME.text_primary).child(
                     "Install Shift’s verified toolchain without changing Homebrew, pip, npm, or your shell.",
                 ))
-                .child(onboarding_button(
-                    "settings-install-dependencies",
-                    if dependency_installing { "Installing…" } else { "Install all dependencies" },
-                    true,
-                    cx,
-                    |this, cx| this.install_all_dependencies(cx),
-                ))
-                .when(dependency_installing, |card| card.child(onboarding_button(
-                    "settings-cancel-dependencies",
-                    "Cancel",
-                    false,
-                    cx,
-                    |this, cx| this.cancel_dependency_install(cx),
-                )))
-                .when_some(dependency_install_status, |card, status| card.child(
-                    div().text_xs().text_color(THEME.text_muted).child(status),
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(onboarding_button(
+                            "settings-install-dependencies",
+                            if dependency_installing {
+                                "Installing…"
+                            } else {
+                                "Install all dependencies"
+                            },
+                            !dependency_installing,
+                            cx,
+                            |this, cx| this.install_all_dependencies(cx),
+                        ))
+                        .when(dependency_installing, |row| {
+                            row.child(onboarding_button(
+                                "settings-cancel-dependencies",
+                                "Cancel",
+                                false,
+                                cx,
+                                |this, cx| this.cancel_dependency_install(cx),
+                            ))
+                        }),
+                )
+                .when(
+                    dependency_installing
+                        || dependency_install_progress.is_some()
+                        || dependency_install_status.is_some(),
+                    |card| {
+                        card.child(dependency_install_progress_ui(
+                            dependency_installing,
+                            dependency_install_progress,
+                            dependency_install_status,
+                        ))
+                    },
+                ),
         ))
         .child(settings_card(
             "Supported vs available",
@@ -6625,6 +6700,7 @@ pub(crate) struct SettingsView {
     diagnostics_loading: bool,
     dependency_installing: bool,
     dependency_install_status: Option<SharedString>,
+    dependency_install_progress: Option<(Option<f32>, SharedString)>,
 }
 
 fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoElement + use<> {
@@ -6667,6 +6743,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
         diagnostics_loading,
         dependency_installing,
         dependency_install_status,
+        dependency_install_progress,
     } = view;
     let section = *section;
     let tab_direction = *tab_direction;
@@ -6754,6 +6831,7 @@ fn settings_content(view: &SettingsView, cx: &mut Context<Shift>) -> impl IntoEl
                                 *diagnostics_loading,
                                 *dependency_installing,
                                 dependency_install_status.clone(),
+                                dependency_install_progress.clone(),
                                 cx,
                             )
                             .into_any_element(),

@@ -3,8 +3,9 @@ use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use shift_core::conversion::{PdfCompression, default_install_command};
 use shift_core::dependencies::{
-    DependencyCapability, InstallOutcome, InstallSelection, available_capabilities,
-    available_dependency_catalog, install_selected,
+    DependencyCapability, InstallOutcome, InstallProgress, InstallSelection,
+    available_capabilities, available_dependency_catalog, components_for_selection,
+    install_selected,
 };
 use std::collections::BTreeMap;
 use std::io;
@@ -262,13 +263,15 @@ pub(crate) struct Shift {
     pub(crate) onboarding_step: Option<OnboardingStep>,
     /// Last onboarding navigation direction (for direction-aware step motion).
     pub(crate) onboarding_nav: crate::ui::animation::OnboardingNavDirection,
-    /// Optional first-run managed dependency installation state.
+    /// Brief "Copied" feedback for the onboarding install command block.
+    pub(crate) onboarding_install_command_copied: bool,
+    /// Optional managed dependency installation state (Settings).
     pub(crate) dependency_installing: bool,
     pub(crate) dependency_install_status: Option<SharedString>,
+    /// Live install progress: optional fraction `0.0..=1.0` plus status label.
+    pub(crate) dependency_install_progress: Option<(Option<f32>, SharedString)>,
     pub(crate) dependency_install_outcome: Option<InstallOutcome>,
     pub(crate) dependency_install_cancel: Arc<AtomicBool>,
-    pub(crate) dependency_capabilities: Vec<DependencyCapability>,
-    pub(crate) dependency_selection: Vec<DependencyCapability>,
     pub(crate) dependency_tools: BTreeMap<String, DependencyCapability>,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
@@ -603,7 +606,6 @@ impl Shift {
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
         let dependency_catalog = available_dependency_catalog().unwrap_or_default();
-        let dependency_capabilities = dependency_catalog.capabilities;
         let cached_available_outputs = OutputFormat::ALL.to_vec();
         let cached_ready_outputs = None;
         let cached_history_filter = (String::new(), session.show_archived, history.len());
@@ -651,12 +653,12 @@ impl Shift {
             recipe_status,
             onboarding_step: (!session.onboarding_completed).then_some(OnboardingStep::Welcome),
             onboarding_nav: crate::ui::animation::OnboardingNavDirection::Enter,
+            onboarding_install_command_copied: false,
             dependency_installing: false,
             dependency_install_status: None,
+            dependency_install_progress: None,
             dependency_install_outcome: None,
             dependency_install_cancel: Arc::new(AtomicBool::new(false)),
-            dependency_capabilities: dependency_capabilities.clone(),
-            dependency_selection: dependency_capabilities,
             dependency_tools: dependency_catalog.tools,
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
@@ -2112,11 +2114,6 @@ impl Shift {
         }
     }
 
-    /// Download only the capability groups selected in onboarding.
-    pub(crate) fn install_selected_dependencies(&mut self, cx: &mut Context<Self>) {
-        self.start_dependency_install(self.dependency_selection.clone(), cx);
-    }
-
     /// Install the one managed capability associated with a failed converter.
     /// Engines outside the release manifest keep their shell-command action.
     pub(crate) fn install_dependency_for_failure(
@@ -2138,6 +2135,7 @@ impl Shift {
         if capabilities.is_empty() {
             self.dependency_install_status =
                 Some("Select at least one dependency group to install.".into());
+            self.dependency_install_progress = None;
             cx.notify();
             return;
         }
@@ -2145,29 +2143,73 @@ impl Shift {
             self.dependency_install_status = Some(
                 "Wait for active conversions to finish before installing dependencies.".into(),
             );
+            self.dependency_install_progress = None;
             cx.notify();
             return;
         }
+        let selection = InstallSelection {
+            capabilities,
+            replace_with_managed: Vec::new(),
+        };
+        let planned = match components_for_selection(&selection) {
+            Ok(components) => components,
+            Err(error) => {
+                self.dependency_install_status =
+                    Some(format!("Dependency setup is unavailable: {error}").into());
+                self.dependency_install_progress = None;
+                cx.notify();
+                return;
+            }
+        };
+        if planned.is_empty() {
+            self.dependency_install_status =
+                Some("No selected dependency components are available for this release.".into());
+            self.dependency_install_progress = None;
+            cx.notify();
+            return;
+        }
+        let component_order: Vec<String> = planned.iter().map(|c| c.id.clone()).collect();
+        let total_components = component_order.len();
         self.dependency_installing = true;
-        self.dependency_install_status = Some("Downloading verified dependencies…".into());
+        self.dependency_install_status = Some("Starting verified dependency install…".into());
+        self.dependency_install_progress =
+            Some((Some(0.0), "Starting verified dependency install…".into()));
         self.dependency_install_outcome = None;
         self.dependency_install_cancel = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&self.dependency_install_cancel);
         cx.notify();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded::<InstallProgress>();
         let task = cx.background_executor().spawn(async move {
-            install_selected(
-                &InstallSelection {
-                    capabilities,
-                    replace_with_managed: Vec::new(),
-                },
-                &cancel,
-                |_| {},
-            )
+            install_selected(&selection, &cancel, |progress| {
+                let _ = progress_tx.unbounded_send(progress);
+            })
         });
+
+        cx.spawn(async move |this, cx| {
+            while let Some(progress) = progress_rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    if !this.dependency_installing {
+                        return;
+                    }
+                    let (fraction, label) = map_dependency_install_progress(
+                        &progress,
+                        &component_order,
+                        total_components,
+                    );
+                    this.dependency_install_progress = Some((fraction, label.clone().into()));
+                    this.dependency_install_status = Some(label.into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.dependency_installing = false;
+                this.dependency_install_progress = None;
                 match result {
                     Ok(outcome) => {
                         let installed = outcome.installed.len();
@@ -2198,31 +2240,15 @@ impl Shift {
         .detach();
     }
 
-    pub(crate) fn toggle_dependency_capability(
-        &mut self,
-        capability: DependencyCapability,
-        cx: &mut Context<Self>,
-    ) {
-        if self.dependency_installing {
-            return;
-        }
-        if let Some(index) = self
-            .dependency_selection
-            .iter()
-            .position(|selected| *selected == capability)
-        {
-            self.dependency_selection.remove(index);
-        } else {
-            self.dependency_selection.push(capability);
-        }
-        cx.notify();
-    }
-
     pub(crate) fn cancel_dependency_install(&mut self, cx: &mut Context<Self>) {
         if self.dependency_installing {
             self.dependency_install_cancel
                 .store(true, Ordering::Relaxed);
             self.dependency_install_status = Some("Cancelling dependency installation…".into());
+            if let Some((fraction, _)) = &self.dependency_install_progress {
+                self.dependency_install_progress =
+                    Some((*fraction, "Cancelling dependency installation…".into()));
+            }
             cx.notify();
         }
     }
@@ -2233,6 +2259,7 @@ impl Shift {
         }
         self.onboarding_step = None;
         self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Enter;
+        self.onboarding_install_command_copied = false;
         self.persist_session_settings(cx);
         cx.notify();
     }
@@ -4239,7 +4266,7 @@ impl Render for Shift {
         };
         let dependency_installing = self.dependency_installing;
         let dependency_install_status = self.dependency_install_status.clone();
-        let dependency_capabilities = self.dependency_capabilities.clone();
+        let dependency_install_progress = self.dependency_install_progress.clone();
         let folder_confirm = self.folder_confirm.clone();
         let settings_section = self.settings_section;
         let settings_tab_direction = self.settings_tab_direction;
@@ -4795,6 +4822,7 @@ impl Render for Shift {
                         diagnostics_loading,
                         dependency_installing,
                         dependency_install_status,
+                        dependency_install_progress,
                     },
                     cx,
                 ))
@@ -4803,14 +4831,48 @@ impl Render for Shift {
                 root.child(onboarding_overlay(
                     step,
                     onboarding_nav,
-                    self.dependency_installing,
-                    self.dependency_install_status.clone(),
-                    dependency_capabilities,
-                    self.dependency_selection.clone(),
+                    self.onboarding_install_command_copied,
                     cx,
                 ))
             })
     }
+}
+
+fn map_dependency_install_progress(
+    progress: &InstallProgress,
+    component_order: &[String],
+    total_components: usize,
+) -> (Option<f32>, String) {
+    let total = total_components.max(1) as f32;
+    let (component, phase) = match progress {
+        InstallProgress::Downloading {
+            component,
+            completed,
+            total: file_total,
+        } => {
+            let download = if *file_total > 0 {
+                0.7 * (*completed as f32 / *file_total as f32).clamp(0.0, 1.0)
+            } else {
+                0.05
+            };
+            (component.as_str(), download)
+        }
+        InstallProgress::Verifying { component } => (component.as_str(), 0.8),
+        InstallProgress::Activating { component } => (component.as_str(), 0.95),
+    };
+    let index = component_order
+        .iter()
+        .position(|id| id == component)
+        .unwrap_or(0) as f32;
+    let fraction = ((index + phase) / total).clamp(0.0, 0.99);
+    let label = match progress {
+        InstallProgress::Downloading { component, .. } => {
+            format!("Downloading {component}…")
+        }
+        InstallProgress::Verifying { component } => format!("Verifying {component}…"),
+        InstallProgress::Activating { component } => format!("Activating {component}…"),
+    };
+    (Some(fraction), label)
 }
 
 /// Finder's `Open With` and `open -a Shift file1 file2` hand local paths to
@@ -6074,5 +6136,34 @@ mod tests {
         ]);
         assert_eq!(paths, vec![path.clone()]);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dependency_install_progress_maps_phases_across_components() {
+        let order = vec!["docs".into(), "media".into()];
+        let (fraction, label) = map_dependency_install_progress(
+            &InstallProgress::Downloading {
+                component: "docs".into(),
+                completed: 50,
+                total: 100,
+            },
+            &order,
+            2,
+        );
+        assert!(label.contains("Downloading docs"));
+        let first = fraction.expect("download fraction");
+        assert!(first > 0.0 && first < 0.5);
+
+        let (fraction, label) = map_dependency_install_progress(
+            &InstallProgress::Activating {
+                component: "media".into(),
+            },
+            &order,
+            2,
+        );
+        assert!(label.contains("Activating media"));
+        let second = fraction.expect("activate fraction");
+        assert!(second > first);
+        assert!(second < 1.0);
     }
 }
