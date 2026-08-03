@@ -13,7 +13,7 @@ Releases](https://github.com/dbuldum4/shift/releases), then verify its checksum
 before opening it:
 
 ```sh
-shasum -a 256 -c shift-1.1.1-macos-<arch>.zip.sha256
+shasum -a 256 -c shift-1.2.0-macos-<arch>.zip.sha256
 ```
 
 Open the DMG and drag `Shift.app` into Applications. The command-line tool is
