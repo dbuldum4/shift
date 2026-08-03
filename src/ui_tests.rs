@@ -19,9 +19,9 @@ use std::time::Duration;
 use gpui::{AppContext, Entity, TestAppContext};
 
 use crate::app::{
-    CancelWork, ClearRecent, ConversionState, CopyOutput, HistoryOutcome, HistorySource,
-    OnboardingStep, OpenAbout, OpenRecent, OpenSettings, RevealOutput, SaveOutput, Shift,
-    ShowShortcuts, ToggleFormatMenu,
+    CancelWork, ClearRecent, ConversionState, CopyOutput, FailureInstallAction, HistoryOutcome,
+    HistorySource, OnboardingStep, OpenAbout, OpenRecent, OpenSettings, RevealOutput, SaveOutput,
+    Shift, ShowShortcuts, ToggleFormatMenu,
 };
 use crate::{
     DEFAULT_UI_FONT, HISTORY_SIDEBAR_MAX, HISTORY_SIDEBAR_MIN, OUTPUT_PANEL_MAX, OUTPUT_PANEL_MIN,
@@ -87,9 +87,25 @@ impl Drop for TestHttpServer {
 }
 
 fn serve_test_http(mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = [0_u8; 8 * 1024];
-    let bytes_read = stream.read(&mut request).unwrap_or(0);
+    let mut bytes_read = 0;
+    while bytes_read < request.len() {
+        match stream.read(&mut request[bytes_read..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                bytes_read += read;
+                if request[..bytes_read]
+                    .windows(2)
+                    .any(|window| window == b"\r\n")
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
     let request = String::from_utf8_lossy(&request[..bytes_read]);
     let path = request
         .lines()
@@ -455,13 +471,19 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::Dependencies)
+    );
+
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
         Some(OnboardingStep::Ready)
     );
 
     shift.update(cx, |this, cx| this.previous_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
-        Some(OnboardingStep::HowItWorks)
+        Some(OnboardingStep::Dependencies)
     );
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_nav),
@@ -470,8 +492,14 @@ async fn onboarding_introduces_shift_before_the_conversion_workspace(cx: &mut Te
     shift.update(cx, |this, cx| this.previous_onboarding(cx));
     assert_eq!(
         shift.read_with(cx, |this, _| this.onboarding_step),
+        Some(OnboardingStep::HowItWorks)
+    );
+    shift.update(cx, |this, cx| this.previous_onboarding(cx));
+    assert_eq!(
+        shift.read_with(cx, |this, _| this.onboarding_step),
         Some(OnboardingStep::Welcome)
     );
+    shift.update(cx, |this, cx| this.advance_onboarding(cx));
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     shift.update(cx, |this, cx| this.advance_onboarding(cx));
     assert_eq!(
@@ -576,7 +604,10 @@ async fn selecting_a_url_converts_via_defuddle(cx: &mut TestAppContext) {
     });
     assert_eq!(format, OutputFormat::MARKDOWN);
     assert_eq!(module, "defuddle");
-    assert!(text.contains("shift test fixture: /article.html"));
+    assert!(
+        text.contains("shift test fixture: /article.html"),
+        "unexpected Defuddle output: {text:?}"
+    );
 }
 
 #[gpui::test]
@@ -3773,6 +3804,10 @@ async fn install_hints_for_failure_nonempty_when_engine_missing(cx: &mut TestApp
             pdf_engines: vec![],
             selected_pdf_engine: None,
         }));
+        this.dependency_tools.insert(
+            "markitdown".into(),
+            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+        );
         this.set_selected_file(path, cx);
         let hints = this.install_hints_for_failure();
         assert!(
@@ -3782,15 +3817,19 @@ async fn install_hints_for_failure_nonempty_when_engine_missing(cx: &mut TestApp
         assert!(
             hints
                 .iter()
-                .any(|(label, hint)| label.as_ref().contains("MarkItDown")
-                    && hint.as_ref().contains("pip install")),
+                .any(|entry| entry.label.as_ref().contains("MarkItDown")
+                    && entry.hint.as_ref().contains("pip install")
+                    && entry.action
+                        == FailureInstallAction::InstallManaged(
+                            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+                        )),
             "hints={hints:?}"
         );
         // Ready engines must not appear.
         assert!(
             !hints
                 .iter()
-                .any(|(label, _)| label.as_ref().contains("FFmpeg"))
+                .any(|entry| entry.label.as_ref().contains("FFmpeg"))
         );
     });
 }
@@ -3804,6 +3843,78 @@ async fn install_hints_empty_without_diagnostics(cx: &mut TestAppContext) {
         this.diagnostics = None;
         let hints = this.install_hints_for_failure();
         assert!(hints.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn dependency_install_waits_for_active_single_and_batch_conversions(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.dependency_selection =
+            vec![shift_core::dependencies::DependencyCapability::DocumentsMarkdown];
+        this.conversion = ConversionState::Converting;
+        this.install_selected_dependencies(cx);
+        assert!(!this.dependency_installing);
+        assert!(
+            this.dependency_install_status
+                .as_deref()
+                .is_some_and(|status| status.contains("active conversions"))
+        );
+
+        this.conversion = ConversionState::Empty;
+        this.batch_running = true;
+        this.dependency_install_status = None;
+        this.install_selected_dependencies(cx);
+        assert!(!this.dependency_installing);
+        assert!(
+            this.dependency_install_status
+                .as_deref()
+                .is_some_and(|status| status.contains("active conversions"))
+        );
+    });
+}
+
+#[gpui::test]
+async fn system_engine_failure_hints_copy_their_own_install_commands(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, _cx| {
+        this.diagnostics = Some(Arc::new(DiagnosticsReport {
+            engines: [
+                ("ffmpeg", "FFmpeg", "brew install ffmpeg"),
+                ("pandoc", "Pandoc", "brew install pandoc"),
+                ("qpdf", "qpdf", "brew install qpdf"),
+            ]
+            .into_iter()
+            .map(|(id, label, install_hint)| EngineDiagnostic {
+                id,
+                label,
+                readiness: Readiness::Missing,
+                version: None,
+                resolved_path: None,
+                env_override: "",
+                install_hint: install_hint.into(),
+                notes: None,
+            })
+            .collect(),
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        }));
+        let hints = this.install_hints_for_failure();
+        assert_eq!(hints.len(), 3, "hints={hints:?}");
+        for (hint, command) in hints.iter().zip([
+            "brew install ffmpeg",
+            "brew install pandoc",
+            "brew install qpdf",
+        ]) {
+            assert_eq!(
+                hint.action,
+                FailureInstallAction::CopyCommand(command.into())
+            );
+        }
     });
 }
 
@@ -4820,8 +4931,16 @@ async fn install_hints_filter_to_active_modules_only(cx: &mut TestAppContext) {
         assert!(modules.contains(&"ffmpeg"), "modules={modules:?}");
         let hints = this.install_hints_for_failure();
         assert_eq!(hints.len(), 1, "hints={hints:?}");
-        assert!(hints[0].0.as_ref().contains("FFmpeg"));
-        assert!(!hints.iter().any(|(l, _)| l.as_ref().contains("MarkItDown")));
+        assert!(hints[0].label.as_ref().contains("FFmpeg"));
+        assert_eq!(
+            hints[0].action,
+            FailureInstallAction::CopyCommand("brew install ffmpeg".into())
+        );
+        assert!(
+            !hints
+                .iter()
+                .any(|entry| entry.label.as_ref().contains("MarkItDown"))
+        );
     });
     cx.run_until_parked();
 }

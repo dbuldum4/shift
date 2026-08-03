@@ -1,7 +1,12 @@
 use crate::*;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
-use shift_core::conversion::PdfCompression;
+use shift_core::conversion::{PdfCompression, default_install_command};
+use shift_core::dependencies::{
+    DependencyCapability, InstallOutcome, InstallSelection, available_capabilities,
+    available_dependency_catalog, install_selected,
+};
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -13,6 +18,19 @@ pub(crate) enum ConversionState {
     /// Shared so render clones stay cheap for large artifacts.
     Ready(Arc<ConversionArtifact>),
     Failed(SharedString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FailureInstallAction {
+    InstallManaged(DependencyCapability),
+    CopyCommand(SharedString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureInstallHint {
+    pub(crate) label: SharedString,
+    pub(crate) hint: SharedString,
+    pub(crate) action: FailureInstallAction,
 }
 
 impl ConversionState {
@@ -208,6 +226,7 @@ pub(crate) struct FolderExpandConfirm {
 pub(crate) enum OnboardingStep {
     Welcome,
     HowItWorks,
+    Dependencies,
     Ready,
 }
 
@@ -243,6 +262,14 @@ pub(crate) struct Shift {
     pub(crate) onboarding_step: Option<OnboardingStep>,
     /// Last onboarding navigation direction (for direction-aware step motion).
     pub(crate) onboarding_nav: crate::ui::animation::OnboardingNavDirection,
+    /// Optional first-run managed dependency installation state.
+    pub(crate) dependency_installing: bool,
+    pub(crate) dependency_install_status: Option<SharedString>,
+    pub(crate) dependency_install_outcome: Option<InstallOutcome>,
+    pub(crate) dependency_install_cancel: Arc<AtomicBool>,
+    pub(crate) dependency_capabilities: Vec<DependencyCapability>,
+    pub(crate) dependency_selection: Vec<DependencyCapability>,
+    pub(crate) dependency_tools: BTreeMap<String, DependencyCapability>,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
     pub(crate) shortcuts_help_open: bool,
@@ -575,6 +602,8 @@ impl Shift {
             history_from_store_detailed(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
+        let dependency_catalog = available_dependency_catalog().unwrap_or_default();
+        let dependency_capabilities = dependency_catalog.capabilities;
         let cached_available_outputs = OutputFormat::ALL.to_vec();
         let cached_ready_outputs = None;
         let cached_history_filter = (String::new(), session.show_archived, history.len());
@@ -622,6 +651,13 @@ impl Shift {
             recipe_status,
             onboarding_step: (!session.onboarding_completed).then_some(OnboardingStep::Welcome),
             onboarding_nav: crate::ui::animation::OnboardingNavDirection::Enter,
+            dependency_installing: false,
+            dependency_install_status: None,
+            dependency_install_outcome: None,
+            dependency_install_cancel: Arc::new(AtomicBool::new(false)),
+            dependency_capabilities: dependency_capabilities.clone(),
+            dependency_selection: dependency_capabilities,
+            dependency_tools: dependency_catalog.tools,
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -2018,6 +2054,10 @@ impl Shift {
             }
             Some(OnboardingStep::HowItWorks) => {
                 self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Forward;
+                Some(OnboardingStep::Dependencies)
+            }
+            Some(OnboardingStep::Dependencies) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Forward;
                 Some(OnboardingStep::Ready)
             }
             Some(OnboardingStep::Ready) => {
@@ -2037,11 +2077,154 @@ impl Shift {
             }
             Some(OnboardingStep::Ready) => {
                 self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Back;
+                Some(OnboardingStep::Dependencies)
+            }
+            Some(OnboardingStep::Dependencies) => {
+                self.onboarding_nav = crate::ui::animation::OnboardingNavDirection::Back;
                 Some(OnboardingStep::HowItWorks)
             }
             _ => return,
         };
         cx.notify();
+    }
+
+    /// Download every managed component published for this release and CPU.
+    /// This deliberately ignores the onboarding selection so the Settings
+    /// action remains an actual "install all" operation.
+    pub(crate) fn install_all_dependencies(&mut self, cx: &mut Context<Self>) {
+        if self.dependency_installing {
+            return;
+        }
+        match available_capabilities() {
+            Ok(capabilities) if !capabilities.is_empty() => {
+                self.start_dependency_install(capabilities, cx)
+            }
+            Ok(_) => {
+                self.dependency_install_status =
+                    Some("Managed dependencies are published with official Shift releases.".into());
+                cx.notify();
+            }
+            Err(error) => {
+                self.dependency_install_status =
+                    Some(format!("Dependency setup is unavailable: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Download only the capability groups selected in onboarding.
+    pub(crate) fn install_selected_dependencies(&mut self, cx: &mut Context<Self>) {
+        self.start_dependency_install(self.dependency_selection.clone(), cx);
+    }
+
+    /// Install the one managed capability associated with a failed converter.
+    /// Engines outside the release manifest keep their shell-command action.
+    pub(crate) fn install_dependency_for_failure(
+        &mut self,
+        capability: DependencyCapability,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_dependency_install(vec![capability], cx);
+    }
+
+    fn start_dependency_install(
+        &mut self,
+        capabilities: Vec<DependencyCapability>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dependency_installing {
+            return;
+        }
+        if capabilities.is_empty() {
+            self.dependency_install_status =
+                Some("Select at least one dependency group to install.".into());
+            cx.notify();
+            return;
+        }
+        if matches!(self.conversion, ConversionState::Converting) || self.batch_running {
+            self.dependency_install_status = Some(
+                "Wait for active conversions to finish before installing dependencies.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.dependency_installing = true;
+        self.dependency_install_status = Some("Downloading verified dependencies…".into());
+        self.dependency_install_outcome = None;
+        self.dependency_install_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&self.dependency_install_cancel);
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            install_selected(
+                &InstallSelection {
+                    capabilities,
+                    replace_with_managed: Vec::new(),
+                },
+                &cancel,
+                |_| {},
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.dependency_installing = false;
+                match result {
+                    Ok(outcome) => {
+                        let installed = outcome.installed.len();
+                        let failed = outcome.failed.len();
+                        this.dependency_install_status = Some(if installed == 0 && failed == 0 {
+                            "No selected dependency components are available for this release."
+                                .into()
+                        } else if failed == 0 {
+                            format!("Installed {installed} verified dependency component(s).")
+                                .into()
+                        } else {
+                            format!("Installed {installed}; {failed} component(s) need retry.")
+                                .into()
+                        });
+                        this.dependency_install_outcome = Some(outcome);
+                        let _ = this.rebuild_registry_with_recipe_preference();
+                        this.diagnostics = None;
+                        this.refresh_diagnostics(cx);
+                    }
+                    Err(error) => {
+                        this.dependency_install_status =
+                            Some(format!("Dependency installation failed: {error}").into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn toggle_dependency_capability(
+        &mut self,
+        capability: DependencyCapability,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dependency_installing {
+            return;
+        }
+        if let Some(index) = self
+            .dependency_selection
+            .iter()
+            .position(|selected| *selected == capability)
+        {
+            self.dependency_selection.remove(index);
+        } else {
+            self.dependency_selection.push(capability);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_dependency_install(&mut self, cx: &mut Context<Self>) {
+        if self.dependency_installing {
+            self.dependency_install_cancel
+                .store(true, Ordering::Relaxed);
+            self.dependency_install_status = Some("Cancelling dependency installation…".into());
+            cx.notify();
+        }
     }
 
     pub(crate) fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
@@ -2768,7 +2951,7 @@ impl Shift {
         }
     }
 
-    pub(crate) fn install_hints_for_failure(&self) -> Vec<(SharedString, SharedString)> {
+    pub(crate) fn install_hints_for_failure(&self) -> Vec<FailureInstallHint> {
         let Some(report) = self.diagnostics.as_ref() else {
             return Vec::new();
         };
@@ -2779,10 +2962,22 @@ impl Shift {
             .filter(|engine| !engine.readiness.is_ready())
             .filter(|engine| modules.is_empty() || modules.contains(&engine.id))
             .map(|engine| {
-                (
-                    format!("Install {}", engine.label).into(),
-                    engine.install_hint.clone().into(),
-                )
+                let managed_capability = self.dependency_tools.get(engine.id).copied();
+                let action = managed_capability.map_or_else(
+                    || {
+                        FailureInstallAction::CopyCommand(
+                            default_install_command(&engine.install_hint)
+                                .unwrap_or_else(|| engine.install_hint.clone())
+                                .into(),
+                        )
+                    },
+                    FailureInstallAction::InstallManaged,
+                );
+                FailureInstallHint {
+                    label: format!("Install {}", engine.label).into(),
+                    hint: engine.install_hint.clone().into(),
+                    action,
+                }
             })
             .collect()
     }
@@ -4042,6 +4237,9 @@ impl Render for Shift {
         } else {
             Vec::new()
         };
+        let dependency_installing = self.dependency_installing;
+        let dependency_install_status = self.dependency_install_status.clone();
+        let dependency_capabilities = self.dependency_capabilities.clone();
         let folder_confirm = self.folder_confirm.clone();
         let settings_section = self.settings_section;
         let settings_tab_direction = self.settings_tab_direction;
@@ -4595,12 +4793,22 @@ impl Render for Shift {
                         markitdown_keep_data_uris,
                         diagnostics,
                         diagnostics_loading,
+                        dependency_installing,
+                        dependency_install_status,
                     },
                     cx,
                 ))
             })
             .when_some(onboarding_step, |root, step| {
-                root.child(onboarding_overlay(step, onboarding_nav, cx))
+                root.child(onboarding_overlay(
+                    step,
+                    onboarding_nav,
+                    self.dependency_installing,
+                    self.dependency_install_status.clone(),
+                    dependency_capabilities,
+                    self.dependency_selection.clone(),
+                    cx,
+                ))
             })
     }
 }

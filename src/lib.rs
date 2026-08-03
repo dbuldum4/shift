@@ -2,6 +2,7 @@
 
 pub mod artifact_cache;
 pub mod conversion;
+pub mod dependencies;
 pub mod history;
 pub mod preferences;
 pub mod recipes;

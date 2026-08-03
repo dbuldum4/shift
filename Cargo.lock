@@ -5085,6 +5085,7 @@ dependencies = [
  "csv",
  "futures",
  "gpui",
+ "libc",
  "lyon",
  "objc",
  "rusqlite",

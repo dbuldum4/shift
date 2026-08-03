@@ -1092,6 +1092,12 @@ pub fn resolve_tool_executable(
 /// The ancestor walk also supports the bundled CLI under `Resources/bin`,
 /// including when Homebrew invokes it through a symlink.
 pub fn bundled_runtime_tool(name: &str) -> Option<PathBuf> {
+    // Managed packs are installed only after digest, archive, and executable
+    // verification. Prefer them over any historical app-bundle payload so the
+    // GUI and bundled CLI share exactly the same optional dependency location.
+    if let Some(managed) = crate::dependencies::managed_runtime_tool(name) {
+        return Some(managed);
+    }
     let executable = std::env::current_exe().ok()?;
     let executable = executable.canonicalize().unwrap_or(executable);
     for ancestor in executable.ancestors() {

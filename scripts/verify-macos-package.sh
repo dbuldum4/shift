@@ -21,6 +21,8 @@ fail() {
 [ -f "$app/Contents/Resources/LICENSE" ] || fail "missing bundled LICENSE"
 [ -f "$app/Contents/Resources/THIRD_PARTY_NOTICES.md" ] || fail "missing bundled third-party notices"
 [ -f "$app/Contents/Info.plist" ] || fail "missing Info.plist"
+[ -f "$app/Contents/Resources/dependency-manifest.json" ] || fail "missing dependency manifest"
+[ ! -e "$app/Contents/Resources/runtime" ] || fail "converter runtime must not be bundled in Shift.app"
 
 bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
 [ "$bundle_version" = "$version" ] || fail "bundle version is $bundle_version, expected $version"
@@ -40,6 +42,16 @@ for artifact in "$archive" "$dmg"; do
     || fail "checksum must be 'HASH  $base' with basename only (got: $checksum_line)"
   (cd "$(dirname "$artifact")" && shasum -a 256 -c "$base.sha256") >/dev/null \
     || fail "checksum does not match: $artifact"
+done
+
+for component in documents-markdown web-extraction; do
+  dependency="$output_dir/shift-dependencies-${version}-macos-${arch}-${component}.zip"
+  [ -f "$dependency" ] || fail "missing dependency component: $dependency"
+  [ -f "$dependency.sha256" ] || fail "missing dependency checksum: $dependency.sha256"
+  (cd "$output_dir" && shasum -a 256 -c "$(basename "$dependency").sha256") >/dev/null \
+    || fail "dependency checksum does not match: $dependency"
+  grep -Fq "$(basename "$dependency")" "$app/Contents/Resources/dependency-manifest.json" \
+    || fail "dependency manifest does not reference: $dependency"
 done
 
 unzip -t "$archive" >/dev/null || fail "ZIP archive is corrupt: $archive"
