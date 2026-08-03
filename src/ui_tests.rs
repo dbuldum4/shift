@@ -19,9 +19,9 @@ use std::time::Duration;
 use gpui::{AppContext, Entity, TestAppContext};
 
 use crate::app::{
-    CancelWork, ClearRecent, ConversionState, CopyOutput, HistoryOutcome, HistorySource,
-    OnboardingStep, OpenAbout, OpenRecent, OpenSettings, RevealOutput, SaveOutput, Shift,
-    ShowShortcuts, ToggleFormatMenu,
+    CancelWork, ClearRecent, ConversionState, CopyOutput, FailureInstallAction, HistoryOutcome,
+    HistorySource, OnboardingStep, OpenAbout, OpenRecent, OpenSettings, RevealOutput, SaveOutput,
+    Shift, ShowShortcuts, ToggleFormatMenu,
 };
 use crate::{
     DEFAULT_UI_FONT, HISTORY_SIDEBAR_MAX, HISTORY_SIDEBAR_MIN, OUTPUT_PANEL_MAX, OUTPUT_PANEL_MIN,
@@ -3785,6 +3785,8 @@ async fn install_hints_for_failure_nonempty_when_engine_missing(cx: &mut TestApp
             pdf_engines: vec![],
             selected_pdf_engine: None,
         }));
+        this.dependency_capabilities =
+            vec![shift_core::dependencies::DependencyCapability::DocumentsMarkdown];
         this.set_selected_file(path, cx);
         let hints = this.install_hints_for_failure();
         assert!(
@@ -3794,15 +3796,19 @@ async fn install_hints_for_failure_nonempty_when_engine_missing(cx: &mut TestApp
         assert!(
             hints
                 .iter()
-                .any(|(label, hint)| label.as_ref().contains("MarkItDown")
-                    && hint.as_ref().contains("pip install")),
+                .any(|entry| entry.label.as_ref().contains("MarkItDown")
+                    && entry.hint.as_ref().contains("pip install")
+                    && entry.action
+                        == FailureInstallAction::InstallManaged(
+                            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+                        )),
             "hints={hints:?}"
         );
         // Ready engines must not appear.
         assert!(
             !hints
                 .iter()
-                .any(|(label, _)| label.as_ref().contains("FFmpeg"))
+                .any(|entry| entry.label.as_ref().contains("FFmpeg"))
         );
     });
 }
@@ -3816,6 +3822,53 @@ async fn install_hints_empty_without_diagnostics(cx: &mut TestAppContext) {
         this.diagnostics = None;
         let hints = this.install_hints_for_failure();
         assert!(hints.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn system_engine_failure_hints_copy_their_own_install_commands(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, _cx| {
+        this.diagnostics = Some(Arc::new(DiagnosticsReport {
+            engines: [
+                ("ffmpeg", "FFmpeg", "brew install ffmpeg"),
+                ("pandoc", "Pandoc", "brew install pandoc"),
+                ("qpdf", "qpdf", "brew install qpdf"),
+            ]
+            .into_iter()
+            .map(|(id, label, install_hint)| EngineDiagnostic {
+                id,
+                label,
+                readiness: Readiness::Missing,
+                version: None,
+                resolved_path: None,
+                env_override: "",
+                install_hint: install_hint.into(),
+                notes: None,
+            })
+            .collect(),
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        }));
+        this.dependency_capabilities = vec![
+            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+            shift_core::dependencies::DependencyCapability::WebExtraction,
+        ];
+
+        let hints = this.install_hints_for_failure();
+        assert_eq!(hints.len(), 3, "hints={hints:?}");
+        for (hint, command) in hints.iter().zip([
+            "brew install ffmpeg",
+            "brew install pandoc",
+            "brew install qpdf",
+        ]) {
+            assert_eq!(
+                hint.action,
+                FailureInstallAction::CopyCommand(command.into())
+            );
+        }
     });
 }
 
@@ -4832,8 +4885,16 @@ async fn install_hints_filter_to_active_modules_only(cx: &mut TestAppContext) {
         assert!(modules.contains(&"ffmpeg"), "modules={modules:?}");
         let hints = this.install_hints_for_failure();
         assert_eq!(hints.len(), 1, "hints={hints:?}");
-        assert!(hints[0].0.as_ref().contains("FFmpeg"));
-        assert!(!hints.iter().any(|(l, _)| l.as_ref().contains("MarkItDown")));
+        assert!(hints[0].label.as_ref().contains("FFmpeg"));
+        assert_eq!(
+            hints[0].action,
+            FailureInstallAction::CopyCommand("brew install ffmpeg".into())
+        );
+        assert!(
+            !hints
+                .iter()
+                .any(|entry| entry.label.as_ref().contains("MarkItDown"))
+        );
     });
     cx.run_until_parked();
 }

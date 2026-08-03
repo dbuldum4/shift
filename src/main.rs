@@ -14,7 +14,8 @@ mod ui_tests;
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use crate::app::{
-    ConversionHistoryEntry, ConversionState, HistoryOutcome, HistorySource, OnboardingStep, Shift,
+    ConversionHistoryEntry, ConversionState, FailureInstallAction, FailureInstallHint,
+    HistoryOutcome, HistorySource, OnboardingStep, Shift,
 };
 use crate::ui::animation;
 use crate::ui::theme::{THEME, card_shadow};
@@ -3361,7 +3362,7 @@ pub(crate) struct OutputPanelView {
     conversion_options: ConversionPanelView,
     conversion_progress: Option<(Option<f32>, SharedString)>,
     show_command_inspect: bool,
-    install_hints: Vec<(SharedString, SharedString)>,
+    install_hints: Vec<FailureInstallHint>,
     /// Pre-staged export path for the ready artifact (avoids rewriting large media on drag).
     cached_ready_path: Option<PathBuf>,
 }
@@ -3521,7 +3522,49 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .text_color(THEME.text_secondary)
                     .child(message),
             )
-            .children(install_hints.into_iter().enumerate().map(|(index, (label, hint))| {
+            .children(install_hints.into_iter().enumerate().map(|(index, install_hint)| {
+                let action = match install_hint.action {
+                    FailureInstallAction::InstallManaged(capability) => div()
+                        .id(("install-managed-dependency", index as u64))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(THEME.elevated)
+                        .border_1()
+                        .border_color(THEME.border_strong)
+                        .text_xs()
+                        .text_color(THEME.text_primary)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(THEME.active))
+                        .active(|style| style.opacity(THEME.active_opacity))
+                        .child("Install with Shift")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.install_dependency_for_failure(capability, cx);
+                            cx.stop_propagation();
+                        }))
+                        .into_any_element(),
+                    FailureInstallAction::CopyCommand(command) => div()
+                        .id(("copy-install", index as u64))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(THEME.elevated)
+                        .border_1()
+                        .border_color(THEME.border_strong)
+                        .text_xs()
+                        .text_color(THEME.text_primary)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(THEME.active))
+                        .active(|style| style.opacity(THEME.active_opacity))
+                        .child("Copy install command")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+                            this.save_status = Some("Install command copied.".into());
+                            cx.notify();
+                            cx.stop_propagation();
+                        }))
+                        .into_any_element(),
+                };
                 div()
                     .id(("install-hint", index as u64))
                     .flex()
@@ -3537,34 +3580,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(THEME.text_secondary)
-                            .child(label),
+                            .child(install_hint.label),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(THEME.text_muted)
-                            .child(hint.clone()),
+                            .child(install_hint.hint),
                     )
-                    .child(
-                        div()
-                            .id(("install-dependencies", index as u64))
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(THEME.elevated)
-                            .border_1()
-                            .border_color(THEME.border_strong)
-                            .text_xs()
-                            .text_color(THEME.text_primary)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(THEME.active))
-                            .active(|style| style.opacity(THEME.active_opacity))
-                            .child("Install managed dependencies")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.install_all_dependencies(cx);
-                                cx.stop_propagation();
-                            })),
-                    )
+                    .child(action)
             })),
         ConversionState::Ready(artifact) => {
             // Full name kept for drag/save; display may be ellipsized in software.

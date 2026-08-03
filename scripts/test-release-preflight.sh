@@ -212,10 +212,42 @@ for required in \
   'cp -R -L "$python_prefix" "$docs_payload/python-runtime"' \
   'cp -R -L "$node_prefix" "$web_payload/node-runtime"' \
   'if find "$docs_payload" "$web_payload" -type l -print' \
+  'ditto -c -k --sequesterRsrc . "$docs_archive"' \
+  'ditto -c -k --sequesterRsrc . "$web_archive"' \
   'provides": $documents_provides'; do
   grep -Fq "$required" "$root/scripts/package-macos.sh" \
     || {
       echo "package-macos missing managed dependency hardening: $required" >&2
+      exit 1
+    }
+done
+
+# ditto accepts one source path per archive. Passing each payload child as a
+# separate source makes release packaging fail before checksums are written.
+if grep -Eq 'ditto -c -k --sequesterRsrc (bin|node|python) ' "$root/scripts/package-macos.sh"; then
+  echo "package-macos passes multiple dependency payload sources to ditto" >&2
+  exit 1
+fi
+
+# Exercise the exact one-source archive form with a minimal payload so the
+# regression test covers both ditto invocation validity and ZIP root layout.
+dependency_archive_fixture="$(mktemp -d "${TMPDIR:-/tmp}/shift-dependency-archive.XXXXXX")"
+trap 'rm -rf "$fixture" "$checksum_fixture" "$dependency_archive_fixture"' EXIT
+mkdir -p "$dependency_archive_fixture/payload/bin" \
+  "$dependency_archive_fixture/payload/python" \
+  "$dependency_archive_fixture/extracted"
+printf 'launcher\n' > "$dependency_archive_fixture/payload/bin/tool"
+printf 'runtime\n' > "$dependency_archive_fixture/payload/python/module"
+(
+  cd "$dependency_archive_fixture/payload"
+  /usr/bin/ditto -c -k --sequesterRsrc . "$dependency_archive_fixture/component.zip"
+)
+/usr/bin/ditto -x -k "$dependency_archive_fixture/component.zip" \
+  "$dependency_archive_fixture/extracted"
+for expected in bin/tool python/module; do
+  test -f "$dependency_archive_fixture/extracted/$expected" \
+    || {
+      echo "dependency archive has the wrong root layout: missing $expected" >&2
       exit 1
     }
 done

@@ -280,11 +280,11 @@ docs_archive="$output_dir/$docs_name"
 web_archive="$output_dir/$web_name"
 (
   cd "$docs_payload"
-  ditto -c -k --sequesterRsrc bin python python-runtime "$docs_archive"
+  ditto -c -k --sequesterRsrc . "$docs_archive"
 )
 (
   cd "$web_payload"
-  ditto -c -k --sequesterRsrc bin node node-runtime "$web_archive"
+  ditto -c -k --sequesterRsrc . "$web_archive"
 )
 docs_sha="$(shasum -a 256 "$docs_archive" | awk '{print $1}')"
 web_sha="$(shasum -a 256 "$web_archive" | awk '{print $1}')"

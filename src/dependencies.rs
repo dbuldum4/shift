@@ -180,15 +180,15 @@ pub fn dependency_root() -> Option<PathBuf> {
     application_support_dir().map(|path| path.join("dependencies"))
 }
 
-fn state_path() -> Option<PathBuf> {
-    dependency_root().map(|path| path.join(STATE_FILE))
-}
-
 pub fn managed_state() -> ManagedDependencyState {
-    let Some(path) = state_path() else {
+    let Some(root) = dependency_root() else {
         return ManagedDependencyState::default();
     };
-    let Ok(bytes) = fs::read(path) else {
+    managed_state_at(&root)
+}
+
+fn managed_state_at(root: &Path) -> ManagedDependencyState {
+    let Ok(bytes) = fs::read(root.join(STATE_FILE)) else {
         return ManagedDependencyState::default();
     };
     serde_json::from_slice(&bytes).unwrap_or_default()
@@ -200,14 +200,26 @@ pub fn managed_runtime_tool(name: &str) -> Option<PathBuf> {
     let manifest = embedded_manifest().ok()?;
     let root = dependency_root()?;
     let state = managed_state();
-    for component in manifest.components {
+    managed_runtime_tool_from(&manifest, &root, &state, name)
+}
+
+fn managed_runtime_tool_from(
+    manifest: &DependencyManifest,
+    root: &Path,
+    state: &ManagedDependencyState,
+    name: &str,
+) -> Option<PathBuf> {
+    for component in &manifest.components {
         let Some(relative) = component.executables.get(name) else {
             continue;
         };
         let Some(active) = state.components.get(&component.id) else {
             continue;
         };
-        if active.sha256 != component.sha256 || state.manifest_version != manifest.release_version {
+        // Component archives are immutable and authenticated by their digest.
+        // A new app release may continue to publish the exact same component,
+        // so the app-level release version must not invalidate it.
+        if active.sha256 != component.sha256 {
             continue;
         }
         if !is_safe_relative(&active.directory) {
@@ -539,29 +551,83 @@ fn activate_component(
     component: &DependencyComponent,
     payload: &Path,
 ) -> Result<(), DependencyError> {
+    let activation_id = STAGING_ID.fetch_add(1, Ordering::Relaxed);
     let directory = format!(
-        "{}-{}-{}",
+        "{}-{}-{}-{}",
         component.id,
         &component.sha256[..12],
-        STAGING_ID.fetch_add(1, Ordering::Relaxed)
+        std::process::id(),
+        activation_id,
     );
     let target = root.join(&directory);
-    fs::rename(payload, &target)?;
-    let mut state = managed_state();
+    let mut state = managed_state_at(root);
     state.manifest_version = manifest.release_version.clone();
     state.components.insert(
         component.id.clone(),
         ActiveComponent {
-            directory,
+            directory: directory.clone(),
             sha256: component.sha256.clone(),
         },
     );
     let bytes =
         serde_json::to_vec_pretty(&state).map_err(|error| DependencyError(error.to_string()))?;
-    let temporary = root.join(format!(".{STATE_FILE}.tmp-{}", std::process::id()));
-    fs::write(&temporary, bytes)?;
-    fs::rename(temporary, root.join(STATE_FILE))?;
+    fs::rename(payload, &target)?;
+    let temporary = root.join(format!(
+        ".{STATE_FILE}.tmp-{}-{activation_id}",
+        std::process::id()
+    ));
+    if let Err(error) =
+        fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, root.join(STATE_FILE)))
+    {
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_dir_all(&target);
+        return Err(error.into());
+    }
+
+    // State now points at the new runtime. Remove every older directory that
+    // follows Shift's private naming scheme, including orphans left by an app
+    // termination after the payload rename but before the state swap.
+    cleanup_inactive_component_directories(root, &component.id, &directory);
     Ok(())
+}
+
+fn cleanup_inactive_component_directories(root: &Path, component_id: &str, active: &str) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == active || !is_component_directory_name(component_id, name) {
+            continue;
+        }
+        // Do not follow or remove a symlink even if its name resembles one of
+        // ours. Installed payloads are always real directories.
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn is_component_directory_name(component_id: &str, name: &str) -> bool {
+    let prefix = format!("{component_id}-");
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    let Some(digest_prefix) = parts.next() else {
+        return false;
+    };
+    if digest_prefix.len() != 12 || !digest_prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let ids = parts.collect::<Vec<_>>();
+    (ids.len() == 1 || ids.len() == 2)
+        && ids
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn verify_file_digest(path: &Path, expected: &str, bytes: u64) -> Result<(), DependencyError> {
@@ -626,6 +692,26 @@ fn is_regular_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "shift-dependencies-{label}-{}-{}",
+                std::process::id(),
+                STAGING_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn test_component(
         id: &str,
@@ -694,6 +780,128 @@ mod tests {
             capabilities_for_components(&components, "x86_64"),
             vec![DependencyCapability::DocumentsMarkdown]
         );
+    }
+
+    #[test]
+    fn matching_component_remains_active_across_app_releases() {
+        let root = TestDirectory::new("upgrade");
+        let mut component = test_component(
+            "documents-markdown",
+            current_manifest_architecture(),
+            DependencyCapability::DocumentsMarkdown,
+            Vec::new(),
+        );
+        component
+            .executables
+            .insert("markitdown".into(), "bin/markitdown".into());
+        let directory = "documents-markdown-000000000000-1";
+        let executable = root.0.join(directory).join("bin/markitdown");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let manifest = DependencyManifest {
+            schema_version: 1,
+            release_version: "2.0.0".into(),
+            components: vec![component.clone()],
+        };
+        let mut state = ManagedDependencyState {
+            manifest_version: "1.0.0".into(),
+            components: BTreeMap::new(),
+        };
+        state.components.insert(
+            component.id.clone(),
+            ActiveComponent {
+                directory: directory.into(),
+                sha256: component.sha256.clone(),
+            },
+        );
+
+        assert_eq!(
+            managed_runtime_tool_from(&manifest, &root.0, &state, "markitdown"),
+            Some(executable)
+        );
+
+        state.components.get_mut(&component.id).unwrap().sha256 = "f".repeat(64);
+        assert_eq!(
+            managed_runtime_tool_from(&manifest, &root.0, &state, "markitdown"),
+            None,
+            "a component with a different authenticated archive must stay inactive"
+        );
+    }
+
+    #[test]
+    fn activation_removes_stale_component_copies_only_after_state_swap() {
+        let root = TestDirectory::new("activation");
+        let component = test_component(
+            "documents-markdown",
+            current_manifest_architecture(),
+            DependencyCapability::DocumentsMarkdown,
+            Vec::new(),
+        );
+        let manifest = DependencyManifest {
+            schema_version: 1,
+            release_version: "2.0.0".into(),
+            components: vec![component.clone()],
+        };
+        let old = "documents-markdown-000000000000-7";
+        let orphan = "documents-markdown-000000000000-123-8";
+        let unrelated = "documents-markdown-user-backup";
+        fs::create_dir(root.0.join(old)).unwrap();
+        fs::create_dir(root.0.join(orphan)).unwrap();
+        fs::create_dir(root.0.join(unrelated)).unwrap();
+        let mut previous = ManagedDependencyState {
+            manifest_version: "1.0.0".into(),
+            components: BTreeMap::new(),
+        };
+        previous.components.insert(
+            component.id.clone(),
+            ActiveComponent {
+                directory: old.into(),
+                sha256: component.sha256.clone(),
+            },
+        );
+        fs::write(
+            root.0.join(STATE_FILE),
+            serde_json::to_vec(&previous).unwrap(),
+        )
+        .unwrap();
+        let payload = root.0.join("payload");
+        fs::create_dir(&payload).unwrap();
+        fs::write(payload.join("runtime"), b"new").unwrap();
+
+        activate_component(&root.0, &manifest, &component, &payload).unwrap();
+
+        let active = managed_state_at(&root.0);
+        let active = active.components.get(&component.id).unwrap();
+        assert_eq!(active.sha256, component.sha256);
+        assert!(root.0.join(&active.directory).join("runtime").is_file());
+        assert!(!root.0.join(old).exists());
+        assert!(!root.0.join(orphan).exists());
+        assert!(root.0.join(unrelated).is_dir());
+    }
+
+    #[test]
+    fn component_directory_names_are_strictly_scoped() {
+        assert!(is_component_directory_name(
+            "web-extraction",
+            "web-extraction-012345abcdef-4"
+        ));
+        assert!(is_component_directory_name(
+            "web-extraction",
+            "web-extraction-012345abcdef-123-4"
+        ));
+        assert!(!is_component_directory_name(
+            "web-extraction",
+            "web-extraction-user-backup"
+        ));
+        assert!(!is_component_directory_name(
+            "web-extraction",
+            "documents-markdown-012345abcdef-4"
+        ));
     }
 
     #[test]

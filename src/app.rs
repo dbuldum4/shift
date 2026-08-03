@@ -1,7 +1,7 @@
 use crate::*;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
-use shift_core::conversion::PdfCompression;
+use shift_core::conversion::{PdfCompression, default_install_command};
 use shift_core::dependencies::{
     DependencyCapability, InstallOutcome, InstallSelection, available_capabilities,
     install_selected,
@@ -17,6 +17,19 @@ pub(crate) enum ConversionState {
     /// Shared so render clones stay cheap for large artifacts.
     Ready(Arc<ConversionArtifact>),
     Failed(SharedString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FailureInstallAction {
+    InstallManaged(DependencyCapability),
+    CopyCommand(SharedString),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureInstallHint {
+    pub(crate) label: SharedString,
+    pub(crate) hint: SharedString,
+    pub(crate) action: FailureInstallAction,
 }
 
 impl ConversionState {
@@ -2100,6 +2113,16 @@ impl Shift {
         self.start_dependency_install(self.dependency_selection.clone(), cx);
     }
 
+    /// Install the one managed capability associated with a failed converter.
+    /// Engines outside the release manifest keep their shell-command action.
+    pub(crate) fn install_dependency_for_failure(
+        &mut self,
+        capability: DependencyCapability,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_dependency_install(vec![capability], cx);
+    }
+
     fn start_dependency_install(
         &mut self,
         capabilities: Vec<DependencyCapability>,
@@ -2917,7 +2940,7 @@ impl Shift {
         }
     }
 
-    pub(crate) fn install_hints_for_failure(&self) -> Vec<(SharedString, SharedString)> {
+    pub(crate) fn install_hints_for_failure(&self) -> Vec<FailureInstallHint> {
         let Some(report) = self.diagnostics.as_ref() else {
             return Vec::new();
         };
@@ -2928,10 +2951,27 @@ impl Shift {
             .filter(|engine| !engine.readiness.is_ready())
             .filter(|engine| modules.is_empty() || modules.contains(&engine.id))
             .map(|engine| {
-                (
-                    format!("Install {}", engine.label).into(),
-                    engine.install_hint.clone().into(),
-                )
+                let managed_capability = match engine.id {
+                    "markitdown" | "docling" => Some(DependencyCapability::DocumentsMarkdown),
+                    "defuddle" => Some(DependencyCapability::WebExtraction),
+                    _ => None,
+                }
+                .filter(|capability| self.dependency_capabilities.contains(capability));
+                let action = managed_capability.map_or_else(
+                    || {
+                        FailureInstallAction::CopyCommand(
+                            default_install_command(&engine.install_hint)
+                                .unwrap_or_else(|| engine.install_hint.clone())
+                                .into(),
+                        )
+                    },
+                    FailureInstallAction::InstallManaged,
+                );
+                FailureInstallHint {
+                    label: format!("Install {}", engine.label).into(),
+                    hint: engine.install_hint.clone().into(),
+                    action,
+                }
             })
             .collect()
     }
