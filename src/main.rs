@@ -3375,6 +3375,48 @@ pub(crate) struct OutputDragPayload {
     staged_path: Option<PathBuf>,
 }
 
+fn failure_install_action_button(
+    index: usize,
+    action: FailureInstallAction,
+    cx: &mut Context<Shift>,
+) -> impl IntoElement {
+    let button = |id| {
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(THEME.elevated)
+            .border_1()
+            .border_color(THEME.border_strong)
+            .text_xs()
+            .text_color(THEME.text_primary)
+            .cursor_pointer()
+            .hover(|style| style.bg(THEME.active))
+            .active(|style| style.opacity(THEME.active_opacity))
+    };
+    match action {
+        FailureInstallAction::InstallManaged(capability) => {
+            button(("install-managed-dependency", index as u64))
+                .child("Install with Shift")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.install_dependency_for_failure(capability, cx);
+                    cx.stop_propagation();
+                }))
+                .into_any_element()
+        }
+        FailureInstallAction::CopyCommand(command) => button(("copy-install", index as u64))
+            .child("Copy install command")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+                this.save_status = Some("Install command copied.".into());
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .into_any_element(),
+    }
+}
+
 fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElement {
     let OutputPanelView {
         state,
@@ -3523,48 +3565,7 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                     .child(message),
             )
             .children(install_hints.into_iter().enumerate().map(|(index, install_hint)| {
-                let action = match install_hint.action {
-                    FailureInstallAction::InstallManaged(capability) => div()
-                        .id(("install-managed-dependency", index as u64))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(THEME.elevated)
-                        .border_1()
-                        .border_color(THEME.border_strong)
-                        .text_xs()
-                        .text_color(THEME.text_primary)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(THEME.active))
-                        .active(|style| style.opacity(THEME.active_opacity))
-                        .child("Install with Shift")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.install_dependency_for_failure(capability, cx);
-                            cx.stop_propagation();
-                        }))
-                        .into_any_element(),
-                    FailureInstallAction::CopyCommand(command) => div()
-                        .id(("copy-install", index as u64))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(THEME.elevated)
-                        .border_1()
-                        .border_color(THEME.border_strong)
-                        .text_xs()
-                        .text_color(THEME.text_primary)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(THEME.active))
-                        .active(|style| style.opacity(THEME.active_opacity))
-                        .child("Copy install command")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
-                            this.save_status = Some("Install command copied.".into());
-                            cx.notify();
-                            cx.stop_propagation();
-                        }))
-                        .into_any_element(),
-                };
+                let action = failure_install_action_button(index, install_hint.action, cx);
                 div()
                     .id(("install-hint", index as u64))
                     .flex()

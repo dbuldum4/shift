@@ -11,15 +11,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use zip::ZipArchive;
 
 const MANIFEST: &str = include_str!("../dependencies/manifest.json");
 const STATE_FILE: &str = "state.json";
+const ACTIVATION_LOCK_FILE: &str = ".activation.lock";
+const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_COMPONENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +63,12 @@ pub enum DependencyCapability {
     WebExtraction,
     MediaTranscription,
     PdfPublishingToolkit,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ManagedDependencyCatalog {
+    pub capabilities: Vec<DependencyCapability>,
+    pub tools: BTreeMap<String, DependencyCapability>,
 }
 
 impl DependencyComponent {
@@ -184,14 +193,34 @@ pub fn managed_state() -> ManagedDependencyState {
     let Some(root) = dependency_root() else {
         return ManagedDependencyState::default();
     };
-    managed_state_at(&root)
+    // Runtime lookup fails closed. Mutation paths use the strict loader below
+    // so malformed state is never silently replaced with an empty document.
+    load_managed_state_at(&root).unwrap_or_default()
 }
 
-fn managed_state_at(root: &Path) -> ManagedDependencyState {
-    let Ok(bytes) = fs::read(root.join(STATE_FILE)) else {
-        return ManagedDependencyState::default();
+fn load_managed_state_at(root: &Path) -> Result<ManagedDependencyState, DependencyError> {
+    let path = root.join(STATE_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManagedDependencyState::default());
+        }
+        Err(error) => {
+            return Err(DependencyError(format!(
+                "could not read managed dependency state: {error}"
+            )));
+        }
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
+        return Err(DependencyError(
+            "managed dependency state is not a valid state file".into(),
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        DependencyError(format!("could not read managed dependency state: {error}"))
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| DependencyError(format!("managed dependency state is invalid: {error}")))
 }
 
 /// Returns only a tool from a component recorded by a verified install state.
@@ -261,15 +290,38 @@ fn capabilities_for_components(
     capabilities.into_iter().collect()
 }
 
+fn tools_for_components(
+    components: &[DependencyComponent],
+    architecture: &str,
+) -> BTreeMap<String, DependencyCapability> {
+    let mut tools = BTreeMap::new();
+    for component in components
+        .iter()
+        .filter(|component| component.architecture == architecture)
+    {
+        for tool in component.executables.keys() {
+            tools.insert(tool.clone(), component.capability);
+        }
+    }
+    tools
+}
+
 /// Capabilities backed by at least one component for this release and CPU.
 /// The onboarding UI uses this instead of advertising future/unpublished
 /// dependency groups that would otherwise install nothing.
 pub fn available_capabilities() -> Result<Vec<DependencyCapability>, DependencyError> {
+    Ok(available_dependency_catalog()?.capabilities)
+}
+
+/// Managed capabilities and executable names published for this release and
+/// CPU, derived together from the embedded manifest as one source of truth.
+pub fn available_dependency_catalog() -> Result<ManagedDependencyCatalog, DependencyError> {
     let manifest = embedded_manifest()?;
-    Ok(capabilities_for_components(
-        &manifest.components,
-        current_manifest_architecture(),
-    ))
+    let architecture = current_manifest_architecture();
+    Ok(ManagedDependencyCatalog {
+        capabilities: capabilities_for_components(&manifest.components, architecture),
+        tools: tools_for_components(&manifest.components, architecture),
+    })
 }
 
 pub fn components_for_selection(
@@ -352,11 +404,7 @@ fn install_component(
     let root = dependency_root()
         .ok_or_else(|| DependencyError("Application Support is unavailable".into()))?;
     ensure_private_dir(&root)?;
-    let staging = root.join(format!(
-        ".staging-{}-{}",
-        std::process::id(),
-        STAGING_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    let staging = root.join(format!(".staging-{}", unique_install_suffix()));
     ensure_private_dir(&staging)?;
     let archive = staging.join("component.zip");
     progress(InstallProgress::Downloading {
@@ -387,6 +435,18 @@ fn install_component(
     })();
     let _ = fs::remove_dir_all(&staging);
     result
+}
+
+fn unique_install_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        STAGING_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn validate_component(component: &DependencyComponent) -> Result<(), DependencyError> {
@@ -545,22 +605,91 @@ fn probe_component(root: &Path, component: &DependencyComponent) -> Result<(), D
     Ok(())
 }
 
+#[cfg(unix)]
+struct ActivationLock {
+    _file: File,
+}
+
+#[cfg(unix)]
+impl ActivationLock {
+    fn acquire(root: &Path) -> Result<Self, DependencyError> {
+        Self::acquire_with_operation(root, libc::LOCK_EX)?.ok_or_else(|| {
+            DependencyError("managed dependency activation lock is unavailable".into())
+        })
+    }
+
+    fn acquire_with_operation(
+        root: &Path,
+        operation: libc::c_int,
+    ) -> Result<Option<Self>, DependencyError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = root.join(ACTIVATION_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| DependencyError(format!("could not open activation lock: {error}")))?;
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            return Err(DependencyError(
+                "managed dependency activation lock is not a regular file".into(),
+            ));
+        }
+        loop {
+            // SAFETY: `file` owns a valid, open descriptor for the duration of
+            // the call. flock does not retain pointers into Rust memory.
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                return Ok(Some(Self { _file: file }));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if operation & libc::LOCK_NB != 0 && error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(DependencyError(format!(
+                "could not lock managed dependency activation: {error}"
+            )));
+        }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(root: &Path) -> Result<Option<Self>, DependencyError> {
+        Self::acquire_with_operation(root, libc::LOCK_EX | libc::LOCK_NB)
+    }
+}
+
+#[cfg(not(unix))]
+struct ActivationLock;
+
+#[cfg(not(unix))]
+impl ActivationLock {
+    fn acquire(_root: &Path) -> Result<Self, DependencyError> {
+        Ok(Self)
+    }
+}
+
 fn activate_component(
     root: &Path,
     manifest: &DependencyManifest,
     component: &DependencyComponent,
     payload: &Path,
 ) -> Result<(), DependencyError> {
-    let activation_id = STAGING_ID.fetch_add(1, Ordering::Relaxed);
-    let directory = format!(
-        "{}-{}-{}-{}",
-        component.id,
-        &component.sha256[..12],
-        std::process::id(),
-        activation_id,
-    );
+    let _activation_lock = ActivationLock::acquire(root)?;
+    let suffix = unique_install_suffix();
+    let directory = format!("{}-{}-{suffix}", component.id, &component.sha256[..12],);
     let target = root.join(&directory);
-    let mut state = managed_state_at(root);
+    let mut state = load_managed_state_at(root)?;
+    let previous = state
+        .components
+        .get(&component.id)
+        .map(|active| active.directory.clone())
+        .filter(|name| is_component_directory_name(&component.id, name));
     state.manifest_version = manifest.release_version.clone();
     state.components.insert(
         component.id.clone(),
@@ -572,26 +701,68 @@ fn activate_component(
     let bytes =
         serde_json::to_vec_pretty(&state).map_err(|error| DependencyError(error.to_string()))?;
     fs::rename(payload, &target)?;
-    let temporary = root.join(format!(
-        ".{STATE_FILE}.tmp-{}-{activation_id}",
-        std::process::id()
-    ));
-    if let Err(error) =
-        fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, root.join(STATE_FILE)))
-    {
-        let _ = fs::remove_file(&temporary);
+    if let Err(error) = sync_directory(root) {
         let _ = fs::remove_dir_all(&target);
         return Err(error.into());
     }
+    if let Err(error) = write_state_atomically(root, &bytes, &suffix) {
+        let _ = fs::remove_dir_all(&target);
+        return Err(error);
+    }
 
-    // State now points at the new runtime. Remove every older directory that
-    // follows Shift's private naming scheme, including orphans left by an app
-    // termination after the payload rename but before the state swap.
-    cleanup_inactive_component_directories(root, &component.id, &directory);
+    // Preserve the immediately previous runtime so a process that resolved it
+    // before the state swap can finish. Older copies and crash orphans are
+    // reclaimed, bounding steady-state storage at two copies per component.
+    cleanup_inactive_component_directories(root, &component.id, &directory, previous.as_deref());
     Ok(())
 }
 
-fn cleanup_inactive_component_directories(root: &Path, component_id: &str, active: &str) {
+fn write_state_atomically(root: &Path, bytes: &[u8], suffix: &str) -> Result<(), DependencyError> {
+    let temporary = root.join(format!(".{STATE_FILE}.tmp-{suffix}"));
+    let result = (|| -> io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, root.join(STATE_FILE))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    // At this point state replacement is committed and cannot be rolled back
+    // safely. Best-effort directory syncing improves crash durability; even if
+    // it fails, both the previous and new runtime directories remain valid.
+    let _ = sync_directory(root);
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn cleanup_inactive_component_directories(
+    root: &Path,
+    component_id: &str,
+    active: &str,
+    previous: Option<&str>,
+) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -600,7 +771,10 @@ fn cleanup_inactive_component_directories(root: &Path, component_id: &str, activ
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name == active || !is_component_directory_name(component_id, name) {
+        if name == active
+            || previous == Some(name)
+            || !is_component_directory_name(component_id, name)
+        {
             continue;
         }
         // Do not follow or remove a symlink even if its name resembles one of
@@ -624,7 +798,7 @@ fn is_component_directory_name(component_id: &str, name: &str) -> bool {
         return false;
     }
     let ids = parts.collect::<Vec<_>>();
-    (ids.len() == 1 || ids.len() == 2)
+    (1..=3).contains(&ids.len())
         && ids
             .iter()
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
@@ -755,13 +929,17 @@ mod tests {
 
     #[test]
     fn available_capabilities_are_architecture_specific() {
+        let mut documents_arm = test_component(
+            "documents-arm",
+            "arm64",
+            DependencyCapability::DocumentsMarkdown,
+            vec![DependencyCapability::MediaTranscription],
+        );
+        documents_arm
+            .executables
+            .insert("docling".into(), "bin/docling".into());
         let components = vec![
-            test_component(
-                "documents-arm",
-                "arm64",
-                DependencyCapability::DocumentsMarkdown,
-                vec![DependencyCapability::MediaTranscription],
-            ),
+            documents_arm,
             test_component(
                 "documents-intel",
                 "x86_64",
@@ -780,6 +958,11 @@ mod tests {
             capabilities_for_components(&components, "x86_64"),
             vec![DependencyCapability::DocumentsMarkdown]
         );
+        assert_eq!(
+            tools_for_components(&components, "arm64").get("docling"),
+            Some(&DependencyCapability::DocumentsMarkdown)
+        );
+        assert!(tools_for_components(&components, "x86_64").is_empty());
     }
 
     #[test]
@@ -834,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_removes_stale_component_copies_only_after_state_swap() {
+    fn activation_preserves_previous_runtime_and_removes_older_copies() {
         let root = TestDirectory::new("activation");
         let component = test_component(
             "documents-markdown",
@@ -875,13 +1058,74 @@ mod tests {
 
         activate_component(&root.0, &manifest, &component, &payload).unwrap();
 
-        let active = managed_state_at(&root.0);
+        let active = load_managed_state_at(&root.0).unwrap();
         let active = active.components.get(&component.id).unwrap();
         assert_eq!(active.sha256, component.sha256);
         assert!(root.0.join(&active.directory).join("runtime").is_file());
-        assert!(!root.0.join(old).exists());
+        assert!(
+            root.0.join(old).is_dir(),
+            "the immediately previous runtime may still be in use"
+        );
         assert!(!root.0.join(orphan).exists());
         assert!(root.0.join(unrelated).is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.0.join(STATE_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn activation_refuses_to_overwrite_corrupt_state() {
+        let root = TestDirectory::new("corrupt-state");
+        let component = test_component(
+            "documents-markdown",
+            current_manifest_architecture(),
+            DependencyCapability::DocumentsMarkdown,
+            Vec::new(),
+        );
+        let manifest = DependencyManifest {
+            schema_version: 1,
+            release_version: "2.0.0".into(),
+            components: vec![component.clone()],
+        };
+        let original = b"{not valid json";
+        fs::write(root.0.join(STATE_FILE), original).unwrap();
+        let payload = root.0.join("payload");
+        fs::create_dir(&payload).unwrap();
+
+        let error = activate_component(&root.0, &manifest, &component, &payload).unwrap_err();
+
+        assert!(error.to_string().contains("state is invalid"), "{error}");
+        assert_eq!(fs::read(root.0.join(STATE_FILE)).unwrap(), original);
+        assert!(payload.is_dir(), "validation must happen before activation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_lock_is_exclusive_and_crash_safe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new("activation-lock");
+        let first = ActivationLock::acquire(&root.0).unwrap();
+        assert!(ActivationLock::try_acquire(&root.0).unwrap().is_none());
+        assert_eq!(
+            fs::metadata(root.0.join(ACTIVATION_LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(first);
+        assert!(ActivationLock::try_acquire(&root.0).unwrap().is_some());
     }
 
     #[test]
@@ -893,6 +1137,10 @@ mod tests {
         assert!(is_component_directory_name(
             "web-extraction",
             "web-extraction-012345abcdef-123-4"
+        ));
+        assert!(is_component_directory_name(
+            "web-extraction",
+            "web-extraction-012345abcdef-123-456-7"
         ));
         assert!(!is_component_directory_name(
             "web-extraction",

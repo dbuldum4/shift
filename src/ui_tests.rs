@@ -87,9 +87,25 @@ impl Drop for TestHttpServer {
 }
 
 fn serve_test_http(mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = [0_u8; 8 * 1024];
-    let bytes_read = stream.read(&mut request).unwrap_or(0);
+    let mut bytes_read = 0;
+    while bytes_read < request.len() {
+        match stream.read(&mut request[bytes_read..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                bytes_read += read;
+                if request[..bytes_read]
+                    .windows(2)
+                    .any(|window| window == b"\r\n")
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
     let request = String::from_utf8_lossy(&request[..bytes_read]);
     let path = request
         .lines()
@@ -588,7 +604,10 @@ async fn selecting_a_url_converts_via_defuddle(cx: &mut TestAppContext) {
     });
     assert_eq!(format, OutputFormat::MARKDOWN);
     assert_eq!(module, "defuddle");
-    assert!(text.contains("shift test fixture: /article.html"));
+    assert!(
+        text.contains("shift test fixture: /article.html"),
+        "unexpected Defuddle output: {text:?}"
+    );
 }
 
 #[gpui::test]
@@ -3785,8 +3804,10 @@ async fn install_hints_for_failure_nonempty_when_engine_missing(cx: &mut TestApp
             pdf_engines: vec![],
             selected_pdf_engine: None,
         }));
-        this.dependency_capabilities =
-            vec![shift_core::dependencies::DependencyCapability::DocumentsMarkdown];
+        this.dependency_tools.insert(
+            "markitdown".into(),
+            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
+        );
         this.set_selected_file(path, cx);
         let hints = this.install_hints_for_failure();
         assert!(
@@ -3826,6 +3847,36 @@ async fn install_hints_empty_without_diagnostics(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn dependency_install_waits_for_active_single_and_batch_conversions(cx: &mut TestAppContext) {
+    let _env = TestEnv::new();
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        this.dependency_selection =
+            vec![shift_core::dependencies::DependencyCapability::DocumentsMarkdown];
+        this.conversion = ConversionState::Converting;
+        this.install_selected_dependencies(cx);
+        assert!(!this.dependency_installing);
+        assert!(
+            this.dependency_install_status
+                .as_deref()
+                .is_some_and(|status| status.contains("active conversions"))
+        );
+
+        this.conversion = ConversionState::Empty;
+        this.batch_running = true;
+        this.dependency_install_status = None;
+        this.install_selected_dependencies(cx);
+        assert!(!this.dependency_installing);
+        assert!(
+            this.dependency_install_status
+                .as_deref()
+                .is_some_and(|status| status.contains("active conversions"))
+        );
+    });
+}
+
+#[gpui::test]
 async fn system_engine_failure_hints_copy_their_own_install_commands(cx: &mut TestAppContext) {
     let _env = TestEnv::new();
     let shift = create_shift(cx);
@@ -3852,11 +3903,6 @@ async fn system_engine_failure_hints_copy_their_own_install_commands(cx: &mut Te
             pdf_engines: vec![],
             selected_pdf_engine: None,
         }));
-        this.dependency_capabilities = vec![
-            shift_core::dependencies::DependencyCapability::DocumentsMarkdown,
-            shift_core::dependencies::DependencyCapability::WebExtraction,
-        ];
-
         let hints = this.install_hints_for_failure();
         assert_eq!(hints.len(), 3, "hints={hints:?}");
         for (hint, command) in hints.iter().zip([

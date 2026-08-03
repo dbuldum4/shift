@@ -4,8 +4,9 @@ use futures::channel::{mpsc, oneshot};
 use shift_core::conversion::{PdfCompression, default_install_command};
 use shift_core::dependencies::{
     DependencyCapability, InstallOutcome, InstallSelection, available_capabilities,
-    install_selected,
+    available_dependency_catalog, install_selected,
 };
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -268,6 +269,7 @@ pub(crate) struct Shift {
     pub(crate) dependency_install_cancel: Arc<AtomicBool>,
     pub(crate) dependency_capabilities: Vec<DependencyCapability>,
     pub(crate) dependency_selection: Vec<DependencyCapability>,
+    pub(crate) dependency_tools: BTreeMap<String, DependencyCapability>,
     /// UI font family for the app chrome (session-persisted Theme setting).
     pub(crate) ui_font_family: String,
     pub(crate) shortcuts_help_open: bool,
@@ -600,7 +602,8 @@ impl Shift {
             history_from_store_detailed(load_history());
         let module_priority = load_module_priority();
         let registry = Arc::new(ConversionRegistry::default().with_priority(&module_priority));
-        let dependency_capabilities = available_capabilities().unwrap_or_default();
+        let dependency_catalog = available_dependency_catalog().unwrap_or_default();
+        let dependency_capabilities = dependency_catalog.capabilities;
         let cached_available_outputs = OutputFormat::ALL.to_vec();
         let cached_ready_outputs = None;
         let cached_history_filter = (String::new(), session.show_archived, history.len());
@@ -654,6 +657,7 @@ impl Shift {
             dependency_install_cancel: Arc::new(AtomicBool::new(false)),
             dependency_capabilities: dependency_capabilities.clone(),
             dependency_selection: dependency_capabilities,
+            dependency_tools: dependency_catalog.tools,
             ui_font_family: session.resolved_ui_font_family().to_owned(),
             shortcuts_help_open: false,
             show_command_inspect: false,
@@ -2137,6 +2141,13 @@ impl Shift {
             cx.notify();
             return;
         }
+        if matches!(self.conversion, ConversionState::Converting) || self.batch_running {
+            self.dependency_install_status = Some(
+                "Wait for active conversions to finish before installing dependencies.".into(),
+            );
+            cx.notify();
+            return;
+        }
         self.dependency_installing = true;
         self.dependency_install_status = Some("Downloading verified dependencies…".into());
         self.dependency_install_outcome = None;
@@ -2951,12 +2962,7 @@ impl Shift {
             .filter(|engine| !engine.readiness.is_ready())
             .filter(|engine| modules.is_empty() || modules.contains(&engine.id))
             .map(|engine| {
-                let managed_capability = match engine.id {
-                    "markitdown" | "docling" => Some(DependencyCapability::DocumentsMarkdown),
-                    "defuddle" => Some(DependencyCapability::WebExtraction),
-                    _ => None,
-                }
-                .filter(|capability| self.dependency_capabilities.contains(capability));
+                let managed_capability = self.dependency_tools.get(engine.id).copied();
                 let action = managed_capability.map_or_else(
                     || {
                         FailureInstallAction::CopyCommand(
