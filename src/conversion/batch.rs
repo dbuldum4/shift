@@ -7,7 +7,8 @@
 
 use super::{
     ConversionArtifact, ConversionError, ConversionOptions, ConversionProgress, ConversionRegistry,
-    InvocationRecord, MAX_BATCH_ADMISSION, OutputFormat, ProgressSink, default_output_path,
+    DiagnosticsReport, InvocationRecord, MAX_BATCH_ADMISSION, OutputFormat, ProgressSink,
+    available_ready_outputs, available_ready_url_outputs, default_output_path,
     is_paste_staging_path, looks_like_url, normalize_path, paths_refer_to_same_file,
 };
 use std::collections::HashSet;
@@ -1230,6 +1231,22 @@ pub fn available_outputs_for_batch_source(
     match source {
         BatchSource::File(path) => registry.available_outputs(path),
         BatchSource::Url(_) => registry.available_url_outputs(),
+    }
+}
+
+/// Outputs for a batch source whose conversion routes are ready on this machine.
+///
+/// Prefer this over [`available_outputs_for_batch_source`] for pickers that
+/// should only offer runnable formats. Capability-only lists remain available
+/// for diagnostics and pre-flight registration checks.
+pub fn available_ready_outputs_for_batch_source(
+    registry: &ConversionRegistry,
+    report: &DiagnosticsReport,
+    source: &BatchSource,
+) -> Vec<OutputFormat> {
+    match source {
+        BatchSource::File(path) => available_ready_outputs(registry, report, path),
+        BatchSource::Url(_) => available_ready_url_outputs(registry, report),
     }
 }
 
@@ -2458,6 +2475,91 @@ mod tests {
         let error = prepare_batch_destination(&source, Some(&source), true).unwrap_err();
         assert!(error.to_string().contains("refusing to overwrite source"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ready_batch_outputs_exclude_missing_engines() {
+        use crate::conversion::{EngineDiagnostic, Readiness};
+
+        struct AlwaysMarkdown;
+        impl ConversionModule for AlwaysMarkdown {
+            fn id(&self) -> &'static str {
+                "markitdown"
+            }
+            fn label(&self) -> &'static str {
+                "MarkItDown"
+            }
+            fn input_extensions(&self) -> &'static [&'static str] {
+                &["txt"]
+            }
+            fn output_formats(&self) -> &[OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn chainable_output_formats(&self) -> &[OutputFormat] {
+                &[OutputFormat::MARKDOWN]
+            }
+            fn convert(
+                &self,
+                _input: &Path,
+                output: OutputFormat,
+                _options: &ConversionOptions,
+            ) -> Result<ConversionArtifact, ConversionError> {
+                Ok(ConversionArtifact {
+                    file_name: "x.md".into(),
+                    media_type: "text/markdown",
+                    bytes: b"# hi".to_vec(),
+                    format: output,
+                    module_id: self.id(),
+                    pipeline: Vec::new(),
+                    invocations: Vec::new(),
+                })
+            }
+        }
+
+        let registry = ConversionRegistry::new().with_module(AlwaysMarkdown);
+        let source = BatchSource::File(PathBuf::from("notes.txt"));
+        assert!(
+            available_outputs_for_batch_source(&registry, &source)
+                .contains(&OutputFormat::MARKDOWN)
+        );
+
+        let missing = DiagnosticsReport {
+            engines: vec![EngineDiagnostic {
+                id: "markitdown",
+                label: "MarkItDown",
+                readiness: Readiness::Missing,
+                version: None,
+                resolved_path: None,
+                env_override: "SHIFT_MARKITDOWN_BIN",
+                install_hint: String::new(),
+                notes: None,
+            }],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+        assert!(
+            available_ready_outputs_for_batch_source(&registry, &missing, &source).is_empty(),
+            "missing engine must not appear in ready picker lists"
+        );
+
+        let ready = DiagnosticsReport {
+            engines: vec![EngineDiagnostic {
+                id: "markitdown",
+                label: "MarkItDown",
+                readiness: Readiness::Ready,
+                version: Some("1".into()),
+                resolved_path: None,
+                env_override: "SHIFT_MARKITDOWN_BIN",
+                install_hint: String::new(),
+                notes: None,
+            }],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        };
+        assert!(
+            available_ready_outputs_for_batch_source(&registry, &ready, &source)
+                .contains(&OutputFormat::MARKDOWN)
+        );
     }
 
     #[test]

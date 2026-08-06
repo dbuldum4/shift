@@ -259,14 +259,15 @@ the given host). URL fetches are **public internet only** by default
 (no localhost/LAN); use the file picker for local files, or set
 `SHIFT_ALLOW_PRIVATE_URLS=1` / CLI `--allow-private-urls` to opt in. The source
 file is never modified; Download refuses to overwrite the selected source. Use the
-output dropdown (with search) on the right to choose a format (formats whose
-engines are missing are labeled). Multi-file queue supports **Overwrite** (CLI
-`--force` parity). The settings button opens a full-screen settings view with a
-left sidebar (Converters, General, Recipes, Options, Paths, Diagnostics, About). On
-Converters, drag a module above another to make it the preferred engine for
-overlapping conversions; status badges show whether each engine is installed.
-The Diagnostics page reports versions, install hints, and distinguishes
-registered format support from conversions that are ready on this Mac. Module
+output dropdown (with search) on the right to choose a format (only formats
+whose engines are installed and ready for the current source are listed).
+Multi-file queue supports **Overwrite** (CLI `--force` parity). The settings
+button opens a full-screen settings view with a left sidebar (Converters,
+General, Recipes, Options, Paths, Diagnostics, About). On Converters, drag a
+module above another to make it the preferred engine for overlapping
+conversions; status badges show whether each engine is installed. The
+Diagnostics page reports versions, install hints, and distinguishes registered
+format support from conversions that are ready on this Mac. Module
 priority, conversion history, and session options are saved under macOS
 Application Support; priority is shared with `shift-cli`.
 

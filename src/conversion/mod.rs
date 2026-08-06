@@ -36,9 +36,10 @@ pub use batch::{
     BATCH_WORKERS_ENV, BatchEnqueueOptions, BatchEvent, BatchFormatSelection, BatchInput,
     BatchItem, BatchItemId, BatchItemState, BatchNamingTemplate, BatchProgress, BatchProvenance,
     BatchQueue, BatchSource, BatchSummary, DEFAULT_BATCH_WORKER_CAP,
-    available_outputs_for_batch_source, batch_worker_count, prepare_batch_destination,
-    resolve_destination, resolve_destination_with_policy, run_batch, suggested_url_file_name,
-    uniquify_destination, validate_batch_output_formats,
+    available_outputs_for_batch_source, available_ready_outputs_for_batch_source,
+    batch_worker_count, prepare_batch_destination, resolve_destination,
+    resolve_destination_with_policy, run_batch, suggested_url_file_name, uniquify_destination,
+    validate_batch_output_formats,
 };
 pub use defuddle::{
     DefuddleModule, DefuddleOptions, block_private_urls, ensure_public_url_fetch_allowed,
