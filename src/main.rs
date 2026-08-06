@@ -36,12 +36,13 @@ use shift_core::conversion::{
     MAX_CLIPBOARD_IMAGE_BYTES, MAX_EXPAND_FILES, MagicPaste, MarkItDownOptions, MaterializedSource,
     OutputFormat, PandocOptions, PasteToken, PdfCompression, PdfInputOptions, Readiness, SipsFlip,
     SipsOptions, SipsQuality, SpreadsheetOptions, StagedInputs, available_outputs_for_batch_source,
-    available_ready_outputs, available_ready_url_outputs, expand_input_paths_preserving_roots,
-    ffmpeg_supports_target_size_output, is_audio_output, is_docling_timed_input,
-    is_docling_video_input, is_ffmpeg_output, is_image_output, is_subtitle_output, is_video_output,
-    looks_like_url, materialize_magic_paste_detailed, parse_magic_paste, paths_refer_to_same_file,
-    pdf_engine_candidates, run_batch, sips_supports_target_size_output, stage_pasted_image,
-    suggested_output_for_path, suggested_output_for_url, url_display_host,
+    available_ready_outputs, available_ready_outputs_for_batch_source, available_ready_url_outputs,
+    expand_input_paths_preserving_roots, ffmpeg_supports_target_size_output, is_audio_output,
+    is_docling_timed_input, is_docling_video_input, is_ffmpeg_output, is_image_output,
+    is_subtitle_output, is_video_output, looks_like_url, materialize_magic_paste_detailed,
+    parse_magic_paste, paths_refer_to_same_file, pdf_engine_candidates, run_batch,
+    sips_supports_target_size_output, stage_pasted_image, suggested_output_for_path,
+    suggested_output_for_url, url_display_host,
 };
 use shift_core::history::{
     LoadedHistory, MAX_HISTORY_ARTIFACT_BYTES, MAX_HISTORY_LIMIT, MIN_HISTORY_LIMIT,
@@ -3354,9 +3355,8 @@ pub(crate) struct OutputPanelView {
     output_menu_open: bool,
     format_filter_input: Entity<TextInput>,
     format_filter: String,
+    /// Selectable formats for the current source (ready-only once diagnostics known).
     available_outputs: Vec<OutputFormat>,
-    /// Formats whose engines are installed and ready (subset of available when diagnostics known).
-    ready_outputs: Option<Vec<OutputFormat>>,
     active_recipe: Option<(String, bool)>,
     show_conversion_options: bool,
     conversion_options: ConversionPanelView,
@@ -3426,7 +3426,6 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
         format_filter_input,
         format_filter,
         available_outputs,
-        ready_outputs,
         active_recipe,
         show_conversion_options,
         conversion_options,
@@ -3964,7 +3963,12 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                         output_format_filter_choices()
                             .iter()
                             .enumerate()
-                            .filter(|(_, (_, label, id))| {
+                            .filter(|(_, (format, label, id))| {
+                                // Only offer formats the current source can convert to
+                                // with engines installed on this Mac.
+                                if !available_outputs.contains(format) {
+                                    return false;
+                                }
                                 if filter_lower.is_empty() {
                                     return true;
                                 }
@@ -3972,18 +3976,6 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                             })
                             .map(|(index, (format, _, _))| {
                                 let format = *format;
-                                let enabled = available_outputs.contains(&format);
-                                let engine_ready = ready_outputs
-                                    .as_ref()
-                                    .map(|ready| ready.contains(&format))
-                                    .unwrap_or(true);
-                                let label_color = if !enabled {
-                                    THEME.text_dim
-                                } else if !engine_ready {
-                                    THEME.text_muted
-                                } else {
-                                    THEME.text_primary
-                                };
                                 div()
                                     .id(("output-format", index))
                                     .flex()
@@ -3993,39 +3985,15 @@ fn output_panel(view: OutputPanelView, cx: &mut Context<Shift>) -> impl IntoElem
                                     .py_2()
                                     .rounded_md()
                                     .text_sm()
-                                    .text_color(label_color)
-                                    .when(enabled, |row| {
-                                        row.cursor_pointer()
-                                            .hover(|style| style.bg(THEME.hover))
-                                            .active(|style| style.opacity(THEME.active_opacity))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.set_output_format(format, cx);
-                                                cx.stop_propagation();
-                                            }))
-                                    })
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(format.label())
-                                            .when(enabled && !engine_ready, |row| {
-                                                row.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(THEME.text_dim)
-                                                        .child("engine not installed"),
-                                                )
-                                            })
-                                            .when(!enabled, |row| {
-                                                row.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(THEME.text_dim)
-                                                        .child("not for this source"),
-                                                )
-                                            }),
-                                    )
+                                    .text_color(THEME.text_primary)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(THEME.hover))
+                                    .active(|style| style.opacity(THEME.active_opacity))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_output_format(format, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(format.label())
                                     .when(format == output_format, |row| {
                                         row.child(div().text_color(THEME.text).child("✓"))
                                     })

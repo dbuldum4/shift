@@ -3965,6 +3965,77 @@ async fn rebuild_output_caches_after_format_change_tracks_source(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn rebuild_output_caches_hides_formats_with_missing_engines(cx: &mut TestAppContext) {
+    let env = TestEnv::new();
+    let path = write_input(&env, "ready_only.txt", b"hello");
+    let shift = create_shift(cx);
+
+    shift.update(cx, |this, cx| {
+        // Avoid the async doctor probe overwriting the fixture report.
+        this.diagnostics_loading = true;
+        this.set_selected_file(path.clone(), cx);
+        this.rebuild_output_caches();
+        assert!(
+            this.cached_available_outputs
+                .contains(&OutputFormat::MARKDOWN),
+            "without diagnostics, capability list still includes markdown"
+        );
+
+        this.diagnostics = Some(Arc::new(DiagnosticsReport {
+            engines: vec![EngineDiagnostic {
+                id: "markitdown",
+                label: "MarkItDown",
+                readiness: Readiness::Missing,
+                version: None,
+                resolved_path: None,
+                env_override: "SHIFT_MARKITDOWN_BIN",
+                install_hint: "pip install markitdown".into(),
+                notes: None,
+            }],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        }));
+        this.rebuild_output_caches();
+        assert!(
+            !this
+                .cached_available_outputs
+                .contains(&OutputFormat::MARKDOWN),
+            "missing MarkItDown must hide markdown from the picker: {:?}",
+            this.cached_available_outputs
+        );
+        assert!(
+            this.cached_ready_outputs
+                .as_ref()
+                .is_some_and(|ready| !ready.contains(&OutputFormat::MARKDOWN)),
+            "ready cache should also exclude markdown"
+        );
+
+        // Make markitdown ready — markdown returns to the list.
+        this.diagnostics = Some(Arc::new(DiagnosticsReport {
+            engines: vec![EngineDiagnostic {
+                id: "markitdown",
+                label: "MarkItDown",
+                readiness: Readiness::Ready,
+                version: Some("0.1".into()),
+                resolved_path: None,
+                env_override: "SHIFT_MARKITDOWN_BIN",
+                install_hint: String::new(),
+                notes: None,
+            }],
+            pdf_engines: vec![],
+            selected_pdf_engine: None,
+        }));
+        this.rebuild_output_caches();
+        assert!(
+            this.cached_available_outputs
+                .contains(&OutputFormat::MARKDOWN),
+            "ready MarkItDown restores markdown: {:?}",
+            this.cached_available_outputs
+        );
+    });
+}
+
+#[gpui::test]
 async fn active_option_modules_for_srt_include_ffmpeg(cx: &mut TestAppContext) {
     let env = TestEnv::new();
     let path = write_input(&env, "subs.mkv", b"vid");

@@ -283,9 +283,15 @@ pub(crate) struct Shift {
     pub(crate) registry: Arc<ConversionRegistry>,
     pub(crate) diagnostics: Option<Arc<DiagnosticsReport>>,
     pub(crate) diagnostics_loading: bool,
-    /// Cached output formats for the current selection.
+    /// Selectable output formats for the current selection.
+    ///
+    /// When a source is selected and diagnostics are known, this is the ready
+    /// subset only (capability ∩ installed engines). Capability-only catalogs
+    /// remain on Diagnostics / `shift-cli formats`.
     pub(crate) cached_available_outputs: Vec<OutputFormat>,
-    /// Formats whose engines are ready (when diagnostics are known).
+    /// Ready formats for the current selection when diagnostics are known.
+    /// Mirrors [`Self::cached_available_outputs`] once diagnostics load with a
+    /// source; `None` while probing or with no selection.
     pub(crate) cached_ready_outputs: Option<Vec<OutputFormat>>,
     pub(crate) url_input: Entity<TextInput>,
     pub(crate) history: Vec<ConversionHistoryEntry>,
@@ -760,11 +766,14 @@ impl Shift {
 
     const MAX_HISTORY_RENDERED: usize = 200;
 
-    /// Recompute the cached available/ready output formats for the current
-    /// selection and diagnostics. Called when the selection, module priority,
-    /// or diagnostics change.
+    /// Recompute the cached selectable output formats for the current selection
+    /// and diagnostics. Called when the selection, module priority, or
+    /// diagnostics change.
+    ///
+    /// With a source and a diagnostics report, only formats whose engines are
+    /// ready on this Mac are listed in the format menu and used for defaults.
     pub(crate) fn rebuild_output_caches(&mut self) {
-        self.cached_available_outputs = if self.selected_url.is_some() {
+        let supported = if self.selected_url.is_some() {
             self.registry.available_url_outputs()
         } else if let Some(path) = self.selected_file.as_ref() {
             self.registry.available_outputs(path)
@@ -772,7 +781,11 @@ impl Shift {
             OutputFormat::ALL.to_vec()
         };
 
+        let has_source = self.selected_file.is_some() || self.selected_url.is_some();
         self.cached_ready_outputs = self.diagnostics.as_ref().and_then(|report| {
+            if !has_source {
+                return None;
+            }
             if self.selected_url.is_some() {
                 Some(available_ready_url_outputs(&self.registry, report))
             } else {
@@ -781,6 +794,31 @@ impl Shift {
                     .map(|path| available_ready_outputs(&self.registry, report, path))
             }
         });
+
+        // Prefer the ready subset for pickers once diagnostics are known so the
+        // UI never offers formats that would fail at engine spawn.
+        self.cached_available_outputs = match &self.cached_ready_outputs {
+            Some(ready) if has_source => ready.clone(),
+            _ => supported,
+        };
+
+        if has_source
+            && !self.cached_available_outputs.is_empty()
+            && !self.cached_available_outputs.contains(&self.output_format)
+        {
+            let suggested = if let Some(path) = self.selected_file.as_ref() {
+                suggested_output_for_path(path)
+            } else if self.selected_url.is_some() {
+                suggested_output_for_url()
+            } else {
+                OutputFormat::MARKDOWN
+            };
+            self.output_format = if self.cached_available_outputs.contains(&suggested) {
+                suggested
+            } else {
+                self.cached_available_outputs[0]
+            };
+        }
     }
 
     /// Rebuild the filtered, capped history list only when the search query,
@@ -1041,13 +1079,20 @@ impl Shift {
         if self.batch_running {
             return;
         }
-        let supported = self
-            .batch_queue
-            .get(id)
-            .map(|item| available_outputs_for_batch_source(&self.registry, &item.source))
-            .is_some_and(|available| available.contains(&format));
+        let supported = self.batch_queue.get(id).is_some_and(|item| {
+            let available = match self.diagnostics.as_ref() {
+                Some(report) => {
+                    available_ready_outputs_for_batch_source(&self.registry, report, &item.source)
+                }
+                None => available_outputs_for_batch_source(&self.registry, &item.source),
+            };
+            available.contains(&format)
+        });
         if !supported {
-            self.batch_status = Some("That output is not supported for this source.".into());
+            self.batch_status = Some(
+                "That output is not available for this source (unsupported or engine missing)."
+                    .into(),
+            );
             cx.notify();
             return;
         }
@@ -1160,10 +1205,16 @@ impl Shift {
         let Some(item) = self.batch_queue.get(id) else {
             return;
         };
-        let available = available_outputs_for_batch_source(&self.registry, &item.source);
+        let available = match self.diagnostics.as_ref() {
+            Some(report) => {
+                available_ready_outputs_for_batch_source(&self.registry, report, &item.source)
+            }
+            None => available_outputs_for_batch_source(&self.registry, &item.source),
+        };
         let used = self.batch_queue.group_formats(id);
         let Some(format) = available.into_iter().find(|format| !used.contains(format)) else {
-            self.batch_status = Some("Every supported output is already queued.".into());
+            self.batch_status =
+                Some("Every available output for this source is already queued.".into());
             cx.notify();
             return;
         };
@@ -4239,7 +4290,6 @@ impl Render for Shift {
         let can_convert = has_selection && !matches!(conversion, ConversionState::Converting);
         let save_status = self.save_status.clone();
         let available_outputs = self.cached_available_outputs.clone();
-        let ready_outputs = self.cached_ready_outputs.clone();
         self.ensure_history_cache(cx);
         let output_format = self.output_format;
         let onboarding_step = self.onboarding_step;
@@ -4368,10 +4418,15 @@ impl Render for Shift {
         let batch_available_formats: HashMap<u64, Vec<OutputFormat>> = batch_items
             .iter()
             .map(|item| {
-                (
-                    item.id.0,
-                    available_outputs_for_batch_source(&self.registry, &item.source),
-                )
+                let formats = match self.diagnostics.as_ref() {
+                    Some(report) => available_ready_outputs_for_batch_source(
+                        &self.registry,
+                        report,
+                        &item.source,
+                    ),
+                    None => available_outputs_for_batch_source(&self.registry, &item.source),
+                };
+                (item.id.0, formats)
             })
             .collect();
         let cached_ready_path = self.cached_ready_path.clone();
@@ -4512,7 +4567,6 @@ impl Render for Shift {
                                 format_filter_input,
                                 format_filter,
                                 available_outputs,
-                                ready_outputs,
                                 active_recipe: active_recipe
                                     .clone()
                                     .map(|name| (name, recipe_modified)),
