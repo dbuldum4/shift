@@ -2177,7 +2177,12 @@ fn run_formats(arguments: &[OsString]) -> Result<ExitCode, String> {
         print_formats(&registry);
     } else {
         for format in formats_for_inputs(&registry, &inputs)? {
-            println!("{}\t{}\t{}", format.id(), format.label(), format.extension());
+            println!(
+                "{}\t{}\t{}",
+                format.id(),
+                format.label(),
+                format.extension()
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -2624,12 +2629,8 @@ mod tests {
 
     #[test]
     fn headless_launch_flag_is_global_and_removed_before_dispatch() {
-        let (arguments, mode) = parse_launch_mode(args(&[
-            "--headless",
-            "report.docx",
-            "--to",
-            "markdown",
-        ]));
+        let (arguments, mode) =
+            parse_launch_mode(args(&["--headless", "report.docx", "--to", "markdown"]));
         assert_eq!(mode, LaunchMode::Headless);
         assert_eq!(arguments, args(&["report.docx", "--to", "markdown"]));
 
@@ -2656,7 +2657,11 @@ mod tests {
                         && format["mediaType"].is_string()
                 })
         }));
-        assert!(response["modules"].as_array().is_some_and(|modules| !modules.is_empty()));
+        assert!(
+            response["modules"]
+                .as_array()
+                .is_some_and(|modules| !modules.is_empty())
+        );
     }
 
     #[test]
@@ -2665,8 +2670,8 @@ mod tests {
         let error = formats_for_inputs(&registry, &args(&[""])).unwrap_err();
         assert!(error.contains("non-empty"), "{error}");
 
-        let formats = formats_for_inputs(&registry, &args(&["https://example.com/article"]))
-            .unwrap();
+        let formats =
+            formats_for_inputs(&registry, &args(&["https://example.com/article"])).unwrap();
         assert!(formats.contains(&OutputFormat::MARKDOWN));
         assert!(formats.contains(&OutputFormat::HTML));
     }
