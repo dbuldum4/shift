@@ -81,7 +81,9 @@ On first launch, onboarding offers a copy-paste Homebrew command for the main
 converter CLIs. The same tools can be installed anytime from Terminal, conversion
 error hints, or Settings. The commands below are the supported setup path.
 
-- macOS with Xcode and its command-line tools
+- macOS with Xcode and its command-line tools (native GPUI app). The CLI/TUI
+  engine builds with Command Line Tools only:
+  `cargo build --bin shift-cli --no-default-features`.
 - Rust stable (selected automatically by `rust-toolchain.toml`)
 - Python 3.11 (packaged launchers and release packaging resolve `python3.11`;
   Homebrew `python@3.11` is the documented path)
@@ -308,8 +310,14 @@ shift-cli --headless formats --json --input report.docx
 ```
 
 The packaged client looks for `shift-tui` beside `shift-cli`; set
-`SHIFT_TUI_BIN` during development or custom packaging. The OpenTUI package is
-under `tui/`:
+`SHIFT_TUI_BIN` during development or custom packaging. For a local TUI loop
+that skips the native GPUI app (no Xcode / `xcrun metal`):
+
+```sh
+scripts/dev-tui.sh
+```
+
+The OpenTUI package is under `tui/`:
 
 ```sh
 cd tui

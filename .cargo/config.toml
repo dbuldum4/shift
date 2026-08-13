@@ -1,5 +1,6 @@
 [alias]
 dev = "run"
+cli = "build --bin shift-cli --no-default-features"
 lint = "clippy --all-targets --all-features -- -D warnings"
 
 # Launch the app with isolated, empty Application Support state.

@@ -50,6 +50,11 @@ macOS (x64/arm64), and Windows (x64). Baseline x64 variants avoid an AVX2
 requirement. A complete cross-platform Shift distribution must place the native
 Rust `shift-cli` engine beside the matching `shift-tui` client.
 
+The matching engine is `cargo build --bin shift-cli --no-default-features`,
+which skips the native GPUI app and does not need `xcrun metal`.
+`scripts/dev-tui.sh` builds that engine and launches `bun run --cwd tui dev`
+with `SHIFT_CLI_ENGINE` set.
+
 The macOS release workflow builds the current-architecture client and packages
 both executables under `Shift.app/Contents/Resources/bin`. Package verification
 executes the TUI's headless bridge to prove sibling engine discovery works.

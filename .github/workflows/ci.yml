@@ -44,11 +44,13 @@ jobs:
       - name: Verify release metadata and script failure paths
         run: sh scripts/test-release-preflight.sh
       - name: Check package scripts parse
-        run: sh -n scripts/package-macos.sh scripts/release-preflight.sh scripts/verify-macos-package.sh
+        run: sh -n scripts/package-macos.sh scripts/release-preflight.sh scripts/verify-macos-package.sh scripts/dev-tui.sh
       - name: Smoke the installed CLI version surface
         run: |
           version="$(awk -F'\"' '/^version = \"/ { print $2; exit }' Cargo.toml)"
           cargo run --locked --quiet --bin shift-cli -- --version | grep -Fqx "shift-cli $version"
+      - name: CLI-only build skips the native GPUI app
+        run: cargo build --locked --bin shift-cli --no-default-features
 
   landing-page:
     runs-on: ubuntu-latest
