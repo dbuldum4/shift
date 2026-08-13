@@ -73,6 +73,9 @@ printf '#!/bin/sh\necho shift-cli %s\n' "$version" \
   > "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-cli"
 chmod +x "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-cli"
 cp "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-cli" \
+  "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-tui"
+chmod +x "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-tui"
+cp "$checksum_fixture/dist/Shift.app/Contents/Resources/bin/shift-cli" \
   "$checksum_fixture/dist/Shift.app/Contents/MacOS/shift"
 chmod +x "$checksum_fixture/dist/Shift.app/Contents/MacOS/shift"
 printf 'license\n' > "$checksum_fixture/dist/Shift.app/Contents/Resources/LICENSE"
@@ -238,12 +241,23 @@ mkdir -p "$dependency_archive_fixture/payload/bin" \
   "$dependency_archive_fixture/extracted"
 printf 'launcher\n' > "$dependency_archive_fixture/payload/bin/tool"
 printf 'runtime\n' > "$dependency_archive_fixture/payload/python/module"
-(
-  cd "$dependency_archive_fixture/payload"
-  /usr/bin/ditto -c -k --sequesterRsrc . "$dependency_archive_fixture/component.zip"
-)
-/usr/bin/ditto -x -k "$dependency_archive_fixture/component.zip" \
-  "$dependency_archive_fixture/extracted"
+if [ -x /usr/bin/ditto ]; then
+  (
+    cd "$dependency_archive_fixture/payload"
+    /usr/bin/ditto -c -k --sequesterRsrc . "$dependency_archive_fixture/component.zip"
+  )
+  /usr/bin/ditto -x -k "$dependency_archive_fixture/component.zip" \
+    "$dependency_archive_fixture/extracted"
+else
+  # Linux development/CI fallback for the same archive-root assertion. macOS
+  # still exercises the exact ditto commands used by the release packager.
+  (
+    cd "$dependency_archive_fixture/payload"
+    zip -q -r "$dependency_archive_fixture/component.zip" .
+  )
+  unzip -q "$dependency_archive_fixture/component.zip" \
+    -d "$dependency_archive_fixture/extracted"
+fi
 for expected in bin/tool python/module; do
   test -f "$dependency_archive_fixture/extracted/$expected" \
     || {

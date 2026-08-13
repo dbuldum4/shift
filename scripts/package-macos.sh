@@ -30,11 +30,23 @@ if [ ! -x target/release/shift ] || [ ! -x target/release/shift-cli ]; then
   exit 2
 fi
 
+tui_arch="$arch"
+case "$arch" in
+  x86_64) tui_arch="x64" ;;
+  arm64) tui_arch="arm64" ;;
+esac
+tui_binary="tui/dist/shift-tui-darwin-${tui_arch}"
+if [ ! -x "$tui_binary" ]; then
+  echo "package-macos: OpenTUI binary is missing: $tui_binary; run (cd tui && bun run build) first" >&2
+  exit 2
+fi
+
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$resources/bin" "$runtime/bin" "$runtime/python" "$runtime/node"
 
 cp target/release/shift "$contents/MacOS/shift"
 cp target/release/shift-cli "$resources/bin/shift-cli"
+cp "$tui_binary" "$resources/bin/shift-tui"
 cp LICENSE "$resources/LICENSE"
 cp THIRD_PARTY_NOTICES.md "$resources/THIRD_PARTY_NOTICES.md"
 
@@ -236,7 +248,7 @@ fi
 exec "$node" "$root/node/node_modules/defuddle/dist/cli.js" "$@"
 EOF
 
-chmod +x "$runtime/bin/"* "$contents/MacOS/shift" "$resources/bin/shift-cli"
+chmod +x "$runtime/bin/"* "$contents/MacOS/shift" "$resources/bin/shift-cli" "$resources/bin/shift-tui"
 
 # Verify every bundled launcher before publishing a large release artifact.
 SHIFT_PYTHON_BIN="$(command -v python3.11)" "$runtime/bin/markitdown" --help >/dev/null

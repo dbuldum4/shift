@@ -1,4 +1,6 @@
 /target
+/tui/node_modules
+/tui/dist
 /.venv
 .DS_Store
 *.swp

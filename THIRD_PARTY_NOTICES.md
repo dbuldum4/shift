@@ -14,6 +14,9 @@ also pins the following runtime packages:
   `docling-slim[format-video]==2.115.0` on Apple Silicon; base
   `docling-slim==2.115.0` on Intel
 - [Defuddle](https://github.com/kepano/defuddle) `defuddle@0.19.2`
+- [OpenTUI](https://github.com/anomalyco/opentui) `@opentui/core@0.4.5` and
+  `@opentui/solid@0.4.5` (MIT), compiled with Bun `1.3.14`
+- [SolidJS](https://github.com/solidjs/solid) `solid-js@1.9.12` (MIT)
 
 Their licenses, notices, and transitive dependencies are governed by their
 respective upstream distributions. The release process preserves this notice in
@@ -26,6 +29,6 @@ also distributed under their upstream licenses. The same is true for optional
 Docling model weights downloaded by Docling on first use.
 
 For source redistribution or compliance review, use the exact revision's
-`Cargo.lock`, the package pins in `scripts/package-macos.sh`, and the upstream
-license files for the dependencies above. Update this document whenever either
-set changes.
+`Cargo.lock`, `tui/package-lock.json`, the package pins in
+`scripts/package-macos.sh`, and the upstream license files for the dependencies
+above. Update this document whenever either set changes.
