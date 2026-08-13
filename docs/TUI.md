@@ -23,7 +23,9 @@ naming, queue ordering, conversion, cancellation, and artifact writes.
 
 The main view consists of an input queue, conversion settings, an activity bar,
 and a shortcut footer. At 96 columns it uses a two-panel layout; below that it
-stacks vertically. Every action in the command palette has a keyboard path and
+stacks vertically. On the empty input state, Add files, Add folder, and Add URL
+are a focus group: arrow keys and j/k move the cursor, and Enter runs the
+focused action. Every action in the command palette has a keyboard path and
 all highlighted rows, buttons, toggles, picker entries, and output links accept
 mouse input. File and output pickers support wheel scrolling and filter input.
 

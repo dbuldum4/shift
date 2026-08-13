@@ -33,11 +33,18 @@ type ModalName =
   | "commands"
   | "doctor"
 
+const emptySourceActions = [
+  { id: "files", label: "Add files", shortcut: "ctrl+p", modal: "files" },
+  { id: "folder", label: "Add folder", shortcut: undefined, modal: "inputFolder" },
+  { id: "url", label: "Add URL", shortcut: "ctrl+l", modal: "url" },
+] as const
+
 export function App() {
   const renderer = useRenderer()
   const terminal = useTerminalDimensions()
   const [items, setItems] = createSignal<QueueItem[]>([])
   const [selected, setSelected] = createSignal(0)
+  const [emptyFocus, setEmptyFocus] = createSignal(0)
   const [modal, setModal] = createSignal<ModalName>()
   const [capabilities, setCapabilities] = createSignal<CapabilityResponse>()
   const [settings, setSettings] = createStore<ConversionSettings>({
@@ -113,6 +120,15 @@ export function App() {
     const y = target.y - list.y
     if (y >= list.height) list.scrollBy(y - list.height + 1)
     if (y < 0) list.scrollBy(y)
+  }
+
+  function moveEmptyFocus(delta: number) {
+    setEmptyFocus((current) => (current + delta + emptySourceActions.length) % emptySourceActions.length)
+  }
+
+  function activateEmptyFocus() {
+    const action = emptySourceActions[emptyFocus()]
+    if (action) setModal(action.modal)
   }
 
   async function start() {
@@ -299,6 +315,12 @@ export function App() {
     if (event.ctrl && event.name === "r") return void start()
     if ((event.ctrl && event.name === "x") || event.name === "delete") return removeSelected()
     if (event.name === "?" || (event.shift && event.name === "/")) return setModal("help")
+    if (!items().length) {
+      if (event.name === "left" || event.name === "up" || event.name === "k") return moveEmptyFocus(-1)
+      if (event.name === "right" || event.name === "down" || event.name === "j") return moveEmptyFocus(1)
+      if (event.name === "return") return activateEmptyFocus()
+      return
+    }
     if (event.name === "up" || event.name === "k") return moveSelection(-1)
     if (event.name === "down" || event.name === "j") return moveSelection(1)
     if (event.name === "return" && selectedItem()?.state === "succeeded" && selectedItem()?.artifacts[0]) {
@@ -319,8 +341,10 @@ export function App() {
         <QueuePanel
           items={items()}
           selected={selected()}
+          emptyFocus={emptyFocus()}
           compact={compact()}
           onSelect={setSelected}
+          onEmptyFocus={setEmptyFocus}
           onAdd={() => setModal("files")}
           onAddFolder={() => setModal("inputFolder")}
           onAddUrl={() => setModal("url")}
@@ -351,7 +375,7 @@ export function App() {
       </box>
 
       <ActivityBar status={capabilityError() ?? status()} outputs={outputs()} busy={busy()} onOpen={openPath} />
-      <Footer />
+      <Footer empty={items().length === 0} />
 
       <Switch>
         <Match when={modal() === "files"}>
@@ -502,14 +526,21 @@ function Header(props: { version?: string; busy: boolean; onCommands: () => void
 function QueuePanel(props: {
   items: QueueItem[]
   selected: number
+  emptyFocus: number
   compact: boolean
   onSelect: (index: number) => void
+  onEmptyFocus: (index: number) => void
   onAdd: () => void
   onAddFolder: () => void
   onAddUrl: () => void
   onRemove: () => void
   bind: (value: ScrollBoxRenderable) => void
 }) {
+  const openEmpty = {
+    files: props.onAdd,
+    folder: props.onAddFolder,
+    url: props.onAddUrl,
+  }
   return (
     <box
       flexGrow={1}
@@ -530,9 +561,17 @@ function QueuePanel(props: {
             </text>
             <text fg={theme.muted}>Pick files, a folder, or paste a public URL.</text>
             <box flexDirection="row" gap={1} paddingTop={1}>
-              <Button label="Add files" shortcut="ctrl+p" primary onUse={props.onAdd} />
-              <Button label="Add folder" onUse={props.onAddFolder} />
-              <Button label="Add URL" shortcut="ctrl+l" onUse={props.onAddUrl} />
+              <For each={emptySourceActions}>
+                {(action, index) => (
+                  <Button
+                    label={action.label}
+                    shortcut={action.shortcut}
+                    focused={props.emptyFocus === index()}
+                    onFocus={() => props.onEmptyFocus(index())}
+                    onUse={openEmpty[action.id]}
+                  />
+                )}
+              </For>
             </box>
           </box>
         }
@@ -719,14 +758,17 @@ function Button(props: {
   label: string
   shortcut?: string
   primary?: boolean
+  focused?: boolean
   danger?: boolean
   disabled?: boolean
+  onFocus?: () => void
   onUse: () => void
 }) {
+  const highlighted = () => !props.disabled && (props.focused || props.primary)
   const background = () =>
-    props.disabled ? theme.elevated : props.danger ? theme.danger : props.primary ? theme.primary : theme.elevated
+    props.disabled ? theme.elevated : props.danger ? theme.danger : highlighted() ? theme.primary : theme.elevated
   const foreground = () =>
-    props.disabled ? theme.subtle : props.primary || props.danger ? theme.onPrimary : theme.text
+    props.disabled ? theme.subtle : highlighted() || props.danger ? theme.onPrimary : theme.text
   return (
     <box
       height={2}
@@ -737,6 +779,8 @@ function Button(props: {
       paddingLeft={1}
       paddingRight={1}
       backgroundColor={background()}
+      onMouseOver={props.onFocus}
+      onMouseDown={props.onFocus}
       onMouseUp={() => {
         if (!props.disabled) props.onUse()
       }}
@@ -778,13 +822,20 @@ function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; 
   )
 }
 
-function Footer() {
+function Footer(props: { empty: boolean }) {
   return (
     <box height={1} flexShrink={0} flexDirection="row" justifyContent="space-between" paddingLeft={1} paddingRight={1}>
       <box flexDirection="row" gap={2}>
-        <KeyHint key="a" label="add" />
-        <KeyHint key="↑↓" label="navigate" />
-        <KeyHint key="ctrl+r" label="run" />
+        <Show when={props.empty}>
+          <KeyHint key="←→" label="move" />
+          <KeyHint key="enter" label="add" />
+          <KeyHint key="a" label="files" />
+        </Show>
+        <Show when={!props.empty}>
+          <KeyHint key="a" label="add" />
+          <KeyHint key="↑↓" label="navigate" />
+          <KeyHint key="ctrl+r" label="run" />
+        </Show>
       </box>
       <text fg={theme.subtle}>{process.cwd()}</text>
     </box>

@@ -46,6 +46,7 @@ test("renders a complete wide-screen application shell", async () => {
     expect(frame).toContain("Inputs")
     expect(frame).toContain("Conversion")
     expect(frame).toContain("Add files")
+    expect(frame).toContain("enter add")
     expect(frame).toContain("Run conversion")
   } finally {
     app.renderer.destroy()
@@ -64,5 +65,49 @@ test("reflows into a usable narrow terminal", async () => {
     expect(frame).toContain("ctrl+k")
   } finally {
     app.renderer.destroy()
+  }
+})
+
+async function renderEmptyApp() {
+  const app = await testRender(() => <App />, { width: 120, height: 34 })
+  await app.waitForFrame((frame) => frame.includes("What should Shift convert?"))
+  return app
+}
+
+test("moves the empty-state add cursor and activates with enter", async () => {
+  const files = await renderEmptyApp()
+  try {
+    files.mockInput.pressEnter()
+    await files.waitForFrame((frame) => frame.includes("Choose input files"))
+  } finally {
+    files.renderer.destroy()
+  }
+
+  const folder = await renderEmptyApp()
+  try {
+    folder.mockInput.pressArrow("right")
+    folder.mockInput.pressEnter()
+    await folder.waitForFrame((frame) => frame.includes("Choose input folder"))
+  } finally {
+    folder.renderer.destroy()
+  }
+
+  const url = await renderEmptyApp()
+  try {
+    url.mockInput.pressArrow("right")
+    url.mockInput.pressArrow("right")
+    url.mockInput.pressEnter()
+    await url.waitForFrame((frame) => frame.includes("Public web page or direct file URL"))
+  } finally {
+    url.renderer.destroy()
+  }
+
+  const wrap = await renderEmptyApp()
+  try {
+    wrap.mockInput.pressArrow("left")
+    wrap.mockInput.pressEnter()
+    await wrap.waitForFrame((frame) => frame.includes("Public web page or direct file URL"))
+  } finally {
+    wrap.renderer.destroy()
   }
 })

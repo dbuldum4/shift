@@ -287,6 +287,9 @@ Common shortcuts:
 | Shortcut | Action |
 |---|---|
 | `Ctrl+P` / `a` | Add files |
+| `←` `→` / `↑` `↓` | Move the empty-state add cursor |
+| `↑` `↓` or `j` `k` | Move through queued inputs |
+| `Enter` | Run the focused add action, or open a finished artifact |
 | `Ctrl+L` | Add a URL |
 | `Ctrl+O` | Choose one or more output formats |
 | `Ctrl+D` | Choose the output folder |
