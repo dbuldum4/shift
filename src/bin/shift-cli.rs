@@ -2268,7 +2268,6 @@ fn formats_json(
         .collect::<Vec<_>>();
     let modules = registry
         .modules()
-        .iter()
         .map(|module| {
             serde_json::json!({
                 "id": module.id(),
