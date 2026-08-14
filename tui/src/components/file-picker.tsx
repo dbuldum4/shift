@@ -1,12 +1,13 @@
 import { readdir } from "node:fs/promises"
 import { basename, dirname, join, normalize } from "node:path"
-import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import type { InputRenderable, ScrollBoxRenderable } from "@opentui/core"
 import { TextAttributes } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { truncateStart } from "../layout"
 import { matchesQuery } from "../model"
 import { theme } from "../theme"
+import { focusInputWhenReady } from "./focus-input"
 import { KeyHint, Modal } from "./modal"
 
 type PickerEntry = {
@@ -50,7 +51,7 @@ export function FilePicker(props: {
     setActive(0)
   })
 
-  onMount(() => setTimeout(() => search?.focus(), 1))
+  focusInputWhenReady(() => search)
 
   async function load() {
     setLoading(true)

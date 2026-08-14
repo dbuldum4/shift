@@ -30,7 +30,11 @@ left so hints never paint over the path. On
 short terminals the activity bar collapses to one row. On the empty input
 state, Add files, Add folder, and Add URL are a focus group: arrow keys and
 j/k move the cursor, and Enter runs the focused action. Narrow terminals stack
-those actions instead of crowding them onto one row. Every action in the
+those actions instead of crowding them onto one row. Adding the first input
+moves focus to the conversion pane so a full input-to-output pass is arrows
+and Enter: Output, Converter, Destination, Naming, Overwrite, Expand folders,
+then Run conversion. Left or up from the first setting returns to the queue;
+down from the last queued item (or right) returns to conversion. Every action in the
 command palette has a keyboard path and all highlighted rows, buttons, toggles,
 picker entries, and output links accept mouse input. File and output pickers
 support wheel scrolling and filter input.

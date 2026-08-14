@@ -165,6 +165,28 @@ test("keeps the command palette usable on a short terminal", async () => {
   }
 })
 
+test("does not crash when a palette is torn down before its input focuses", async () => {
+  const palette = await testRender(() => <App />, { width: 50, height: 20 })
+  try {
+    await palette.renderOnce()
+    palette.mockInput.pressKey("k", { ctrl: true })
+    await palette.waitForFrame((frame) => frame.includes("Command palette"))
+  } finally {
+    palette.renderer.destroy()
+  }
+
+  await Bun.sleep(5)
+  const help = await testRender(() => <App />, { width: 50, height: 20 })
+  try {
+    await help.renderOnce()
+    help.mockInput.pressKey("?")
+    const frame = await help.waitForFrame((value) => value.includes("Keyboard"))
+    expect(frame).toContain("Add input files")
+  } finally {
+    help.renderer.destroy()
+  }
+})
+
 test("keeps the help overlay readable on a short terminal", async () => {
   const app = await testRender(() => <App />, { width: 50, height: 20 })
   try {
@@ -206,6 +228,77 @@ async function renderEmptyApp() {
   await app.waitForFrame((frame) => frame.includes("What should Shift convert?"))
   return app
 }
+
+async function addTestUrl(app: Awaited<ReturnType<typeof renderEmptyApp>>, url = "https://shift.test/article") {
+  app.mockInput.pressArrow("right")
+  app.mockInput.pressArrow("right")
+  app.mockInput.pressEnter()
+  await app.waitForFrame((frame) => frame.includes("Public web page"))
+  await Bun.sleep(20)
+  await app.mockInput.typeText(url)
+  app.mockInput.pressEnter()
+  await app.waitForFrame((frame) => frame.includes("1 queued") && frame.includes("shift.test"))
+}
+
+test("moves focus to conversion options after the first input is added", async () => {
+  const app = await renderEmptyApp()
+  try {
+    await addTestUrl(app)
+    app.mockInput.pressEnter()
+    const frame = await app.waitForFrame((value) => value.includes("Choose output formats"))
+    expect(frame).toContain("Markdown")
+    expect(frame).toContain("PDF")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("runs a conversion with only arrows and enter after adding an input", async () => {
+  const app = await renderEmptyApp()
+  try {
+    await addTestUrl(app)
+    for (let step = 0; step < 6; step++) app.mockInput.pressArrow("down")
+    app.mockInput.pressEnter()
+    const frame = await app.waitForFrame((value) => /Converting|Done|Conversion exited/.test(value))
+    expect(frame).toMatch(/Converting|Done|Conversion exited/)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("returns to the input queue from conversion options", async () => {
+  const app = await renderEmptyApp()
+  try {
+    await addTestUrl(app)
+    app.mockInput.pressArrow("left")
+    await Bun.sleep(20)
+    await app.renderOnce()
+    app.mockInput.pressEnter()
+    await Bun.sleep(30)
+    await app.renderOnce()
+    expect(app.captureCharFrame()).not.toContain("Choose output formats")
+    app.mockInput.pressArrow("right")
+    await Bun.sleep(20)
+    app.mockInput.pressEnter()
+    await app.waitForFrame((value) => value.includes("Choose output formats"))
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("toggles a focused conversion setting with enter", async () => {
+  const app = await renderEmptyApp()
+  try {
+    await addTestUrl(app)
+    for (let step = 0; step < 4; step++) app.mockInput.pressArrow("down")
+    app.mockInput.pressEnter()
+    await Bun.sleep(20)
+    await app.renderOnce()
+    expect(app.captureCharFrame()).toContain("● on")
+  } finally {
+    app.renderer.destroy()
+  }
+})
 
 test("moves the empty-state add cursor and activates with enter", async () => {
   const files = await renderEmptyApp()

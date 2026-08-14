@@ -1,9 +1,10 @@
-import { createMemo, createSignal, For, onMount, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import { TextAttributes, type InputRenderable } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { paletteLabelWidth, truncateEnd } from "../layout"
 import { matchesQuery } from "../model"
 import { theme } from "../theme"
+import { focusInputWhenReady } from "./focus-input"
 import { KeyHint, Modal } from "./modal"
 
 export type PaletteAction = {
@@ -23,7 +24,7 @@ export function ActionPalette(props: { actions: PaletteAction[]; onCancel: () =>
   const visible = createMemo(() =>
     props.actions.filter((action) => matchesQuery(`${action.label} ${action.description}`, query())),
   )
-  onMount(() => setTimeout(() => input?.focus(), 1))
+  focusInputWhenReady(() => input)
 
   function move(delta: number) {
     if (visible().length) setActive((current) => (current + delta + visible().length) % visible().length)

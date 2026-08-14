@@ -44,10 +44,28 @@ const emptyFooterHints: Hint[] = [
 ]
 
 const queueFooterHints: Hint[] = [
+  { key: "arrows", label: "move" },
   { key: "a", label: "add" },
-  { key: "j/k", label: "move" },
   { key: "ctrl+r", label: "run" },
 ]
+
+const settingsFooterHints: Hint[] = [
+  { key: "arrows", label: "move" },
+  { key: "enter", label: "use" },
+  { key: "ctrl+r", label: "run" },
+]
+
+const SETTINGS = {
+  formats: 0,
+  module: 1,
+  destination: 2,
+  naming: 3,
+  force: 4,
+  recursive: 5,
+  run: 6,
+} as const
+
+const SETTING_COUNT = 7
 
 type ModalName =
   | "files"
@@ -73,6 +91,8 @@ export function App() {
   const [items, setItems] = createSignal<QueueItem[]>([])
   const [selected, setSelected] = createSignal(0)
   const [emptyFocus, setEmptyFocus] = createSignal(0)
+  const [focusPane, setFocusPane] = createSignal<"queue" | "settings">("queue")
+  const [settingsFocus, setSettingsFocus] = createSignal<number>(SETTINGS.formats)
   const [modal, setModal] = createSignal<ModalName>()
   const [capabilities, setCapabilities] = createSignal<CapabilityResponse>()
   const [settings, setSettings] = createStore<ConversionSettings>({
@@ -124,20 +144,30 @@ export function App() {
   })
 
   function addSources(sources: string[], folder = false) {
+    const wasEmpty = items().length === 0
     const all = dedupeSources([...items().map((item) => item.source), ...sources])
     setItems(all.map((source) => items().find((item) => item.source === source) ?? createQueueItem(source)))
     if (folder) setSettings("recursive", true)
     setSelected(Math.max(0, all.length - sources.length))
     setModal(undefined)
     setStatus(`${sources.length} input${sources.length === 1 ? "" : "s"} added`)
+    if (wasEmpty) {
+      setFocusPane("settings")
+      setSettingsFocus(SETTINGS.formats)
+    }
   }
 
   function removeSelected() {
     if (busy() || items().length === 0) return
     const index = selected()
+    const remaining = items().length - 1
     setItems((current) => current.filter((_, itemIndex) => itemIndex !== index))
     setSelected((current) => Math.max(0, Math.min(current, items().length - 2)))
     setStatus("Input removed")
+    if (remaining === 0) {
+      setFocusPane("queue")
+      setEmptyFocus(0)
+    }
   }
 
   function moveSelection(delta: number) {
@@ -157,6 +187,52 @@ export function App() {
   function activateEmptyFocus() {
     const action = emptySourceActions[emptyFocus()]
     if (action) setModal(action.modal)
+  }
+
+  function activateQueueItem() {
+    const item = selectedItem()
+    if (item?.state === "succeeded" && item.artifacts[0]) return openPath(item.artifacts[0])
+  }
+
+  function moveQueue(delta: number) {
+    if (delta > 0 && selected() === items().length - 1) {
+      setFocusPane("settings")
+      setSettingsFocus(SETTINGS.formats)
+      return
+    }
+    if (delta < 0 && selected() === 0) return
+    moveSelection(delta)
+  }
+
+  function moveSettings(delta: number) {
+    const next = settingsFocus() + delta
+    if (next < 0) {
+      setFocusPane("queue")
+      return
+    }
+    if (next >= SETTING_COUNT) return
+    setSettingsFocus(next)
+  }
+
+  function activateSetting() {
+    switch (settingsFocus()) {
+      case SETTINGS.formats:
+        if (availableFormats().length) setModal("formats")
+        return
+      case SETTINGS.module:
+        return setModal("modules")
+      case SETTINGS.destination:
+        return setModal("outputDir")
+      case SETTINGS.naming:
+        return setModal("naming")
+      case SETTINGS.force:
+        return setSettings("force", !settings.force)
+      case SETTINGS.recursive:
+        return setSettings("recursive", !settings.recursive)
+      case SETTINGS.run:
+        if (busy()) return cancel()
+        return void start()
+    }
   }
 
   async function start() {
@@ -349,11 +425,27 @@ export function App() {
       if (event.name === "return") return activateEmptyFocus()
       return
     }
-    if (event.name === "up" || event.name === "k") return moveSelection(-1)
-    if (event.name === "down" || event.name === "j") return moveSelection(1)
-    if (event.name === "return" && selectedItem()?.state === "succeeded" && selectedItem()?.artifacts[0]) {
-      return openPath(selectedItem()!.artifacts[0])
+    if (event.name === "tab") {
+      setFocusPane((pane) => (pane === "settings" ? "queue" : "settings"))
+      return
     }
+    if (focusPane() === "settings") {
+      if (event.name === "up" || event.name === "k") return moveSettings(-1)
+      if (event.name === "down" || event.name === "j") return moveSettings(1)
+      if (event.name === "left" || event.name === "h") return setFocusPane("queue")
+      if (event.name === "return") return activateSetting()
+      if (event.name === "space" && (settingsFocus() === SETTINGS.force || settingsFocus() === SETTINGS.recursive)) {
+        return activateSetting()
+      }
+      return
+    }
+    if (event.name === "up" || event.name === "k") return moveQueue(-1)
+    if (event.name === "down" || event.name === "j") return moveQueue(1)
+    if (event.name === "right" || event.name === "l") {
+      setFocusPane("settings")
+      return
+    }
+    if (event.name === "return") return activateQueueItem()
   })
 
   return (
@@ -371,7 +463,11 @@ export function App() {
           selected={selected()}
           emptyFocus={emptyFocus()}
           compact={compact()}
-          onSelect={setSelected}
+          paneActive={items().length === 0 || focusPane() === "queue"}
+          onSelect={(index) => {
+            setSelected(index)
+            setFocusPane("queue")
+          }}
           onEmptyFocus={setEmptyFocus}
           onAdd={() => setModal("files")}
           onAddFolder={() => setModal("inputFolder")}
@@ -389,6 +485,11 @@ export function App() {
           recursive={settings.recursive}
           busy={busy()}
           canRun={canRun()}
+          focusedIndex={items().length > 0 && focusPane() === "settings" ? settingsFocus() : undefined}
+          onFocus={(index) => {
+            setFocusPane("settings")
+            setSettingsFocus(index)
+          }}
           onFormats={() => setModal("formats")}
           onModule={() => setModal("modules")}
           onOutputDir={() => setModal("outputDir")}
@@ -403,7 +504,7 @@ export function App() {
       </box>
 
       <ActivityBar status={capabilityError() ?? status()} outputs={outputs()} busy={busy()} onOpen={openPath} />
-      <Footer empty={items().length === 0} />
+      <Footer empty={items().length === 0} settings={items().length > 0 && focusPane() === "settings"} />
 
       <Switch>
         <Match when={modal() === "files"}>
@@ -558,6 +659,7 @@ function QueuePanel(props: {
   selected: number
   emptyFocus: number
   compact: boolean
+  paneActive: boolean
   onSelect: (index: number) => void
   onEmptyFocus: (index: number) => void
   onAdd: () => void
@@ -582,7 +684,7 @@ function QueuePanel(props: {
       overflow="hidden"
       border
       borderStyle="rounded"
-      borderColor={theme.border}
+      borderColor={props.paneActive ? theme.borderActive : theme.border}
       title=" Inputs "
       titleColor={theme.text}
     >
@@ -642,8 +744,8 @@ function QueuePanel(props: {
                   paddingLeft={1}
                   paddingRight={1}
                   overflow="hidden"
-                  backgroundColor={active() ? theme.elevated : theme.transparent}
-                  border={active() ? ["left"] : undefined}
+                  backgroundColor={active() ? (props.paneActive ? theme.elevated : theme.panel) : theme.transparent}
+                  border={active() && props.paneActive ? ["left"] : undefined}
                   borderColor={theme.primary}
                   onMouseOver={() => props.onSelect(index())}
                   onMouseDown={() => props.onSelect(index())}
@@ -730,6 +832,8 @@ function SettingsPanel(props: {
   recursive: boolean
   busy: boolean
   canRun: boolean
+  focusedIndex?: number
+  onFocus: (index: number) => void
   onFormats: () => void
   onModule: () => void
   onOutputDir: () => void
@@ -746,6 +850,19 @@ function SettingsPanel(props: {
   const showShortcuts = () => terminal().width >= SHORTCUT_BREAKPOINT
   const rowWidth = () => (props.wide ? 36 : terminal().width - 6)
   const paneHeight = () => (props.wide ? undefined : stackedSettingsHeight(terminal().height))
+  const paneActive = () => props.focusedIndex !== undefined
+  let settingsList: ScrollBoxRenderable | undefined
+
+  createEffect(() => {
+    const index = props.focusedIndex
+    if (index === undefined || index >= SETTINGS.run || !settingsList) return
+    const target = settingsList.getChildren()[index]
+    if (!target) return
+    const y = target.y - settingsList.y
+    if (y >= settingsList.height) settingsList.scrollBy(y - settingsList.height + 1)
+    if (y < 0) settingsList.scrollBy(y)
+  })
+
   return (
     <box
       width={props.wide ? 42 : "100%"}
@@ -757,19 +874,27 @@ function SettingsPanel(props: {
       overflow="hidden"
       border
       borderStyle="rounded"
-      borderColor={theme.border}
+      borderColor={paneActive() ? theme.borderActive : theme.border}
       title=" Conversion "
       titleColor={theme.text}
       paddingLeft={1}
       paddingRight={1}
     >
-      <scrollbox flexGrow={1} minHeight={0} scrollX={false} horizontalScrollbarOptions={{ visible: false }}>
+      <scrollbox
+        ref={(value: ScrollBoxRenderable) => (settingsList = value)}
+        flexGrow={1}
+        minHeight={0}
+        scrollX={false}
+        horizontalScrollbarOptions={{ visible: false }}
+      >
         <Setting
           dense={dense()}
           rowWidth={rowWidth()}
           label="Output"
           value={props.formats || "No compatible output"}
           shortcut={showShortcuts() ? "ctrl+o" : undefined}
+          focused={props.focusedIndex === SETTINGS.formats}
+          onFocus={() => props.onFocus(SETTINGS.formats)}
           onUse={props.onFormats}
         />
         <Setting
@@ -778,6 +903,8 @@ function SettingsPanel(props: {
           label="Converter"
           value={props.module}
           shortcut={showShortcuts() ? "ctrl+m" : undefined}
+          focused={props.focusedIndex === SETTINGS.module}
+          onFocus={() => props.onFocus(SETTINGS.module)}
           onUse={props.onModule}
         />
         <Setting
@@ -786,6 +913,8 @@ function SettingsPanel(props: {
           label="Destination"
           value={props.outputDir ?? "Beside each source"}
           shortcut={showShortcuts() ? "ctrl+d" : undefined}
+          focused={props.focusedIndex === SETTINGS.destination}
+          onFocus={() => props.onFocus(SETTINGS.destination)}
           onUse={props.onOutputDir}
           onClear={props.outputDir ? props.onClearOutput : undefined}
         />
@@ -794,14 +923,25 @@ function SettingsPanel(props: {
           rowWidth={rowWidth()}
           label="Naming"
           value={props.namingTemplate ?? "{stem}.{ext}"}
+          focused={props.focusedIndex === SETTINGS.naming}
+          onFocus={() => props.onFocus(SETTINGS.naming)}
           onUse={props.onNaming}
           onClear={props.namingTemplate ? props.onClearNaming : undefined}
         />
-        <Toggle dense={dense()} label="Overwrite existing" enabled={props.force} onUse={props.onToggleForce} />
+        <Toggle
+          dense={dense()}
+          label="Overwrite existing"
+          enabled={props.force}
+          focused={props.focusedIndex === SETTINGS.force}
+          onFocus={() => props.onFocus(SETTINGS.force)}
+          onUse={props.onToggleForce}
+        />
         <Toggle
           dense={dense()}
           label={dense() ? "Expand folders" : "Expand folders recursively"}
           enabled={props.recursive}
+          focused={props.focusedIndex === SETTINGS.recursive}
+          onFocus={() => props.onFocus(SETTINGS.recursive)}
           onUse={props.onToggleRecursive}
         />
       </scrollbox>
@@ -809,9 +949,10 @@ function SettingsPanel(props: {
         label={props.busy ? "Cancel conversion" : "Run conversion"}
         shortcut={showShortcuts() ? (props.busy ? "ctrl+c" : "ctrl+r") : undefined}
         compact={dense()}
-        primary={!props.busy}
+        focused={props.focusedIndex === SETTINGS.run}
         danger={props.busy}
         disabled={!props.busy && !props.canRun}
+        onFocus={() => props.onFocus(SETTINGS.run)}
         onUse={props.busy ? props.onCancel : props.onRun}
       />
       <Show when={!dense()}>
@@ -826,7 +967,9 @@ function Setting(props: {
   value: string
   shortcut?: string
   dense?: boolean
+  focused?: boolean
   rowWidth: number
+  onFocus?: () => void
   onUse: () => void
   onClear?: () => void
 }) {
@@ -837,12 +980,20 @@ function Setting(props: {
     }
     return Math.max(4, row - (props.onClear ? 6 : 0))
   }
+  const labelFg = () => (props.focused ? theme.onPrimary : theme.muted)
+  const valueFg = () => (props.focused ? theme.onPrimary : theme.text)
+  const hintFg = () => (props.focused ? theme.onPrimary : theme.subtle)
   return (
     <box
       height={props.dense ? 1 : undefined}
       paddingTop={props.dense ? 0 : 1}
       paddingBottom={props.dense ? 0 : 1}
+      paddingLeft={props.focused ? 1 : 0}
+      paddingRight={props.focused ? 1 : 0}
       overflow="hidden"
+      backgroundColor={props.focused ? theme.primary : theme.transparent}
+      onMouseOver={props.onFocus}
+      onMouseDown={props.onFocus}
       onMouseUp={props.onUse}
     >
       <Show
@@ -850,16 +1001,16 @@ function Setting(props: {
         fallback={
           <>
             <box flexDirection="row" justifyContent="space-between" overflow="hidden">
-              <text fg={theme.muted}>{props.label}</text>
-              <text fg={theme.subtle}>{props.shortcut}</text>
+              <text fg={labelFg()}>{props.label}</text>
+              <text fg={hintFg()}>{props.shortcut}</text>
             </box>
             <box flexDirection="row" overflow="hidden" minWidth={0}>
-              <text flexGrow={1} minWidth={0} fg={theme.text} wrapMode="none">
+              <text flexGrow={1} minWidth={0} fg={valueFg()} wrapMode="none">
                 {truncateEnd(props.value, valueWidth())}
               </text>
               <Show when={props.onClear}>
                 <text
-                  fg={theme.muted}
+                  fg={hintFg()}
                   onMouseUp={(event: { stopPropagation(): void }) => {
                     event.stopPropagation()
                     props.onClear?.()
@@ -873,15 +1024,15 @@ function Setting(props: {
         }
       >
         <box flexDirection="row" alignItems="center" overflow="hidden" minWidth={0} gap={1}>
-          <text width={Math.min(11, props.label.length)} fg={theme.muted}>
+          <text width={Math.min(11, props.label.length)} fg={labelFg()}>
             {props.label}
           </text>
-          <text flexGrow={1} minWidth={0} fg={theme.text} wrapMode="none">
+          <text flexGrow={1} minWidth={0} fg={valueFg()} wrapMode="none">
             {truncateEnd(props.value, valueWidth())}
           </text>
           <Show when={props.onClear}>
             <text
-              fg={theme.muted}
+              fg={hintFg()}
               onMouseUp={(event: { stopPropagation(): void }) => {
                 event.stopPropagation()
                 props.onClear?.()
@@ -891,7 +1042,7 @@ function Setting(props: {
             </text>
           </Show>
           <Show when={props.shortcut}>
-            <text fg={theme.subtle}>{props.shortcut}</text>
+            <text fg={hintFg()}>{props.shortcut}</text>
           </Show>
         </box>
       </Show>
@@ -899,20 +1050,34 @@ function Setting(props: {
   )
 }
 
-function Toggle(props: { label: string; enabled: boolean; dense?: boolean; onUse: () => void }) {
+function Toggle(props: {
+  label: string
+  enabled: boolean
+  dense?: boolean
+  focused?: boolean
+  onFocus?: () => void
+  onUse: () => void
+}) {
   return (
     <box
       height={props.dense ? 1 : 2}
       flexDirection="row"
       alignItems="center"
       justifyContent="space-between"
+      paddingLeft={props.focused ? 1 : 0}
+      paddingRight={props.focused ? 1 : 0}
       overflow="hidden"
+      backgroundColor={props.focused ? theme.primary : theme.transparent}
+      onMouseOver={props.onFocus}
+      onMouseDown={props.onFocus}
       onMouseUp={props.onUse}
     >
-      <text fg={theme.text} wrapMode="none">
+      <text fg={props.focused ? theme.onPrimary : theme.text} wrapMode="none">
         {props.label}
       </text>
-      <text fg={props.enabled ? theme.accent : theme.subtle}>{props.enabled ? "● on" : "○ off"}</text>
+      <text fg={props.focused ? theme.onPrimary : props.enabled ? theme.accent : theme.subtle}>
+        {props.enabled ? "● on" : "○ off"}
+      </text>
     </box>
   )
 }
@@ -935,12 +1100,12 @@ function Button(props: {
     props.disabled ? theme.subtle : highlighted() || props.danger ? theme.onPrimary : theme.text
   return (
     <box
-      height={props.compact ? 1 : 2}
+      height={props.compact ? 1 : 3}
       flexShrink={0}
       alignItems="center"
       justifyContent="center"
-      flexDirection="row"
-      gap={1}
+      flexDirection={props.compact ? "row" : "column"}
+      gap={props.compact ? 1 : 0}
       paddingLeft={1}
       paddingRight={1}
       overflow="hidden"
@@ -951,12 +1116,17 @@ function Button(props: {
         if (!props.disabled) props.onUse()
       }}
     >
-      <text fg={foreground()} attributes={TextAttributes.BOLD}>
-        {props.label}
-      </text>
-      <Show when={props.shortcut}>
-        <text fg={foreground()}>{props.shortcut}</text>
+      <Show when={!props.compact}>
+        <box height={1} />
       </Show>
+      <box height={1} flexDirection="row" alignItems="center" justifyContent="center" gap={1}>
+        <text fg={foreground()} attributes={TextAttributes.BOLD}>
+          {props.label}
+        </text>
+        <Show when={props.shortcut}>
+          <text fg={foreground()}>{props.shortcut}</text>
+        </Show>
+      </box>
     </box>
   )
 }
@@ -964,7 +1134,7 @@ function Button(props: {
 function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; onOpen: (path: string) => void }) {
   const terminal = useTerminalDimensions()
   const latest = () => props.outputs.at(-1)
-  const statusWidth = () => Math.max(8, terminal().width - (latest() ? 22 : 8))
+  const statusWidth = () => Math.max(8, terminal().width - (latest() && terminal().width >= 48 ? 24 : 8))
   return (
     <box
       height={activityHeight(terminal().height)}
@@ -976,12 +1146,21 @@ function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; 
       paddingRight={1}
       backgroundColor={theme.panel}
     >
-      <text width={3} fg={props.busy ? theme.warning : theme.accent}>
-        {props.busy ? "◉" : "●"}
-      </text>
-      <text flexGrow={1} minWidth={0} fg={theme.muted} wrapMode="none">
-        {truncateEnd(props.status, statusWidth())}
-      </text>
+      <box
+        flexGrow={1}
+        minWidth={0}
+        height={1}
+        overflow="hidden"
+        flexDirection="row"
+        alignItems="center"
+        justifyContent="center"
+        gap={1}
+      >
+        <text fg={props.busy ? theme.warning : theme.accent}>{props.busy ? "◉" : "●"}</text>
+        <text fg={theme.muted} wrapMode="none">
+          {truncateEnd(props.status, statusWidth())}
+        </text>
+      </box>
       <Show when={latest() && terminal().width >= 48}>
         <text fg={theme.accent} onMouseUp={() => props.onOpen(latest()!)}>
           open latest ↗
@@ -991,10 +1170,14 @@ function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; 
   )
 }
 
-function Footer(props: { empty: boolean }) {
+function Footer(props: { empty: boolean; settings?: boolean }) {
   const terminal = useTerminalDimensions()
   const contents = createMemo(() =>
-    footerContents(props.empty ? emptyFooterHints : queueFooterHints, process.cwd(), terminal().width),
+    footerContents(
+      props.empty ? emptyFooterHints : props.settings ? settingsFooterHints : queueFooterHints,
+      process.cwd(),
+      terminal().width,
+    ),
   )
   return (
     <box

@@ -1,7 +1,8 @@
-import { createSignal, onMount } from "solid-js"
+import { createSignal } from "solid-js"
 import { TextAttributes, type InputRenderable } from "@opentui/core"
 import { useKeyboard } from "@opentui/solid"
 import { theme } from "../theme"
+import { focusInputWhenReady } from "./focus-input"
 import { KeyHint, Modal } from "./modal"
 
 export function TextPrompt(props: {
@@ -15,7 +16,7 @@ export function TextPrompt(props: {
 }) {
   const [value, setValue] = createSignal(props.initialValue ?? "")
   let input: InputRenderable | undefined
-  onMount(() => setTimeout(() => input?.focus(), 1))
+  focusInputWhenReady(() => input)
 
   function submit() {
     const next = value().trim()

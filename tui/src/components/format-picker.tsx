@@ -1,9 +1,10 @@
-import { createMemo, createSignal, For, onMount, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import { TextAttributes, type InputRenderable, type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import type { FormatCapability } from "../model"
 import { formatCategory, formatDescription, matchesQuery } from "../model"
 import { theme } from "../theme"
+import { focusInputWhenReady } from "./focus-input"
 import { KeyHint, Modal } from "./modal"
 
 export function FormatPicker(props: {
@@ -31,7 +32,7 @@ export function FormatPicker(props: {
     ),
   )
 
-  onMount(() => setTimeout(() => search?.focus(), 1))
+  focusInputWhenReady(() => search)
 
   function move(delta: number) {
     if (visible().length === 0) return
