@@ -24,14 +24,15 @@ export function Modal(
       onMouseUp={() => props.onClose()}
     >
       <box
-        width={Math.min(props.width ?? 78, terminal().width - 2)}
-        maxHeight={terminal().height - 2}
+        width={Math.min(props.width ?? 78, Math.max(24, terminal().width - 2))}
+        maxHeight={Math.max(8, terminal().height - 2)}
         backgroundColor={theme.panel}
         border
         borderStyle="rounded"
         borderColor={theme.borderActive}
         title={` ${props.title} `}
         titleColor={theme.text}
+        overflow="hidden"
         onMouseUp={(event: { stopPropagation(): void }) => event.stopPropagation()}
       >
         <box flexGrow={1} minHeight={0}>

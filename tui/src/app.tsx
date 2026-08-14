@@ -10,6 +10,22 @@ import { KeyHint, Modal } from "./components/modal"
 import { TextPrompt } from "./components/text-prompt"
 import { openPath, queryCapabilities, queryDoctor, runConversion } from "./engine"
 import {
+  activityHeight,
+  COMMANDS_BREAKPOINT,
+  EMPTY_SHORTCUT_BREAKPOINT,
+  footerContents,
+  HELP_BREAKPOINT,
+  QUEUE_BADGE_BREAKPOINT,
+  QUEUE_REMOVE_BREAKPOINT,
+  QUEUE_URL_BREAKPOINT,
+  SHORTCUT_BREAKPOINT,
+  STACK_ACTIONS_BREAKPOINT,
+  stackedSettingsHeight,
+  truncateEnd,
+  WIDE_BREAKPOINT,
+  type Hint,
+} from "./layout"
+import {
   createQueueItem,
   dedupeSources,
   sourceBadge,
@@ -20,6 +36,18 @@ import {
   type QueueItem,
 } from "./model"
 import { theme } from "./theme"
+
+const emptyFooterHints: Hint[] = [
+  { key: "arrows", label: "move" },
+  { key: "enter", label: "add" },
+  { key: "a", label: "files" },
+]
+
+const queueFooterHints: Hint[] = [
+  { key: "a", label: "add" },
+  { key: "j/k", label: "move" },
+  { key: "ctrl+r", label: "run" },
+]
 
 type ModalName =
   | "files"
@@ -61,8 +89,8 @@ export function App() {
   let list: ScrollBoxRenderable | undefined
   let capabilityGeneration = 0
 
-  const wide = createMemo(() => terminal().width >= 96)
-  const compact = createMemo(() => terminal().height < 24)
+  const wide = createMemo(() => terminal().width >= WIDE_BREAKPOINT)
+  const compact = createMemo(() => terminal().height <= 24)
   const selectedItem = createMemo(() => items()[selected()])
   const availableFormats = createMemo(() => capabilities()?.formats ?? [])
   const selectedFormatLabels = createMemo(() =>
@@ -329,7 +357,7 @@ export function App() {
   })
 
   return (
-    <box width="100%" height="100%" backgroundColor={theme.background} padding={1} gap={1}>
+    <box width="100%" height="100%" backgroundColor={theme.background} padding={1} gap={1} overflow="hidden">
       <Header
         version={capabilities()?.cliVersion}
         busy={busy()}
@@ -337,7 +365,7 @@ export function App() {
         onHelp={() => setModal("help")}
       />
 
-      <box flexGrow={1} minHeight={0} flexDirection={wide() ? "row" : "column"} gap={1}>
+      <box flexGrow={1} minWidth={0} minHeight={0} overflow="hidden" flexDirection={wide() ? "row" : "column"} gap={1}>
         <QueuePanel
           items={items()}
           selected={selected()}
@@ -484,18 +512,19 @@ export function App() {
 
 function Header(props: { version?: string; busy: boolean; onCommands: () => void; onHelp: () => void }) {
   const terminal = useTerminalDimensions()
-  const roomy = () => terminal().width >= 96
+  const roomy = () => terminal().width >= WIDE_BREAKPOINT
   return (
     <box
-      height={3}
+      height={1}
       flexShrink={0}
+      overflow="hidden"
       flexDirection="row"
       alignItems="center"
       justifyContent="space-between"
       paddingLeft={1}
       paddingRight={1}
     >
-      <box flexDirection="row" gap={2} alignItems="center">
+      <box flexDirection="row" gap={2} alignItems="center" minWidth={0} flexShrink={1} overflow="hidden">
         <text fg={theme.primary} attributes={TextAttributes.BOLD}>
           SHIFT
         </text>
@@ -506,14 +535,15 @@ function Header(props: { version?: string; busy: boolean; onCommands: () => void
           </Show>
         </Show>
       </box>
-      <box flexDirection="row" gap={2}>
+      <box flexDirection="row" gap={2} flexShrink={0}>
         <Show when={props.busy}>
           <text fg={theme.accent}>● working</text>
         </Show>
         <text fg={theme.muted} onMouseUp={props.onCommands}>
-          <span style={{ fg: theme.text }}>ctrl+k</span> commands
+          <span style={{ fg: theme.text }}>ctrl+k</span>
+          <Show when={terminal().width >= COMMANDS_BREAKPOINT}> commands</Show>
         </text>
-        <Show when={terminal().width >= 70}>
+        <Show when={terminal().width >= HELP_BREAKPOINT}>
           <text fg={theme.muted} onMouseUp={props.onHelp}>
             <span style={{ fg: theme.text }}>?</span> help
           </text>
@@ -536,6 +566,8 @@ function QueuePanel(props: {
   onRemove: () => void
   bind: (value: ScrollBoxRenderable) => void
 }) {
+  const terminal = useTerminalDimensions()
+  const stackActions = () => terminal().width < STACK_ACTIONS_BREAKPOINT
   const openEmpty = {
     files: props.onAdd,
     folder: props.onAddFolder,
@@ -544,8 +576,10 @@ function QueuePanel(props: {
   return (
     <box
       flexGrow={1}
+      flexShrink={1}
       minWidth={0}
-      minHeight={props.compact ? 8 : 12}
+      minHeight={4}
+      overflow="hidden"
       border
       borderStyle="rounded"
       borderColor={theme.border}
@@ -555,17 +589,26 @@ function QueuePanel(props: {
       <Show
         when={props.items.length > 0}
         fallback={
-          <box flexGrow={1} alignItems="center" justifyContent="center" gap={1}>
+          <box flexGrow={1} minHeight={0} overflow="hidden" alignItems="center" justifyContent="center" gap={1}>
             <text fg={theme.text} attributes={TextAttributes.BOLD}>
               What should Shift convert?
             </text>
-            <text fg={theme.muted}>Pick files, a folder, or paste a public URL.</text>
-            <box flexDirection="row" gap={1} paddingTop={1}>
+            <Show when={!props.compact}>
+              <text fg={theme.muted}>Pick files, a folder, or paste a public URL.</text>
+            </Show>
+            <box
+              flexDirection={stackActions() ? "column" : "row"}
+              gap={stackActions() ? 0 : 1}
+              paddingTop={props.compact || stackActions() ? 0 : 1}
+              alignItems="center"
+              flexShrink={0}
+            >
               <For each={emptySourceActions}>
                 {(action, index) => (
                   <Button
                     label={action.label}
-                    shortcut={action.shortcut}
+                    shortcut={terminal().width >= EMPTY_SHORTCUT_BREAKPOINT ? action.shortcut : undefined}
+                    compact={stackActions() || props.compact}
                     focused={props.emptyFocus === index()}
                     onFocus={() => props.onEmptyFocus(index())}
                     onUse={openEmpty[action.id]}
@@ -576,16 +619,29 @@ function QueuePanel(props: {
           </box>
         }
       >
-        <scrollbox ref={props.bind} flexGrow={1} scrollbarOptions={{ visible: true }}>
+        <scrollbox
+          ref={props.bind}
+          flexGrow={1}
+          scrollX={false}
+          horizontalScrollbarOptions={{ visible: false }}
+          verticalScrollbarOptions={{ visible: true }}
+        >
           <For each={props.items}>
             {(item, index) => {
               const active = () => props.selected === index()
+              const showBadge = () => terminal().width >= QUEUE_BADGE_BREAKPOINT
+              const showRemove = () => active() && terminal().width >= QUEUE_REMOVE_BREAKPOINT
+              const nameWidth = () => {
+                const panel = terminal().width >= WIDE_BREAKPOINT ? terminal().width - 52 : terminal().width - 12
+                return Math.max(8, panel - 3 - (showBadge() ? 8 : 0) - (showRemove() ? 7 : 0))
+              }
               return (
                 <box
                   minHeight={2}
                   flexDirection="row"
                   paddingLeft={1}
                   paddingRight={1}
+                  overflow="hidden"
                   backgroundColor={active() ? theme.elevated : theme.transparent}
                   border={active() ? ["left"] : undefined}
                   borderColor={theme.primary}
@@ -606,22 +662,24 @@ function QueuePanel(props: {
                   >
                     {statusGlyph(item.state)}
                   </text>
-                  <box flexGrow={1} minWidth={0}>
+                  <box flexGrow={1} minWidth={0} overflow="hidden">
                     <text
                       fg={active() ? theme.text : theme.muted}
                       attributes={active() ? TextAttributes.BOLD : undefined}
                       wrapMode="none"
                     >
-                      {item.name}
+                      {truncateEnd(item.name, nameWidth())}
                     </text>
                     <text fg={theme.subtle} wrapMode="none">
-                      {item.detail ?? item.source}
+                      {truncateEnd(item.detail ?? item.source, nameWidth())}
                     </text>
                   </box>
-                  <text width={8} fg={theme.accent}>
-                    {sourceBadge(item)}
-                  </text>
-                  <Show when={active()}>
+                  <Show when={showBadge()}>
+                    <text width={8} fg={theme.accent}>
+                      {sourceBadge(item)}
+                    </text>
+                  </Show>
+                  <Show when={showRemove()}>
                     <text fg={theme.muted} onMouseUp={props.onRemove}>
                       remove
                     </text>
@@ -631,18 +689,31 @@ function QueuePanel(props: {
             }}
           </For>
         </scrollbox>
-        <box height={2} flexShrink={0} flexDirection="row" gap={2} paddingLeft={1} paddingRight={1} alignItems="center">
+        <box
+          height={1}
+          flexShrink={0}
+          overflow="hidden"
+          flexDirection="row"
+          gap={2}
+          paddingLeft={1}
+          paddingRight={1}
+          alignItems="center"
+        >
           <text fg={theme.accent} onMouseUp={props.onAdd}>
             + files
           </text>
           <text fg={theme.accent} onMouseUp={props.onAddFolder}>
             + folder
           </text>
-          <text fg={theme.accent} onMouseUp={props.onAddUrl}>
-            + URL
-          </text>
-          <text flexGrow={1} />
-          <text fg={theme.muted}>{props.items.length} queued</text>
+          <Show when={terminal().width >= QUEUE_URL_BREAKPOINT}>
+            <text fg={theme.accent} onMouseUp={props.onAddUrl}>
+              + URL
+            </text>
+          </Show>
+          <text flexGrow={1} minWidth={0} />
+          <Show when={terminal().width >= SHORTCUT_BREAKPOINT}>
+            <text fg={theme.muted}>{props.items.length} queued</text>
+          </Show>
         </box>
       </Show>
     </box>
@@ -670,10 +741,20 @@ function SettingsPanel(props: {
   onRun: () => void
   onCancel: () => void
 }) {
+  const terminal = useTerminalDimensions()
+  const dense = () => !props.wide || terminal().height < 28
+  const showShortcuts = () => terminal().width >= SHORTCUT_BREAKPOINT
+  const rowWidth = () => (props.wide ? 36 : terminal().width - 6)
+  const paneHeight = () => (props.wide ? undefined : stackedSettingsHeight(terminal().height))
   return (
     <box
       width={props.wide ? 42 : "100%"}
-      minHeight={props.wide ? 0 : 8}
+      height={paneHeight()}
+      flexGrow={props.wide ? 1 : 0}
+      flexShrink={0}
+      minWidth={0}
+      minHeight={props.wide ? 0 : 4}
+      overflow="hidden"
       border
       borderStyle="rounded"
       borderColor={theme.border}
@@ -682,73 +763,155 @@ function SettingsPanel(props: {
       paddingLeft={1}
       paddingRight={1}
     >
-      <Setting
-        label="Output"
-        value={props.formats || "No compatible output"}
-        shortcut="ctrl+o"
-        onUse={props.onFormats}
-      />
-      <Setting label="Converter" value={props.module} shortcut="ctrl+m" onUse={props.onModule} />
-      <Setting
-        label="Destination"
-        value={props.outputDir ?? "Beside each source"}
-        shortcut="ctrl+d"
-        onUse={props.onOutputDir}
-        onClear={props.outputDir ? props.onClearOutput : undefined}
-      />
-      <Setting
-        label="Naming"
-        value={props.namingTemplate ?? "{stem}.{ext}"}
-        onUse={props.onNaming}
-        onClear={props.namingTemplate ? props.onClearNaming : undefined}
-      />
-      <Toggle label="Overwrite existing" enabled={props.force} onUse={props.onToggleForce} />
-      <Toggle label="Expand folders recursively" enabled={props.recursive} onUse={props.onToggleRecursive} />
-      <box flexGrow={1} minHeight={1} />
+      <scrollbox flexGrow={1} minHeight={0} scrollX={false} horizontalScrollbarOptions={{ visible: false }}>
+        <Setting
+          dense={dense()}
+          rowWidth={rowWidth()}
+          label="Output"
+          value={props.formats || "No compatible output"}
+          shortcut={showShortcuts() ? "ctrl+o" : undefined}
+          onUse={props.onFormats}
+        />
+        <Setting
+          dense={dense()}
+          rowWidth={rowWidth()}
+          label="Converter"
+          value={props.module}
+          shortcut={showShortcuts() ? "ctrl+m" : undefined}
+          onUse={props.onModule}
+        />
+        <Setting
+          dense={dense()}
+          rowWidth={rowWidth()}
+          label="Destination"
+          value={props.outputDir ?? "Beside each source"}
+          shortcut={showShortcuts() ? "ctrl+d" : undefined}
+          onUse={props.onOutputDir}
+          onClear={props.outputDir ? props.onClearOutput : undefined}
+        />
+        <Setting
+          dense={dense()}
+          rowWidth={rowWidth()}
+          label="Naming"
+          value={props.namingTemplate ?? "{stem}.{ext}"}
+          onUse={props.onNaming}
+          onClear={props.namingTemplate ? props.onClearNaming : undefined}
+        />
+        <Toggle dense={dense()} label="Overwrite existing" enabled={props.force} onUse={props.onToggleForce} />
+        <Toggle
+          dense={dense()}
+          label={dense() ? "Expand folders" : "Expand folders recursively"}
+          enabled={props.recursive}
+          onUse={props.onToggleRecursive}
+        />
+      </scrollbox>
       <Button
         label={props.busy ? "Cancel conversion" : "Run conversion"}
-        shortcut={props.busy ? "ctrl+c" : "ctrl+r"}
+        shortcut={showShortcuts() ? (props.busy ? "ctrl+c" : "ctrl+r") : undefined}
+        compact={dense()}
         primary={!props.busy}
         danger={props.busy}
         disabled={!props.busy && !props.canRun}
         onUse={props.busy ? props.onCancel : props.onRun}
       />
-      <box height={1} />
+      <Show when={!dense()}>
+        <box height={1} flexShrink={0} />
+      </Show>
     </box>
   )
 }
 
-function Setting(props: { label: string; value: string; shortcut?: string; onUse: () => void; onClear?: () => void }) {
+function Setting(props: {
+  label: string
+  value: string
+  shortcut?: string
+  dense?: boolean
+  rowWidth: number
+  onUse: () => void
+  onClear?: () => void
+}) {
+  const valueWidth = () => {
+    const row = Math.max(16, props.rowWidth)
+    if (props.dense) {
+      return Math.max(4, row - props.label.length - (props.shortcut?.length ?? 0) - (props.onClear ? 8 : 2) - 2)
+    }
+    return Math.max(4, row - (props.onClear ? 6 : 0))
+  }
   return (
-    <box paddingTop={1} paddingBottom={1} onMouseUp={props.onUse}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme.muted}>{props.label}</text>
-        <text fg={theme.subtle}>{props.shortcut}</text>
-      </box>
-      <box flexDirection="row">
-        <text flexGrow={1} fg={theme.text} wrapMode="none">
-          {props.value}
-        </text>
-        <Show when={props.onClear}>
-          <text
-            fg={theme.muted}
-            onMouseUp={(event: { stopPropagation(): void }) => {
-              event.stopPropagation()
-              props.onClear?.()
-            }}
-          >
-            clear
+    <box
+      height={props.dense ? 1 : undefined}
+      paddingTop={props.dense ? 0 : 1}
+      paddingBottom={props.dense ? 0 : 1}
+      overflow="hidden"
+      onMouseUp={props.onUse}
+    >
+      <Show
+        when={props.dense}
+        fallback={
+          <>
+            <box flexDirection="row" justifyContent="space-between" overflow="hidden">
+              <text fg={theme.muted}>{props.label}</text>
+              <text fg={theme.subtle}>{props.shortcut}</text>
+            </box>
+            <box flexDirection="row" overflow="hidden" minWidth={0}>
+              <text flexGrow={1} minWidth={0} fg={theme.text} wrapMode="none">
+                {truncateEnd(props.value, valueWidth())}
+              </text>
+              <Show when={props.onClear}>
+                <text
+                  fg={theme.muted}
+                  onMouseUp={(event: { stopPropagation(): void }) => {
+                    event.stopPropagation()
+                    props.onClear?.()
+                  }}
+                >
+                  clear
+                </text>
+              </Show>
+            </box>
+          </>
+        }
+      >
+        <box flexDirection="row" alignItems="center" overflow="hidden" minWidth={0} gap={1}>
+          <text width={Math.min(11, props.label.length)} fg={theme.muted}>
+            {props.label}
           </text>
-        </Show>
-      </box>
+          <text flexGrow={1} minWidth={0} fg={theme.text} wrapMode="none">
+            {truncateEnd(props.value, valueWidth())}
+          </text>
+          <Show when={props.onClear}>
+            <text
+              fg={theme.muted}
+              onMouseUp={(event: { stopPropagation(): void }) => {
+                event.stopPropagation()
+                props.onClear?.()
+              }}
+            >
+              clear
+            </text>
+          </Show>
+          <Show when={props.shortcut}>
+            <text fg={theme.subtle}>{props.shortcut}</text>
+          </Show>
+        </box>
+      </Show>
     </box>
   )
 }
 
-function Toggle(props: { label: string; enabled: boolean; onUse: () => void }) {
+function Toggle(props: { label: string; enabled: boolean; dense?: boolean; onUse: () => void }) {
   return (
-    <box height={2} flexDirection="row" alignItems="center" justifyContent="space-between" onMouseUp={props.onUse}>
-      <text fg={theme.text}>{props.label}</text>
+    <box
+      height={props.dense ? 1 : 2}
+      flexDirection="row"
+      alignItems="center"
+      justifyContent="space-between"
+      overflow="hidden"
+      onMouseUp={props.onUse}
+    >
+      <text fg={theme.text} wrapMode="none">
+        {props.label}
+      </text>
       <text fg={props.enabled ? theme.accent : theme.subtle}>{props.enabled ? "● on" : "○ off"}</text>
     </box>
   )
@@ -761,6 +924,7 @@ function Button(props: {
   focused?: boolean
   danger?: boolean
   disabled?: boolean
+  compact?: boolean
   onFocus?: () => void
   onUse: () => void
 }) {
@@ -771,13 +935,15 @@ function Button(props: {
     props.disabled ? theme.subtle : highlighted() || props.danger ? theme.onPrimary : theme.text
   return (
     <box
-      height={2}
+      height={props.compact ? 1 : 2}
+      flexShrink={0}
       alignItems="center"
       justifyContent="center"
       flexDirection="row"
       gap={1}
       paddingLeft={1}
       paddingRight={1}
+      overflow="hidden"
       backgroundColor={background()}
       onMouseOver={props.onFocus}
       onMouseDown={props.onFocus}
@@ -796,11 +962,14 @@ function Button(props: {
 }
 
 function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; onOpen: (path: string) => void }) {
+  const terminal = useTerminalDimensions()
   const latest = () => props.outputs.at(-1)
+  const statusWidth = () => Math.max(8, terminal().width - (latest() ? 22 : 8))
   return (
     <box
-      height={2}
+      height={activityHeight(terminal().height)}
       flexShrink={0}
+      overflow="hidden"
       flexDirection="row"
       alignItems="center"
       paddingLeft={1}
@@ -810,10 +979,10 @@ function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; 
       <text width={3} fg={props.busy ? theme.warning : theme.accent}>
         {props.busy ? "◉" : "●"}
       </text>
-      <text flexGrow={1} fg={theme.muted} wrapMode="none">
-        {props.status}
+      <text flexGrow={1} minWidth={0} fg={theme.muted} wrapMode="none">
+        {truncateEnd(props.status, statusWidth())}
       </text>
-      <Show when={latest()}>
+      <Show when={latest() && terminal().width >= 48}>
         <text fg={theme.accent} onMouseUp={() => props.onOpen(latest()!)}>
           open latest ↗
         </text>
@@ -823,21 +992,29 @@ function ActivityBar(props: { status: string; outputs: string[]; busy: boolean; 
 }
 
 function Footer(props: { empty: boolean }) {
+  const terminal = useTerminalDimensions()
+  const contents = createMemo(() =>
+    footerContents(props.empty ? emptyFooterHints : queueFooterHints, process.cwd(), terminal().width),
+  )
   return (
-    <box height={1} flexShrink={0} flexDirection="row" justifyContent="space-between" paddingLeft={1} paddingRight={1}>
-      <box flexDirection="row" gap={2}>
-        <Show when={props.empty}>
-          <KeyHint key="←→" label="move" />
-          <KeyHint key="enter" label="add" />
-          <KeyHint key="a" label="files" />
-        </Show>
-        <Show when={!props.empty}>
-          <KeyHint key="a" label="add" />
-          <KeyHint key="↑↓" label="navigate" />
-          <KeyHint key="ctrl+r" label="run" />
-        </Show>
+    <box
+      height={1}
+      flexShrink={0}
+      overflow="hidden"
+      flexDirection="row"
+      justifyContent="space-between"
+      paddingLeft={1}
+      paddingRight={1}
+      gap={2}
+    >
+      <box flexDirection="row" gap={2} flexShrink={0} overflow="hidden">
+        <For each={contents().hints}>{(hint) => <KeyHint key={hint.key} label={hint.label} />}</For>
       </box>
-      <text fg={theme.subtle}>{process.cwd()}</text>
+      <Show when={contents().path}>
+        <text fg={theme.subtle} wrapMode="none">
+          {contents().path}
+        </text>
+      </Show>
     </box>
   )
 }
@@ -848,7 +1025,7 @@ function Doctor(props: { lines: string[]; onClose: () => void }) {
   })
   return (
     <Modal title="Converter health" onClose={props.onClose} width={82}>
-      <scrollbox padding={2} maxHeight={24} scrollbarOptions={{ visible: true }}>
+      <scrollbox padding={2} maxHeight={24} scrollX={false} horizontalScrollbarOptions={{ visible: false }}>
         <For each={props.lines}>
           {(line) => <text fg={line.includes("missing") ? theme.warning : theme.text}>{line}</text>}
         </For>

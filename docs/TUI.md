@@ -23,11 +23,17 @@ naming, queue ordering, conversion, cancellation, and artifact writes.
 
 The main view consists of an input queue, conversion settings, an activity bar,
 and a shortcut footer. At 96 columns it uses a two-panel layout; below that it
-stacks vertically. On the empty input state, Add files, Add folder, and Add URL
-are a focus group: arrow keys and j/k move the cursor, and Enter runs the
-focused action. Every action in the command palette has a keyboard path and
-all highlighted rows, buttons, toggles, picker entries, and output links accept
-mouse input. File and output pickers support wheel scrolling and filter input.
+stacks vertically, compresses the conversion pane, and scrolls settings when
+they no longer fit. The run action stays pinned below that list. The footer
+keeps only the shortcuts that fit and shortens the working directory from the
+left so hints never paint over the path. On
+short terminals the activity bar collapses to one row. On the empty input
+state, Add files, Add folder, and Add URL are a focus group: arrow keys and
+j/k move the cursor, and Enter runs the focused action. Narrow terminals stack
+those actions instead of crowding them onto one row. Every action in the
+command palette has a keyboard path and all highlighted rows, buttons, toggles,
+picker entries, and output links accept mouse input. File and output pickers
+support wheel scrolling and filter input.
 
 OpenTUI owns terminal lifecycle, alternate-screen behavior, selection, mouse
 tracking, and Windows/Linux/macOS rendering. Shift sets `exitOnCtrlC: false` so

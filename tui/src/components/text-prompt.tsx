@@ -33,7 +33,15 @@ export function TextPrompt(props: {
       onClose={props.onCancel}
       width={72}
       footer={
-        <box paddingLeft={2} paddingRight={2} paddingBottom={1} flexDirection="row" justifyContent="space-between">
+        <box
+          paddingLeft={2}
+          paddingRight={2}
+          paddingBottom={1}
+          flexDirection="row"
+          justifyContent="space-between"
+          overflow="hidden"
+          gap={1}
+        >
           <KeyHint key="esc" label="cancel" />
           <box backgroundColor={theme.primary} paddingLeft={1} paddingRight={1} onMouseUp={submit}>
             <text fg={theme.onPrimary} attributes={TextAttributes.BOLD}>

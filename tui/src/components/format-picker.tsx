@@ -81,20 +81,31 @@ export function FormatPicker(props: {
       onClose={props.onCancel}
       width={88}
       footer={
-        <box paddingLeft={2} paddingRight={2} paddingBottom={1} flexDirection="row" justifyContent="space-between">
-          <box flexDirection="row" gap={2}>
+        <box
+          paddingLeft={2}
+          paddingRight={2}
+          paddingBottom={1}
+          flexDirection={dimensions().width < 64 ? "column" : "row"}
+          justifyContent="space-between"
+          gap={1}
+          overflow="hidden"
+        >
+          <box flexDirection="row" gap={2} flexWrap="wrap" overflow="hidden">
             <KeyHint key="space" label="add output" />
-            <KeyHint key="enter" label="make primary" />
+            <Show when={dimensions().width >= 56}>
+              <KeyHint key="enter" label="make primary" />
+            </Show>
           </box>
           <box backgroundColor={theme.primary} paddingLeft={1} paddingRight={1} onMouseUp={submit}>
             <text fg={theme.onPrimary} attributes={TextAttributes.BOLD}>
-              Use {selected().size} output{selected().size === 1 ? "" : "s"} ctrl+enter
+              Use {selected().size}
+              {dimensions().width >= 56 ? ` output${selected().size === 1 ? "" : "s"}` : ""} ctrl+enter
             </text>
           </box>
         </box>
       }
     >
-      <box paddingLeft={2} paddingRight={2} paddingTop={1} gap={1} flexGrow={1} minHeight={0}>
+      <box paddingLeft={2} paddingRight={2} paddingTop={1} gap={1} flexGrow={1} minHeight={0} overflow="hidden">
         <input
           ref={(value: InputRenderable) => (search = value)}
           placeholder="Search formats (PDF, audio, publishing…)"
@@ -116,8 +127,9 @@ export function FormatPicker(props: {
           <scrollbox
             ref={(value: ScrollBoxRenderable) => (scroll = value)}
             flexGrow={1}
-            minHeight={Math.min(10, dimensions().height - 9)}
-            scrollbarOptions={{ visible: true }}
+            minHeight={0}
+            scrollX={false}
+            horizontalScrollbarOptions={{ visible: false }}
           >
             <For each={visible()}>
               {(format, index) => {
@@ -129,6 +141,8 @@ export function FormatPicker(props: {
                     flexDirection="row"
                     paddingLeft={1}
                     paddingRight={1}
+                    minWidth={0}
+                    overflow="hidden"
                     backgroundColor={isActive() ? theme.primary : theme.transparent}
                     onMouseOver={() => setActive(index())}
                     onMouseDown={() => setActive(index())}
@@ -138,18 +152,20 @@ export function FormatPicker(props: {
                       {isSelected() ? "●" : "○"}
                     </text>
                     <text
-                      width={22}
+                      width={dimensions().width < 64 ? 14 : 22}
                       fg={isActive() ? theme.onPrimary : theme.text}
                       attributes={primary() ? TextAttributes.BOLD : undefined}
                     >
                       {format.label}
                     </text>
-                    <text flexGrow={1} fg={isActive() ? theme.onPrimary : theme.muted} wrapMode="none">
+                    <text flexGrow={1} minWidth={0} fg={isActive() ? theme.onPrimary : theme.muted} wrapMode="none">
                       {formatDescription(format)}
                     </text>
-                    <text width={24} fg={isActive() ? theme.onPrimary : theme.subtle}>
-                      {formatCategory(format)}
-                    </text>
+                    <Show when={dimensions().width >= 72}>
+                      <text width={24} fg={isActive() ? theme.onPrimary : theme.subtle}>
+                        {formatCategory(format)}
+                      </text>
+                    </Show>
                     <Show when={format.id === props.suggested}>
                       <text fg={isActive() ? theme.onPrimary : theme.accent}> suggested</text>
                     </Show>

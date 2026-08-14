@@ -4,6 +4,7 @@ import { createEffect, createMemo, createSignal, For, onMount, Show } from "soli
 import type { InputRenderable, ScrollBoxRenderable } from "@opentui/core"
 import { TextAttributes } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
+import { truncateStart } from "../layout"
 import { matchesQuery } from "../model"
 import { theme } from "../theme"
 import { KeyHint, Modal } from "./modal"
@@ -142,14 +143,24 @@ export function FilePicker(props: {
       onClose={props.onCancel}
       width={86}
       footer={
-        <box paddingLeft={2} paddingRight={2} paddingBottom={1} flexDirection="row" justifyContent="space-between">
-          <box flexDirection="row" gap={2}>
-            <KeyHint key="↑↓" label="navigate" />
+        <box
+          paddingLeft={2}
+          paddingRight={2}
+          paddingBottom={1}
+          flexDirection={dimensions().width < 64 ? "column" : "row"}
+          justifyContent="space-between"
+          gap={1}
+          overflow="hidden"
+        >
+          <box flexDirection="row" gap={2} flexWrap="wrap" overflow="hidden">
+            <KeyHint key="j/k" label="navigate" />
             <KeyHint
               key={props.mode === "files" ? "space" : "enter"}
               label={props.mode === "files" ? "mark" : "open"}
             />
-            <KeyHint key="ctrl+h" label={showHidden() ? "hide hidden" : "show hidden"} />
+            <Show when={dimensions().width >= 56}>
+              <KeyHint key="ctrl+h" label={showHidden() ? "hide hidden" : "show hidden"} />
+            </Show>
           </box>
           <box backgroundColor={theme.primary} paddingLeft={1} paddingRight={1} onMouseUp={() => submit()}>
             <text fg={theme.onPrimary} attributes={TextAttributes.BOLD}>
@@ -159,9 +170,9 @@ export function FilePicker(props: {
         </box>
       }
     >
-      <box paddingLeft={2} paddingRight={2} paddingTop={1} gap={1} flexGrow={1} minHeight={0}>
+      <box paddingLeft={2} paddingRight={2} paddingTop={1} gap={1} flexGrow={1} minHeight={0} overflow="hidden">
         <text fg={theme.accent} wrapMode="none">
-          {directory()}
+          {truncateStart(directory(), Math.max(8, dimensions().width - 8))}
         </text>
         <input
           ref={(value: InputRenderable) => (search = value)}
@@ -179,8 +190,9 @@ export function FilePicker(props: {
             <scrollbox
               ref={(value: ScrollBoxRenderable) => (scroll = value)}
               flexGrow={1}
-              minHeight={Math.min(8, dimensions().height - 10)}
-              scrollbarOptions={{ visible: true }}
+              minHeight={0}
+              scrollX={false}
+              horizontalScrollbarOptions={{ visible: false }}
             >
               <For each={visible()}>
                 {(entry, index) => {
@@ -192,6 +204,8 @@ export function FilePicker(props: {
                       flexDirection="row"
                       paddingLeft={1}
                       paddingRight={1}
+                      minWidth={0}
+                      overflow="hidden"
                       backgroundColor={isActive() ? theme.primary : theme.transparent}
                       onMouseOver={() => setActive(index())}
                       onMouseDown={() => setActive(index())}
@@ -200,7 +214,7 @@ export function FilePicker(props: {
                       <text width={3} fg={isActive() ? theme.onPrimary : theme.accent}>
                         {entry.directory ? "▸" : isSelected() ? "●" : "○"}
                       </text>
-                      <text fg={isActive() ? theme.onPrimary : theme.text} wrapMode="none">
+                      <text flexGrow={1} minWidth={0} fg={isActive() ? theme.onPrimary : theme.text} wrapMode="none">
                         {entry.name}
                       </text>
                     </box>
