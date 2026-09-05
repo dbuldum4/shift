@@ -21,7 +21,9 @@ resolution, retry, cancellation, or recursive source discovery.
   for new adapters and register them once in `ConversionRegistry::default`.
 - Keep `src/main.rs` focused on GPUI state and presentation.
 - Keep `src/bin/shift-cli.rs` focused on arguments, output selection, and exit
-  behavior.
+  behavior. The `native-ui` feature (default) is the GPUI app; CLI/TUI engine
+  builds use `cargo build --bin shift-cli --no-default-features` so they do not
+  compile Metal shaders. `scripts/dev-tui.sh` is the local TUI loop.
 - Return `ConversionArtifact` values from modules (with `pipeline` + redacted
   `invocations` for provenance). Callers decide when and where to write them
   (single-file) or use the batch runner (multi-file).

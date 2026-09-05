@@ -19,6 +19,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "shift"
 path = "src/main.rs"
+required-features = ["native-ui"]
 
 [[bin]]
 name = "shift-cli"
@@ -28,8 +29,13 @@ path = "src/bin/shift-cli.rs"
 name = "shift-new-user"
 path = "src/bin/shift-new-user.rs"
 
+[features]
+default = ["native-ui"]
+# Native GPUI app. Off for CLI/TUI engine builds so `xcrun metal` is not required.
+native-ui = ["dep:gpui"]
+
 [dependencies]
-gpui = "=0.2.2"
+gpui = { version = "=0.2.2", optional = true }
 lyon = "1.0"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 unicode-segmentation = "1.12"

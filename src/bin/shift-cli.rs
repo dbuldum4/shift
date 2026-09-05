@@ -17,8 +17,9 @@ use shift_core::recipes::{
     ConversionRecipe, RecipeDestination, load_default_recipe_store, save_default_recipe_store,
 };
 use std::ffi::{OsStr, OsString};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -34,9 +35,31 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
+    let (arguments, launch_mode) = parse_launch_mode(arguments);
+
     if arguments.is_empty() {
+        if launch_mode != LaunchMode::Headless
+            && std::env::var_os("SHIFT_HEADLESS").is_none()
+            && stdin_is_tty()
+            && std::io::stdout().is_terminal()
+        {
+            return launch_tui();
+        }
         print_help();
         return Ok(ExitCode::FAILURE);
+    }
+
+    if arguments
+        .first()
+        .is_some_and(|value| matches!(value.to_string_lossy().as_ref(), "tui" | "--tui"))
+    {
+        if arguments.len() > 1 {
+            return Err(
+                "tui does not accept conversion arguments; use `shift-cli --headless ...` for scripts"
+                    .to_owned(),
+            );
+        }
+        return launch_tui();
     }
 
     let first_is_existing_path = arguments
@@ -62,8 +85,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         .first()
         .is_some_and(|value| value == "formats" && !first_is_existing_path)
     {
-        print_formats();
-        return Ok(ExitCode::SUCCESS);
+        return run_formats(&arguments[1..]);
     }
 
     if arguments
@@ -251,6 +273,77 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     write_result?;
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchMode {
+    Automatic,
+    Headless,
+}
+
+fn parse_launch_mode(mut arguments: Vec<OsString>) -> (Vec<OsString>, LaunchMode) {
+    let headless = arguments.first().is_some_and(|argument| {
+        matches!(
+            argument.to_string_lossy().as_ref(),
+            "--headless" | "--no-tui"
+        )
+    });
+    if headless {
+        arguments.remove(0);
+    }
+    (
+        arguments,
+        if headless {
+            LaunchMode::Headless
+        } else {
+            LaunchMode::Automatic
+        },
+    )
+}
+
+fn launch_tui() -> Result<ExitCode, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("could not locate shift-cli executable: {error}"))?;
+    let mut candidates = Vec::new();
+    if let Some(explicit) = std::env::var_os("SHIFT_TUI_BIN") {
+        candidates.push(PathBuf::from(explicit));
+    }
+    if let Some(parent) = current_exe.parent() {
+        candidates.push(parent.join(if cfg!(windows) {
+            "shift-tui.exe"
+        } else {
+            "shift-tui"
+        }));
+    }
+
+    let mut last_error = None;
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        match Command::new(&candidate)
+            .env("SHIFT_CLI_ENGINE", &current_exe)
+            .status()
+        {
+            Ok(status) => return Ok(exit_code_from_status(status.code())),
+            Err(error) => last_error = Some(format!("{}: {error}", candidate.display())),
+        }
+    }
+
+    match Command::new("shift-tui")
+        .env("SHIFT_CLI_ENGINE", &current_exe)
+        .status()
+    {
+        Ok(status) => Ok(exit_code_from_status(status.code())),
+        Err(error) => Err(format!(
+            "the interactive OpenTUI companion is not installed ({error}). {}Run `shift-cli --headless --help` for scripted usage or set SHIFT_TUI_BIN to the shift-tui executable",
+            last_error.map_or_else(String::new, |detail| format!("{detail}; "))
+        )),
+    }
+}
+
+fn exit_code_from_status(code: Option<i32>) -> ExitCode {
+    ExitCode::from(code.unwrap_or(1).clamp(0, 255) as u8)
 }
 
 fn cli_version_string() -> String {
@@ -2043,8 +2136,60 @@ fn is_network_or_file_url_input(input: &OsStr) -> bool {
     })
 }
 
-fn print_formats() {
-    for module in ConversionRegistry::default().modules() {
+fn run_formats(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut json = false;
+    let mut inputs = Vec::new();
+    let mut cursor = 0;
+    while cursor < arguments.len() {
+        match arguments[cursor].to_string_lossy().as_ref() {
+            "--json" => json = true,
+            "--input" => {
+                cursor += 1;
+                inputs.push(
+                    arguments
+                        .get(cursor)
+                        .ok_or_else(|| "formats --input requires a path or URL".to_owned())?
+                        .clone(),
+                );
+            }
+            "-h" | "--help" | "help" => {
+                println!(
+                    "Usage: shift-cli formats [--json] [--input PATH_OR_URL]...\n\n\
+                     List registered conversion capability. Repeat --input to return the\n\
+                     intersection of formats supported by every selected source. --json is\n\
+                     the stable machine-readable bridge used by the interactive TUI."
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            unknown => {
+                return Err(format!(
+                    "unknown formats argument: {unknown} (try `shift-cli formats --help`)"
+                ));
+            }
+        }
+        cursor += 1;
+    }
+
+    let registry = ConversionRegistry::default();
+    if json {
+        println!("{}", formats_json(&registry, &inputs)?);
+    } else if inputs.is_empty() {
+        print_formats(&registry);
+    } else {
+        for format in formats_for_inputs(&registry, &inputs)? {
+            println!(
+                "{}\t{}\t{}",
+                format.id(),
+                format.label(),
+                format.extension()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_formats(registry: &ConversionRegistry) {
+    for module in registry.modules() {
         let outputs = module
             .output_formats()
             .iter()
@@ -2066,6 +2211,91 @@ fn print_formats() {
             module.id(),
         );
     }
+}
+
+fn formats_for_inputs(
+    registry: &ConversionRegistry,
+    inputs: &[OsString],
+) -> Result<Vec<OutputFormat>, String> {
+    if inputs.is_empty() {
+        return Ok(OutputFormat::ALL.to_vec());
+    }
+
+    let mut intersection = OutputFormat::ALL.to_vec();
+    for input in inputs {
+        let source = classify_capability_input(input)?;
+        let available =
+            shift_core::conversion::available_outputs_for_batch_source(registry, &source);
+        intersection.retain(|format| available.contains(format));
+    }
+    Ok(intersection)
+}
+
+fn classify_capability_input(input: &OsStr) -> Result<BatchSource, String> {
+    let value = input.to_string_lossy();
+    if looks_like_url(value.trim()) {
+        Ok(BatchSource::Url(value.trim().to_owned()))
+    } else if value.trim().is_empty() {
+        Err("formats --input requires a non-empty path or URL".to_owned())
+    } else {
+        Ok(BatchSource::File(PathBuf::from(input)))
+    }
+}
+
+fn formats_json(
+    registry: &ConversionRegistry,
+    inputs: &[OsString],
+) -> Result<serde_json::Value, String> {
+    let formats = formats_for_inputs(registry, inputs)?;
+    let suggested = inputs.first().and_then(|input| {
+        let source = classify_capability_input(input).ok()?;
+        let candidate = match source {
+            BatchSource::Url(_) => shift_core::conversion::suggested_output_for_url(),
+            BatchSource::File(path) => shift_core::conversion::suggested_output_for_path(path),
+        };
+        formats.contains(&candidate).then_some(candidate.id())
+    });
+    let format_values = formats
+        .iter()
+        .map(|format| {
+            serde_json::json!({
+                "id": format.id(),
+                "label": format.label(),
+                "extension": format.extension(),
+                "mediaType": format.media_type(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let modules = registry
+        .modules()
+        .map(|module| {
+            serde_json::json!({
+                "id": module.id(),
+                "label": module.label(),
+                "inputs": module.input_extensions(),
+                "outputs": module
+                    .output_formats()
+                    .iter()
+                    .map(|format| format.id())
+                    .collect::<Vec<_>>(),
+                "supportsUrl": module.supports_url(OutputFormat::MARKDOWN)
+                    || module.supports_url(OutputFormat::HTML),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
+        "schemaVersion": 1,
+        "cliVersion": env!("CARGO_PKG_VERSION"),
+        "platform": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "inputCount": inputs.len(),
+        "suggestedFormat": suggested,
+        "formats": format_values,
+        "modules": modules,
+    }))
 }
 
 fn parse_secs(value: &OsStr, flag: &str) -> Result<f64, String> {
@@ -2134,11 +2364,14 @@ fn print_help() {
     println!(
         "Shift converts files and URLs through the same modules as the native app.\n\n\
          Usage:\n  shift-cli <INPUT|URL> [-t <FORMAT>] [-o <OUTPUT>] [--stdout] [--force] [--module <ID>]\n  \
+         shift-cli                         # launch the interactive OpenTUI app\n  \
+         shift-cli tui                     # explicitly launch the app\n  \
+         shift-cli --headless <ARGS>       # force script/non-TUI behavior\n  \
          shift-cli convert <INPUT|URL> …\n  \
          shift-cli batch <INPUT|URL>… [-t <FORMAT>] [--also-to <FORMAT>]… [-O <DIR>] [--force]\n  \
          shift-cli watch <FOLDER> -O <DIR> [-t <FORMAT>] [--once]\n  \
          shift-cli <INPUT>… -O <DIR> [-t <FORMAT>]   # multi-file batch (shared queue)\n  \
-         shift-cli formats\n  \
+         shift-cli formats [--json] [--input <PATH_OR_URL>]…\n  \
          shift-cli doctor [--script] [--quiet]\n  \
          shift-cli recipes list|show|save|delete …
   \
@@ -2320,7 +2553,6 @@ fn confirm_network_sources(sources: &[BatchSource], yes: bool) -> Result<(), Str
 }
 
 fn stdin_is_tty() -> bool {
-    use std::io::IsTerminal;
     std::io::stdin().is_terminal()
 }
 
@@ -2392,6 +2624,55 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn headless_launch_flag_is_global_and_removed_before_dispatch() {
+        let (arguments, mode) =
+            parse_launch_mode(args(&["--headless", "report.docx", "--to", "markdown"]));
+        assert_eq!(mode, LaunchMode::Headless);
+        assert_eq!(arguments, args(&["report.docx", "--to", "markdown"]));
+
+        let (arguments, mode) = parse_launch_mode(args(&["--no-tui", "doctor"]));
+        assert_eq!(mode, LaunchMode::Headless);
+        assert_eq!(arguments, args(&["doctor"]));
+
+        let (arguments, mode) = parse_launch_mode(args(&["report.docx", "--headless"]));
+        assert_eq!(mode, LaunchMode::Automatic);
+        assert_eq!(arguments, args(&["report.docx", "--headless"]));
+    }
+
+    #[test]
+    fn formats_json_is_versioned_and_filters_selected_inputs() {
+        let registry = ConversionRegistry::default();
+        let response = formats_json(&registry, &args(&["report.docx"])).unwrap();
+        assert_eq!(response["schemaVersion"], 1);
+        assert_eq!(response["inputCount"], 1);
+        assert!(response["formats"].as_array().is_some_and(|formats| {
+            formats.iter().any(|format| format["id"] == "markdown")
+                && formats.iter().all(|format| {
+                    format["label"].is_string()
+                        && format["extension"].is_string()
+                        && format["mediaType"].is_string()
+                })
+        }));
+        assert!(
+            response["modules"]
+                .as_array()
+                .is_some_and(|modules| !modules.is_empty())
+        );
+    }
+
+    #[test]
+    fn formats_intersection_rejects_empty_inputs_and_handles_urls() {
+        let registry = ConversionRegistry::default();
+        let error = formats_for_inputs(&registry, &args(&[""])).unwrap_err();
+        assert!(error.contains("non-empty"), "{error}");
+
+        let formats =
+            formats_for_inputs(&registry, &args(&["https://example.com/article"])).unwrap();
+        assert!(formats.contains(&OutputFormat::MARKDOWN));
+        assert!(formats.contains(&OutputFormat::HTML));
     }
 
     struct AppSupportGuard {

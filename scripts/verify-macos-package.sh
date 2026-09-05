@@ -18,17 +18,27 @@ fail() {
 [ -d "$app" ] || fail "missing app bundle: $app"
 [ -x "$app/Contents/MacOS/shift" ] || fail "missing app executable"
 [ -x "$app/Contents/Resources/bin/shift-cli" ] || fail "missing bundled CLI"
+[ -x "$app/Contents/Resources/bin/shift-tui" ] || fail "missing bundled OpenTUI client"
 [ -f "$app/Contents/Resources/LICENSE" ] || fail "missing bundled LICENSE"
 [ -f "$app/Contents/Resources/THIRD_PARTY_NOTICES.md" ] || fail "missing bundled third-party notices"
 [ -f "$app/Contents/Info.plist" ] || fail "missing Info.plist"
 [ -f "$app/Contents/Resources/dependency-manifest.json" ] || fail "missing dependency manifest"
 [ ! -e "$app/Contents/Resources/runtime" ] || fail "converter runtime must not be bundled in Shift.app"
 
-bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+if [ -x /usr/libexec/PlistBuddy ]; then
+  bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+else
+  # Keep failure-path fixtures runnable on Linux/Windows CI hosts. The release
+  # still uses PlistBuddy on macOS; this only extracts the adjacent key/string
+  # form emitted by package-macos.sh.
+  bundle_version="$(sed -n 's|.*<key>CFBundleShortVersionString</key><string>\([^<]*\)</string>.*|\1|p' "$app/Contents/Info.plist" | head -n 1)"
+fi
 [ "$bundle_version" = "$version" ] || fail "bundle version is $bundle_version, expected $version"
 
 cli_version="$("$app/Contents/Resources/bin/shift-cli" --version)"
 [ "$cli_version" = "shift-cli $version" ] || fail "bundled CLI reports '$cli_version', expected 'shift-cli $version'"
+tui_cli_version="$("$app/Contents/Resources/bin/shift-tui" --headless --version)"
+[ "$tui_cli_version" = "shift-cli $version" ] || fail "OpenTUI headless bridge reports '$tui_cli_version', expected 'shift-cli $version'"
 
 for artifact in "$archive" "$dmg"; do
   [ -f "$artifact" ] || fail "missing artifact: $artifact"

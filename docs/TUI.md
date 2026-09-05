@@ -1,0 +1,72 @@
+# Shift terminal application
+
+Shift's terminal UI is a standalone OpenTUI/Solid client. It deliberately owns
+presentation only: the Rust `shift-cli` binary remains the authoritative engine
+for capability discovery, argument validation, recipes, URL policy, output
+naming, queue ordering, conversion, cancellation, and artifact writes.
+
+## Process boundary
+
+- `shift-cli` with no arguments and an attached input/output terminal launches
+  the sibling `shift-tui` executable.
+- `shift-cli --headless …` always stays in the Rust process and preserves the
+  existing CLI contract.
+- `shift-tui` resolves its engine from `SHIFT_CLI_ENGINE`, then a sibling
+  `shift-cli`, then `PATH`.
+- `shift-cli formats --json --input …` returns schema version 1 capability
+  data. Repeated inputs return the supported-format intersection, so the TUI
+  cannot offer an output the shared registry would reject.
+- Conversion commands are passed as an argv array—never through a shell. Output
+  records are JSON strings on stdout; progress and diagnostics remain stderr.
+
+## Interaction contract
+
+The main view consists of an input queue, conversion settings, an activity bar,
+and a shortcut footer. At 96 columns it uses a two-panel layout; below that it
+stacks vertically, compresses the conversion pane, and scrolls settings when
+they no longer fit. The run action stays pinned below that list. The footer
+keeps only the shortcuts that fit and shortens the working directory from the
+left so hints never paint over the path. On
+short terminals the activity bar collapses to one row. On the empty input
+state, Add files, Add folder, and Add URL are a focus group: arrow keys and
+j/k move the cursor, and Enter runs the focused action. Narrow terminals stack
+those actions instead of crowding them onto one row. Adding the first input
+moves focus to the conversion pane so a full input-to-output pass is arrows
+and Enter: Output, Converter, Destination, Naming, Overwrite, Expand folders,
+then Run conversion. Left or up from the first setting returns to the queue;
+down from the last queued item (or right) returns to conversion. Every action in the
+command palette has a keyboard path and all highlighted rows, buttons, toggles,
+picker entries, and output links accept mouse input. File and output pickers
+support wheel scrolling and filter input.
+
+OpenTUI owns terminal lifecycle, alternate-screen behavior, selection, mouse
+tracking, and Windows/Linux/macOS rendering. Shift sets `exitOnCtrlC: false` so
+it can cancel an active conversion before exiting and restores the renderer on
+normal exit, `SIGHUP`, or `SIGTERM`.
+
+## Building
+
+Dependencies are pinned in `tui/package.json` and `package-lock.json`.
+
+```sh
+cd tui
+npm ci --ignore-scripts
+npm run typecheck
+npm run test:node
+bun test
+bun run build
+```
+
+`bun run build:all` emits OpenTUI clients for glibc and musl Linux (x64/arm64),
+macOS (x64/arm64), and Windows (x64). Baseline x64 variants avoid an AVX2
+requirement. A complete cross-platform Shift distribution must place the native
+Rust `shift-cli` engine beside the matching `shift-tui` client.
+
+The matching engine is `cargo build --bin shift-cli --no-default-features`,
+which skips the native GPUI app and does not need `xcrun metal`.
+`scripts/dev-tui.sh` builds that engine and launches `bun run --cwd tui dev`
+with `SHIFT_CLI_ENGINE` set.
+
+The macOS release workflow builds the current-architecture client and packages
+both executables under `Shift.app/Contents/Resources/bin`. Package verification
+executes the TUI's headless bridge to prove sibling engine discovery works.

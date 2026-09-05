@@ -81,7 +81,9 @@ On first launch, onboarding offers a copy-paste Homebrew command for the main
 converter CLIs. The same tools can be installed anytime from Terminal, conversion
 error hints, or Settings. The commands below are the supported setup path.
 
-- macOS with Xcode and its command-line tools
+- macOS with Xcode and its command-line tools (native GPUI app). The CLI/TUI
+  engine builds with Command Line Tools only:
+  `cargo build --bin shift-cli --no-default-features`.
 - Rust stable (selected automatically by `rust-toolchain.toml`)
 - Python 3.11 (packaged launchers and release packaging resolve `python3.11`;
   Homebrew `python@3.11` is the documented path)
@@ -273,6 +275,63 @@ Application Support; priority is shared with `shift-cli`.
 
 ## CLI
 
+Running `shift-cli` with no arguments in a terminal opens the interactive app.
+It is built with [OpenTUI](https://github.com/anomalyco/opentui) and its SolidJS
+renderer—the same renderer used by OpenCode. The interface supports keyboard
+and mouse input, narrow-terminal reflow, multi-file and recursive-folder
+queues, capability-filtered multi-output selection, an output-folder picker,
+live progress, cancellation, converter diagnostics, and a searchable command
+palette.
+
+Common shortcuts:
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+P` / `a` | Add files |
+| `←` `→` / `↑` `↓` | Move the empty-state add cursor |
+| `↑` `↓` or `j` `k` | Move through queued inputs |
+| `Enter` | Run the focused add action, or open a finished artifact |
+| `Ctrl+L` | Add a URL |
+| `Ctrl+O` | Choose one or more output formats |
+| `Ctrl+D` | Choose the output folder |
+| `Ctrl+K` | Open the command palette |
+| `Ctrl+R` | Run the queue |
+| `Ctrl+C` | Cancel active work, or exit when idle |
+| `?` | Show keyboard and mouse help |
+
+Existing argument-based commands remain headless and script-safe. Prefix a
+command with `--headless` (or set `SHIFT_HEADLESS=1`) to explicitly prevent any
+interactive launch. `formats --json --input PATH` is the versioned JSON bridge
+used by the TUI to keep output choices aligned with the Rust conversion
+registry; conversion itself still runs exclusively through the existing shared
+`ConversionRegistry` and `BatchQueue`.
+
+```sh
+shift-cli                         # interactive app
+shift-cli tui                     # explicit interactive app
+shift-cli --headless report.docx --to markdown --print-json
+shift-cli --headless formats --json --input report.docx
+```
+
+The packaged client looks for `shift-tui` beside `shift-cli`; set
+`SHIFT_TUI_BIN` during development or custom packaging. For a local TUI loop
+that skips the native GPUI app (no Xcode / `xcrun metal`):
+
+```sh
+scripts/dev-tui.sh
+```
+
+The OpenTUI package is under `tui/`:
+
+```sh
+cd tui
+npm ci
+npm run typecheck
+bun test
+bun run build       # current platform
+bun run build:all   # Linux/macOS/Windows OpenTUI clients
+```
+
 ```sh
 # Probe external engines
 # exit 0 = at least one conversion engine ready; 1 = none ready
@@ -452,11 +511,11 @@ secrets: automation should be explicit, inspectable, and easy to stop.
 ## Architecture
 
 ```text
-GPUI app ─────┐                          ┌─ MarkItDownModule
-              ├── ConversionRegistry ───┼─ PandocModule
-shift-cli ────┘                          ├─ DefuddleModule  (URLs + HTML)
-         └── BatchQueue / run_batch      ├─ DoclingModule   (docs → text formats; ARM ASR → transcript)
-                                         └─ FfmpegModule    (audio/video/stills/subs)
+GPUI app ───────────┐                          ┌─ MarkItDownModule
+OpenTUI client ─┐   ├── ConversionRegistry ───┼─ PandocModule
+                └ shift-cli JSON/argv bridge  ├─ DefuddleModule  (URLs + HTML)
+headless scripts ───┘                          ├─ DoclingModule   (docs → text formats; ARM ASR → transcript)
+                 └── BatchQueue / run_batch   └─ FfmpegModule    (audio/video/stills/subs)
 ```
 
 `src/conversion/` is the product boundary. A module advertises supported
@@ -473,6 +532,9 @@ identical across the app and CLI.
 cargo fmt --check
 cargo lint
 cargo test --all-targets
+cd tui && npm run typecheck
+cd tui && npm run test:node
+cd tui && bun test
 ```
 
 For optimized binaries, run `cargo build --release`. GPUI is pre-1.0 and pinned
