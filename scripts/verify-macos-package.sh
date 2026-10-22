@@ -54,6 +54,20 @@ for component in documents-markdown web-extraction; do
     || fail "dependency manifest does not reference: $dependency"
 done
 
+# Check the runtime actually shipped in the dependency archive, not the host.
+verification_dir="$(mktemp -d "${TMPDIR:-/tmp}/shift-node-verification.XXXXXX")"
+trap 'rm -rf "$verification_dir"' EXIT
+web_archive="$output_dir/shift-dependencies-${version}-macos-${arch}-web-extraction.zip"
+unzip -q "$web_archive" -d "$verification_dir"
+"$verification_dir/node-runtime/bin/node" "$(dirname "$0")/check-node-runtime.cjs" \
+  || fail "web-extraction archive contains an unpatched or unusable Node runtime"
+"$verification_dir/bin/defuddle" --help >/dev/null \
+  || fail "packaged Defuddle launcher failed"
+printf '<html><head><title>Runtime check</title></head><body><article><h1>Runtime check</h1><p>Local conversion remains available.</p></article></body></html>\n' > "$verification_dir/control.html"
+"$verification_dir/bin/defuddle" parse "$verification_dir/control.html" --markdown > "$verification_dir/control.md"
+grep -Fq 'Local conversion remains available.' "$verification_dir/control.md" \
+  || fail "packaged Defuddle failed the local HTML conversion control"
+
 unzip -t "$archive" >/dev/null || fail "ZIP archive is corrupt: $archive"
 unzip -Z1 "$archive" | grep -Fxq 'Shift.app/Contents/Info.plist' \
   || fail "ZIP archive does not contain Shift.app/Contents/Info.plist"

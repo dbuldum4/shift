@@ -8,7 +8,7 @@ on:
       tag:
         description: Existing version tag to release
         required: true
-        default: v1.2.0
+        default: v1.2.1
 
 permissions:
   contents: write
@@ -80,7 +80,7 @@ jobs:
           python-version: "3.11"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "22"
+          node-version: "22.23.4"
       - name: Verify host architecture matches matrix
         run: |
           set -eu

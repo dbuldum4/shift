@@ -40,7 +40,7 @@ notarization to test during development.
 
 ## Security status
 
-Shift 1.2.0 is not yet distributed with a Developer ID signature or Apple
+Shift 1.2.1 is not yet distributed with a Developer ID signature or Apple
 notarization. This release process deliberately does not add signing work.
 Users may need to use macOS's Control-click → Open flow. Signing and
 notarization are explicit follow-up release work, not an implied guarantee of
@@ -52,3 +52,16 @@ Moving `Shift.app` to the Trash removes the application. Deleting
 `~/Library/Application Support/Shift` additionally removes local preferences,
 history, session settings, and cached artifacts; it does not remove converted
 files written outside that directory.
+
+## October 2026 Node security update
+
+Shift 1.2.1 packages Node.js 22.23.4 in its web-extraction component and checks
+the actual archived runtime before release. Install Shift 1.2.1 and reinstall
+the web-extraction pack through setup; Shift 1.2.0 retains its old component
+URL and checksum and cannot acquire this fix by downloading that old pack again.
+
+The managed Defuddle launcher checks its selected bundled or system interpreter
+before conversion. Development installs that use an external Defuddle CLI must
+also update the Node.js used by that CLI's PATH or shebang. Shift's URL download
+path uses curl and passes local HTML to Defuddle; this update does not claim a
+demonstrated Node network exploit in that path.
