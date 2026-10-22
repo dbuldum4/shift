@@ -25,6 +25,10 @@ if [ "$version" != "$manifest_version" ]; then
   exit 2
 fi
 
+# Validate the same interpreter whose prefix becomes the downloadable runtime.
+node_bin="$(command -v node)"
+"$node_bin" scripts/check-node-runtime.cjs
+
 if [ ! -x target/release/shift ] || [ ! -x target/release/shift-cli ]; then
   echo "package-macos: release binaries are missing; run cargo build --release --locked first" >&2
   exit 2
@@ -35,6 +39,7 @@ mkdir -p "$contents/MacOS" "$resources/bin" "$runtime/bin" "$runtime/python" "$r
 
 cp target/release/shift "$contents/MacOS/shift"
 cp target/release/shift-cli "$resources/bin/shift-cli"
+cp scripts/check-node-runtime.cjs "$runtime/bin/check-node-runtime.cjs"
 cp LICENSE "$resources/LICENSE"
 cp THIRD_PARTY_NOTICES.md "$resources/THIRD_PARTY_NOTICES.md"
 
@@ -233,6 +238,7 @@ if [ -z "$node" ] || [ ! -x "$node" ]; then
     "defuddle: Node.js not found. Install Node (for example: brew install node) or set SHIFT_NODE_BIN to an absolute path to node." >&2
   exit 127
 fi
+"$node" "$root/bin/check-node-runtime.cjs"
 exec "$node" "$root/node/node_modules/defuddle/dist/cli.js" "$@"
 EOF
 
@@ -250,7 +256,6 @@ docs_payload="$resources/.dependency-documents"
 web_payload="$resources/.dependency-web"
 mkdir -p "$docs_payload/bin" "$web_payload/bin"
 python_bin="$(command -v python3.11)"
-node_bin="$(command -v node)"
 # Use the interpreter's real prefix rather than the parent of a PATH shim
 # (setup-uv commonly exposes Python through ~/.local/bin/python3.11).
 python_prefix="$("$python_bin" -c 'import sys; print(sys.prefix)')"
@@ -264,7 +269,7 @@ cp -R -L "$python_prefix" "$docs_payload/python-runtime"
 cp "$runtime/bin/markitdown" "$runtime/bin/docling" "$docs_payload/bin/"
 cp -R -L "$runtime/node" "$web_payload/node"
 cp -R -L "$node_prefix" "$web_payload/node-runtime"
-cp "$runtime/bin/defuddle" "$web_payload/bin/"
+cp "$runtime/bin/defuddle" "$runtime/bin/check-node-runtime.cjs" "$web_payload/bin/"
 chmod +x "$docs_payload/bin/"* "$web_payload/bin/"*
 if find "$docs_payload" "$web_payload" -type l -print | grep -q .; then
   echo "package-macos: dependency payload still contains symlinks" >&2
